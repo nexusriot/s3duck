@@ -1,9 +1,12 @@
+import datetime
 import sys
 
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import QIcon, QPixmap, QStandardItemModel, QStandardItem
 from PyQt5.QtWidgets import QTreeWidget, QTreeWidgetItem, QApplication, QWidget
+
+from qjsonmodel import QJsonModel, QJsonTreeItem
 # from collections import deque
 
 
@@ -46,33 +49,36 @@ class MyWindow(QMainWindow):
         self.tBar.addSeparator()
 
         self.model = QStandardItemModel()
-        self.model.setHorizontalHeaderLabels(['col1', 'col2', 'col3'])
+
+        self.model.setHorizontalHeaderLabels(['name', 'size', 'modified'])
         self.listview.header().setDefaultSectionSize(180)
         self.listview.setModel(self.model)
-
-        for i in range(3):
-            parent1 = QStandardItem(QIcon().fromTheme("folder-remote"),
-                                    'Family {}. Some long status text for sp'.format(i))
-            for j in range(3):
-                child1 = QStandardItem(QIcon().fromTheme("folder-remote"), 'Child {}'.format(i * 3 + j))
-                child2 = QStandardItem('row: {}, col: {}'.format(i, j + 1))
-                child3 = QStandardItem('row: {}, col: {}'.format(i, j + 2))
-                parent1.appendRow([child1, child2, child3])
-            self.model.appendRow(parent1)
-            # span container columns
-            self.listview.setFirstColumnSpanned(i, self.listview.rootIndex(), True)
-
+        # demo set
+        self.model.appendRow([
+            QStandardItem(QIcon().fromTheme("folder-remote"), 'docs'),
+            QStandardItem("<DIR>"),
+            QStandardItem("")])
+        self.model.appendRow([
+            QStandardItem(QIcon().fromTheme("folder-remote"), 'video'),
+            QStandardItem("<DIR>"),
+            QStandardItem("")])
+        self.model.appendRow([
+            QStandardItem(QIcon().fromTheme("document-new"), 'file.day'),
+            QStandardItem("688374411"),
+            QStandardItem(datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))])
         self.listview.header().resizeSection(0, 320)
         self.listview.header().resizeSection(1, 80)
         self.listview.header().resizeSection(2, 80)
+        self.listview.doubleClicked.connect(self.list_doubleClicked)
         self.listview.setSortingEnabled(True)
         # docs = QStandardPaths.standardLocations(QStandardPaths.DocumentsLocation)[0]
         self.splitter.setSizes([20, 160])
         self.listview.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.listview.setDragDropMode(QAbstractItemView.DragDrop)
-        self.listview.setDragEnabled(True)
-        self.listview.setAcceptDrops(True)
-        self.listview.setDropIndicatorShown(True)
+        # self.listview.setDragEnabled(True)
+        # self.listview.setAcceptDrops(True)
+        # self.listview.setDropIndicatorShown(True)
+
         self.listview.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.listview.setIndentation(10)
         self.listview.sortByColumn(0, Qt.AscendingOrder)
@@ -81,6 +87,9 @@ class MyWindow(QMainWindow):
     def createStatusBar(self):
         welcome = "Welcome to S3 Duck🦆 for Linux"
         self.statusBar().showMessage(welcome, 0)
+
+    def list_doubleClicked(self):
+        index = self.listview.selectionModel().currentIndex()
 
     def goBack(self):
         index = self.listview.selectionModel().currentIndex()
