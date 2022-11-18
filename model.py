@@ -33,6 +33,7 @@ class Model:
         self._client = None
         self._fernet = None
         self.current_folder = ""
+        self.prev_folder = ""
         self.endpoint_url = endpoint_url
         self.region_name = region_name
         self.encrypted_key_id = encrypted_key_id
@@ -70,7 +71,7 @@ class Model:
 
     def list(self, fld):
         if fld:
-            path = self.current_folder + fld + "/"
+            path = fld
         else:
             path = fld
         rsp = self.client.list_objects_v2(
