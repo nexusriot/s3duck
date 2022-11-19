@@ -121,3 +121,15 @@ class Model:
     def download_file(self, key, local_name):
         self.client.download_file(self.bucket, key, local_name)
 
+    def create_folder(self, key):
+        return self.client.put_object(Bucket=self.bucket, Key=key)
+
+    def delete(self, key):
+        # TODO: check usage
+        if key.endswith("/"):
+            r = self.client.list_objects_v2(Bucket=self.bucket, Prefix=key)
+            keys = [key.get('Key') for key in r.get("Contents", [])]
+            for key in keys:
+                self.client.delete_object(Bucket=self.bucket, Key=key)
+        else:
+            self.client.delete_object(Bucket=self.bucket, Key=key)
