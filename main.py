@@ -215,8 +215,14 @@ class MyWindow(QMainWindow):
         self.saveFunc()
 
     def new_folder(self):
-        r = self.data_model.create_folder(self.data_model.current_folder + "inner_test/")
-        self.navigate()
+        name, ok = QInputDialog.getText(self, 'Create folder', 'Folder name')
+        # TODO: try to make it better
+        name.replace("/", "")
+        if ok:
+            key = self.data_model.current_folder + "%s/" % name
+            self.data_model.create_folder(key)
+            self.logview.appendPlainText("Created folder %s (%s)" %( name, key))
+            self.navigate()
 
     def delete(self):
         names = list()
