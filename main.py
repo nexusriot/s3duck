@@ -36,8 +36,8 @@ class Worker(QObject):
 
     def download(self):
         for i in self.job:
-            key, local_name = i
-            msg = "Downloading %s -> %s" % (key, local_name)
+            key, local_name, size = i
+            msg = "Downloading %s -> %s (%s)" % (key, local_name, size)
             self.progress.emit(msg)
             self.data_model.download_file(key, local_name)
         self.finished.emit()
@@ -101,6 +101,8 @@ class MyWindow(QMainWindow):
         self.tBar.addAction(self.btnCreateFolder)
         self.tBar.addAction(self.btnRemove)
         self.tBar.addSeparator()
+        self.tBar.addAction(self.btnAbout)
+        self.tBar.addSeparator()
         self.model = QStandardItemModel()
 
         self.model.setHorizontalHeaderLabels(['Name', 'Size', 'Modified'])
@@ -133,6 +135,30 @@ class MyWindow(QMainWindow):
         self.thread = None
         self.worker = None
         self.restoreSettings()
+
+    def simple(self, title, message):
+        QMessageBox(QMessageBox.Information,
+                    title,
+                    message,
+                    QMessageBox.NoButton,
+                    self,
+                    Qt.Dialog | Qt.NoDropShadowWindowHint).show()
+
+    def about(self):
+        sysinfo = QSysInfo()
+        sys_info = (
+                sysinfo.prettyProductName() +
+                "<br>" + sysinfo.kernelType() +
+                " " + sysinfo.kernelVersion())
+        title = "S3 Duck 🦆 %s" % __VERSION__
+        message = """
+                    <span style='color: #3465a4; font-size: 20pt;font-weight: bold;text-align: center;'
+                    ></span></p><center><h3>S3 Duck 🦆
+                    </h3></center><a title='Vladislav Ananev' href='https://github.com/nexusriot'
+                     target='_blank'><br><span style='color: #8743e2; font-size: 10pt;'>
+                     ©2022 Vladislav Ananev</a><br><br></strong></span></p>
+                     """ + "version %s" % __VERSION__ + "<br><br>" + sys_info
+        self.simple(title, message)
 
     def modelToListView(self, model_result):
         """
@@ -262,7 +288,7 @@ class MyWindow(QMainWindow):
                 key = self.data_model.current_folder + name
                 # todo join path
                 local_name = folder_path + "/" + name
-                job.append((key, local_name))
+                job.append((key, local_name, m.size))
         self.logview.appendPlainText("Starting downloading")
         self.thread = QThread()
         self.worker = Worker(self.data_model, job)
@@ -289,6 +315,7 @@ class MyWindow(QMainWindow):
         self.btnCreateFolder = QAction(QIcon.fromTheme("folder-new"), "new folder", triggered=self.new_folder)
         self.btnRemove = QAction(QIcon.fromTheme("edit-delete"), "delete", triggered=self.delete)
         self.btnRefresh = QAction(QIcon.fromTheme("view-refresh"), "refresh", triggered=self.navigate)
+        self.btnAbout = QAction(QIcon.fromTheme("help-about"), "about", triggered=self.about)
 
     def restoreSettings(self):
         if self.settings.contains("pos"):
