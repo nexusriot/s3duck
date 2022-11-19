@@ -1,3 +1,4 @@
+import platform
 import boto3
 import botocore
 
@@ -40,6 +41,10 @@ class Model:
         self.encrypted_secret = encrypted_secret
         self.key = key
         self.bucket = bucket
+
+    @staticmethod
+    def get_os_family():
+        return platform.system()
 
     @staticmethod
     def generate_key():
