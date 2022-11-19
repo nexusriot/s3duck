@@ -112,3 +112,7 @@ class Model:
                     obj['Size']
                 ))
         return items
+
+    def download_file(self, key, local_name):
+        self.client.download_file(self.bucket, key, local_name)
+

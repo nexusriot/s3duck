@@ -3,9 +3,16 @@ import sys
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import QIcon, QPixmap, QStandardItemModel, QStandardItem
-from PyQt5.QtWidgets import QTreeWidget, QTreeWidgetItem, QApplication, QWidget
+from PyQt5.QtWidgets import QTreeWidget, QTreeWidgetItem, QApplication, QWidget, QFileDialog
 
 from model import Model as DataModel
+
+
+class ListItem(QStandardItem):
+
+    def __init__(self, downloadable, *args, **kwargs):
+        self.downloadable = downloadable
+        super().__init__(*args, **kwargs)
 
 
 class MyWindow(QMainWindow):
@@ -77,6 +84,11 @@ class MyWindow(QMainWindow):
         self.restoreSettings()
 
     def modelToListView(self, model_result):
+        """
+        Converts data mode items to List Items
+        :param model_result:
+        :return:
+        """
         if not model_result:
             self.model.setRowCount(0)
         else:
@@ -86,14 +98,16 @@ class MyWindow(QMainWindow):
                     icon = QIcon().fromTheme("go-first")
                     size = str(i.size)
                     modified = str(i.modified)
+                    downloadable = True
                 else:
                     icon = QIcon().fromTheme("folder-remote")
                     size = "<DIR>"
                     modified = ""
+                    downloadable = False
                 self.model.appendRow([
-                    QStandardItem(icon, i.name),
-                    QStandardItem(size),
-                    QStandardItem(modified)])
+                    ListItem(downloadable, icon, i.name),
+                    ListItem(downloadable, size),
+                    ListItem(downloadable, modified)])
 
     def change_current_folder(self, new_folder):
         self.data_model.prev_folder = self.data_model.current_folder
@@ -105,10 +119,13 @@ class MyWindow(QMainWindow):
         show_folder = (self.data_model.current_folder if self.data_model.current_folder else "/")
         self.statusBar().showMessage("path: %s" % show_folder, 0)
 
-    def list_doubleClicked(self):
+    def get_elem_name(self):
         index = self.listview.selectionModel().currentIndex()
         i = index.model().itemFromIndex(index)
-        name = i.text()
+        return i.text()
+
+    def list_doubleClicked(self):
+        name = self.get_elem_name()
         self.change_current_folder(self.data_model.current_folder + "%s/" % name)
         self.navigate()
 
@@ -117,7 +134,7 @@ class MyWindow(QMainWindow):
         self.navigate()
 
     def download(self):
-        pass
+        self.saveFunc()
 
     def goUp(self):
         p = self.data_model.current_folder
@@ -131,6 +148,19 @@ class MyWindow(QMainWindow):
     def goHome(self):
         self.change_current_folder("")
         self.navigate()
+
+    def saveFunc(self):
+        folder_path = QFileDialog.getExistingDirectory(self, 'Select Folder')
+        for ix in self.listview.selectionModel().selectedIndexes():
+            if ix.column() == 0:
+                m = ix.model().itemFromIndex(ix)
+                if not m.downloadable:
+                    continue
+                name = m.text()
+                key = self.data_model.current_folder + name
+                # todo joinpath
+                local_name = folder_path + "/" + name
+                self.data_model.download_file(key, local_name)
 
     def createActions(self):
         self.btnBack = QAction(QIcon.fromTheme("go-previous"), "go back", triggered=self.goBack)
