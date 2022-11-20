@@ -1,0 +1,3 @@
+boto3=1.24.96
+PyQt5==5.15.7
+cryptography==38.0.3

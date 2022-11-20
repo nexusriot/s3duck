@@ -1,9 +1,11 @@
+#!/bin/env python3
+
 import sys
 import os
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
-from PyQt5.QtGui import QIcon, QPixmap, QStandardItemModel, QStandardItem
-from PyQt5.QtWidgets import QTreeWidget, QTreeWidgetItem, QApplication, QWidget, QFileDialog, QPlainTextEdit
+from PyQt5.QtGui import QIcon, QStandardItemModel, QStandardItem
+from PyQt5.QtWidgets import QApplication, QWidget, QFileDialog, QPlainTextEdit
 
 from model import Model as DataModel
 from settings import SettingsWindow

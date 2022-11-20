@@ -45,6 +45,7 @@ class SettingsWindow(QDialog):
         self.bucketName.setText(bucket)
         self.accessKeyEdit.setText(access_key)
         self.secretKeyEdit.setText(secret_key)
+        self.secretKeyEdit.setEchoMode(QLineEdit.Password)
 
     @QtCore.pyqtSlot()
     def on_text_changed(self):
