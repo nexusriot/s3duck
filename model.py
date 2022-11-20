@@ -47,6 +47,11 @@ class Model:
         return platform.system()
 
     @staticmethod
+    def encrypt(key, value):
+        fernet = Fernet(key.encode())
+        return fernet.encrypt(value.encode())
+
+    @staticmethod
     def generate_key():
         return Fernet.generate_key().decode()
 

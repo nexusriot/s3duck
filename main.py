@@ -6,6 +6,7 @@ from PyQt5.QtGui import QIcon, QPixmap, QStandardItemModel, QStandardItem
 from PyQt5.QtWidgets import QTreeWidget, QTreeWidgetItem, QApplication, QWidget, QFileDialog, QPlainTextEdit
 
 from model import Model as DataModel
+from settings import SettingsWindow
 
 OS_FAMILY_MAP = {
     "Linux": "🐧",
@@ -266,7 +267,44 @@ class MyWindow(QMainWindow):
             self.navigate()
 
     def sys_settings(self):
-        print("settings")
+        enc_settings = self.get_connection_settings()
+        endpoint, region, bucket, key, enc_access_key, enc_secret_key = enc_settings
+        if key:  # fill form
+            dm = DataModel(
+                endpoint,
+                region,
+                enc_access_key,
+                enc_secret_key,
+                key,
+                bucket
+            )
+            access_key = dm.decrypt_cred(enc_access_key)
+            secret_key = dm.decrypt_cred(enc_secret_key)
+            settings = (endpoint, region, bucket, access_key, secret_key)
+        else:
+            key = DataModel.generate_key()
+            settings = ("", "", "", "", "")
+        settings = SettingsWindow(self, settings=settings)
+        value = settings.exec_()
+        if value:
+            endpoint, region, bucket, access_key, secret_key = value
+            enc_access_key = DataModel.encrypt(key, access_key)
+            enc_secret_key = DataModel.encrypt(key, secret_key)
+            dm = DataModel(
+                endpoint,
+                region,
+                enc_access_key,
+                enc_secret_key,
+                key,
+                bucket
+            )
+            self.settings.setValue("uri", endpoint)
+            self.settings.setValue("region", region)
+            self.settings.setValue("bucket", bucket)
+            self.settings.setValue("key", key)
+            self.settings.setValue("access_key", enc_access_key)
+            self.settings.setValue("secret_key", enc_secret_key)
+            self.data_model = dm
 
     def delete(self):
         names = list()
@@ -310,7 +348,7 @@ class MyWindow(QMainWindow):
         dialog = QFileDialog()
         dialog.setFileMode(QFileDialog.ExistingFiles)
         names = dialog.getOpenFileNames(self, "Open files", "", filter)
-        if not names:
+        if not all(map(lambda x: x, names)):
             return
         for name in names[0]:
             basename = os.path.basename(name)
