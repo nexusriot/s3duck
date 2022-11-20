@@ -111,6 +111,7 @@ class MyWindow(QMainWindow):
         self.tBar.addAction(self.btnCreateFolder)
         self.tBar.addAction(self.btnRemove)
         self.tBar.addSeparator()
+        self.tBar.addAction(self.btnSettings)
         self.tBar.addAction(self.btnAbout)
         self.model = QStandardItemModel()
 
@@ -264,6 +265,9 @@ class MyWindow(QMainWindow):
             self.logview.appendPlainText("Created folder %s (%s)" %( name, key))
             self.navigate()
 
+    def sys_settings(self):
+        print("settings")
+
     def delete(self):
         names = list()
         job = list()
@@ -367,6 +371,7 @@ class MyWindow(QMainWindow):
         self.btnRemove = QAction(QIcon.fromTheme("edit-delete"), "delete", triggered=self.delete)
         self.btnRefresh = QAction(QIcon.fromTheme("view-refresh"), "refresh", triggered=self.navigate)
         self.btnUpload = QAction(QIcon.fromTheme("network-server"), "upload", triggered=self.upload)
+        self.btnSettings = QAction(QIcon.fromTheme("emblem-system"), "settings", triggered=self.sys_settings)
         self.btnAbout = QAction(QIcon.fromTheme("help-about"), "about", triggered=self.about)
 
     def restoreSettings(self):
