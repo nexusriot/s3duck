@@ -1,4 +1,5 @@
 import sys
+import os
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import QIcon, QPixmap, QStandardItemModel, QStandardItem
@@ -28,6 +29,7 @@ class ListItem(QStandardItem):
 class Worker(QObject):
     finished = pyqtSignal()
     progress = pyqtSignal(str)
+    refresh = pyqtSignal()
 
     def __init__(self, data_model, job):
         self.data_model = data_model
@@ -47,11 +49,17 @@ class Worker(QObject):
             msg = "Moving %s -> /dev/null" % key
             self.progress.emit(msg)
             self.data_model.delete(key)
+            self.refresh.emit()
         self.finished.emit()
 
     def upload(self):
-        # TODO: implement
-        raise NotImplementedError
+        for i in self.job:
+            key, local_name = i
+            msg = "Uploading %s -> %s" % (local_name, key)
+            self.progress.emit(msg)
+            self.data_model.upload_file(local_name, key)
+            self.refresh.emit()
+        self.finished.emit()
 
 
 class MyWindow(QMainWindow):
@@ -98,11 +106,12 @@ class MyWindow(QMainWindow):
         self.tBar.addAction(self.btnRefresh)
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnDownload)
+        self.tBar.addAction(self.btnUpload)
+        self.tBar.addSeparator()
         self.tBar.addAction(self.btnCreateFolder)
         self.tBar.addAction(self.btnRemove)
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnAbout)
-        self.tBar.addSeparator()
         self.model = QStandardItemModel()
 
         self.model.setHorizontalHeaderLabels(['Name', 'Size', 'Modified'])
@@ -177,7 +186,7 @@ class MyWindow(QMainWindow):
                     modified = str(i.modified)
                     downloadable = True
                 else:
-                    icon = QIcon().fromTheme("folder-remote")
+                    icon = QIcon().fromTheme("network-server")
                     size = "<DIR>"
                     modified = ""
                     downloadable = False
@@ -212,7 +221,38 @@ class MyWindow(QMainWindow):
         self.navigate()
 
     def download(self):
-        self.saveFunc()
+        job = list()
+        folder_path = QFileDialog.getExistingDirectory(self, 'Select Folder')
+        if not folder_path:
+            return
+        for ix in self.listview.selectionModel().selectedIndexes():
+            if ix.column() == 0:
+                m = ix.model().itemFromIndex(ix)
+                if not m.downloadable:
+                    self.logview.appendPlainText("Skipping %s, because it's a directory" % m.text())
+                    continue
+                name = m.text()
+                key = self.data_model.current_folder + name
+                # todo join path
+                local_name = folder_path + "/" + name
+                job.append((key, local_name, m.size))
+        self.logview.appendPlainText("Starting downloading")
+        self.thread = QThread()
+        self.worker = Worker(self.data_model, job)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.download)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.worker.progress.connect(self.report_logger_progress)
+        self.thread.start()
+        self.disable_action_buttons()
+        self.thread.finished.connect(
+            lambda: self.logview.appendPlainText("Download completed")
+        )
+        self.thread.finished.connect(
+            lambda: self.enable_action_buttons()
+        )
 
     def new_folder(self):
         name, ok = QInputDialog.getText(self, 'Create folder', 'Folder name')
@@ -250,18 +290,57 @@ class MyWindow(QMainWindow):
                 self.worker.finished.connect(self.worker.deleteLater)
                 self.thread.finished.connect(self.thread.deleteLater)
                 self.worker.progress.connect(self.report_logger_progress)
+                self.worker.refresh.connect(self.navigate)
                 self.thread.start()
-                # todo: move to disable action buttons
-                self.btnRemove.setEnabled(False)
+                self.disable_action_buttons()
                 self.thread.finished.connect(
                     lambda: self.logview.appendPlainText("Deleting completed")
                 )
                 self.thread.finished.connect(
-                    lambda: self.btnRemove.setEnabled(True)
+                    lambda: self.enable_action_buttons()
                 )
-                self.thread.finished.connect(
-                    lambda: self.navigate()
-                )
+
+    def upload(self):
+        job = list()
+        filter = "All files (*.*)"
+        dialog = QFileDialog()
+        dialog.setFileMode(QFileDialog.ExistingFiles)
+        names = dialog.getOpenFileNames(self, "Open files", "", filter)
+        if not names:
+            return
+        for name in names[0]:
+            basename = os.path.basename(name)
+            key = self.data_model.current_folder + basename
+            job.append((key, name))
+        self.logview.appendPlainText("Starting uploading")
+        # TODO: common code?
+        self.thread = QThread()
+        self.worker = Worker(self.data_model, job)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.upload)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.worker.progress.connect(self.report_logger_progress)
+        self.worker.refresh.connect(self.navigate)
+        self.thread.start()
+        self.disable_action_buttons()
+        self.thread.finished.connect(
+            lambda: self.logview.appendPlainText("Uploading completed")
+        )
+        self.thread.finished.connect(
+            lambda: self.enable_action_buttons()
+        )
+
+    def enable_action_buttons(self):
+        self.btnUpload.setEnabled(True)
+        self.btnDownload.setEnabled(True)
+        self.btnRemove.setEnabled(True)
+
+    def disable_action_buttons(self):
+        self.btnUpload.setEnabled(False)
+        self.btnDownload.setEnabled(False)
+        self.btnRemove.setEnabled(False)
 
     def goUp(self):
         p = self.data_model.current_folder
@@ -279,40 +358,6 @@ class MyWindow(QMainWindow):
     def report_logger_progress(self, msg):
         self.logview.appendPlainText(msg)
 
-    def saveFunc(self):
-        job = list()
-        folder_path = QFileDialog.getExistingDirectory(self, 'Select Folder')
-        if not folder_path:
-            return
-        for ix in self.listview.selectionModel().selectedIndexes():
-            if ix.column() == 0:
-                m = ix.model().itemFromIndex(ix)
-                if not m.downloadable:
-                    self.logview.appendPlainText("Skipping %s, because it's a directory" % m.text())
-                    continue
-                name = m.text()
-                key = self.data_model.current_folder + name
-                # todo join path
-                local_name = folder_path + "/" + name
-                job.append((key, local_name, m.size))
-        self.logview.appendPlainText("Starting downloading")
-        self.thread = QThread()
-        self.worker = Worker(self.data_model, job)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.download)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self.thread.deleteLater)
-        self.worker.progress.connect(self.report_logger_progress)
-        self.thread.start()
-        self.btnDownload.setEnabled(False)
-        self.thread.finished.connect(
-            lambda: self.logview.appendPlainText("Download completed")
-        )
-        self.thread.finished.connect(
-            lambda: self.btnDownload.setEnabled(True)
-        )
-
     def createActions(self):
         self.btnBack = QAction(QIcon.fromTheme("go-previous"), "go back", triggered=self.goBack)
         self.btnUp = QAction(QIcon.fromTheme("go-up"), "go up", triggered=self.goUp)
@@ -321,6 +366,7 @@ class MyWindow(QMainWindow):
         self.btnCreateFolder = QAction(QIcon.fromTheme("folder-new"), "new folder", triggered=self.new_folder)
         self.btnRemove = QAction(QIcon.fromTheme("edit-delete"), "delete", triggered=self.delete)
         self.btnRefresh = QAction(QIcon.fromTheme("view-refresh"), "refresh", triggered=self.navigate)
+        self.btnUpload = QAction(QIcon.fromTheme("network-server"), "upload", triggered=self.upload)
         self.btnAbout = QAction(QIcon.fromTheme("help-about"), "about", triggered=self.about)
 
     def restoreSettings(self):

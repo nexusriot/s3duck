@@ -133,3 +133,6 @@ class Model:
                 self.client.delete_object(Bucket=self.bucket, Key=key)
         else:
             self.client.delete_object(Bucket=self.bucket, Key=key)
+
+    def upload_file(self, local_file, key):
+        self.client.upload_file(local_file, self.bucket, key)
