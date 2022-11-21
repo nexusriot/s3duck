@@ -403,16 +403,16 @@ class MyWindow(QMainWindow):
         self.logview.appendPlainText(msg)
 
     def createActions(self):
-        self.btnBack = QAction(QIcon.fromTheme("go-previous"), "go back", triggered=self.goBack)
-        self.btnUp = QAction(QIcon.fromTheme("go-up"), "go up", triggered=self.goUp)
-        self.btnHome = QAction(QIcon.fromTheme("go-home"), "home folder", triggered=self.goHome)
-        self.btnDownload = QAction(QIcon.fromTheme("emblem-downloads"), "download", triggered=self.download)
-        self.btnCreateFolder = QAction(QIcon.fromTheme("folder-new"), "new folder", triggered=self.new_folder)
-        self.btnRemove = QAction(QIcon.fromTheme("edit-delete"), "delete", triggered=self.delete)
-        self.btnRefresh = QAction(QIcon.fromTheme("view-refresh"), "refresh", triggered=self.navigate)
-        self.btnUpload = QAction(QIcon.fromTheme("network-server"), "upload", triggered=self.upload)
-        self.btnSettings = QAction(QIcon.fromTheme("emblem-system"), "settings", triggered=self.sys_settings)
-        self.btnAbout = QAction(QIcon.fromTheme("help-about"), "about", triggered=self.about)
+        self.btnBack = QAction(QIcon.fromTheme("go-previous", QIcon("./icons/arrow_back_24px.svg")), "go back", triggered=self.goBack)
+        self.btnUp = QAction(QIcon.fromTheme("go-up", QIcon("./icons/arrow_upward_24px.svg")), "go up", triggered=self.goUp)
+        self.btnHome = QAction(QIcon.fromTheme("go-home", QIcon("./icons/home_24px.svg")), "home folder", triggered=self.goHome)
+        self.btnDownload = QAction(QIcon.fromTheme("emblem-downloads", QIcon("./icons/download_24px.svg")), "download", triggered=self.download)
+        self.btnCreateFolder = QAction(QIcon.fromTheme("folder-new", QIcon("./icons/create_new_folder_24px.svg")), "new folder", triggered=self.new_folder)
+        self.btnRemove = QAction(QIcon.fromTheme("edit-delete", QIcon("./icons/delete_24px.svg")), "delete", triggered=self.delete)
+        self.btnRefresh = QAction(QIcon.fromTheme("view-refresh", QIcon("./icons/refresh_24px.svg")), "refresh", triggered=self.navigate)
+        self.btnUpload = QAction(QIcon.fromTheme("network-server", QIcon("./icons/file_upload_24px.svg")), "upload", triggered=self.upload)
+        self.btnSettings = QAction(QIcon.fromTheme("emblem-system", QIcon("./icons/settings_24px.svg")), "settings", triggered=self.sys_settings)
+        self.btnAbout = QAction(QIcon.fromTheme("help-about", QIcon("./icons/info_24px.svg")), "about", triggered=self.about)
 
     def restoreSettings(self):
         if self.settings.contains("pos"):
