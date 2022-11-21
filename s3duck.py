@@ -72,7 +72,7 @@ class MyWindow(QMainWindow):
         self.setWindowIcon(QIcon.fromTheme("applications-internet"))
         self.listview = QTreeView()
 
-        self.settings = QSettings("s3duck", "s3duck")
+        self.settings = QSettings("./s3duck.conf", QSettings.IniFormat)
         self.clip = QApplication.clipboard()
 
         self.splitter = QSplitter()
