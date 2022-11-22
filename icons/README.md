@@ -1,0 +1,1 @@
+These icons were imported from [MaterialUI](https://github.com/mui/material-ui)
