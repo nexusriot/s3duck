@@ -12,7 +12,6 @@ OS_FAMILY_MAP = {
     # TODO: Mac
 }
 
-
 __VERSION__ = "0.0.2"
 
 
@@ -69,7 +68,7 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(QIcon.fromTheme("applications-internet"))
         self.listview = QTreeView()
 
-        settings, url, region, bucket, access_key, secret_key = settings
+        settings, profile_name, url, region, bucket, access_key, secret_key = settings
         self.settings = settings
 
         self.clip = QApplication.clipboard()
@@ -90,7 +89,7 @@ class MainWindow(QMainWindow):
         wid.setLayout(hlay)
         self.setCentralWidget(wid)
         self.setGeometry(0, 26, 900, 500)
-
+        self.profile_name = profile_name
         self.copyPath = ""
         self.copyList = []
         self.copyListNew = ""
@@ -200,8 +199,8 @@ class MainWindow(QMainWindow):
         self.modelToListView(self.data_model.list(self.data_model.current_folder))
         self.listview.sortByColumn(0, Qt.AscendingOrder)
         show_folder = (self.data_model.current_folder if self.data_model.current_folder else "/")
-        self.statusBar().showMessage("[%s] %s" % (
-            self.data_model.bucket, show_folder), 0)
+        self.statusBar().showMessage("[%s][%s] %s" % (
+            self.profile_name, self.data_model.bucket, show_folder), 0)
 
     def get_elem_name(self):
         index = self.listview.selectionModel().currentIndex()

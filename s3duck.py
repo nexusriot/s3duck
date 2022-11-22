@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QSplitter,
     QMessageBox,
-    QDialog
+    QDialog,
 )
 
 
@@ -76,6 +76,7 @@ class Profiles(QDialog):
         self.btnAdd.clicked.connect(self.onAdd)
         self.btnEdit.clicked.connect(self.onEdit)
         self.btnDelete.clicked.connect(self.onDelete)
+        self.main_window = None
 
         vbox.addWidget(self.listWidget)
         hbox.addWidget(self.btnAdd)
@@ -124,6 +125,7 @@ class Profiles(QDialog):
         crypto = Crypto(key)
         settings = (
             self.settings,
+            item.name,
             item.url,
             item.region,
             item.bucket_name,
@@ -131,9 +133,9 @@ class Profiles(QDialog):
             crypto.decrypt_cred(item.enc_secret_key)
         )
         self.main_settings = settings
+        self.main_window = MainWindow(settings=self.main_settings)
+        self.main_window.show()
         self.hide()
-        ui2 = MainWindow(settings=self.main_settings)
-        ui2.show()
 
     def save_settings(self):
         self.settings.beginGroup("profiles")
@@ -247,16 +249,9 @@ class Profiles(QDialog):
 
 
 def main():
-
     app = QApplication(sys.argv)
-    ex = Profiles()
-    finish_profiles = app.exec_()
-    if ex.main_settings:
-        app2 = QApplication(sys.argv)
-        ui2 = MainWindow(settings=ex.main_settings)
-        ui2.show()
-        app2 = app.exec_()
-        sys.exit(app2)
+    profiles = Profiles()
+    sys.exit(app.exec_())
 
 
 if __name__ == '__main__':
