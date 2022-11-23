@@ -2,8 +2,6 @@ import platform
 import boto3
 import botocore
 
-from cryptography.fernet import Fernet
-
 
 class Item:
     def __init__(self, name, type_, modified, size):
@@ -25,9 +23,8 @@ class Item:
 class Model:
     def __init__(self, endpoint_url,
                  region_name,
-                 encrypted_key_id,
-                 encrypted_secret,
-                 key,
+                 access_key,
+                 secret_key,
                  bucket):
 
         self.session = boto3.session.Session()
@@ -37,45 +34,24 @@ class Model:
         self.prev_folder = ""
         self.endpoint_url = endpoint_url
         self.region_name = region_name
-        self.encrypted_key_id = encrypted_key_id
-        self.encrypted_secret = encrypted_secret
-        self.key = key
+        self.access_key = access_key
+        self.secret_key = secret_key
         self.bucket = bucket
 
     @staticmethod
     def get_os_family():
         return platform.system()
 
-    @staticmethod
-    def encrypt(key, value):
-        fernet = Fernet(key.encode())
-        return fernet.encrypt(value.encode())
-
-    @staticmethod
-    def generate_key():
-        return Fernet.generate_key().decode()
-
-    @property
-    def fernet(self):
-        if self._fernet is None:
-            self._fernet = Fernet(self.key.encode())
-        return self._fernet
-
-    def decrypt_cred(self, val):
-        return self.fernet.decrypt(val).decode()
-
     @property
     def client(self):
         if self._client is None:
-            decrypted_key_id = self.decrypt_cred(self.encrypted_key_id)
-            decrypted_key_secret_access_key = self.decrypt_cred(self.encrypted_secret)
             self._client = self.session.client(
                 's3',
                 endpoint_url=self.endpoint_url,
                 config=botocore.config.Config(s3={'addressing_style': 'virtual'}),
                 region_name=self.region_name,
-                aws_access_key_id=decrypted_key_id,
-                aws_secret_access_key=decrypted_key_secret_access_key
+                aws_access_key_id=self.access_key,
+                aws_secret_access_key=self.secret_key
             )
         return self._client
 

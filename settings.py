@@ -6,10 +6,10 @@ from PyQt5.QtWidgets import *
 class SettingsWindow(QDialog):
 
     def __init__(self, *args, **kwargs):
-        settings = kwargs.pop("settings")
+        settings = kwargs.pop("settings", ("", "", "", "", "", ""))
         super().__init__(*args, **kwargs)
-        url, region, bucket, access_key, secret_key = settings
-        self.setWindowTitle("Application settings")
+        name, url, region, bucket, access_key, secret_key = settings
+        self.setWindowTitle("Profile settings")
         self.setGeometry(100, 100, 460, 200)
         qtRectangle = self.frameGeometry()
         centerPoint = QDesktopWidget().availableGeometry().center()
@@ -18,6 +18,7 @@ class SettingsWindow(QDialog):
         self.setWindowModality(Qt.ApplicationModal)
 
         self.formGroupBox = QGroupBox("Connection settings")
+        self.nameLineEdit = QLineEdit()
         self.urlLineEdit = QLineEdit()
         self.regionEdit = QLineEdit()
         self.bucketName = QLineEdit()
@@ -32,6 +33,7 @@ class SettingsWindow(QDialog):
         mainLayout.addWidget(self.formGroupBox)
         mainLayout.addWidget(self.buttonBox)
         self.setLayout(mainLayout)
+        self.nameLineEdit.textChanged.connect(self.on_text_changed)
         self.urlLineEdit.textChanged.connect(self.on_text_changed)
         self.regionEdit.textChanged.connect(self.on_text_changed)
         self.accessKeyEdit.textChanged.connect(self.on_text_changed)
@@ -40,6 +42,7 @@ class SettingsWindow(QDialog):
         btn_apply.clicked.connect(self.setRetVal)
         btn_apply.setEnabled(False)
         self.retrunVal = None
+        self.nameLineEdit.setText(name)
         self.urlLineEdit.setText(url)
         self.regionEdit.setText(region)
         self.bucketName.setText(bucket)
@@ -51,6 +54,7 @@ class SettingsWindow(QDialog):
     def on_text_changed(self):
         btn_apply = self.buttonBox.button(QDialogButtonBox.Ok)
         btn_apply.setEnabled(
+            bool(self.nameLineEdit.text()) and
             bool(self.urlLineEdit.text()) and
             bool(self.regionEdit.text()) and
             bool(self.bucketName.text()) and
@@ -60,6 +64,7 @@ class SettingsWindow(QDialog):
 
     def setRetVal(self):
         self.retrunVal = (
+            self.nameLineEdit.text(),
             self.urlLineEdit.text(),
             self.regionEdit.text(),
             self.bucketName.text(),
@@ -74,6 +79,7 @@ class SettingsWindow(QDialog):
 
     def createForm(self):
         layout = QFormLayout()
+        layout.addRow(QLabel("Name"), self.nameLineEdit)
         layout.addRow(QLabel("Url"), self.urlLineEdit)
         layout.addRow(QLabel("Region"), self.regionEdit)
         layout.addRow(QLabel("Bucket name"), self.bucketName)
