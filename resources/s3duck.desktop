@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=S3Duck
+GenericName=s3duck
+Exec=/usr/bin/s3duck %U
+Terminal=false
+Icon=/usr/lib/s3duck/ducky.png
+Type=Application
+Categories=Application;Network;
+Comment=S3Duck S3 browser 
