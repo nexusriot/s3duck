@@ -1,5 +1,6 @@
 .venv/
 .vscode/
+.idea/
 __pycache__/
 
 s3duck.conf
