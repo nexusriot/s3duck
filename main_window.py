@@ -355,24 +355,25 @@ class MainWindow(QMainWindow):
         self.logview.appendPlainText(msg)
 
     def createActions(self):
-        self.btnBack = QAction(QIcon.fromTheme("go-previous", QIcon("./icons/arrow_back_24px.svg")), "back",
-                               triggered=self.goBack)
-        self.btnUp = QAction(QIcon.fromTheme("go-up", QIcon("./icons/arrow_upward_24px.svg")), "up",
-                             triggered=self.goUp)
-        self.btnHome = QAction(QIcon.fromTheme("go-home", QIcon("./icons/home_24px.svg")), "home",
-                               triggered=self.goHome)
-        self.btnDownload = QAction(QIcon.fromTheme("emblem-downloads", QIcon("./icons/download_24px.svg")), "download",
-                                   triggered=self.download)
-        self.btnCreateFolder = QAction(QIcon.fromTheme("folder-new", QIcon("./icons/create_new_folder_24px.svg")),
-                                       "new folder", triggered=self.new_folder)
-        self.btnRemove = QAction(QIcon.fromTheme("edit-delete", QIcon("./icons/delete_24px.svg")), "delete",
-                                 triggered=self.delete)
-        self.btnRefresh = QAction(QIcon.fromTheme("view-refresh", QIcon("./icons/refresh_24px.svg")), "refresh",
-                                  triggered=self.navigate)
-        self.btnUpload = QAction(QIcon.fromTheme("network-server", QIcon("./icons/file_upload_24px.svg")), "upload",
-                                 triggered=self.upload)
-        self.btnAbout = QAction(QIcon.fromTheme("help-about", QIcon("./icons/info_24px.svg")), "about",
-                                triggered=self.about)
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        self.btnBack = QAction(QIcon.fromTheme("go-previous", QIcon(os.path.join(
+            current_dir, "icons/arrow_back_24px.svg"))), "back", triggered=self.goBack)
+        self.btnUp = QAction(QIcon.fromTheme("go-up", QIcon(os.path.join(
+            current_dir, "icons/arrow_upward_24px.svg"))), "up", triggered=self.goUp)
+        self.btnHome = QAction(QIcon.fromTheme("go-home", QIcon(os.path.join(
+            current_dir, "icons/home_24px.svg"))), "home", triggered=self.goHome)
+        self.btnDownload = QAction(QIcon.fromTheme("emblem-downloads", QIcon(os.path.join(
+            current_dir, "icons/download_24px.svg"))), "download", triggered=self.download)
+        self.btnCreateFolder = QAction(QIcon.fromTheme("folder-new", QIcon(os.path.join(
+            current_dir, "icons/create_new_folder_24px.svg"))), "new folder", triggered=self.new_folder)
+        self.btnRemove = QAction(QIcon.fromTheme("edit-delete", QIcon(os.path.join(
+            current_dir, "icons/delete_24px.svg"))), "delete", triggered=self.delete)
+        self.btnRefresh = QAction(QIcon.fromTheme("view-refresh", QIcon(os.path.join(
+            current_dir, "icons/refresh_24px.svg"))), "refresh", triggered=self.navigate)
+        self.btnUpload = QAction(QIcon.fromTheme("network-server", QIcon(os.path.join(
+            current_dir, "icons/file_upload_24px.svg"))), "upload", triggered=self.upload)
+        self.btnAbout = QAction(QIcon.fromTheme("help-about", QIcon(os.path.join(
+            current_dir, "icons/info_24px.svg"))), "about", triggered=self.about)
 
     def restoreSettings(self):
         self.settings.beginGroup("geometry")
