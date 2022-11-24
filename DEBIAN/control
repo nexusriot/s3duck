@@ -1,5 +1,5 @@
 Package: s3duck
-Version: 0.0.2
+Version: _version_
 Architecture: amd64
 Maintainer: Vladislav Ananev <nexus.riot@gmail.com>
 Description:Simple free cross-platform client for Simple Storage Service.

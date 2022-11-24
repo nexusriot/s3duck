@@ -1,6 +1,6 @@
 #!/bin/env bash
 
-version=0.0-2
+version=0.0.2
 
 echo "building deb for s3duck $version"
 
@@ -24,11 +24,7 @@ cp resources/s3duck.desktop $lib_dir
 cp LICENSE $lib_dir
 cp *.py $lib_dir
 
+
+sed -i "s/_version_/$version/g" $folder_name/DEBIAN/control
+
 cd build/ && dpkg-deb --build --root-owner-group $project
-
-
-
-# mkdir s3duck_0.0-2_amd64
-# cd s3duck_0.0-2_amd64
-
-# dpkg-deb --build --root-owner-group s3duck_0.0-2_amd64
