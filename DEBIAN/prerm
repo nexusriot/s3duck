@@ -1,0 +1,4 @@
+#!/bin/sh
+
+rm /usr/share/applications/s3duck.desktop
+

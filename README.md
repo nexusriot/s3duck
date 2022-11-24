@@ -30,3 +30,11 @@ pip3 install -r requirements.txt
 ```
 python3 s3duck.py
 ```
+
+Building deb package
+------------- 
+
+Install required packages
+```
+sudo apt-get install git devscripts build-essential lintian
+```

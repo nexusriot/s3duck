@@ -1,0 +1,7 @@
+Package: s3duck
+Version: _version_
+Architecture: amd64
+Maintainer: Vladislav Ananev <nexus.riot@gmail.com>
+Description:Simple free cross-platform client for Simple Storage Service.
+Installed-Size: 58
+Depends: python3 (>=3.6), python3-boto3, python3-cryptography, python3-pyqt5
