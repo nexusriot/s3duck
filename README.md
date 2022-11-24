@@ -7,10 +7,11 @@ Simple cross-platform client for Simple Storage Service
 
 How to launch
 -------------
-At the moment, you have to run the tool from the source code.
 
-On Ubuntu/Mint
+On Ubuntu/Mint: [use pre-built deb](https://github.com/nexusriot/s3duck/releases/latest)
 
+
+Also, you can run the tool from the source code.
 ```
 sudo apt install python3-boto3 python3-cryptography python3-pyqt5
 ```
