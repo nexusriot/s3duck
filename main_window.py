@@ -8,9 +8,10 @@ from model import Model as DataModel
 
 OS_FAMILY_MAP = {
     "Linux": "🐧",
-    "Windows": "⊞ Win"
-    # TODO: Mac
+    "Windows": "⊞ Win",
+    "Darwin": "🍎",
 }
+
 
 __VERSION__ = "0.0.2"
 
@@ -205,12 +206,13 @@ class MainWindow(QMainWindow):
     def get_elem_name(self):
         index = self.listview.selectionModel().currentIndex()
         i = index.model().itemFromIndex(index)
-        return i.text()
+        return i.text(), i.t
 
     def list_doubleClicked(self):
-        name = self.get_elem_name()
-        self.change_current_folder(self.data_model.current_folder + "%s/" % name)
-        self.navigate()
+        name, t = self.get_elem_name()
+        if t == 2:
+            self.change_current_folder(self.data_model.current_folder + "%s/" % name)
+            self.navigate()
 
     def goBack(self):
         self.change_current_folder(self.data_model.prev_folder)
