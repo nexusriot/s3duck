@@ -1,11 +1,11 @@
 #!/bin/env bash
 
-version=0.0.2
+version=0.0.3
 
 echo "building deb for s3duck $version"
 
 if ! type "dpkg-deb" > /dev/null; then
-  echo "please install reauired build tools first"
+  echo "please install required build tools first"
 fi
 
 project="s3duck_${version}_amd64"

@@ -1,4 +1,5 @@
 import os
+import glob
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import QIcon, QStandardItemModel, QStandardItem
@@ -13,7 +14,90 @@ OS_FAMILY_MAP = {
 }
 
 
-__VERSION__ = "0.0.2"
+__VERSION__ = "0.0.3"
+
+
+class Tree(QTreeView):
+    def __init__(self, parent):
+        self.parent = parent
+        QTreeView.__init__(self)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+
+    def dragEnterEvent(self, event):
+        widget = event.source()
+
+        if widget == self:
+            event.ignore()
+            return
+
+        if event.mimeData().hasUrls:
+            event.accept()
+        else:
+            event.ignore()
+        event.accept()
+
+    def dragMoveEvent(self, event):
+        widget = event.source()
+        if widget == self:
+            event.ignore()
+            return
+
+        if event.mimeData().hasUrls:
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+
+        widget = event.source()
+        if widget == self:
+            event.ignore()
+            return
+
+        if event.mimeData().hasUrls:
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+
+            job = list()
+            for url in event.mimeData().urls():
+                path = str(url.toLocalFile())
+                base_path, tail = os.path.split(path)
+                if os.path.isdir(path):
+                    for filename in glob.iglob(path + '**/**', recursive=True):
+                        key = self.parent.data_model.current_folder + os.path.relpath(filename, base_path)
+                        if os.path.isdir(filename):
+                            # append folder
+                            job.append((key, None))
+                        else:
+                            job.append((key, filename))
+                else:
+                    key = self.parent.data_model.current_folder + os.path.relpath(path, base_path)
+                    job.append((key, path))
+            # todo: think about code duplication
+            self.parent.logview.appendPlainText("Starting uploading")
+            self.parent.thread = QThread()
+            self.parent.worker = Worker(self.parent.data_model, job)
+            self.parent.worker.moveToThread(self.parent.thread)
+            self.parent.thread.started.connect(self.parent.worker.upload)
+            self.parent.worker.finished.connect(self.parent.thread.quit)
+            self.parent.worker.finished.connect(self.parent.worker.deleteLater)
+            self.parent.thread.finished.connect(self.parent.thread.deleteLater)
+            self.parent.worker.progress.connect(self.parent.report_logger_progress)
+            self.parent.worker.refresh.connect(self.parent.navigate)
+            self.parent.thread.start()
+            self.parent.disable_action_buttons()
+            self.parent.thread.finished.connect(
+                lambda: self.parent.logview.appendPlainText("Uploading completed")
+            )
+            self.parent.thread.finished.connect(
+                lambda: self.parent.enable_action_buttons()
+            )
+        else:
+            event.ignore()
 
 
 class ListItem(QStandardItem):
@@ -54,7 +138,10 @@ class Worker(QObject):
     def upload(self):
         for i in self.job:
             key, local_name = i
-            msg = "Uploading %s -> %s" % (local_name, key)
+            if local_name is not None:
+                msg = "Uploading %s -> %s" % (local_name, key)
+            else:
+                msg = "Creating folder %s" % key
             self.progress.emit(msg)
             self.data_model.upload_file(local_name, key)
             self.refresh.emit()
@@ -67,11 +154,19 @@ class MainWindow(QMainWindow):
         super(MainWindow, self).__init__(*args, **kwargs)
         self.setWindowTitle("S3 Duck 🦆 %s PoC" % __VERSION__)
         self.setWindowIcon(QIcon.fromTheme("applications-internet"))
-        self.listview = QTreeView()
-
         settings, profile_name, url, region, bucket, access_key, secret_key = settings
         self.settings = settings
 
+        self.data_model = DataModel(
+            url,
+            region,
+            access_key,
+            secret_key,
+            bucket
+        )
+        self.logview = QPlainTextEdit(self)
+
+        self.listview = Tree(self)
         self.clip = QApplication.clipboard()
         self.splitter = QSplitter()
         self.splitter.setOrientation(Qt.Vertical)
@@ -116,16 +211,10 @@ class MainWindow(QMainWindow):
         self.model = QStandardItemModel()
 
         self.model.setHorizontalHeaderLabels(['Name', 'Size', 'Modified'])
+        self.listview.setAcceptDrops(True)
         self.listview.header().setDefaultSectionSize(180)
         self.listview.setModel(self.model)
 
-        self.data_model = DataModel(
-            url,
-            region,
-            access_key,
-            secret_key,
-            bucket
-        )
         self.navigate()
 
         self.listview.header().resizeSection(0, 320)
@@ -135,7 +224,7 @@ class MainWindow(QMainWindow):
         self.listview.setSortingEnabled(True)
         self.splitter.setSizes([20, 160])
         self.listview.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        # self.listview.setDragDropMode(QAbstractItemView.DragDrop)
+        self.listview.setDragDropMode(QAbstractItemView.DragDrop)
         self.listview.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.listview.setIndentation(10)
         self.thread = None
