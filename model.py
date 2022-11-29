@@ -1,4 +1,5 @@
 import platform
+import os
 import boto3
 import botocore
 
@@ -99,8 +100,21 @@ class Model:
                 ))
         return items
 
-    def download_file(self, key, local_name):
-        self.client.download_file(self.bucket, key, local_name)
+    def download_file(self, key: str, local_name: str, folder_path: str):
+        if not local_name:
+            keys = self.get_keys(key)
+            for k, size in keys:
+                rp = os.path.relpath(k, self.current_folder)
+                path = os.path.join(folder_path, rp)
+                if k.endswith("/"):
+                    # make folder
+                    os.makedirs(path, exist_ok=True)
+                    continue
+                # make sure directory exists before downloading
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                self.client.download_file(self.bucket, k, path)
+        else:
+            self.client.download_file(self.bucket, key, local_name)
 
     def create_folder(self, key):
         return self.client.put_object(Bucket=self.bucket, Key=key)

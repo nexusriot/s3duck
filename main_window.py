@@ -1,5 +1,6 @@
 import os
 import glob
+from enum import Enum
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import QIcon, QStandardItemModel, QStandardItem
@@ -13,8 +14,12 @@ OS_FAMILY_MAP = {
     "Darwin": "🍎",
 }
 
+__VERSION__ = "0.0.4"
 
-__VERSION__ = "0.0.3"
+
+class FSObjectType(Enum):
+    FILE = 1
+    FOLDER = 2
 
 
 class Tree(QTreeView):
@@ -58,7 +63,6 @@ class Tree(QTreeView):
             event.ignore()
 
     def dropEvent(self, event):
-
         widget = event.source()
         if widget == self:
             event.ignore()
@@ -94,8 +98,7 @@ class Tree(QTreeView):
 
 class ListItem(QStandardItem):
 
-    def __init__(self, downloadable, size, t, *args, **kwargs):
-        self.downloadable = downloadable
+    def __init__(self, size, t, *args, **kwargs):
         self.size = size
         self.t = t
         super().__init__(*args, **kwargs)
@@ -113,15 +116,18 @@ class Worker(QObject):
 
     def download(self):
         for i in self.job:
-            key, local_name, size = i
-            msg = "Downloading %s -> %s (%s)" % (key, local_name, size)
+            key, local_name, size, folder_path = i
+            if local_name:
+                msg = "downloading %s -> %s (%s)" % (key, local_name, size)
+            else:
+                msg = "downloading directory: %s" % key
             self.progress.emit(msg)
-            self.data_model.download_file(key, local_name)
+            self.data_model.download_file(key, local_name, folder_path)
         self.finished.emit()
 
     def delete(self):
         for key in self.job:
-            msg = "Moving %s -> /dev/null" % key
+            msg = "moving %s -> /dev/null" % key
             self.progress.emit(msg)
             self.data_model.delete(key)
             self.refresh.emit()
@@ -131,9 +137,9 @@ class Worker(QObject):
         for i in self.job:
             key, local_name = i
             if local_name is not None:
-                msg = "Uploading %s -> %s" % (local_name, key)
+                msg = "uploading %s -> %s" % (local_name, key)
             else:
-                msg = "Creating folder %s" % key
+                msg = "creating folder %s" % key
             self.progress.emit(msg)
             self.data_model.upload_file(local_name, key)
             self.refresh.emit()
@@ -261,16 +267,14 @@ class MainWindow(QMainWindow):
                     icon = QIcon().fromTheme("go-first")
                     size = str(i.size)
                     modified = str(i.modified)
-                    downloadable = True
                 else:
                     icon = QIcon().fromTheme("network-server")
                     size = "<DIR>"
                     modified = ""
-                    downloadable = False
                 self.model.appendRow([
-                    ListItem(downloadable, size,  i.type_, icon, i.name),
-                    ListItem(downloadable, size, i.type_, size),
-                    ListItem(downloadable, size, i.type_, modified)])
+                    ListItem(size,  i.type_, icon, i.name),
+                    ListItem(size, i.type_, size),
+                    ListItem(size, i.type_, modified)])
 
     def change_current_folder(self, new_folder):
         self.data_model.prev_folder = self.data_model.current_folder
@@ -302,18 +306,20 @@ class MainWindow(QMainWindow):
         job = list()
         folder_path = QFileDialog.getExistingDirectory(self, 'Select Folder')
         if not folder_path:
+            # nothing selected
             return
         for ix in self.listview.selectionModel().selectedIndexes():
             if ix.column() == 0:
                 m = ix.model().itemFromIndex(ix)
-                # TODO: implement recursive downloading
-                if not m.downloadable:
-                    self.logview.appendPlainText("Skipping %s, because it's a directory" % m.text())
-                    continue
+                # TODO: make Enum
                 name = m.text()
                 key = self.data_model.current_folder + name
+                if m.t == 2:
+                    job.append((key, None, None, folder_path))
+                    # got a folder
+                    continue
                 local_name = os.path.join(folder_path, name)
-                job.append((key, local_name, m.size))
+                job.append((key, local_name, m.size, folder_path))
         self.assign_thread_operation("download", job, need_refresh=False)
 
     def assign_thread_operation(self, method, job, need_refresh=True):
@@ -324,6 +330,8 @@ class MainWindow(QMainWindow):
         :param need_refresh:
         :return:
         """
+        if not job:
+            return
         self.logview.appendPlainText("starting %s" % method)
         self.thread = QThread()
         self.worker = Worker(self.data_model, job)
