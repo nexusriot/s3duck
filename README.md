@@ -34,7 +34,11 @@ python3 s3duck.py
 Building deb package
 ------------- 
 
-Install required packages
+Install required packages:
 ```
 sudo apt-get install git devscripts build-essential lintian
+```
+Run build:
+```
+./build_deb.sh
 ```
