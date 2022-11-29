@@ -105,15 +105,21 @@ class Model:
     def create_folder(self, key):
         return self.client.put_object(Bucket=self.bucket, Key=key)
 
+    def get_keys(self, prefix):
+        r = self.client.list_objects_v2(Bucket=self.bucket, Prefix=prefix)
+        return [(key.get('Key'), key.get("Size")) for key in r.get("Contents", [])]
+
     def delete(self, key):
         # TODO: check usage
         if key.endswith("/"):
-            r = self.client.list_objects_v2(Bucket=self.bucket, Prefix=key)
-            keys = [key.get('Key') for key in r.get("Contents", [])]
-            for key in keys:
+            keys = self.get_keys(key)
+            for key, _ in keys:
                 self.client.delete_object(Bucket=self.bucket, Key=key)
         else:
             self.client.delete_object(Bucket=self.bucket, Key=key)
 
     def upload_file(self, local_file, key):
-        self.client.upload_file(local_file, self.bucket, key)
+        if local_file is None:
+            self.create_folder("%s/" % key)
+        else:
+            self.client.upload_file(local_file, self.bucket, key)

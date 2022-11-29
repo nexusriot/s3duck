@@ -1,4 +1,5 @@
 import os
+import glob
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import QIcon, QStandardItemModel, QStandardItem
@@ -13,7 +14,82 @@ OS_FAMILY_MAP = {
 }
 
 
-__VERSION__ = "0.0.2"
+__VERSION__ = "0.0.3"
+
+
+class Tree(QTreeView):
+    def __init__(self, parent):
+        self.parent = parent
+        QTreeView.__init__(self)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.enable_drag_drop()
+
+    def enable_drag_drop(self):
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+
+    def disable_drag_drop(self):
+        self.setAcceptDrops(False)
+        self.setDropIndicatorShown(False)
+
+    def dragEnterEvent(self, event):
+        widget = event.source()
+
+        if widget == self:
+            event.ignore()
+            return
+
+        if event.mimeData().hasUrls:
+            event.accept()
+        else:
+            event.ignore()
+        event.accept()
+
+    def dragMoveEvent(self, event):
+        widget = event.source()
+        if widget == self:
+            event.ignore()
+            return
+
+        if event.mimeData().hasUrls:
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+
+        widget = event.source()
+        if widget == self:
+            event.ignore()
+            return
+
+        if event.mimeData().hasUrls:
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+
+            job = list()
+            for url in event.mimeData().urls():
+                path = str(url.toLocalFile())
+                base_path, tail = os.path.split(path)
+                if os.path.isdir(path):
+                    for filename in glob.iglob(path + '**/**', recursive=True):
+                        key = self.parent.data_model.current_folder + os.path.relpath(filename, base_path)
+                        if os.path.isdir(filename):
+                            # append folder
+                            job.append((key, None))
+                        else:
+                            job.append((key, filename))
+                else:
+                    key = self.parent.data_model.current_folder + os.path.relpath(path, base_path)
+                    job.append((key, path))
+            self.disable_drag_drop()
+            self.parent.assign_thread_operation('upload', job)
+            self.parent.thread.finished.connect(
+                lambda: self.enable_drag_drop()
+            )
+        else:
+            event.ignore()
 
 
 class ListItem(QStandardItem):
@@ -54,7 +130,10 @@ class Worker(QObject):
     def upload(self):
         for i in self.job:
             key, local_name = i
-            msg = "Uploading %s -> %s" % (local_name, key)
+            if local_name is not None:
+                msg = "Uploading %s -> %s" % (local_name, key)
+            else:
+                msg = "Creating folder %s" % key
             self.progress.emit(msg)
             self.data_model.upload_file(local_name, key)
             self.refresh.emit()
@@ -67,11 +146,18 @@ class MainWindow(QMainWindow):
         super(MainWindow, self).__init__(*args, **kwargs)
         self.setWindowTitle("S3 Duck 🦆 %s PoC" % __VERSION__)
         self.setWindowIcon(QIcon.fromTheme("applications-internet"))
-        self.listview = QTreeView()
-
         settings, profile_name, url, region, bucket, access_key, secret_key = settings
         self.settings = settings
 
+        self.data_model = DataModel(
+            url,
+            region,
+            access_key,
+            secret_key,
+            bucket
+        )
+        self.logview = QPlainTextEdit(self)
+        self.listview = Tree(self)
         self.clip = QApplication.clipboard()
         self.splitter = QSplitter()
         self.splitter.setOrientation(Qt.Vertical)
@@ -116,26 +202,20 @@ class MainWindow(QMainWindow):
         self.model = QStandardItemModel()
 
         self.model.setHorizontalHeaderLabels(['Name', 'Size', 'Modified'])
+        self.listview.setAcceptDrops(True)
         self.listview.header().setDefaultSectionSize(180)
         self.listview.setModel(self.model)
-
-        self.data_model = DataModel(
-            url,
-            region,
-            access_key,
-            secret_key,
-            bucket
-        )
         self.navigate()
 
         self.listview.header().resizeSection(0, 320)
         self.listview.header().resizeSection(1, 80)
         self.listview.header().resizeSection(2, 80)
+
         self.listview.doubleClicked.connect(self.list_doubleClicked)
         self.listview.setSortingEnabled(True)
         self.splitter.setSizes([20, 160])
         self.listview.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        # self.listview.setDragDropMode(QAbstractItemView.DragDrop)
+        self.listview.setDragDropMode(QAbstractItemView.DragDrop)
         self.listview.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.listview.setIndentation(10)
         self.thread = None
@@ -226,27 +306,40 @@ class MainWindow(QMainWindow):
         for ix in self.listview.selectionModel().selectedIndexes():
             if ix.column() == 0:
                 m = ix.model().itemFromIndex(ix)
+                # TODO: implement recursive downloading
                 if not m.downloadable:
                     self.logview.appendPlainText("Skipping %s, because it's a directory" % m.text())
                     continue
                 name = m.text()
                 key = self.data_model.current_folder + name
-                # todo join path
-                local_name = folder_path + "/" + name
+                local_name = os.path.join(folder_path, name)
                 job.append((key, local_name, m.size))
-        self.logview.appendPlainText("Starting downloading")
+        self.assign_thread_operation("download", job, need_refresh=False)
+
+    def assign_thread_operation(self, method, job, need_refresh=True):
+        """
+        Runs jobs in the separate thread
+        :param method:
+        :param job:
+        :param need_refresh:
+        :return:
+        """
+        self.logview.appendPlainText("starting %s" % method)
         self.thread = QThread()
         self.worker = Worker(self.data_model, job)
         self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.download)
+        m = getattr(self.worker, method)
+        self.thread.started.connect(m)
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
         self.worker.progress.connect(self.report_logger_progress)
+        if need_refresh:
+            self.worker.refresh.connect(self.navigate)
         self.thread.start()
         self.disable_action_buttons()
         self.thread.finished.connect(
-            lambda: self.logview.appendPlainText("Download completed")
+            lambda: self.logview.appendPlainText("%s completed" % method)
         )
         self.thread.finished.connect(
             lambda: self.enable_action_buttons()
@@ -259,7 +352,7 @@ class MainWindow(QMainWindow):
         if ok:
             key = self.data_model.current_folder + "%s/" % name
             self.data_model.create_folder(key)
-            self.logview.appendPlainText("Created folder %s (%s)" %( name, key))
+            self.logview.appendPlainText("Created folder %s (%s)" % ( name, key))
             self.navigate()
 
     def delete(self):
@@ -278,25 +371,7 @@ class MainWindow(QMainWindow):
             qm = QMessageBox
             ret = qm.question(self, '', "Are you sure to delete objects : %s ?" % ",".join(names), qm.Yes | qm.No)
             if ret == qm.Yes:
-                self.logview.appendPlainText("Starting deleting")
-                # todo: remove duplicate code
-                self.thread = QThread()
-                self.worker = Worker(self.data_model, job)
-                self.worker.moveToThread(self.thread)
-                self.thread.started.connect(self.worker.delete)
-                self.worker.finished.connect(self.thread.quit)
-                self.worker.finished.connect(self.worker.deleteLater)
-                self.thread.finished.connect(self.thread.deleteLater)
-                self.worker.progress.connect(self.report_logger_progress)
-                self.worker.refresh.connect(self.navigate)
-                self.thread.start()
-                self.disable_action_buttons()
-                self.thread.finished.connect(
-                    lambda: self.logview.appendPlainText("Deleting completed")
-                )
-                self.thread.finished.connect(
-                    lambda: self.enable_action_buttons()
-                )
+                self.assign_thread_operation('delete', job)
 
     def upload(self):
         job = list()
@@ -310,25 +385,7 @@ class MainWindow(QMainWindow):
             basename = os.path.basename(name)
             key = self.data_model.current_folder + basename
             job.append((key, name))
-        self.logview.appendPlainText("Starting uploading")
-        # TODO: common code?
-        self.thread = QThread()
-        self.worker = Worker(self.data_model, job)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.upload)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self.thread.deleteLater)
-        self.worker.progress.connect(self.report_logger_progress)
-        self.worker.refresh.connect(self.navigate)
-        self.thread.start()
-        self.disable_action_buttons()
-        self.thread.finished.connect(
-            lambda: self.logview.appendPlainText("Uploading completed")
-        )
-        self.thread.finished.connect(
-            lambda: self.enable_action_buttons()
-        )
+        self.assign_thread_operation('upload', job)
 
     def enable_action_buttons(self):
         self.btnUpload.setEnabled(True)
