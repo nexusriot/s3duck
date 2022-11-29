@@ -1,12 +1,12 @@
 import os
 import glob
-from enum import Enum
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import QIcon, QStandardItemModel, QStandardItem
 from PyQt5.QtWidgets import QApplication, QWidget, QFileDialog, QPlainTextEdit
 
 from model import Model as DataModel
+from model import FSObjectType
 
 OS_FAMILY_MAP = {
     "Linux": "🐧",
@@ -15,11 +15,6 @@ OS_FAMILY_MAP = {
 }
 
 __VERSION__ = "0.0.4"
-
-
-class FSObjectType(Enum):
-    FILE = 1
-    FOLDER = 2
 
 
 class Tree(QTreeView):
@@ -208,7 +203,6 @@ class MainWindow(QMainWindow):
         self.model = QStandardItemModel()
 
         self.model.setHorizontalHeaderLabels(['Name', 'Size', 'Modified'])
-        self.listview.setAcceptDrops(True)
         self.listview.header().setDefaultSectionSize(180)
         self.listview.setModel(self.model)
         self.navigate()
@@ -263,7 +257,7 @@ class MainWindow(QMainWindow):
         else:
             self.model.setRowCount(0)
             for i in model_result:
-                if i.type_ == 1:
+                if i.type_ == FSObjectType.FILE:
                     icon = QIcon().fromTheme("go-first")
                     size = str(i.size)
                     modified = str(i.modified)
@@ -294,7 +288,7 @@ class MainWindow(QMainWindow):
 
     def list_doubleClicked(self):
         name, t = self.get_elem_name()
-        if t == 2:
+        if t == FSObjectType.FOLDER:
             self.change_current_folder(self.data_model.current_folder + "%s/" % name)
             self.navigate()
 
@@ -311,10 +305,9 @@ class MainWindow(QMainWindow):
         for ix in self.listview.selectionModel().selectedIndexes():
             if ix.column() == 0:
                 m = ix.model().itemFromIndex(ix)
-                # TODO: make Enum
                 name = m.text()
                 key = self.data_model.current_folder + name
-                if m.t == 2:
+                if m.t == FSObjectType.FOLDER:
                     job.append((key, None, None, folder_path))
                     # got a folder
                     continue
@@ -371,7 +364,7 @@ class MainWindow(QMainWindow):
                 m = ix.model().itemFromIndex(ix)
                 name = m.text()
                 key = self.data_model.current_folder + name
-                if m.t == 2:  # dir
+                if m.t == FSObjectType.FOLDER:  # dir
                     key = key + "/"
                 job.append(key)
                 names.append(name)

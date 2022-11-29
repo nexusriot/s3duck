@@ -1,7 +1,13 @@
+from enum import Enum
 import platform
 import os
 import boto3
 import botocore
+
+
+class FSObjectType(Enum):
+    FILE = 1
+    FOLDER = 2
 
 
 class Item:
@@ -15,7 +21,7 @@ class Item:
         return "name: %s; type_: %d(%s), modified: %s size: %d" % (
             self.name,
             self.type_,
-            "file" if self.type_ == 1 else "dir",
+            "file" if self.type_ == FSObjectType.FILE else "dir",
             self.modified,
             self.size
         )
@@ -80,7 +86,7 @@ class Model:
             items.append(
                 Item(
                     folder,
-                    2,
+                    FSObjectType.FOLDER,
                     "",
                     0
                 )
@@ -94,7 +100,7 @@ class Model:
             items.append(
                 Item(
                     filename,
-                    1,
+                    FSObjectType.FILE,
                     obj['LastModified'],
                     obj['Size']
                 ))
@@ -124,7 +130,6 @@ class Model:
         return [(key.get('Key'), key.get("Size")) for key in r.get("Contents", [])]
 
     def delete(self, key):
-        # TODO: check usage
         if key.endswith("/"):
             keys = self.get_keys(key)
             for key, _ in keys:
