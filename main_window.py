@@ -22,9 +22,15 @@ class Tree(QTreeView):
         self.parent = parent
         QTreeView.__init__(self)
         self.setDragDropMode(QAbstractItemView.InternalMove)
-        self.setDragEnabled(True)
+        self.enable_drag_drop()
+
+    def enable_drag_drop(self):
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
+
+    def disable_drag_drop(self):
+        self.setAcceptDrops(False)
+        self.setDropIndicatorShown(False)
 
     def dragEnterEvent(self, event):
         widget = event.source()
@@ -77,24 +83,10 @@ class Tree(QTreeView):
                 else:
                     key = self.parent.data_model.current_folder + os.path.relpath(path, base_path)
                     job.append((key, path))
-            # todo: think about code duplication
-            self.parent.logview.appendPlainText("Starting uploading")
-            self.parent.thread = QThread()
-            self.parent.worker = Worker(self.parent.data_model, job)
-            self.parent.worker.moveToThread(self.parent.thread)
-            self.parent.thread.started.connect(self.parent.worker.upload)
-            self.parent.worker.finished.connect(self.parent.thread.quit)
-            self.parent.worker.finished.connect(self.parent.worker.deleteLater)
-            self.parent.thread.finished.connect(self.parent.thread.deleteLater)
-            self.parent.worker.progress.connect(self.parent.report_logger_progress)
-            self.parent.worker.refresh.connect(self.parent.navigate)
-            self.parent.thread.start()
-            self.parent.disable_action_buttons()
+            self.disable_drag_drop()
+            self.parent.assign_thread_operation('upload', job)
             self.parent.thread.finished.connect(
-                lambda: self.parent.logview.appendPlainText("Uploading completed")
-            )
-            self.parent.thread.finished.connect(
-                lambda: self.parent.enable_action_buttons()
+                lambda: self.enable_drag_drop()
             )
         else:
             event.ignore()
@@ -165,7 +157,6 @@ class MainWindow(QMainWindow):
             bucket
         )
         self.logview = QPlainTextEdit(self)
-
         self.listview = Tree(self)
         self.clip = QApplication.clipboard()
         self.splitter = QSplitter()
@@ -214,12 +205,12 @@ class MainWindow(QMainWindow):
         self.listview.setAcceptDrops(True)
         self.listview.header().setDefaultSectionSize(180)
         self.listview.setModel(self.model)
-
         self.navigate()
 
         self.listview.header().resizeSection(0, 320)
         self.listview.header().resizeSection(1, 80)
         self.listview.header().resizeSection(2, 80)
+
         self.listview.doubleClicked.connect(self.list_doubleClicked)
         self.listview.setSortingEnabled(True)
         self.splitter.setSizes([20, 160])
@@ -315,27 +306,40 @@ class MainWindow(QMainWindow):
         for ix in self.listview.selectionModel().selectedIndexes():
             if ix.column() == 0:
                 m = ix.model().itemFromIndex(ix)
+                # TODO: implement recursive downloading
                 if not m.downloadable:
                     self.logview.appendPlainText("Skipping %s, because it's a directory" % m.text())
                     continue
                 name = m.text()
                 key = self.data_model.current_folder + name
-                # todo join path
-                local_name = folder_path + "/" + name
+                local_name = os.path.join(folder_path, name)
                 job.append((key, local_name, m.size))
-        self.logview.appendPlainText("Starting downloading")
+        self.assign_thread_operation("download", job, need_refresh=False)
+
+    def assign_thread_operation(self, method, job, need_refresh=True):
+        """
+        Runs jobs in the separate thread
+        :param method:
+        :param job:
+        :param need_refresh:
+        :return:
+        """
+        self.logview.appendPlainText("starting %s" % method)
         self.thread = QThread()
         self.worker = Worker(self.data_model, job)
         self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.download)
+        m = getattr(self.worker, method)
+        self.thread.started.connect(m)
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
         self.worker.progress.connect(self.report_logger_progress)
+        if need_refresh:
+            self.worker.refresh.connect(self.navigate)
         self.thread.start()
         self.disable_action_buttons()
         self.thread.finished.connect(
-            lambda: self.logview.appendPlainText("Download completed")
+            lambda: self.logview.appendPlainText("%s completed" % method)
         )
         self.thread.finished.connect(
             lambda: self.enable_action_buttons()
@@ -348,7 +352,7 @@ class MainWindow(QMainWindow):
         if ok:
             key = self.data_model.current_folder + "%s/" % name
             self.data_model.create_folder(key)
-            self.logview.appendPlainText("Created folder %s (%s)" %( name, key))
+            self.logview.appendPlainText("Created folder %s (%s)" % ( name, key))
             self.navigate()
 
     def delete(self):
@@ -367,25 +371,7 @@ class MainWindow(QMainWindow):
             qm = QMessageBox
             ret = qm.question(self, '', "Are you sure to delete objects : %s ?" % ",".join(names), qm.Yes | qm.No)
             if ret == qm.Yes:
-                self.logview.appendPlainText("Starting deleting")
-                # todo: remove duplicate code
-                self.thread = QThread()
-                self.worker = Worker(self.data_model, job)
-                self.worker.moveToThread(self.thread)
-                self.thread.started.connect(self.worker.delete)
-                self.worker.finished.connect(self.thread.quit)
-                self.worker.finished.connect(self.worker.deleteLater)
-                self.thread.finished.connect(self.thread.deleteLater)
-                self.worker.progress.connect(self.report_logger_progress)
-                self.worker.refresh.connect(self.navigate)
-                self.thread.start()
-                self.disable_action_buttons()
-                self.thread.finished.connect(
-                    lambda: self.logview.appendPlainText("Deleting completed")
-                )
-                self.thread.finished.connect(
-                    lambda: self.enable_action_buttons()
-                )
+                self.assign_thread_operation('delete', job)
 
     def upload(self):
         job = list()
@@ -399,25 +385,7 @@ class MainWindow(QMainWindow):
             basename = os.path.basename(name)
             key = self.data_model.current_folder + basename
             job.append((key, name))
-        self.logview.appendPlainText("Starting uploading")
-        # TODO: common code?
-        self.thread = QThread()
-        self.worker = Worker(self.data_model, job)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.upload)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self.thread.deleteLater)
-        self.worker.progress.connect(self.report_logger_progress)
-        self.worker.refresh.connect(self.navigate)
-        self.thread.start()
-        self.disable_action_buttons()
-        self.thread.finished.connect(
-            lambda: self.logview.appendPlainText("Uploading completed")
-        )
-        self.thread.finished.connect(
-            lambda: self.enable_action_buttons()
-        )
+        self.assign_thread_operation('upload', job)
 
     def enable_action_buttons(self):
         self.btnUpload.setEnabled(True)
