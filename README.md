@@ -36,7 +36,7 @@ Building deb package
 
 Install required packages:
 ```
-sudo apt-get install git devscripts build-essential lintian
+sudo apt-get install git devscripts build-essential lintian upx-ucl
 ```
 Run build:
 ```
