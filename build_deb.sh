@@ -15,10 +15,13 @@ mkdir -p $folder_name
 cp -r DEBIAN/ $folder_name
 bin_dir="$folder_name/usr/bin"
 lib_dir="$folder_name/usr/lib/s3duck"
+res_dir="$lib_dir/resources"
 mkdir -p $bin_dir
 mkdir -p $lib_dir
+mkdir -p $res_dir
 cp s3duck $bin_dir
 cp -r icons/ $lib_dir
+cp resources/ducky.ico $res_dir
 cp resources/ducky.png $lib_dir
 cp resources/s3duck.desktop $lib_dir
 cp LICENSE $lib_dir

@@ -1,7 +1,10 @@
 #!/usr/bin/python
 
 import sys
+import os
+import pathlib
 
+from PyQt5.QtGui import QIcon
 from cryptography.fernet import Fernet
 from PyQt5 import QtCore
 from PyQt5.QtCore import *
@@ -55,10 +58,19 @@ class SettingsItem:
         self.enc_secret_key = enc_secret_key
 
 
+def get_current_dir():
+    if getattr(sys, "frozen", False) and hasattr(sys, '_MEIPASS'):
+        current_dir = pathlib.Path(sys._MEIPASS)
+    else:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+    return current_dir
+
+
 class Profiles(QDialog):
 
     def __init__(self):
         super().__init__()
+        self.current_dir = get_current_dir()
         # store settings in ~/config/s3duck
         self.settings = QSettings("s3duck", "s3duck")
         self.items = []
@@ -125,6 +137,7 @@ class Profiles(QDialog):
         self.settings.endGroup()
         crypto = Crypto(key)
         settings = (
+            self.current_dir,
             self.settings,
             item.name,
             item.url,
@@ -251,6 +264,9 @@ class Profiles(QDialog):
 
 def main():
     app = QApplication(sys.argv)
+    icon = QIcon(
+        os.path.join(get_current_dir(), "resources", "ducky.ico"))
+    app.setWindowIcon(icon)
     profiles = Profiles()
     sys.exit(app.exec_())
 

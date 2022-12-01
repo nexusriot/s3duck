@@ -8,7 +8,7 @@ a = Analysis(
     ['s3duck.py'],
     pathex=[],
     binaries=[],
-    datas=[('icons', 'icons')],
+    datas=[('icons', 'icons'), ('resources/ducky.ico', 'resources/.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

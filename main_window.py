@@ -1,5 +1,4 @@
 import os
-import sys
 import glob
 import pathlib
 from PyQt5.QtWidgets import *
@@ -153,14 +152,11 @@ class MainWindow(QMainWindow):
         super(MainWindow, self).__init__(*args, **kwargs)
         self.setWindowTitle("S3 Duck 🦆 %s PoC" % __VERSION__)
         self.setWindowIcon(QIcon.fromTheme("applications-internet"))
-        if getattr(sys, "frozen", False) and hasattr(sys, '_MEIPASS'):
-            self.current_dir = pathlib.Path(sys._MEIPASS)
-        else:
-            self.current_dir = os.path.dirname(os.path.abspath(__file__))
 
-        settings, profile_name, url, region, bucket, access_key, secret_key = settings
+        (current_dir, settings, profile_name, url, region,
+         bucket, access_key, secret_key) = settings
         self.settings = settings
-
+        self.current_dir = current_dir
         self.data_model = DataModel(
             url,
             region,
@@ -231,6 +227,8 @@ class MainWindow(QMainWindow):
         self.listview.setIndentation(10)
         self.thread = None
         self.worker = None
+        self.setWindowIcon(QIcon(
+            os.path.join(self.current_dir, "resources", "ducky.ico")))
         self.restoreSettings()
 
     def simple(self, title, message):
