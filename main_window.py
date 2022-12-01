@@ -74,20 +74,18 @@ class Tree(QTreeView):
                 base_path, tail = os.path.split(path)
                 if os.path.isdir(path):
                     for filename in glob.iglob(path + '**/**', recursive=True):
-                        key = str(pathlib.PurePosixPath(
-                            os.path.join(
+                        key = pathlib.Path(os.path.join(
                                 self.parent.data_model.current_folder,
-                                os.path.relpath(filename, base_path))))
-
+                                os.path.relpath(filename, base_path))).as_posix()
                         if os.path.isdir(filename):
                             # append folder
                             job.append((key, None))
                         else:
                             job.append((key, filename))
                 else:
-                    key = str(pathlib.PurePosixPath(os.path.join(
+                    key = pathlib.Path(os.path.join(
                         self.parent.data_model.current_folder,
-                        os.path.relpath(path, base_path))))
+                        os.path.relpath(path, base_path))).as_posix()
                     job.append((key, path))
             self.disable_drag_drop()
             self.parent.assign_thread_operation('upload', job)
