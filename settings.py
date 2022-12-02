@@ -10,7 +10,7 @@ class SettingsWindow(QDialog):
         super().__init__(*args, **kwargs)
         name, url, region, bucket, access_key, secret_key = settings
         self.setWindowTitle("Profile settings")
-        self.setGeometry(100, 100, 460, 200)
+        self.setGeometry(140, 140, 490, 250)
         qtRectangle = self.frameGeometry()
         centerPoint = QDesktopWidget().availableGeometry().center()
         qtRectangle.moveCenter(centerPoint)

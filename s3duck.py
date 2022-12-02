@@ -3,7 +3,7 @@
 import sys
 import os
 import pathlib
-
+from copy import deepcopy
 from PyQt5.QtGui import QIcon
 from cryptography.fernet import Fernet
 from PyQt5 import QtCore
@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QSplitter,
     QMessageBox,
-    QDialog,
+    QDialog, QMenu, QAction,
 )
 
 
@@ -104,10 +104,47 @@ class Profiles(QDialog):
         self.setLayout(vbox)
         self.setGeometry(800, 400, 350, 250)
         self.setWindowTitle('Profiles')
-        self.listWidget.currentItemChanged.connect(self.on_element_count_changed)
+        self.listWidget.currentItemChanged.connect(self.on_elements_changed)
+        self. listWidget.itemSelectionChanged.connect(self.on_elements_changed)
+        self.listWidget.installEventFilter(self)
         self.load()
         self.populate_list()
+        if self.listWidget.count() > 0:
+            index = self.listWidget.model().index(0, 0)
+            self.listWidget.setCurrentIndex(index)
+        self.listWidget.doubleClicked.connect(self.onStart)
         self.show()
+
+    def copy_profile(self):
+        index = self.listWidget.selectionModel().currentIndex()
+        elem = index.row()
+        item = deepcopy(self.items[elem])
+        item.name = "%s-copy" % item.name
+        self.items.append(item)
+        self.save_settings()
+        self.populate_list()
+
+    def eventFilter(self, source, event):
+        if (event.type() == QtCore.QEvent.ContextMenu and
+                source is self.listWidget):
+            ixs = self.listWidget.selectedIndexes()
+            if ixs:
+                menu = QMenu()
+                copy_profile = QAction("Copy profile")
+                edit_profile = QAction("Edit profile")
+                delete_action = QAction("Delete profile")
+                menu.addAction(copy_profile)
+                menu.addAction(edit_profile)
+                menu.addAction(delete_action)
+                clk = menu.exec_(event.globalPos())
+                if clk == copy_profile:
+                    self.copy_profile()
+                if clk == edit_profile:
+                    self.onEdit()
+                if clk == delete_action:
+                    self.onDelete()
+                return True
+        return super().eventFilter(source, event)
 
     def load(self):
         self.settings.beginGroup("common")
@@ -248,18 +285,16 @@ class Profiles(QDialog):
             self.populate_list()
 
     @QtCore.pyqtSlot()
-    def on_element_count_changed(self):
+    def on_elements_changed(self):
         self.btnRun.setEnabled(
-            self.listWidget.count() > 0
+            self.listWidget.count() > 0 and bool(self.listWidget.selectedIndexes())
         )
         self.btnEdit.setEnabled(
-            self.listWidget.count() > 0
+            self.listWidget.count() > 0 and bool(self.listWidget.selectedIndexes())
         )
         self.btnDelete .setEnabled(
-            self.listWidget.count() > 0
+            self.listWidget.count() > 0 and bool(self.listWidget.selectedIndexes())
         )
-        if self.listWidget.count() > 0:
-            self.listWidget.selectionModel().selectedIndexes()
 
 
 def main():
