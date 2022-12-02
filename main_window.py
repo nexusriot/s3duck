@@ -1,5 +1,6 @@
 import os
 import glob
+import pathlib
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import QIcon, QStandardItemModel, QStandardItem
@@ -73,14 +74,18 @@ class Tree(QTreeView):
                 base_path, tail = os.path.split(path)
                 if os.path.isdir(path):
                     for filename in glob.iglob(path + '**/**', recursive=True):
-                        key = self.parent.data_model.current_folder + os.path.relpath(filename, base_path)
+                        key = pathlib.Path(os.path.join(
+                                self.parent.data_model.current_folder,
+                                os.path.relpath(filename, base_path))).as_posix()
                         if os.path.isdir(filename):
                             # append folder
                             job.append((key, None))
                         else:
                             job.append((key, filename))
                 else:
-                    key = self.parent.data_model.current_folder + os.path.relpath(path, base_path)
+                    key = pathlib.Path(os.path.join(
+                        self.parent.data_model.current_folder,
+                        os.path.relpath(path, base_path))).as_posix()
                     job.append((key, path))
             self.disable_drag_drop()
             self.parent.assign_thread_operation('upload', job)
@@ -147,9 +152,11 @@ class MainWindow(QMainWindow):
         super(MainWindow, self).__init__(*args, **kwargs)
         self.setWindowTitle("S3 Duck 🦆 %s PoC" % __VERSION__)
         self.setWindowIcon(QIcon.fromTheme("applications-internet"))
-        settings, profile_name, url, region, bucket, access_key, secret_key = settings
-        self.settings = settings
 
+        (current_dir, settings, profile_name, url, region,
+         bucket, access_key, secret_key) = settings
+        self.settings = settings
+        self.current_dir = current_dir
         self.data_model = DataModel(
             url,
             region,
@@ -163,7 +170,6 @@ class MainWindow(QMainWindow):
         self.splitter = QSplitter()
         self.splitter.setOrientation(Qt.Vertical)
         self.splitter.addWidget(self.listview)
-        self.logview = QPlainTextEdit(self)
         self.splitter.addWidget(self.logview)
         self.logview.setReadOnly(True)
         self.logview.appendPlainText(
@@ -185,7 +191,7 @@ class MainWindow(QMainWindow):
 
         self.tBar = self.addToolBar("Tools")
         self.tBar.setContextMenuPolicy(Qt.PreventContextMenu)
-        self.tBar.setMovable(False)
+        self.tBar.setMovable(True)
         self.tBar.setIconSize(QSize(16, 16))
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnHome)
@@ -200,6 +206,7 @@ class MainWindow(QMainWindow):
         self.tBar.addAction(self.btnRemove)
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnAbout)
+        self.tBar.setIconSize(QSize(26, 26))
         self.model = QStandardItemModel()
 
         self.model.setHorizontalHeaderLabels(['Name', 'Size', 'Modified'])
@@ -220,6 +227,8 @@ class MainWindow(QMainWindow):
         self.listview.setIndentation(10)
         self.thread = None
         self.worker = None
+        self.setWindowIcon(QIcon(
+            os.path.join(self.current_dir, "resources", "ducky.ico")))
         self.restoreSettings()
 
     def simple(self, title, message):
@@ -258,11 +267,13 @@ class MainWindow(QMainWindow):
             self.model.setRowCount(0)
             for i in model_result:
                 if i.type_ == FSObjectType.FILE:
-                    icon = QIcon().fromTheme("go-first")
+                    icon = QIcon().fromTheme("go-first", QIcon(os.path.join(
+                        self.current_dir, "icons", "document_24px.svg")))
                     size = str(i.size)
                     modified = str(i.modified)
                 else:
-                    icon = QIcon().fromTheme("network-server")
+                    icon = QIcon().fromTheme("network-server", QIcon(os.path.join(
+                        self.current_dir, "icons", "folder_24px.svg")))
                     size = "<DIR>"
                     modified = ""
                 self.model.appendRow([
@@ -415,25 +426,24 @@ class MainWindow(QMainWindow):
         self.logview.appendPlainText(msg)
 
     def createActions(self):
-        current_dir = os.path.dirname(os.path.abspath(__file__))
         self.btnBack = QAction(QIcon.fromTheme("go-previous", QIcon(os.path.join(
-            current_dir, "icons/arrow_back_24px.svg"))), "back", triggered=self.goBack)
+            self.current_dir, "icons", "arrow_back_24px.svg"))), "back", triggered=self.goBack)
         self.btnUp = QAction(QIcon.fromTheme("go-up", QIcon(os.path.join(
-            current_dir, "icons/arrow_upward_24px.svg"))), "up", triggered=self.goUp)
+            self.current_dir, "icons", "arrow_upward_24px.svg"))), "up", triggered=self.goUp)
         self.btnHome = QAction(QIcon.fromTheme("go-home", QIcon(os.path.join(
-            current_dir, "icons/home_24px.svg"))), "home", triggered=self.goHome)
+            self.current_dir, "icons", "home_24px.svg"))), "home", triggered=self.goHome)
         self.btnDownload = QAction(QIcon.fromTheme("emblem-downloads", QIcon(os.path.join(
-            current_dir, "icons/download_24px.svg"))), "download", triggered=self.download)
+            self.current_dir, "icons", "download_24px.svg"))), "download", triggered=self.download)
         self.btnCreateFolder = QAction(QIcon.fromTheme("folder-new", QIcon(os.path.join(
-            current_dir, "icons/create_new_folder_24px.svg"))), "new folder", triggered=self.new_folder)
+            self.current_dir, "icons", "create_new_folder_24px.svg"))), "new folder", triggered=self.new_folder)
         self.btnRemove = QAction(QIcon.fromTheme("edit-delete", QIcon(os.path.join(
-            current_dir, "icons/delete_24px.svg"))), "delete", triggered=self.delete)
+            self.current_dir, "icons", "delete_24px.svg"))), "delete", triggered=self.delete)
         self.btnRefresh = QAction(QIcon.fromTheme("view-refresh", QIcon(os.path.join(
-            current_dir, "icons/refresh_24px.svg"))), "refresh", triggered=self.navigate)
+            self.current_dir, "icons", "refresh_24px.svg"))), "refresh", triggered=self.navigate)
         self.btnUpload = QAction(QIcon.fromTheme("network-server", QIcon(os.path.join(
-            current_dir, "icons/file_upload_24px.svg"))), "upload", triggered=self.upload)
+            self.current_dir, "icons", "file_upload_24px.svg"))), "upload", triggered=self.upload)
         self.btnAbout = QAction(QIcon.fromTheme("help-about", QIcon(os.path.join(
-            current_dir, "icons/info_24px.svg"))), "about", triggered=self.about)
+            self.current_dir, "icons", "info_24px.svg"))), "about", triggered=self.about)
 
     def restoreSettings(self):
         self.settings.beginGroup("geometry")
