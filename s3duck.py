@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (
     QDialog, QMenu, QAction,
 )
 
-
+from model import Model as DataModel
 from settings import SettingsWindow
 from main_window import MainWindow
 
@@ -115,6 +115,10 @@ class Profiles(QDialog):
         self.listWidget.doubleClicked.connect(self.onStart)
         self.show()
 
+    def select_last(self):
+        index = self.listWidget.model().index(self.listWidget.count() - 1, 0)
+        self.listWidget.setCurrentIndex(index)
+
     def copy_profile(self):
         index = self.listWidget.selectionModel().currentIndex()
         elem = index.row()
@@ -123,8 +127,34 @@ class Profiles(QDialog):
         self.items.append(item)
         self.save_settings()
         self.populate_list()
-        index = self.listWidget.model().index(self.listWidget.count() - 1, 0)
-        self.listWidget.setCurrentIndex(index)
+        self.select_last()
+
+    def check_profile(self):
+        index = self.listWidget.selectionModel().currentIndex()
+        elem = index.row()
+        item = self.items[elem]
+        self.settings.beginGroup("common")
+        key = self.settings.value("key")
+        self.settings.endGroup()
+        crypto = Crypto(key)
+        dm = DataModel(
+            item.url,
+            item.region,
+            crypto.decrypt_cred(item.enc_access_key),
+            crypto.decrypt_cred(item.enc_secret_key),
+            item.bucket_name,
+        )
+        ok, reason = dm.check_profile()
+        msgBox = QMessageBox()
+        msgBox.setWindowTitle("Profile check")
+        msgBox.setStandardButtons(QMessageBox.Ok)
+        if ok:
+            msgBox.setIcon(QMessageBox.Information)
+            msgBox.setText("Check result OK")
+        else:
+            msgBox.setIcon(QMessageBox.Critical)
+            msgBox.setText("Check failed: %s" % reason)
+        msgBox.exec()
 
     def eventFilter(self, source, event):
         if (event.type() == QtCore.QEvent.ContextMenu and
@@ -134,9 +164,11 @@ class Profiles(QDialog):
                 menu = QMenu()
                 copy_profile = QAction("Copy profile")
                 edit_profile = QAction("Edit profile")
+                check_action = QAction("Check profile")
                 delete_action = QAction("Delete profile")
                 menu.addAction(copy_profile)
                 menu.addAction(edit_profile)
+                menu.addAction(check_action)
                 menu.addAction(delete_action)
                 clk = menu.exec_(event.globalPos())
                 if clk == copy_profile:
@@ -145,6 +177,8 @@ class Profiles(QDialog):
                     self.onEdit()
                 if clk == delete_action:
                     self.onDelete()
+                if clk == check_action:
+                    self.check_profile()
                 return True
         return super().eventFilter(source, event)
 
@@ -175,20 +209,41 @@ class Profiles(QDialog):
         key = self.settings.value("key")
         self.settings.endGroup()
         crypto = Crypto(key)
-        settings = (
-            self.current_dir,
-            self.settings,
-            item.name,
+
+        acc_key = crypto.decrypt_cred(item.enc_access_key)
+        secret_key = crypto.decrypt_cred(item.enc_secret_key)
+
+        # try to get bucket
+        dm = DataModel(
             item.url,
             item.region,
+            acc_key,
+            secret_key,
             item.bucket_name,
-            crypto.decrypt_cred(item.enc_access_key),
-            crypto.decrypt_cred(item.enc_secret_key)
         )
-        self.main_settings = settings
-        self.main_window = MainWindow(settings=self.main_settings)
-        self.main_window.show()
-        self.hide()
+        res, reason = dm.check_bucket()
+        if res:
+            settings = (
+                self.current_dir,
+                self.settings,
+                item.name,
+                item.url,
+                item.region,
+                item.bucket_name,
+                acc_key,
+                secret_key,
+            )
+            self.main_settings = settings
+            self.main_window = MainWindow(settings=self.main_settings)
+            self.main_window.show()
+            self.hide()
+        else:
+            msgBox = QMessageBox()
+            msgBox.setWindowTitle("Profile check")
+            msgBox.setStandardButtons(QMessageBox.Ok)
+            msgBox.setIcon(QMessageBox.Critical)
+            msgBox.setText("Check failed: %s" % reason)
+            msgBox.exec()
 
     def save_settings(self):
         self.settings.beginGroup("profiles")
@@ -238,6 +293,7 @@ class Profiles(QDialog):
                 )
             self.save_settings()
             self.populate_list()
+            self.select_last()
 
     def onEdit(self):
         index = self.listWidget.selectionModel().currentIndex()
@@ -273,6 +329,7 @@ class Profiles(QDialog):
                 )
             self.save_settings()
             self.populate_list()
+            self.listWidget.setCurrentIndex(index)
 
     def onDelete(self):
         index = self.listWidget.selectionModel().currentIndex()

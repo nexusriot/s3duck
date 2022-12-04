@@ -1,5 +1,6 @@
 from enum import Enum
 import platform
+import uuid
 import os
 import boto3
 import botocore
@@ -129,16 +130,45 @@ class Model:
         r = self.client.list_objects_v2(Bucket=self.bucket, Prefix=prefix)
         return [(key.get('Key'), key.get("Size")) for key in r.get("Contents", [])]
 
-    def delete(self, key):
+    def delete(self, key) -> bool:
         if key.endswith("/"):
             keys = self.get_keys(key)
             for key, _ in keys:
                 self.client.delete_object(Bucket=self.bucket, Key=key)
         else:
             self.client.delete_object(Bucket=self.bucket, Key=key)
+        return True
 
     def upload_file(self, local_file, key):
         if local_file is None:
             self.create_folder("%s/" % key)
         else:
             self.client.upload_file(local_file, self.bucket, key)
+
+    def check_bucket(self):
+        try:
+            res = self.client.list_buckets()
+            for b in res.get("Buckets", []):
+                if b["Name"] == self.bucket:
+                    return True, None
+            reason = "bucket not found"
+        except botocore.exceptions.ClientError as exc:
+            reason = exc.response["Error"]["Message"]
+        except Exception as exc:
+            reason = str(exc)
+        return False, reason
+
+    def check_profile(self):
+        res_c = res_d = False
+        reason = None
+        key = str(uuid.uuid4())
+        try:
+            try:
+                res_c = self.create_folder(key)
+            finally:
+                res_d = self.delete(key)
+        except botocore.exceptions.ClientError as exc:
+            reason = exc.response["Error"]["Message"]
+        except Exception as exc:
+            reason = str(exc)
+        return bool(res_c) and res_d, reason
