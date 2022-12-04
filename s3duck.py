@@ -123,6 +123,8 @@ class Profiles(QDialog):
         self.items.append(item)
         self.save_settings()
         self.populate_list()
+        index = self.listWidget.model().index(self.listWidget.count() - 1, 0)
+        self.listWidget.setCurrentIndex(index)
 
     def eventFilter(self, source, event):
         if (event.type() == QtCore.QEvent.ContextMenu and
