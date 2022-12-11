@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import QApplication, QWidget, QFileDialog, QPlainTextEdit
 from model import Model as DataModel
 from model import FSObjectType
 
+
 OS_FAMILY_MAP = {
     "Linux": "🐧",
     "Windows": "⊞ Win",
@@ -229,7 +230,37 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.setWindowIcon(QIcon(
             os.path.join(self.current_dir, "resources", "ducky.ico")))
+        self.listview.installEventFilter(self)
         self.restoreSettings()
+        self.select_first()
+
+    def select_first(self):
+        if self.listview.model().rowCount() > 0:
+            index = self.listview.model().index(0, 0)
+            self.listview.setCurrentIndex(index)
+
+    def eventFilter(self, obj, event):
+        if obj == self.listview:
+            if event.type() == QEvent.KeyPress:
+                if event.key() == Qt.Key_Return:
+                    self.list_doubleClicked()
+                if event.key() == Qt.Key_Delete:
+                    self.delete()
+                if event.key() == Qt.Key_Backspace:
+                    self.goUp()
+                if event.key() in [Qt.Key_Insert, Qt.Key_C]:
+                    self.new_folder()
+                if event.key() == Qt.Key_B:
+                    self.goBack()
+                if event.key() in [Qt.Key_H, Qt.Key_Home]:
+                    self.goHome()
+                if event.key() == Qt.Key_A:
+                    self.about()
+                if event.key() == Qt.Key_U:
+                    self.upload()
+                if event.key() == Qt.Key_D:
+                    self.download()
+        return super(MainWindow, self).eventFilter(obj, event)
 
     def simple(self, title, message):
         QMessageBox(QMessageBox.Information,
@@ -281,7 +312,7 @@ class MainWindow(QMainWindow):
                     ListItem(size, i.type_, size),
                     ListItem(size, i.type_, modified)])
 
-    def change_current_folder(self, new_folder):
+    def change_current_folder(self, new_folder, restore_index=False):
         self.data_model.prev_folder = self.data_model.current_folder
         self.data_model.current_folder = new_folder
 
@@ -304,7 +335,7 @@ class MainWindow(QMainWindow):
             self.navigate()
 
     def goBack(self):
-        self.change_current_folder(self.data_model.prev_folder)
+        self.change_current_folder(self.data_model.prev_folder, True)
         self.navigate()
 
     def download(self):
@@ -421,29 +452,31 @@ class MainWindow(QMainWindow):
     def goHome(self):
         self.change_current_folder("")
         self.navigate()
+        self.select_first()
 
     def report_logger_progress(self, msg):
         self.logview.appendPlainText(msg)
 
     def createActions(self):
         self.btnBack = QAction(QIcon.fromTheme("go-previous", QIcon(os.path.join(
-            self.current_dir, "icons", "arrow_back_24px.svg"))), "back", triggered=self.goBack)
+            self.current_dir, "icons", "arrow_back_24px.svg"))), "Back(B)", triggered=self.goBack)
         self.btnUp = QAction(QIcon.fromTheme("go-up", QIcon(os.path.join(
-            self.current_dir, "icons", "arrow_upward_24px.svg"))), "up", triggered=self.goUp)
+            self.current_dir, "icons", "arrow_upward_24px.svg"))), "Up(Backspace)", triggered=self.goUp)
         self.btnHome = QAction(QIcon.fromTheme("go-home", QIcon(os.path.join(
-            self.current_dir, "icons", "home_24px.svg"))), "home", triggered=self.goHome)
+            self.current_dir, "icons", "home_24px.svg"))), "Home(Home, H)", triggered=self.goHome)
         self.btnDownload = QAction(QIcon.fromTheme("emblem-downloads", QIcon(os.path.join(
-            self.current_dir, "icons", "download_24px.svg"))), "download", triggered=self.download)
+            self.current_dir, "icons", "download_24px.svg"))), "Download(D)", triggered=self.download)
         self.btnCreateFolder = QAction(QIcon.fromTheme("folder-new", QIcon(os.path.join(
-            self.current_dir, "icons", "create_new_folder_24px.svg"))), "new folder", triggered=self.new_folder)
+            self.current_dir, "icons", "create_new_folder_24px.svg"))), "Create folder(Insert, C)",
+                                       triggered=self.new_folder)
         self.btnRemove = QAction(QIcon.fromTheme("edit-delete", QIcon(os.path.join(
-            self.current_dir, "icons", "delete_24px.svg"))), "delete", triggered=self.delete)
+            self.current_dir, "icons", "delete_24px.svg"))), "Delete(Delete)", triggered=self.delete)
         self.btnRefresh = QAction(QIcon.fromTheme("view-refresh", QIcon(os.path.join(
-            self.current_dir, "icons", "refresh_24px.svg"))), "refresh", triggered=self.navigate)
+            self.current_dir, "icons", "refresh_24px.svg"))), "Refresh(R)", triggered=self.navigate)
         self.btnUpload = QAction(QIcon.fromTheme("network-server", QIcon(os.path.join(
-            self.current_dir, "icons", "file_upload_24px.svg"))), "upload", triggered=self.upload)
+            self.current_dir, "icons", "file_upload_24px.svg"))), "Upload(U)", triggered=self.upload)
         self.btnAbout = QAction(QIcon.fromTheme("help-about", QIcon(os.path.join(
-            self.current_dir, "icons", "info_24px.svg"))), "about", triggered=self.about)
+            self.current_dir, "icons", "info_24px.svg"))), "About(A)", triggered=self.about)
 
     def restoreSettings(self):
         self.settings.beginGroup("geometry")
