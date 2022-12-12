@@ -16,7 +16,7 @@ OS_FAMILY_MAP = {
     "Darwin": "🍎",
 }
 
-__VERSION__ = "0.0.4"
+__VERSION__ = "0.0.5"
 
 
 class Tree(QTreeView):
@@ -228,6 +228,7 @@ class MainWindow(QMainWindow):
         self.listview.setIndentation(10)
         self.thread = None
         self.worker = None
+        self.map = dict()
         self.setWindowIcon(QIcon(
             os.path.join(self.current_dir, "resources", "ducky.ico")))
         self.listview.installEventFilter(self)
@@ -238,6 +239,12 @@ class MainWindow(QMainWindow):
         if self.listview.model().rowCount() > 0:
             index = self.listview.model().index(0, 0)
             self.listview.setCurrentIndex(index)
+
+    def ix_by_name(self, name):
+        for r in range(self.listview.model().rowCount()):
+            ix = self.listview.model().index(r, 0)
+            if name  == self.listview.model().itemFromIndex(ix).text():
+                return ix
 
     def eventFilter(self, obj, event):
         if obj == self.listview:
@@ -312,30 +319,41 @@ class MainWindow(QMainWindow):
                     ListItem(size, i.type_, size),
                     ListItem(size, i.type_, modified)])
 
-    def change_current_folder(self, new_folder, restore_index=False):
+    def change_current_folder(self, new_folder):
         self.data_model.prev_folder = self.data_model.current_folder
         self.data_model.current_folder = new_folder
+        return self.data_model.current_folder
 
-    def navigate(self):
+    def navigate(self, restore_last_index=False):
         self.modelToListView(self.data_model.list(self.data_model.current_folder))
         self.listview.sortByColumn(0, Qt.AscendingOrder)
         show_folder = (self.data_model.current_folder if self.data_model.current_folder else "/")
         self.statusBar().showMessage("[%s][%s] %s" % (
             self.profile_name, self.data_model.bucket, show_folder), 0)
+        if restore_last_index and self.data_model.prev_folder:
+            name = self.map.get(self.data_model.current_folder)
+            if name:
+                ix = self.ix_by_name(name)
+                if ix:
+                    self.listview.setCurrentIndex(ix)
 
     def get_elem_name(self):
         index = self.listview.selectionModel().currentIndex()
-        i = index.model().itemFromIndex(index)
-        return i.text(), i.t
+        if index.model():
+            i = index.model().itemFromIndex(index)
+            return i.text(), i.t
 
     def list_doubleClicked(self):
-        name, t = self.get_elem_name()
-        if t == FSObjectType.FOLDER:
-            self.change_current_folder(self.data_model.current_folder + "%s/" % name)
-            self.navigate()
+        selection = self.listview.selectionModel().selectedIndexes()
+        if selection:
+            name, t = self.get_elem_name()
+            if t == FSObjectType.FOLDER:
+                self.map[self.data_model.current_folder] = name
+                self.change_current_folder(self.data_model.current_folder + "%s/" % name)
+                self.navigate()
 
     def goBack(self):
-        self.change_current_folder(self.data_model.prev_folder, True)
+        self.change_current_folder(self.data_model.prev_folder)
         self.navigate()
 
     def download(self):
@@ -447,12 +465,12 @@ class MainWindow(QMainWindow):
         if new_path:
             new_path = new_path + "/"
         self.change_current_folder(new_path)
-        self.navigate()
+        self.navigate(True)
+        self.map.pop(p, None)
 
     def goHome(self):
         self.change_current_folder("")
         self.navigate()
-        self.select_first()
 
     def report_logger_progress(self, msg):
         self.logview.appendPlainText(msg)
