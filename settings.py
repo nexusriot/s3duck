@@ -1,16 +1,18 @@
+import json
 from PyQt5 import QtCore
 from PyQt5.QtCore import *
 from PyQt5.QtWidgets import *
 
+from utils import str_to_bool
 
 class SettingsWindow(QDialog):
 
     def __init__(self, *args, **kwargs):
-        settings = kwargs.pop("settings", ("", "", "", "", "", ""))
+        settings = kwargs.pop("settings", ("", "", "", "", "", "", "false", "true"))
         super().__init__(*args, **kwargs)
-        name, url, region, bucket, access_key, secret_key = settings
+        name, url, region, bucket, access_key, secret_key, no_ssl_check, use_path = settings
         self.setWindowTitle("Profile settings")
-        self.setGeometry(140, 140, 490, 250)
+        self.setGeometry(140, 140, 600, 250)
         qtRectangle = self.frameGeometry()
         centerPoint = QDesktopWidget().availableGeometry().center()
         qtRectangle.moveCenter(centerPoint)
@@ -24,6 +26,8 @@ class SettingsWindow(QDialog):
         self.bucketName = QLineEdit()
         self.accessKeyEdit = QLineEdit()
         self.secretKeyEdit = QLineEdit()
+        self.noSslCheck = QCheckBox()
+        self.usePath = QCheckBox()
 
         self.createForm()
         self.buttonBox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -49,6 +53,8 @@ class SettingsWindow(QDialog):
         self.accessKeyEdit.setText(access_key)
         self.secretKeyEdit.setText(secret_key)
         self.secretKeyEdit.setEchoMode(QLineEdit.Password)
+        self.noSslCheck.setChecked(str_to_bool(no_ssl_check))
+        self.usePath.setChecked(str_to_bool(use_path))
 
     @QtCore.pyqtSlot()
     def on_text_changed(self):
@@ -56,7 +62,6 @@ class SettingsWindow(QDialog):
         btn_apply.setEnabled(
             bool(self.nameLineEdit.text()) and
             bool(self.urlLineEdit.text()) and
-            bool(self.regionEdit.text()) and
             bool(self.bucketName.text()) and
             bool(self.accessKeyEdit.text()) and
             bool(self.secretKeyEdit.text())
@@ -69,7 +74,9 @@ class SettingsWindow(QDialog):
             self.regionEdit.text(),
             self.bucketName.text(),
             self.accessKeyEdit.text(),
-            self.secretKeyEdit.text()
+            self.secretKeyEdit.text(),
+            self.noSslCheck.isChecked(),
+            self.usePath.isChecked()
         )
         self.close()
 
@@ -85,4 +92,6 @@ class SettingsWindow(QDialog):
         layout.addRow(QLabel("Bucket name"), self.bucketName)
         layout.addRow(QLabel("Access key"), self.accessKeyEdit)
         layout.addRow(QLabel("Secret key"), self.secretKeyEdit)
+        layout.addRow(QLabel("No SSL check (self-signed certificate support)"), self.noSslCheck)
+        layout.addRow(QLabel("Use path in config (minio support)"), self.usePath)
         self.formGroupBox.setLayout(layout)

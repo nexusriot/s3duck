@@ -16,7 +16,7 @@ OS_FAMILY_MAP = {
     "Darwin": "🍎",
 }
 
-__VERSION__ = "0.0.5"
+__VERSION__ = "0.0.6"
 
 
 class Tree(QTreeView):
@@ -155,7 +155,7 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(QIcon.fromTheme("applications-internet"))
 
         (current_dir, settings, profile_name, url, region,
-         bucket, access_key, secret_key) = settings
+         bucket, access_key, secret_key, no_ssl_check, use_path) = settings
         self.settings = settings
         self.current_dir = current_dir
         self.data_model = DataModel(
@@ -163,7 +163,9 @@ class MainWindow(QMainWindow):
             region,
             access_key,
             secret_key,
-            bucket
+            bucket,
+            no_ssl_check,
+            use_path
         )
         self.logview = QPlainTextEdit(self)
         self.listview = Tree(self)

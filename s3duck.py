@@ -3,6 +3,7 @@
 import sys
 import os
 import pathlib
+import urllib3
 from copy import deepcopy
 from PyQt5.QtGui import QIcon
 from cryptography.fernet import Fernet
@@ -22,6 +23,9 @@ from PyQt5.QtWidgets import (
 from model import Model as DataModel
 from settings import SettingsWindow
 from main_window import MainWindow
+from utils import str_to_bool
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class Crypto:
@@ -49,13 +53,25 @@ class Crypto:
 
 class SettingsItem:
 
-    def __init__(self, name, url, region, bucket_name, enc_access_key, enc_secret_key):
+    def __init__(
+            self,
+            name,
+            url,
+            region,
+            bucket_name,
+            enc_access_key,
+            enc_secret_key,
+            no_ssl_check,
+            use_path
+    ):
         self.name = name
         self.url = url
         self.region = region
         self.bucket_name = bucket_name
         self.enc_access_key = enc_access_key
         self.enc_secret_key = enc_secret_key
+        self.no_ssl_check = no_ssl_check
+        self.use_path = use_path
 
 
 def get_current_dir():
@@ -143,6 +159,8 @@ class Profiles(QDialog):
             crypto.decrypt_cred(item.enc_access_key),
             crypto.decrypt_cred(item.enc_secret_key),
             item.bucket_name,
+            str_to_bool(item.no_ssl_check),
+            str_to_bool(item.use_path)
         )
         ok, reason = dm.check_profile()
         msgBox = QMessageBox()
@@ -194,7 +212,9 @@ class Profiles(QDialog):
                 self.settings.value("region"),
                 self.settings.value("bucket_name"),
                 self.settings.value("access_key"),
-                self.settings.value("secret_key")
+                self.settings.value("secret_key"),
+                self.settings.value("no_ssl_check", "false"),
+                self.settings.value("use_path", "false")
             ))
         self.settings.endArray()
         self.settings.endGroup()
@@ -212,6 +232,8 @@ class Profiles(QDialog):
 
         acc_key = crypto.decrypt_cred(item.enc_access_key)
         secret_key = crypto.decrypt_cred(item.enc_secret_key)
+        no_ssl_check = str_to_bool(item.no_ssl_check)
+        use_path = str_to_bool(item.use_path)
 
         # try to get bucket
         dm = DataModel(
@@ -220,6 +242,8 @@ class Profiles(QDialog):
             acc_key,
             secret_key,
             item.bucket_name,
+            no_ssl_check,
+            use_path
         )
         res, reason = dm.check_bucket()
         if res:
@@ -232,6 +256,8 @@ class Profiles(QDialog):
                 item.bucket_name,
                 acc_key,
                 secret_key,
+                no_ssl_check,
+                use_path
             )
             self.main_settings = settings
             self.main_window = MainWindow(settings=self.main_settings)
@@ -256,6 +282,8 @@ class Profiles(QDialog):
             self.settings.setValue('bucket_name', item.bucket_name)
             self.settings.setValue('access_key', item.enc_access_key)
             self.settings.setValue('secret_key', item.enc_secret_key)
+            self.settings.setValue("no_ssl_check", item.no_ssl_check)
+            self.settings.setValue("use_path", item.use_path)
         self.settings.endArray()
         self.settings.endGroup()
 
@@ -276,7 +304,7 @@ class Profiles(QDialog):
                 self.settings.beginGroup("common")
                 self.settings.setValue("key", key)
                 self.settings.endGroup()
-            name, url, region, bucket, access_key, secret_key = value
+            name, url, region, bucket, access_key, secret_key, no_ssl_check, use_path = value
             # encrypt access & secret key
             crypto = Crypto(key)
             enc_access_key = crypto.encrypt(access_key)
@@ -288,7 +316,9 @@ class Profiles(QDialog):
                     region,
                     bucket,
                     enc_access_key,
-                    enc_secret_key
+                    enc_secret_key,
+                    no_ssl_check,
+                    use_path
                     )
                 )
             self.save_settings()
@@ -311,12 +341,14 @@ class Profiles(QDialog):
             item.region,
             item.bucket_name,
             crypto.decrypt_cred(item.enc_access_key),
-            crypto.decrypt_cred(item.enc_secret_key)
+            crypto.decrypt_cred(item.enc_secret_key),
+            item.no_ssl_check,
+            item.use_path
         )
         settings = SettingsWindow(self, settings=settings)
         value = settings.exec_()
         if value:
-            name, url, region, bucket, access_key, secret_key = value
+            name, url, region, bucket, access_key, secret_key, no_ssl_check, use_path = value
             enc_access_key = crypto.encrypt(access_key)
             enc_secret_key = crypto.encrypt(secret_key)
             self.items[elem] = SettingsItem(
@@ -325,7 +357,9 @@ class Profiles(QDialog):
                     region,
                     bucket,
                     enc_access_key,
-                    enc_secret_key
+                    enc_secret_key,
+                    no_ssl_check,
+                    use_path
                 )
             self.save_settings()
             self.populate_list()

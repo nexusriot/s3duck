@@ -33,7 +33,12 @@ class Model:
                  region_name,
                  access_key,
                  secret_key,
-                 bucket):
+                 bucket,
+                 no_ssl_check,
+                 use_path,
+                 timeout=3,
+                 retries=3
+                 ):
 
         self.session = boto3.session.Session()
         self._client = None
@@ -45,6 +50,10 @@ class Model:
         self.access_key = access_key
         self.secret_key = secret_key
         self.bucket = bucket
+        self.no_ssl_check = no_ssl_check
+        self.use_path = use_path
+        self.timeout = timeout
+        self.retries = retries
 
     @staticmethod
     def get_os_family():
@@ -53,13 +62,35 @@ class Model:
     @property
     def client(self):
         if self._client is None:
+            params = {
+                "endpoint_url": self.endpoint_url,
+                "aws_access_key_id": self.access_key,
+                "aws_secret_access_key": self.secret_key,
+            }
+            if self.region_name:
+                params.update({
+                    "region_name": self.region_name,
+                })
+
+            if not self.use_path:
+                s3_config = {'addressing_style': 'virtual'}
+
+            else:
+                s3_config = {'addressing_style': 'path'}
+
+            if self.no_ssl_check:
+                params.update({
+                    "verify": False
+                })
+            params.update({
+                "config": botocore.config.Config(
+                    s3=s3_config,
+                    connect_timeout = self.timeout,
+                    retries = {'max_attempts': self.retries}),
+            })
             self._client = self.session.client(
                 's3',
-                endpoint_url=self.endpoint_url,
-                config=botocore.config.Config(s3={'addressing_style': 'virtual'}),
-                region_name=self.region_name,
-                aws_access_key_id=self.access_key,
-                aws_secret_access_key=self.secret_key
+                **params
             )
         return self._client
 
