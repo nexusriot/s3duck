@@ -417,6 +417,10 @@ class MainWindow(QMainWindow):
             self.data_model.create_folder(key)
             self.logview.appendPlainText("Created folder %s (%s)" % ( name, key))
             self.navigate()
+            ix = self.ix_by_name(name)
+            if ix:
+                self.listview.setCurrentIndex(ix)
+
 
     def delete(self):
         names = list()
