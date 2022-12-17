@@ -180,10 +180,14 @@ class Profiles(QDialog):
             ixs = self.listWidget.selectedIndexes()
             if ixs:
                 menu = QMenu()
-                copy_profile = QAction("Copy profile")
-                edit_profile = QAction("Edit profile")
-                check_action = QAction("Check profile")
-                delete_action = QAction("Delete profile")
+                copy_profile = QAction(QIcon.fromTheme("edit-copy", QIcon(os.path.join(
+                        self.current_dir, "icons", "copy_24px.svg"))), "Copy profile")
+                edit_profile = QAction(QIcon.fromTheme("edit-clear", QIcon(os.path.join(
+                        self.current_dir, "icons", "edit_24px.svg"))), "Edit profile")
+                check_action = QAction(QIcon.fromTheme("applications-utilities", QIcon(os.path.join(
+                        self.current_dir, "icons", "ok_24px.svg"))), "Check profile")
+                delete_action = QAction(QIcon.fromTheme("edit-delete", QIcon(os.path.join(
+            self.current_dir, "icons", "delete_24px.svg"))), "Delete profile")
                 menu.addAction(copy_profile)
                 menu.addAction(edit_profile)
                 menu.addAction(check_action)

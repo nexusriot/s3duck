@@ -250,6 +250,53 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, obj, event):
         if obj == self.listview:
+            if (event.type() == QEvent.ContextMenu and
+                    obj is self.listview):
+                upload_path = self.data_model.current_folder
+                upload_selected_action = delete_action = download_action = QObject()
+                ixs = self.listview.selectedIndexes()
+                menu = QMenu()
+                if ixs:
+                    ix = ixs[0]
+                    if ix.column() == 0:
+                        m = ix.model().itemFromIndex(ix)
+                        name = m.text()
+                        upload_path = self.data_model.current_folder + name
+                        if m.t == FSObjectType.FOLDER:
+                            upload_selected_action = QAction(
+                                QIcon.fromTheme("network-server", QIcon(os.path.join(
+                                    self.current_dir, "icons", "file_upload_24px.svg"))),
+                                                       "Upload -> %s" % upload_path)
+                            menu.addAction(upload_selected_action)
+                upload_current_action = QAction(
+                    QIcon.fromTheme("network-server", QIcon(os.path.join(
+                        self.current_dir, "icons", "file_upload_24px.svg"))), "Upload -> %s" % (
+                        "/" if not self.data_model.current_folder else self.data_model.current_folder))
+                menu.addAction(upload_current_action)
+                create_folder_action = QAction(
+                    QIcon.fromTheme("folder-new", QIcon(os.path.join(
+                        self.current_dir, "icons", "create_new_folder_24px.svg"))), "Create folder")
+                menu.addAction(create_folder_action)
+                if ixs:
+                    download_action = QAction(
+                        QIcon.fromTheme("emblem-downloads", QIcon(os.path.join(
+                            self.current_dir, "icons", "download_24px.svg"))), "Download")
+                    menu.addAction(download_action)
+                    delete_action = QAction(
+                        QIcon.fromTheme("edit-delete", QIcon(os.path.join(
+                            self.current_dir, "icons", "delete_24px.svg"))), "Delete")
+                    menu.addAction(delete_action)
+                clk = menu.exec_(event.globalPos())
+                if clk == upload_selected_action:
+                    self.upload(upload_path)
+                if clk == upload_current_action:
+                    self.upload()
+                if clk == delete_action:
+                    self.delete()
+                if clk == download_action:
+                    self.download()
+                if clk == create_folder_action:
+                    self.new_folder()
             if event.type() == QEvent.KeyPress:
                 if event.key() == Qt.Key_Return:
                     self.list_doubleClicked()
@@ -440,7 +487,7 @@ class MainWindow(QMainWindow):
             if ret == qm.Yes:
                 self.assign_thread_operation('delete', job)
 
-    def upload(self):
+    def upload(self, folder=None):
         job = list()
         filter = "All files (*.*)"
         dialog = QFileDialog()
@@ -450,7 +497,10 @@ class MainWindow(QMainWindow):
             return
         for name in names[0]:
             basename = os.path.basename(name)
-            key = self.data_model.current_folder + basename
+            if folder is not None:
+                key = folder + "/" + basename
+            else:
+                key = self.data_model.current_folder + basename
             job.append((key, name))
         self.assign_thread_operation('upload', job)
 
