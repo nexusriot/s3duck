@@ -177,30 +177,37 @@ class Profiles(QDialog):
     def eventFilter(self, source, event):
         if (event.type() == QtCore.QEvent.ContextMenu and
                 source is self.listWidget):
+            copy_profile_action = delete_action = edit_profile_action = check_action = QObject()
+            menu = QMenu()
             ixs = self.listWidget.selectedIndexes()
+            add_profile_action = QAction(QIcon.fromTheme("list-add", QIcon(os.path.join(
+                        self.current_dir, "icons", "plus_24px.svg"))), "Add profile")
+            menu.addAction(add_profile_action)
             if ixs:
-                menu = QMenu()
-                copy_profile = QAction(QIcon.fromTheme("edit-copy", QIcon(os.path.join(
+                copy_profile_action = QAction(QIcon.fromTheme("edit-copy", QIcon(os.path.join(
                         self.current_dir, "icons", "copy_24px.svg"))), "Copy profile")
-                edit_profile = QAction(QIcon.fromTheme("edit-clear", QIcon(os.path.join(
+                edit_profile_action = QAction(QIcon.fromTheme("edit-clear", QIcon(os.path.join(
                         self.current_dir, "icons", "edit_24px.svg"))), "Edit profile")
                 check_action = QAction(QIcon.fromTheme("applications-utilities", QIcon(os.path.join(
                         self.current_dir, "icons", "ok_24px.svg"))), "Check profile")
                 delete_action = QAction(QIcon.fromTheme("edit-delete", QIcon(os.path.join(
-            self.current_dir, "icons", "delete_24px.svg"))), "Delete profile")
-                menu.addAction(copy_profile)
-                menu.addAction(edit_profile)
+                    self.current_dir, "icons", "delete_24px.svg"))), "Delete profile")
+                menu.addAction(copy_profile_action)
+                menu.addAction(edit_profile_action)
                 menu.addAction(check_action)
                 menu.addAction(delete_action)
-                clk = menu.exec_(event.globalPos())
-                if clk == copy_profile:
-                    self.copy_profile()
-                if clk == edit_profile:
-                    self.onEdit()
-                if clk == delete_action:
-                    self.onDelete()
-                if clk == check_action:
-                    self.check_profile()
+
+            clk = menu.exec_(event.globalPos())
+            if clk == copy_profile_action:
+                self.copy_profile()
+            if clk == edit_profile_action:
+                self.onEdit()
+            if clk == delete_action:
+                self.onDelete()
+            if clk == check_action:
+                self.check_profile()
+            if clk == add_profile_action:
+                self.onAdd()
                 return True
         return super().eventFilter(source, event)
 

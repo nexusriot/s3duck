@@ -121,7 +121,7 @@ class Worker(QObject):
             if local_name:
                 msg = "downloading %s -> %s (%s)" % (key, local_name, size)
             else:
-                msg = "downloading directory: %s" % key
+                msg = "downloading directory: %s ->%s" % (key, folder_path)
             self.progress.emit(msg)
             self.data_model.download_file(key, local_name, folder_path)
         self.finished.emit()
