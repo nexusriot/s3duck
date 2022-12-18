@@ -489,7 +489,7 @@ class MainWindow(QMainWindow):
 
     def upload(self, folder=None):
         job = list()
-        filter = "All files (*.*)"
+        filter = "All files (*)"
         dialog = QFileDialog()
         dialog.setFileMode(QFileDialog.ExistingFiles)
         names = dialog.getOpenFileNames(self, "Open files", "", filter)
