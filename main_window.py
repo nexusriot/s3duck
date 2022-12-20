@@ -13,7 +13,7 @@ from model import FSObjectType
 OS_FAMILY_MAP = {
     "Linux": "🐧",
     "Windows": "⊞ Win",
-    "Darwin": "🍎",
+    "Darwin": " MacOS"
 }
 
 __VERSION__ = "0.0.6"
