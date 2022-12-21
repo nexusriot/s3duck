@@ -50,3 +50,8 @@ Run build:
 ```
 ./build_macos_bin.sh
 ```
+
+Pack build into .dmg:
+```
+./build_dmg.sh
+```
