@@ -42,3 +42,11 @@ Run build:
 ```
 ./build_deb.sh
 ```
+
+Building app for MacOS
+----------------------
+
+Run build:
+```
+./build_macos_bin.sh
+```
