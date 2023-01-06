@@ -16,7 +16,7 @@ OS_FAMILY_MAP = {
     "Darwin": " MacOS"
 }
 
-__VERSION__ = "0.0.6"
+__VERSION__ = "0.0.7"
 
 
 class Tree(QTreeView):
@@ -497,7 +497,7 @@ class MainWindow(QMainWindow):
             return
         for name in names[0]:
             basename = os.path.basename(name)
-            if folder is not None:
+            if folder:
                 key = folder + "/" + basename
             else:
                 key = self.data_model.current_folder + basename
