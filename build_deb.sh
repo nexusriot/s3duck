@@ -30,4 +30,4 @@ cp *.py $lib_dir
 
 sed -i "s/_version_/$version/g" $folder_name/DEBIAN/control
 
-cd build/ && dpkg-deb --build --root-owner-group $project
+cd build/ && dpkg-deb --build -Z gzip --root-owner-group $project
