@@ -203,3 +203,16 @@ class Model:
         except Exception as exc:
             reason = str(exc)
         return bool(res_c) and res_d, reason
+
+    def get_size(self, key):
+        r = self.client.list_objects_v2(Bucket=self.bucket, Prefix=key)
+        items = r.get("Contents", [])
+        return 0 if not items else sum([key.get('Size') for key in items])
+
+    def object_properties(self, key):
+        bk = self.client.get_object(
+            Bucket=self.bucket,
+            Key = key,
+        )
+        return bk
+
