@@ -2,6 +2,7 @@ import botocore.exceptions
 from PyQt5.QtCore import *
 from PyQt5.QtWidgets import *
 
+
 class PropertiesWindow(QDialog):
 
     def __init__(self, *args, **kwargs):
@@ -34,11 +35,11 @@ class PropertiesWindow(QDialog):
         self.keyName.setText(key)
         self.e_tag = ""
         try:
-            resp =  self.model.object_properties(key)
-            self.e_tag = resp.get("ETag", "")
+            resp = self.model.object_properties(key)
+            self.e_tag = resp.get("ETag", "").replace('"', '')
         except botocore.exceptions.ClientError:
             pass
-        self.size.setText(str(self.model.get_size(key)))
+        self.size.setText(str(self.model.get_size(key)) + " Bytes")
         self.eTag.setText(self.e_tag)
 
     def exit(self):
@@ -49,7 +50,7 @@ class PropertiesWindow(QDialog):
 
     def createForm(self):
         layout = QFormLayout()
-        layout.addRow(QLabel("Key name"), self.keyName)
+        layout.addRow(QLabel("Key"), self.keyName)
         layout.addRow(QLabel("Size"), self.size)
         layout.addRow(QLabel("ETag"), self.eTag)
         self.formGroupBox.setLayout(layout)
