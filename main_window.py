@@ -9,6 +9,8 @@ from PyQt5.QtWidgets import QApplication, QWidget, QFileDialog, QPlainTextEdit
 from model import Model as DataModel
 from model import FSObjectType
 
+from properties_window import PropertiesWindow
+
 
 OS_FAMILY_MAP = {
     "Linux": "🐧",
@@ -248,26 +250,34 @@ class MainWindow(QMainWindow):
             if name  == self.listview.model().itemFromIndex(ix).text():
                 return ix
 
+    def name_by_first_ix(self, ixs):
+        if ixs:
+            ix = ixs[0]
+            if ix.column() == 0:
+                m = ix.model().itemFromIndex(ix)
+                name = m.text()
+                if m.t == FSObjectType.FOLDER:
+                    name = "%s/" % name
+                return m, name, self.data_model.current_folder + name
+        return None, None, None
+
     def eventFilter(self, obj, event):
         if obj == self.listview:
             if (event.type() == QEvent.ContextMenu and
                     obj is self.listview):
-                upload_path = self.data_model.current_folder
-                upload_selected_action = delete_action = download_action = QObject()
+                upload_selected_action = delete_action = download_action = properties_selected_action =QObject()
                 ixs = self.listview.selectedIndexes()
                 menu = QMenu()
-                if ixs:
-                    ix = ixs[0]
-                    if ix.column() == 0:
-                        m = ix.model().itemFromIndex(ix)
-                        name = m.text()
-                        upload_path = self.data_model.current_folder + name
-                        if m.t == FSObjectType.FOLDER:
-                            upload_selected_action = QAction(
-                                QIcon.fromTheme("network-server", QIcon(os.path.join(
-                                    self.current_dir, "icons", "file_upload_24px.svg"))),
-                                                       "Upload -> %s" % upload_path)
-                            menu.addAction(upload_selected_action)
+                m, name, upload_path = self.name_by_first_ix(ixs)
+                if upload_path is None:
+                    upload_path = self.data_model.current_folder
+                if name:
+                    if m.t == FSObjectType.FOLDER:
+                        upload_selected_action = QAction(
+                            QIcon.fromTheme("network-server", QIcon(os.path.join(
+                                self.current_dir, "icons", "file_upload_24px.svg"))),
+                                                   "Upload -> %s" % upload_path)
+                        menu.addAction(upload_selected_action)
                 upload_current_action = QAction(
                     QIcon.fromTheme("network-server", QIcon(os.path.join(
                         self.current_dir, "icons", "file_upload_24px.svg"))), "Upload -> %s" % (
@@ -286,6 +296,15 @@ class MainWindow(QMainWindow):
                         QIcon.fromTheme("edit-delete", QIcon(os.path.join(
                             self.current_dir, "icons", "delete_24px.svg"))), "Delete")
                     menu.addAction(delete_action)
+                m, name, key = self.name_by_first_ix(ixs)
+                if not key:
+                    key = self.data_model.current_folder
+                if name:
+                    properties_selected_action = QAction(
+                        QIcon.fromTheme("document-properties", QIcon(os.path.join(
+                            self.current_dir, "icons", "puzzle_24px.svg"))),
+                                               "Properties")
+                    menu.addAction(properties_selected_action)
                 clk = menu.exec_(event.globalPos())
                 if clk == upload_selected_action:
                     self.upload(upload_path)
@@ -297,6 +316,8 @@ class MainWindow(QMainWindow):
                     self.download()
                 if clk == create_folder_action:
                     self.new_folder()
+                if clk == properties_selected_action:
+                    self.properties(self.data_model, key)
             if event.type() == QEvent.KeyPress:
                 if event.key() == Qt.Key_Return:
                     self.list_doubleClicked()
@@ -341,6 +362,10 @@ class MainWindow(QMainWindow):
                      ©2022 Vladislav Ananev</a><br><br></strong></span></p>
                      """ + "version %s" % __VERSION__ + "<br><br>" + sys_info
         self.simple(title, message)
+
+    def properties(self, model, key):
+        properties = PropertiesWindow(self, settings=(model, key))
+        properties.exec_()
 
     def modelToListView(self, model_result):
         """
@@ -467,7 +492,6 @@ class MainWindow(QMainWindow):
             ix = self.ix_by_name(name)
             if ix:
                 self.listview.setCurrentIndex(ix)
-
 
     def delete(self):
         names = list()
