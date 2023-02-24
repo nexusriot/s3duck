@@ -212,6 +212,6 @@ class Model:
     def object_properties(self, key):
         bk = self.client.get_object(
             Bucket=self.bucket,
-            Key = key,
+            Key=key,
         )
         return bk
