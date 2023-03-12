@@ -4,11 +4,10 @@ from PyQt5.QtWidgets import *
 
 
 class PropertiesWindow(QDialog):
-
     def __init__(self, *args, **kwargs):
         settings = kwargs.pop("settings")
         super().__init__(*args, **kwargs)
-        model , key = settings
+        model, key = settings
         self.setWindowTitle("Object properties")
         self.setGeometry(140, 140, 600, 200)
         qtRectangle = self.frameGeometry()
@@ -36,7 +35,7 @@ class PropertiesWindow(QDialog):
         self.e_tag = ""
         try:
             resp = self.model.object_properties(key)
-            self.e_tag = resp.get("ETag", "").replace('"', '')
+            self.e_tag = resp.get("ETag", "").replace('"', "")
         except botocore.exceptions.ClientError:
             pass
         self.size.setText(str(self.model.get_size(key)) + " Bytes")

@@ -17,7 +17,9 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QSplitter,
     QMessageBox,
-    QDialog, QMenu, QAction,
+    QDialog,
+    QMenu,
+    QAction,
 )
 
 from model import Model as DataModel
@@ -29,7 +31,6 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class Crypto:
-
     def __init__(self, key):
         self.key = key
         self._fernet = None
@@ -52,17 +53,16 @@ class Crypto:
 
 
 class SettingsItem:
-
     def __init__(
-            self,
-            name,
-            url,
-            region,
-            bucket_name,
-            enc_access_key,
-            enc_secret_key,
-            no_ssl_check,
-            use_path
+        self,
+        name,
+        url,
+        region,
+        bucket_name,
+        enc_access_key,
+        enc_secret_key,
+        no_ssl_check,
+        use_path,
     ):
         self.name = name
         self.url = url
@@ -75,7 +75,7 @@ class SettingsItem:
 
 
 def get_current_dir():
-    if getattr(sys, "frozen", False) and hasattr(sys, '_MEIPASS'):
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         current_dir = pathlib.Path(sys._MEIPASS)
     else:
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -83,7 +83,6 @@ def get_current_dir():
 
 
 class Profiles(QDialog):
-
     def __init__(self):
         super().__init__()
         self.current_dir = get_current_dir()
@@ -119,9 +118,9 @@ class Profiles(QDialog):
         vbox.addLayout(hbox)
         self.setLayout(vbox)
         self.setGeometry(800, 400, 350, 250)
-        self.setWindowTitle('Profiles')
+        self.setWindowTitle("Profiles")
         self.listWidget.currentItemChanged.connect(self.on_elements_changed)
-        self. listWidget.itemSelectionChanged.connect(self.on_elements_changed)
+        self.listWidget.itemSelectionChanged.connect(self.on_elements_changed)
         self.listWidget.installEventFilter(self)
         self.load()
         self.populate_list()
@@ -160,7 +159,7 @@ class Profiles(QDialog):
             crypto.decrypt_cred(item.enc_secret_key),
             item.bucket_name,
             str_to_bool(item.no_ssl_check),
-            str_to_bool(item.use_path)
+            str_to_bool(item.use_path),
         )
         ok, reason = dm.check_profile()
         msgBox = QMessageBox()
@@ -175,23 +174,51 @@ class Profiles(QDialog):
         msgBox.exec()
 
     def eventFilter(self, source, event):
-        if (event.type() == QtCore.QEvent.ContextMenu and
-                source is self.listWidget):
-            copy_profile_action = delete_action = edit_profile_action = check_action = QObject()
+        if event.type() == QtCore.QEvent.ContextMenu and source is self.listWidget:
+            copy_profile_action = (
+                delete_action
+            ) = edit_profile_action = check_action = QObject()
             menu = QMenu()
             ixs = self.listWidget.selectedIndexes()
-            add_profile_action = QAction(QIcon.fromTheme("list-add", QIcon(os.path.join(
-                        self.current_dir, "icons", "plus_24px.svg"))), "Add profile")
+            add_profile_action = QAction(
+                QIcon.fromTheme(
+                    "list-add",
+                    QIcon(os.path.join(self.current_dir, "icons", "plus_24px.svg")),
+                ),
+                "Add profile",
+            )
             menu.addAction(add_profile_action)
             if ixs:
-                copy_profile_action = QAction(QIcon.fromTheme("edit-copy", QIcon(os.path.join(
-                        self.current_dir, "icons", "copy_24px.svg"))), "Copy profile")
-                edit_profile_action = QAction(QIcon.fromTheme("edit-clear", QIcon(os.path.join(
-                        self.current_dir, "icons", "edit_24px.svg"))), "Edit profile")
-                check_action = QAction(QIcon.fromTheme("applications-utilities", QIcon(os.path.join(
-                        self.current_dir, "icons", "ok_24px.svg"))), "Check profile")
-                delete_action = QAction(QIcon.fromTheme("edit-delete", QIcon(os.path.join(
-                    self.current_dir, "icons", "delete_24px.svg"))), "Delete profile")
+                copy_profile_action = QAction(
+                    QIcon.fromTheme(
+                        "edit-copy",
+                        QIcon(os.path.join(self.current_dir, "icons", "copy_24px.svg")),
+                    ),
+                    "Copy profile",
+                )
+                edit_profile_action = QAction(
+                    QIcon.fromTheme(
+                        "edit-clear",
+                        QIcon(os.path.join(self.current_dir, "icons", "edit_24px.svg")),
+                    ),
+                    "Edit profile",
+                )
+                check_action = QAction(
+                    QIcon.fromTheme(
+                        "applications-utilities",
+                        QIcon(os.path.join(self.current_dir, "icons", "ok_24px.svg")),
+                    ),
+                    "Check profile",
+                )
+                delete_action = QAction(
+                    QIcon.fromTheme(
+                        "edit-delete",
+                        QIcon(
+                            os.path.join(self.current_dir, "icons", "delete_24px.svg")
+                        ),
+                    ),
+                    "Delete profile",
+                )
                 menu.addAction(copy_profile_action)
                 menu.addAction(edit_profile_action)
                 menu.addAction(check_action)
@@ -215,18 +242,20 @@ class Profiles(QDialog):
         self.settings.beginGroup("common")
         self.settings.endGroup()
         self.settings.beginGroup("profiles")
-        for index in range(self.settings.beginReadArray('profiles')):
+        for index in range(self.settings.beginReadArray("profiles")):
             self.settings.setArrayIndex(index)
-            self.items.append(SettingsItem(
-                self.settings.value("name"),
-                self.settings.value("url"),
-                self.settings.value("region"),
-                self.settings.value("bucket_name"),
-                self.settings.value("access_key"),
-                self.settings.value("secret_key"),
-                self.settings.value("no_ssl_check", "false"),
-                self.settings.value("use_path", "false")
-            ))
+            self.items.append(
+                SettingsItem(
+                    self.settings.value("name"),
+                    self.settings.value("url"),
+                    self.settings.value("region"),
+                    self.settings.value("bucket_name"),
+                    self.settings.value("access_key"),
+                    self.settings.value("secret_key"),
+                    self.settings.value("no_ssl_check", "false"),
+                    self.settings.value("use_path", "false"),
+                )
+            )
         self.settings.endArray()
         self.settings.endGroup()
 
@@ -254,7 +283,7 @@ class Profiles(QDialog):
             secret_key,
             item.bucket_name,
             no_ssl_check,
-            use_path
+            use_path,
         )
         res, reason = dm.check_bucket()
         if res:
@@ -268,7 +297,7 @@ class Profiles(QDialog):
                 acc_key,
                 secret_key,
                 no_ssl_check,
-                use_path
+                use_path,
             )
             self.main_settings = settings
             self.main_window = MainWindow(settings=self.main_settings)
@@ -284,15 +313,15 @@ class Profiles(QDialog):
 
     def save_settings(self):
         self.settings.beginGroup("profiles")
-        self.settings.beginWriteArray('profiles')
+        self.settings.beginWriteArray("profiles")
         for index, item in enumerate(self.items):
             self.settings.setArrayIndex(index)
             self.settings.setValue("name", item.name)
-            self.settings.setValue('url', item.url)
-            self.settings.setValue('region', item.region)
-            self.settings.setValue('bucket_name', item.bucket_name)
-            self.settings.setValue('access_key', item.enc_access_key)
-            self.settings.setValue('secret_key', item.enc_secret_key)
+            self.settings.setValue("url", item.url)
+            self.settings.setValue("region", item.region)
+            self.settings.setValue("bucket_name", item.bucket_name)
+            self.settings.setValue("access_key", item.enc_access_key)
+            self.settings.setValue("secret_key", item.enc_secret_key)
             self.settings.setValue("no_ssl_check", item.no_ssl_check)
             self.settings.setValue("use_path", item.use_path)
         self.settings.endArray()
@@ -315,7 +344,16 @@ class Profiles(QDialog):
                 self.settings.beginGroup("common")
                 self.settings.setValue("key", key)
                 self.settings.endGroup()
-            name, url, region, bucket, access_key, secret_key, no_ssl_check, use_path = value
+            (
+                name,
+                url,
+                region,
+                bucket,
+                access_key,
+                secret_key,
+                no_ssl_check,
+                use_path,
+            ) = value
             # encrypt access & secret key
             crypto = Crypto(key)
             enc_access_key = crypto.encrypt(access_key)
@@ -329,9 +367,9 @@ class Profiles(QDialog):
                     enc_access_key,
                     enc_secret_key,
                     no_ssl_check,
-                    use_path
-                    )
+                    use_path,
                 )
+            )
             self.save_settings()
             self.populate_list()
             self.select_last()
@@ -354,24 +392,33 @@ class Profiles(QDialog):
             crypto.decrypt_cred(item.enc_access_key),
             crypto.decrypt_cred(item.enc_secret_key),
             item.no_ssl_check,
-            item.use_path
+            item.use_path,
         )
         settings = SettingsWindow(self, settings=settings)
         value = settings.exec_()
         if value:
-            name, url, region, bucket, access_key, secret_key, no_ssl_check, use_path = value
+            (
+                name,
+                url,
+                region,
+                bucket,
+                access_key,
+                secret_key,
+                no_ssl_check,
+                use_path,
+            ) = value
             enc_access_key = crypto.encrypt(access_key)
             enc_secret_key = crypto.encrypt(secret_key)
             self.items[elem] = SettingsItem(
-                    name,
-                    url,
-                    region,
-                    bucket,
-                    enc_access_key,
-                    enc_secret_key,
-                    no_ssl_check,
-                    use_path
-                )
+                name,
+                url,
+                region,
+                bucket,
+                enc_access_key,
+                enc_secret_key,
+                no_ssl_check,
+                use_path,
+            )
             self.save_settings()
             self.populate_list()
             self.listWidget.setCurrentIndex(index)
@@ -382,7 +429,12 @@ class Profiles(QDialog):
         if elem < 0:
             return
         qm = QMessageBox
-        ret = qm.question(self, '', "Are you sure to delete objects : %s ?" % self.items[elem].name, qm.Yes | qm.No)
+        ret = qm.question(
+            self,
+            "",
+            "Are you sure to delete objects : %s ?" % self.items[elem].name,
+            qm.Yes | qm.No,
+        )
         if ret == qm.Yes:
             del self.items[elem]
             self.save_settings()
@@ -396,19 +448,18 @@ class Profiles(QDialog):
         self.btnEdit.setEnabled(
             self.listWidget.count() > 0 and bool(self.listWidget.selectedIndexes())
         )
-        self.btnDelete .setEnabled(
+        self.btnDelete.setEnabled(
             self.listWidget.count() > 0 and bool(self.listWidget.selectedIndexes())
         )
 
 
 def main():
     app = QApplication(sys.argv)
-    icon = QIcon(
-        os.path.join(get_current_dir(), "resources", "ducky.ico"))
+    icon = QIcon(os.path.join(get_current_dir(), "resources", "ducky.ico"))
     app.setWindowIcon(icon)
     profiles = Profiles()
     sys.exit(app.exec_())
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -4,12 +4,21 @@ from PyQt5.QtWidgets import *
 
 from utils import str_to_bool
 
-class SettingsWindow(QDialog):
 
+class SettingsWindow(QDialog):
     def __init__(self, *args, **kwargs):
         settings = kwargs.pop("settings", ("", "", "", "", "", "", "false", "true"))
         super().__init__(*args, **kwargs)
-        name, url, region, bucket, access_key, secret_key, no_ssl_check, use_path = settings
+        (
+            name,
+            url,
+            region,
+            bucket,
+            access_key,
+            secret_key,
+            no_ssl_check,
+            use_path,
+        ) = settings
         self.setWindowTitle("Profile settings")
         self.setGeometry(140, 140, 600, 250)
         qtRectangle = self.frameGeometry()
@@ -59,11 +68,11 @@ class SettingsWindow(QDialog):
     def on_text_changed(self):
         btn_apply = self.buttonBox.button(QDialogButtonBox.Ok)
         btn_apply.setEnabled(
-            bool(self.nameLineEdit.text()) and
-            bool(self.urlLineEdit.text()) and
-            bool(self.bucketName.text()) and
-            bool(self.accessKeyEdit.text()) and
-            bool(self.secretKeyEdit.text())
+            bool(self.nameLineEdit.text())
+            and bool(self.urlLineEdit.text())
+            and bool(self.bucketName.text())
+            and bool(self.accessKeyEdit.text())
+            and bool(self.secretKeyEdit.text())
         )
 
     def setRetVal(self):
@@ -75,7 +84,7 @@ class SettingsWindow(QDialog):
             self.accessKeyEdit.text(),
             self.secretKeyEdit.text(),
             self.noSslCheck.isChecked(),
-            self.usePath.isChecked()
+            self.usePath.isChecked(),
         )
         self.close()
 
@@ -91,6 +100,8 @@ class SettingsWindow(QDialog):
         layout.addRow(QLabel("Bucket name"), self.bucketName)
         layout.addRow(QLabel("Access key"), self.accessKeyEdit)
         layout.addRow(QLabel("Secret key"), self.secretKeyEdit)
-        layout.addRow(QLabel("No SSL check (self-signed certificate support)"), self.noSslCheck)
+        layout.addRow(
+            QLabel("No SSL check (self-signed certificate support)"), self.noSslCheck
+        )
         layout.addRow(QLabel("Use path in config (minio support)"), self.usePath)
         self.formGroupBox.setLayout(layout)

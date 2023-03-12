@@ -1,5 +1,3 @@
-
-
 def str_to_bool(s):
     if str(s).lower() == "true":
         return True

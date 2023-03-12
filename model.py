@@ -24,21 +24,23 @@ class Item:
             self.type_,
             "file" if self.type_ == FSObjectType.FILE else "dir",
             self.modified,
-            self.size
+            self.size,
         )
 
 
 class Model:
-    def __init__(self, endpoint_url,
-                 region_name,
-                 access_key,
-                 secret_key,
-                 bucket,
-                 no_ssl_check,
-                 use_path,
-                 timeout=3,
-                 retries=3
-                 ):
+    def __init__(
+        self,
+        endpoint_url,
+        region_name,
+        access_key,
+        secret_key,
+        bucket,
+        no_ssl_check,
+        use_path,
+        timeout=3,
+        retries=3,
+    ):
 
         self.session = boto3.session.Session()
         self._client = None
@@ -68,30 +70,30 @@ class Model:
                 "aws_secret_access_key": self.secret_key,
             }
             if self.region_name:
-                params.update({
-                    "region_name": self.region_name,
-                })
+                params.update(
+                    {
+                        "region_name": self.region_name,
+                    }
+                )
 
             if not self.use_path:
-                s3_config = {'addressing_style': 'virtual'}
+                s3_config = {"addressing_style": "virtual"}
 
             else:
-                s3_config = {'addressing_style': 'path'}
+                s3_config = {"addressing_style": "path"}
 
             if self.no_ssl_check:
-                params.update({
-                    "verify": False
-                })
-            params.update({
-                "config": botocore.config.Config(
-                    s3=s3_config,
-                    connect_timeout = self.timeout,
-                    retries = {'max_attempts': self.retries}),
-            })
-            self._client = self.session.client(
-                's3',
-                **params
+                params.update({"verify": False})
+            params.update(
+                {
+                    "config": botocore.config.Config(
+                        s3=s3_config,
+                        connect_timeout=self.timeout,
+                        retries={"max_attempts": self.retries},
+                    ),
+                }
             )
+            self._client = self.session.client("s3", **params)
         return self._client
 
     def list(self, fld):
@@ -100,29 +102,17 @@ class Model:
         else:
             path = fld
         rsp = self.client.list_objects_v2(
-            Bucket=self.bucket,
-            Prefix=path,
-            Delimiter='/')
+            Bucket=self.bucket, Prefix=path, Delimiter="/"
+        )
 
-        folders = [
-            fld["Prefix"] for fld in rsp.get("CommonPrefixes", list())
-        ]
-        objects = [
-            obj for obj in rsp.get("Contents", list())
-        ]
+        folders = [fld["Prefix"] for fld in rsp.get("CommonPrefixes", list())]
+        objects = [obj for obj in rsp.get("Contents", list())]
         items = list()
         for folder in folders:
             s = folder.split("/")
             if len(s) > 1:
                 folder = s[-2]
-            items.append(
-                Item(
-                    folder,
-                    FSObjectType.FOLDER,
-                    "",
-                    0
-                )
-            )
+            items.append(Item(folder, FSObjectType.FOLDER, "", 0))
 
         for obj in objects:
             key = obj["Key"]
@@ -130,12 +120,8 @@ class Model:
                 continue
             filename = key.split("/")[-1]
             items.append(
-                Item(
-                    filename,
-                    FSObjectType.FILE,
-                    obj['LastModified'],
-                    obj['Size']
-                ))
+                Item(filename, FSObjectType.FILE, obj["LastModified"], obj["Size"])
+            )
         return items
 
     def download_file(self, key: str, local_name: str, folder_path: str):
@@ -159,7 +145,7 @@ class Model:
 
     def get_keys(self, prefix):
         r = self.client.list_objects_v2(Bucket=self.bucket, Prefix=prefix)
-        return [(key.get('Key'), key.get("Size")) for key in r.get("Contents", [])]
+        return [(key.get("Key"), key.get("Size")) for key in r.get("Contents", [])]
 
     def delete(self, key) -> bool:
         if key.endswith("/"):
@@ -207,7 +193,7 @@ class Model:
     def get_size(self, key):
         r = self.client.list_objects_v2(Bucket=self.bucket, Prefix=key)
         items = r.get("Contents", [])
-        return 0 if not items else sum([key.get('Size') for key in items])
+        return 0 if not items else sum([key.get("Size") for key in items])
 
     def object_properties(self, key):
         bk = self.client.get_object(
