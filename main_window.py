@@ -14,7 +14,7 @@ from properties_window import PropertiesWindow
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
 
-__VERSION__ = "0.0.8"
+__VERSION__ = "0.0.9"
 
 
 class Tree(QTreeView):
@@ -242,6 +242,7 @@ class MainWindow(QMainWindow):
         self.listview.installEventFilter(self)
         self.restoreSettings()
         self.select_first()
+        self.menu = QMenu()
 
     def select_first(self):
         if self.listview.model().rowCount() > 0:
@@ -272,10 +273,10 @@ class MainWindow(QMainWindow):
                     delete_action
                 ) = download_action = properties_selected_action = QObject()
                 ixs = self.listview.selectedIndexes()
-                menu = QMenu()
                 m, name, upload_path = self.name_by_first_ix(ixs)
                 if upload_path is None:
                     upload_path = self.data_model.current_folder
+                self.menu.clear()
                 if name:
                     if m.t == FSObjectType.FOLDER:
                         upload_selected_action = QAction(
@@ -291,7 +292,7 @@ class MainWindow(QMainWindow):
                             ),
                             "Upload -> %s" % upload_path,
                         )
-                        menu.addAction(upload_selected_action)
+                        self.menu.addAction(upload_selected_action)
                 upload_current_action = QAction(
                     QIcon.fromTheme(
                         "network-server",
@@ -308,7 +309,7 @@ class MainWindow(QMainWindow):
                         else self.data_model.current_folder
                     ),
                 )
-                menu.addAction(upload_current_action)
+                self.menu.addAction(upload_current_action)
                 create_folder_action = QAction(
                     QIcon.fromTheme(
                         "folder-new",
@@ -320,7 +321,7 @@ class MainWindow(QMainWindow):
                     ),
                     "Create folder",
                 )
-                menu.addAction(create_folder_action)
+                self.menu.addAction(create_folder_action)
                 if ixs:
                     download_action = QAction(
                         QIcon.fromTheme(
@@ -333,7 +334,7 @@ class MainWindow(QMainWindow):
                         ),
                         "Download",
                     )
-                    menu.addAction(download_action)
+                    self.menu.addAction(download_action)
                     delete_action = QAction(
                         QIcon.fromTheme(
                             "edit-delete",
@@ -345,7 +346,7 @@ class MainWindow(QMainWindow):
                         ),
                         "Delete",
                     )
-                    menu.addAction(delete_action)
+                    self.menu.addAction(delete_action)
                 m, name, key = self.name_by_first_ix(ixs)
                 if not key:
                     key = self.data_model.current_folder
@@ -361,8 +362,8 @@ class MainWindow(QMainWindow):
                         ),
                         "Properties",
                     )
-                    menu.addAction(properties_selected_action)
-                clk = menu.exec_(event.globalPos())
+                    self.menu.addAction(properties_selected_action)
+                clk = self.menu.exec_(event.globalPos())
                 if clk == upload_selected_action:
                     self.upload(upload_path)
                 if clk == upload_current_action:
@@ -615,11 +616,15 @@ class MainWindow(QMainWindow):
         self.assign_thread_operation("upload", job)
 
     def enable_action_buttons(self):
+        self.btnCreateFolder.setEnabled(True)
         self.btnUpload.setEnabled(True)
         self.btnDownload.setEnabled(True)
         self.btnRemove.setEnabled(True)
+        self.menu.setEnabled(True)
 
     def disable_action_buttons(self):
+        self.menu.setEnabled(False)
+        self.btnCreateFolder.setEnabled(False)
         self.btnUpload.setEnabled(False)
         self.btnDownload.setEnabled(False)
         self.btnRemove.setEnabled(False)
