@@ -1,4 +1,4 @@
-boto3==1.26.69
+boto3==1.28.25
 PyQt5==5.15.9
-cryptography==39.0.1
-pyinstaller==5.7.0
+cryptography==41.0.3
+pyinstaller==5.13.0
