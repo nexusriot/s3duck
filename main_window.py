@@ -14,7 +14,7 @@ from properties_window import PropertiesWindow
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
 
-__VERSION__ = "0.0.8"
+__VERSION__ = "0.0.9"
 
 
 class Tree(QTreeView):
@@ -388,7 +388,7 @@ class MainWindow(QMainWindow):
                     self.goBack()
                 if event.key() in [Qt.Key_H, Qt.Key_Home]:
                     self.goHome()
-                if event.key() == Qt.Key_A:
+                if event.key() == Qt.Key_F1:
                     self.about()
                 if event.key() == Qt.Key_U:
                     self.upload()
@@ -715,7 +715,7 @@ class MainWindow(QMainWindow):
                 "help-about",
                 QIcon(os.path.join(self.current_dir, "icons", "info_24px.svg")),
             ),
-            "About(A)",
+            "About(F1)",
             triggered=self.about,
         )
 

@@ -101,27 +101,29 @@ class Model:
             path = fld
         else:
             path = fld
-        rsp = self.client.list_objects_v2(
-            Bucket=self.bucket, Prefix=path, Delimiter="/"
-        )
 
-        folders = [fld["Prefix"] for fld in rsp.get("CommonPrefixes", list())]
-        objects = [obj for obj in rsp.get("Contents", list())]
+        paginator = self.client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=self.bucket, Prefix=path, Delimiter="/")
+
         items = list()
-        for folder in folders:
-            s = folder.split("/")
-            if len(s) > 1:
-                folder = s[-2]
-            items.append(Item(folder, FSObjectType.FOLDER, "", 0))
+        for page in pages:
+            folders = [fld["Prefix"] for fld in page.get("CommonPrefixes", list())]
+            objects = [obj for obj in page.get("Contents", list())]
 
-        for obj in objects:
-            key = obj["Key"]
-            if key == path:
-                continue
-            filename = key.split("/")[-1]
-            items.append(
-                Item(filename, FSObjectType.FILE, obj["LastModified"], obj["Size"])
-            )
+            for folder in folders:
+                s = folder.split("/")
+                if len(s) > 1:
+                    folder = s[-2]
+                items.append(Item(folder, FSObjectType.FOLDER, "", 0))
+
+            for obj in objects:
+                key = obj["Key"]
+                if key == path:
+                    continue
+                filename = key.split("/")[-1]
+                items.append(
+                    Item(filename, FSObjectType.FILE, obj["LastModified"], obj["Size"])
+                )
         return items
 
     def download_file(self, key: str, local_name: str, folder_path: str):
