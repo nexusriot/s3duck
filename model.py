@@ -74,12 +74,11 @@ class Model:
         self.retries = retries
 
         # Smaller chunks -> more frequent callbacks -> smoother progress
-        # Tune as you like (these are conservative and smooth).
         self.transfer_cfg = TransferConfig(
             multipart_threshold=8 * 1024 * 1024,   # start multipart at 8MB
             multipart_chunksize=1 * 1024 * 1024,   # 1MB parts
             io_chunksize=256 * 1024,               # 256KB read size
-            max_concurrency=4,                     # parallel parts
+            max_concurrency=4,
             use_threads=True,
         )
 
@@ -147,34 +146,21 @@ class Model:
         progress_cb(total_bytes:int, downloaded_bytes:int, key:str) -> None
         """
         if not local_name:
-            # --- FIX: preserve the top-level folder name locally ---
-            # Normalize prefix to always end with '/'
+            # Preserve the top-level folder: create base_dir/<folder> then put contents inside
             prefix = key if key.endswith("/") else key + "/"
-            # Create base dir named after the last segment of the prefix
-            base_name = os.path.basename(prefix.rstrip("/"))  # e.g. "test"
+            base_name = os.path.basename(prefix.rstrip("/"))
             base_dir = os.path.join(folder_path, base_name)
             os.makedirs(base_dir, exist_ok=True)
 
             for k, size in self.get_keys(prefix):
-                # Compute relative path inside the prefix
-                rel = os.path.relpath(k, prefix)  # e.g. "file1.txt" or "sub/inner.txt"
-                # Handle possible placeholder key equal to the prefix itself
-                if rel == ".":
-                    # This is the "folder placeholder" object – nothing to download
-                    # but ensure base_dir exists (already done above)
+                rel = os.path.relpath(k, prefix)
+                if rel == ".":  # placeholder object exactly equal to prefix
                     continue
-
                 out_path = os.path.join(base_dir, rel)
-
                 if k.endswith("/"):
-                    # It's a subfolder placeholder
                     os.makedirs(out_path, exist_ok=True)
                     continue
-
-                # Ensure parent dir exists
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-                # Stream the object with progress
                 self.client.download_file(
                     self.bucket,
                     k,
@@ -223,11 +209,28 @@ class Model:
             self.client.delete_object(Bucket=self.bucket, Key=key)
         return True
 
-    def upload_file(self, local_file, key):
+    def upload_file(self, local_file, key, progress_cb=None):
+        """
+        Upload a file (with progress) or create a folder placeholder if local_file is None.
+
+        progress_cb(total_bytes:int, uploaded_bytes:int, key:str) -> None
+        """
         if local_file is None:
             self.create_folder("%s/" % key)
-        else:
-            self.client.upload_file(local_file, self.bucket, key, Config=self.transfer_cfg)
+            return
+
+        try:
+            total = os.path.getsize(local_file)
+        except Exception:
+            total = None
+
+        self.client.upload_file(
+            local_file,
+            self.bucket,
+            key,
+            Callback=_BotoProgressAdapter(total, key, progress_cb),
+            Config=self.transfer_cfg,
+        )
 
     def check_bucket(self):
         try:

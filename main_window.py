@@ -14,7 +14,7 @@ from properties_window import PropertiesWindow
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
 
-__VERSION__ = "0.1.0"
+__VERSION__ = "0.1.1"
 
 
 def _human_bytes(n):
@@ -116,9 +116,9 @@ class Worker(QObject):
     progress = pyqtSignal(str)
     refresh = pyqtSignal()
 
-    # smoother progress
-    file_progress = pyqtSignal(int, int, str)   # (downloaded, total, key)
-    batch_progress = pyqtSignal(int, int)       # (downloaded_total, total_total)
+    # progress signals used for both download & upload
+    file_progress = pyqtSignal(int, int, str)   # (done, total, key)
+    batch_progress = pyqtSignal(int, int)       # (done_all, total_all)
 
     def __init__(self, data_model, job):
         self.data_model = data_model
@@ -126,7 +126,7 @@ class Worker(QObject):
         super().__init__()
 
     def download(self):
-        # 1) Determine total bytes across the entire job
+        # Total bytes for all items
         total_bytes = 0
         for key, local_name, size, folder_path in self.job:
             if local_name is not None:   # single file
@@ -135,11 +135,9 @@ class Worker(QObject):
                 for k, s in self.data_model.get_keys(key):
                     if not k.endswith("/"):
                         total_bytes += int(s or 0)
-
         total_bytes = max(1, int(total_bytes))
         sofar_all = 0
 
-        # 2) Per-file callback -> delta -> update batch
         def make_cb():
             last = {"v": 0}
             def _cb(total, cur, key):
@@ -152,7 +150,6 @@ class Worker(QObject):
                     self.batch_progress.emit(int(sofar_all), int(total_bytes))
             return _cb
 
-        # 3) Run items
         for key, local_name, size, folder_path in self.job:
             if local_name:
                 msg = "downloading %s -> %s (%s)" % (key, local_name, size)
@@ -173,15 +170,40 @@ class Worker(QObject):
         self.finished.emit()
 
     def upload(self):
-        for i in self.job:
-            key, local_name = i
+        # Total bytes across files (skip "create folder" entries where local_name is None)
+        total_bytes = 0
+        for key, local_name in self.job:
+            if local_name:
+                try:
+                    total_bytes += int(os.path.getsize(local_name))
+                except Exception:
+                    pass
+        total_bytes = max(1, int(total_bytes))
+        sofar_all = 0
+
+        def make_cb():
+            last = {"v": 0}
+            def _cb(total, cur, key):
+                self.file_progress.emit(int(cur), int(total or 1), key)
+                nonlocal sofar_all
+                delta = max(0, int(cur) - int(last["v"]))
+                last["v"] = int(cur)
+                if delta:
+                    sofar_all += delta
+                    self.batch_progress.emit(int(sofar_all), int(total_bytes))
+            return _cb
+
+        for key, local_name in self.job:
             if local_name is not None:
                 msg = "uploading %s -> %s" % (local_name, key)
             else:
                 msg = "creating folder %s" % key
             self.progress.emit(msg)
-            self.data_model.upload_file(local_name, key)
+
+            cb = make_cb() if local_name else None
+            self.data_model.upload_file(local_name, key, progress_cb=cb)
             self.refresh.emit()
+
         self.finished.emit()
 
 
@@ -189,7 +211,7 @@ class MainWindow(QMainWindow):
     def __init__(self, *args, **kwargs):
         settings = kwargs.pop("settings")
         super(MainWindow, self).__init__(*args, **kwargs)
-        self.setWindowTitle("S3 Duck 🦆 %s PoC" % __VERSION__)
+        self.setWindowTitle("S3 Duck 🦆 %s" % __VERSION__)
         self.setWindowIcon(QIcon.fromTheme("applications-internet"))
 
         (
@@ -281,7 +303,7 @@ class MainWindow(QMainWindow):
         self.select_first()
         self.menu = QMenu()
 
-        # --- Progress UI ---
+        # --- Progress UI (shared for download & upload) ---
         self.pb = QProgressBar()
         self.pb.setMinimum(0)
         self.pb.setMaximum(100)
@@ -290,48 +312,44 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.status_text, 2)
         self.statusBar().addPermanentWidget(self.pb, 1)
 
-        # Smoothed updates: cache values, tick at ~10 Hz
+        # Smooth updates (~10 Hz) via timer
         self._smooth_total = 1
         self._smooth_done = 0
         self._rate_bytes = 0.0
         self._last_tick_time = None
         self._last_tick_done = 0
         self._tick_timer = QTimer(self)
-        self._tick_timer.setInterval(100)  # ms
+        self._tick_timer.setInterval(100)
         self._tick_timer.timeout.connect(self._on_tick)
+        self._status_prefix = "Transferring…"
 
     # ====== helpers for smooth status ======
     def _on_file_progress(self, cur, total, key):
-        # no UI write here (too frequent) — just compute live rate samples
-        now = time.time()
-        if self._last_tick_time is None:
-            self._last_tick_time = now
-            self._last_tick_done = self._smooth_done
-            return
+        # we only compute speed inside _on_tick using batch deltas
+        return
 
     def _on_batch_progress(self, done, total):
-        # Just cache the latest totals; UI updates happen on timer
         self._smooth_total = max(1, int(total))
         self._smooth_done = max(0, int(done))
 
     def _on_tick(self):
-        # compute instantaneous speed from last tick
         now = time.time()
         if self._last_tick_time is None:
             self._last_tick_time = now
             self._last_tick_done = self._smooth_done
+
         dt = max(1e-6, now - self._last_tick_time)
         delta = max(0, self._smooth_done - self._last_tick_done)
-        self._rate_bytes = (0.7 * self._rate_bytes) + (0.3 * (delta / dt))  # EMA smooth
+        # EMA for smoother rate
+        inst_rate = delta / dt
+        self._rate_bytes = (0.7 * self._rate_bytes) + (0.3 * inst_rate)
         self._last_tick_time = now
         self._last_tick_done = self._smooth_done
 
-        # update bar + text
         pct = int((self._smooth_done / self._smooth_total) * 100)
         self.pb.setMaximum(100)
         self.pb.setValue(min(100, max(0, pct)))
 
-        # ETA
         eta_txt = ""
         if self._rate_bytes > 1:
             remaining = self._smooth_total - self._smooth_done
@@ -341,7 +359,7 @@ class MainWindow(QMainWindow):
             eta_txt = f"  ETA {h:02d}:{m:02d}:{s:02d}"
 
         self.status_text.setText(
-            f"Downloading… {_human_bytes(self._smooth_done)} / {_human_bytes(self._smooth_total)}"
+            f"{self._status_prefix} {_human_bytes(self._smooth_done)} / {_human_bytes(self._smooth_total)}"
             f"  ({_human_bytes(self._rate_bytes)}/s){eta_txt}"
         )
 
@@ -488,7 +506,7 @@ class MainWindow(QMainWindow):
             <span style='color: #3465a4; font-size: 20pt;font-weight: bold;text-align: center;'></span>
             <center><h3>S3 Duck 🦆</h3></center>
             <a title='Vladislav Ananev' href='https://github.com/nexusriot' target='_blank'>
-            <br><span style='color: #8743e2; font-size: 10pt;'>©2022 Vladislav Ananev</a><br><br></strong></span></p>
+            <br><span style='color: #8743e2; font-size: 10pt;'>©2022-2025 Vladislav Ananev</a><br><br></strong></span></p>
             """
             + "version %s" % __VERSION__
             + "<br><br>"
@@ -599,10 +617,10 @@ class MainWindow(QMainWindow):
             self.worker.refresh.connect(self.navigate)
 
         if method == "download":
-            # show & reset
             self.pb.reset()
             self.pb.setValue(0)
             self.pb.show()
+            self._status_prefix = "Downloading…"
             self.status_text.setText("Preparing…")
             self._smooth_total = 1
             self._smooth_done = 0
@@ -611,7 +629,28 @@ class MainWindow(QMainWindow):
             self._last_tick_done = 0
             self._tick_timer.start()
 
-            # connect signals — do not spam UI directly; cache and let timer render
+            self.worker.batch_progress.connect(self._on_batch_progress)
+            self.worker.file_progress.connect(self._on_file_progress)
+
+            def _hide():
+                self._tick_timer.stop()
+                self.pb.hide()
+                self.status_text.setText("Done")
+            self.thread.finished.connect(_hide)
+
+        if method == "upload":
+            self.pb.reset()
+            self.pb.setValue(0)
+            self.pb.show()
+            self._status_prefix = "Uploading…"
+            self.status_text.setText("Preparing…")
+            self._smooth_total = 1
+            self._smooth_done = 0
+            self._rate_bytes = 0.0
+            self._last_tick_time = None
+            self._last_tick_done = 0
+            self._tick_timer.start()
+
             self.worker.batch_progress.connect(self._on_batch_progress)
             self.worker.file_progress.connect(self._on_file_progress)
 
