@@ -2,6 +2,7 @@ import os
 import glob
 import pathlib
 import time
+from datetime import datetime
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import QIcon, QStandardItemModel, QStandardItem
@@ -307,6 +308,7 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(1, 1)
 
         self.logview.setReadOnly(True)
+        # NOTE: per request, this one line stays WITHOUT timestamp
         self.logview.appendPlainText(
             "Welcome to S3 Duck 🦆 %s (on %s)"
             % (__VERSION__, OS_FAMILY_MAP.get(DataModel.get_os_family(), "❓"))
@@ -382,7 +384,8 @@ class MainWindow(QMainWindow):
                 "edit-copy", QIcon(os.path.join(self.current_dir, "icons", "copy_24px.svg"))
             ),
             "Copy S3 path",
-            self,
+
+        self,
         )
         self.actCopyS3Path.triggered.connect(self.copy_s3_path_to_clipboard)
         self.tBar.addAction(self.actCopyS3Path)
@@ -413,6 +416,11 @@ class MainWindow(QMainWindow):
 
         # Double-click: proxy-aware handler
         self.listview.doubleClicked.connect(self.list_doubleClicked)
+
+    # ====== tiny logging helper (timestamps) ======
+    def log(self, message: str):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.logview.appendPlainText(f"[{ts}] {message}")
 
     # ====== progress helpers ======
     def _on_file_progress(self, cur, total, key):
@@ -739,7 +747,7 @@ class MainWindow(QMainWindow):
     def assign_thread_operation(self, method, job, need_refresh=True):
         if not job:
             return
-        self.logview.appendPlainText("starting %s" % method)
+        self.log(f"starting {method}")
         self.thread = QThread()
         self.worker = Worker(self.data_model, job)
         self.worker.moveToThread(self.thread)
@@ -798,7 +806,7 @@ class MainWindow(QMainWindow):
 
         self.thread.start()
         self.disable_action_buttons()
-        self.thread.finished.connect(lambda: self.logview.appendPlainText("%s completed" % method))
+        self.thread.finished.connect(lambda: self.log(f"{method} completed"))
         self.thread.finished.connect(lambda: self.enable_action_buttons())
 
     def new_folder(self):
@@ -807,7 +815,7 @@ class MainWindow(QMainWindow):
         if ok and name:
             key = self.data_model.current_folder + "%s/" % name
             self.data_model.create_folder(key)
-            self.logview.appendPlainText("Created folder %s (%s)" % (name, key))
+            self.log(f"Created folder {name} ({key})")
             self.navigate()
             ix = self.ix_by_name(name)
             if ix:
@@ -876,7 +884,8 @@ class MainWindow(QMainWindow):
         self.navigate()
 
     def report_logger_progress(self, msg):
-        self.logview.appendPlainText(msg)
+        # All progress lines from the worker get a timestamp
+        self.log(msg)
 
     # ---- S3 path helpers + resize hook ----
     def current_s3_path(self) -> str:
