@@ -4,6 +4,7 @@ import uuid
 import os
 import boto3
 import botocore
+from boto3.s3.transfer import TransferConfig
 
 
 class FSObjectType(Enum):
@@ -28,6 +29,23 @@ class Item:
         )
 
 
+class _BotoProgressAdapter:
+    """
+    Adapt boto3 Callback(bytes_amount) -> progress_cb(total, current, key).
+    """
+    def __init__(self, total, key, cb):
+        self.total = max(1, int(total or 0))
+        self.key = key
+        self.cb = cb
+        self._sofar = 0
+
+    def __call__(self, bytes_amount):
+        self._sofar += int(bytes_amount or 0)
+        if self.cb:
+            cur = self._sofar if self._sofar <= self.total else self.total
+            self.cb(self.total, cur, self.key)
+
+
 class Model:
     def __init__(
         self,
@@ -41,10 +59,8 @@ class Model:
         timeout=3,
         retries=3,
     ):
-
         self.session = boto3.session.Session()
         self._client = None
-        self._fernet = None
         self.current_folder = ""
         self.prev_folder = ""
         self.endpoint_url = endpoint_url
@@ -56,6 +72,16 @@ class Model:
         self.use_path = use_path
         self.timeout = timeout
         self.retries = retries
+
+        # Smaller chunks -> more frequent callbacks -> smoother progress
+        # Tune as you like (these are conservative and smooth).
+        self.transfer_cfg = TransferConfig(
+            multipart_threshold=8 * 1024 * 1024,   # start multipart at 8MB
+            multipart_chunksize=1 * 1024 * 1024,   # 1MB parts
+            io_chunksize=256 * 1024,               # 256KB read size
+            max_concurrency=4,                     # parallel parts
+            use_threads=True,
+        )
 
     @staticmethod
     def get_os_family():
@@ -70,20 +96,12 @@ class Model:
                 "aws_secret_access_key": self.secret_key,
             }
             if self.region_name:
-                params.update(
-                    {
-                        "region_name": self.region_name,
-                    }
-                )
+                params.update({"region_name": self.region_name})
 
-            if not self.use_path:
-                s3_config = {"addressing_style": "virtual"}
-
-            else:
-                s3_config = {"addressing_style": "path"}
-
+            s3_config = {"addressing_style": "virtual"} if not self.use_path else {"addressing_style": "path"}
             if self.no_ssl_check:
                 params.update({"verify": False})
+
             params.update(
                 {
                     "config": botocore.config.Config(
@@ -97,18 +115,14 @@ class Model:
         return self._client
 
     def list(self, fld):
-        if fld:
-            path = fld
-        else:
-            path = fld
-
-        paginator = self.client.get_paginator('list_objects_v2')
+        path = fld or ""
+        paginator = self.client.get_paginator("list_objects_v2")
         pages = paginator.paginate(Bucket=self.bucket, Prefix=path, Delimiter="/")
 
-        items = list()
+        items = []
         for page in pages:
-            folders = [fld["Prefix"] for fld in page.get("CommonPrefixes", list())]
-            objects = [obj for obj in page.get("Contents", list())]
+            folders = [fld["Prefix"] for fld in page.get("CommonPrefixes", [])]
+            objects = [obj for obj in page.get("Contents", [])]
 
             for folder in folders:
                 s = folder.split("/")
@@ -121,39 +135,90 @@ class Model:
                 if key == path:
                     continue
                 filename = key.split("/")[-1]
-                items.append(
-                    Item(filename, FSObjectType.FILE, obj["LastModified"], obj["Size"])
-                )
+                items.append(Item(filename, FSObjectType.FILE, obj["LastModified"], obj["Size"]))
         return items
 
-    def download_file(self, key: str, local_name: str, folder_path: str):
+    def download_file(self, key: str, local_name: str, folder_path: str, progress_cb=None):
+        """
+        Download a single file or a whole prefix.
+        - If local_name is truthy: download a single object to local_name.
+        - Else: treat 'key' as a folder prefix and download whole tree into folder_path.
+
+        progress_cb(total_bytes:int, downloaded_bytes:int, key:str) -> None
+        """
         if not local_name:
-            keys = self.get_keys(key)
-            for k, size in keys:
-                rp = os.path.relpath(k, self.current_folder)
-                path = os.path.join(folder_path, rp)
-                if k.endswith("/"):
-                    # make folder
-                    os.makedirs(path, exist_ok=True)
+            # --- FIX: preserve the top-level folder name locally ---
+            # Normalize prefix to always end with '/'
+            prefix = key if key.endswith("/") else key + "/"
+            # Create base dir named after the last segment of the prefix
+            base_name = os.path.basename(prefix.rstrip("/"))  # e.g. "test"
+            base_dir = os.path.join(folder_path, base_name)
+            os.makedirs(base_dir, exist_ok=True)
+
+            for k, size in self.get_keys(prefix):
+                # Compute relative path inside the prefix
+                rel = os.path.relpath(k, prefix)  # e.g. "file1.txt" or "sub/inner.txt"
+                # Handle possible placeholder key equal to the prefix itself
+                if rel == ".":
+                    # This is the "folder placeholder" object – nothing to download
+                    # but ensure base_dir exists (already done above)
                     continue
-                # make sure directory exists before downloading
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                self.client.download_file(self.bucket, k, path)
+
+                out_path = os.path.join(base_dir, rel)
+
+                if k.endswith("/"):
+                    # It's a subfolder placeholder
+                    os.makedirs(out_path, exist_ok=True)
+                    continue
+
+                # Ensure parent dir exists
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+                # Stream the object with progress
+                self.client.download_file(
+                    self.bucket,
+                    k,
+                    out_path,
+                    Callback=_BotoProgressAdapter(size, k, progress_cb),
+                    Config=self.transfer_cfg,
+                )
         else:
-            self.client.download_file(self.bucket, key, local_name)
+            # Single file
+            size = None
+            try:
+                head = self.client.head_object(Bucket=self.bucket, Key=key)
+                size = head.get("ContentLength")
+            except Exception:
+                pass
+            self.client.download_file(
+                self.bucket,
+                key,
+                local_name,
+                Callback=_BotoProgressAdapter(size, key, progress_cb),
+                Config=self.transfer_cfg,
+            )
 
     def create_folder(self, key):
         return self.client.put_object(Bucket=self.bucket, Key=key)
 
     def get_keys(self, prefix):
-        r = self.client.list_objects_v2(Bucket=self.bucket, Prefix=prefix)
-        return [(key.get("Key"), key.get("Size")) for key in r.get("Contents", [])]
+        """
+        Return [(Key, Size), ...] for ALL objects under 'prefix', paginated.
+        Includes 'folder placeholder' keys (ending with '/').
+        """
+        paginator = self.client.get_paginator("list_objects_v2")
+        pages = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
+
+        result = []
+        for page in pages:
+            for obj in page.get("Contents", []) or []:
+                result.append((obj.get("Key"), obj.get("Size")))
+        return result
 
     def delete(self, key) -> bool:
         if key.endswith("/"):
-            keys = self.get_keys(key)
-            for key, _ in keys:
-                self.client.delete_object(Bucket=self.bucket, Key=key)
+            for k, _ in self.get_keys(key):
+                self.client.delete_object(Bucket=self.bucket, Key=k)
         else:
             self.client.delete_object(Bucket=self.bucket, Key=key)
         return True
@@ -162,7 +227,7 @@ class Model:
         if local_file is None:
             self.create_folder("%s/" % key)
         else:
-            self.client.upload_file(local_file, self.bucket, key)
+            self.client.upload_file(local_file, self.bucket, key, Config=self.transfer_cfg)
 
     def check_bucket(self):
         try:
@@ -193,13 +258,12 @@ class Model:
         return bool(res_c) and res_d, reason
 
     def get_size(self, key):
-        r = self.client.list_objects_v2(Bucket=self.bucket, Prefix=key)
-        items = r.get("Contents", [])
-        return 0 if not items else sum([key.get("Size") for key in items])
+        # Sum sizes across full pagination
+        total = 0
+        for k, s in self.get_keys(key):
+            if not k.endswith("/"):
+                total += int(s or 0)
+        return total
 
     def object_properties(self, key):
-        bk = self.client.get_object(
-            Bucket=self.bucket,
-            Key=key,
-        )
-        return bk
+        return self.client.get_object(Bucket=self.bucket, Key=key)
