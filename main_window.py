@@ -69,6 +69,7 @@ class Tree(QTreeView):
         if widget == self:
             event.ignore()
             return
+
         if event.mimeData().hasUrls:
             event.setDropAction(Qt.CopyAction)
             event.accept()
@@ -275,10 +276,49 @@ class MainWindow(QMainWindow):
         self.tBar.addAction(self.btnAbout)
         self.tBar.setIconSize(QSize(26, 26))
         self.model = QStandardItemModel()
-
         self.model.setHorizontalHeaderLabels(["Name", "Size", "Modified"])
         self.listview.header().setDefaultSectionSize(180)
         self.listview.setModel(self.model)
+
+        # ---------- Progress UI & S3 path widgets BEFORE first navigate() ----------
+        # Progress UI (shared for download & upload)
+        self.pb = QProgressBar()
+        self.pb.setMinimum(0)
+        self.pb.setMaximum(100)
+        self.pb.hide()
+        self.status_text = QLabel("")
+        self.statusBar().addPermanentWidget(self.status_text, 2)
+        self.statusBar().addPermanentWidget(self.pb, 1)
+
+        # Smooth updates (~10 Hz) via timer
+        self._smooth_total = 1
+        self._smooth_done = 0
+        self._rate_bytes = 0.0
+        self._last_tick_time = None
+        self._last_tick_done = 0
+        self._tick_timer = QTimer(self)
+        self._tick_timer.setInterval(100)
+        self._tick_timer.timeout.connect(self._on_tick)
+        self._status_prefix = "Transferring…"
+
+        # Read-only S3 path line + copy button (CREATE BEFORE navigate)
+        self.s3PathEdit = QLineEdit()
+        self.s3PathEdit.setReadOnly(True)
+        self.s3PathEdit.setStyleSheet("font-family: monospace; background: #f0f0f0;")
+        self.statusBar().addPermanentWidget(self.s3PathEdit, 3)
+
+        self.actCopyS3Path = QAction(
+            QIcon.fromTheme(
+                "edit-copy", QIcon(os.path.join(self.current_dir, "icons", "copy_24px.svg"))
+            ),
+            "Copy S3 path",
+            self,
+        )
+        self.actCopyS3Path.triggered.connect(self.copy_s3_path_to_clipboard)
+        self.tBar.addAction(self.actCopyS3Path)
+        # ---------------------------------------------------------------------------
+
+        # Now safe to navigate (this calls update_s3_path_label)
         self.navigate()
 
         self.listview.header().resizeSection(0, 320)
@@ -302,26 +342,6 @@ class MainWindow(QMainWindow):
         self.restoreSettings()
         self.select_first()
         self.menu = QMenu()
-
-        # --- Progress UI (shared for download & upload) ---
-        self.pb = QProgressBar()
-        self.pb.setMinimum(0)
-        self.pb.setMaximum(100)
-        self.pb.hide()
-        self.status_text = QLabel("")
-        self.statusBar().addPermanentWidget(self.status_text, 2)
-        self.statusBar().addPermanentWidget(self.pb, 1)
-
-        # Smooth updates (~10 Hz) via timer
-        self._smooth_total = 1
-        self._smooth_done = 0
-        self._rate_bytes = 0.0
-        self._last_tick_time = None
-        self._last_tick_done = 0
-        self._tick_timer = QTimer(self)
-        self._tick_timer.setInterval(100)
-        self._tick_timer.timeout.connect(self._on_tick)
-        self._status_prefix = "Transferring…"
 
     # ====== helpers for smooth status ======
     def _on_file_progress(self, cur, total, key):
@@ -555,7 +575,12 @@ class MainWindow(QMainWindow):
         self.modelToListView(self.data_model.list(self.data_model.current_folder))
         self.listview.sortByColumn(0, Qt.AscendingOrder)
         show_folder = self.data_model.current_folder if self.data_model.current_folder else "/"
-        self.statusBar().showMessage("[%s][%s] %s" % (self.profile_name, self.data_model.bucket, show_folder), 0)
+        self.statusBar().showMessage(
+            "[%s][%s] %s" % (self.profile_name, self.data_model.bucket, show_folder), 0
+        )
+        # update read-only S3 path
+        self.update_s3_path_label()
+
         if restore_last_index and self.data_model.prev_folder:
             name = self.map.get(self.data_model.current_folder)
             if name:
@@ -738,6 +763,26 @@ class MainWindow(QMainWindow):
 
     def report_logger_progress(self, msg):
         self.logview.appendPlainText(msg)
+
+    # ---- S3 path helpers + resize hook ----
+    def current_s3_path(self) -> str:
+        prefix = self.data_model.current_folder or ""
+        return f"s3://{self.data_model.bucket}/{prefix}"
+
+    def update_s3_path_label(self):
+        # Guard in case called before widget exists (defensive)
+        if hasattr(self, "s3PathEdit") and self.s3PathEdit is not None:
+            full = self.current_s3_path()
+            self.s3PathEdit.setText(full)
+            self.s3PathEdit.setToolTip(full)
+
+    def copy_s3_path_to_clipboard(self):
+        self.clip.setText(self.current_s3_path())
+        self.statusBar().showMessage("S3 path copied", 2000)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.update_s3_path_label()
 
     def createActions(self):
         self.btnBack = QAction(
