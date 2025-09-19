@@ -1,26 +1,37 @@
 import os
 import glob
 import pathlib
+import time
+from datetime import datetime
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import QIcon, QStandardItemModel, QStandardItem
-from PyQt5.QtWidgets import QApplication, QWidget, QFileDialog, QPlainTextEdit
 
 from model import Model as DataModel
 from model import FSObjectType
-
 from properties_window import PropertiesWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
+__VERSION__ = "0.1.1"
 
-__VERSION__ = "0.0.9"
+UP_ENTRY_LABEL = "[..]"  # special row to go one level up
+
+
+def _human_bytes(n):
+    n = float(n or 0)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    while n >= 1024 and i < len(units) - 1:
+        n /= 1024.0
+        i += 1
+    return f"{n:.1f} {units[i]}"
 
 
 class Tree(QTreeView):
     def __init__(self, parent):
+        super().__init__()
         self.parent = parent
-        QTreeView.__init__(self)
         self.setDragDropMode(QAbstractItemView.InternalMove)
         self.enable_drag_drop()
 
@@ -34,11 +45,9 @@ class Tree(QTreeView):
 
     def dragEnterEvent(self, event):
         widget = event.source()
-
         if widget == self:
             event.ignore()
             return
-
         if event.mimeData().hasUrls:
             event.accept()
         else:
@@ -50,7 +59,6 @@ class Tree(QTreeView):
         if widget == self:
             event.ignore()
             return
-
         if event.mimeData().hasUrls:
             event.setDropAction(Qt.MoveAction)
             event.accept()
@@ -67,7 +75,7 @@ class Tree(QTreeView):
             event.setDropAction(Qt.CopyAction)
             event.accept()
 
-            job = list()
+            job = []
             for url in event.mimeData().urls():
                 path = str(url.toLocalFile())
                 base_path, tail = os.path.split(path)
@@ -80,7 +88,6 @@ class Tree(QTreeView):
                             )
                         ).as_posix()
                         if os.path.isdir(filename):
-                            # append folder
                             job.append((key, None))
                         else:
                             job.append((key, filename))
@@ -101,30 +108,122 @@ class Tree(QTreeView):
 
 class ListItem(QStandardItem):
     def __init__(self, size, t, *args, **kwargs):
-        self.size = size
-        self.t = t
         super().__init__(*args, **kwargs)
+        self.size = size
+        self.t = t  # FSObjectType
+
+
+class UpTopProxyModel(QSortFilterProxyModel):
+    """
+    Proxy to:
+      - always pin the UP_ENTRY_LABEL row to the very top
+      - always put folders before files (within the active sort column)
+    """
+    def __init__(self, up_label, parent=None):
+        super().__init__(parent)
+        self.up_label = up_label
+
+    def _is_up_row(self, src_idx: QModelIndex) -> bool:
+        base = src_idx.sibling(src_idx.row(), 0)
+        return str(base.data()) == self.up_label
+
+    def _item_type(self, src_idx: QModelIndex):
+        model = self.sourceModel()
+        item = model.itemFromIndex(src_idx.sibling(src_idx.row(), 0))
+        if hasattr(item, "t"):
+            return item.t
+        return None
+
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
+        # 1) Keep [..] on top
+        left_is_up = self._is_up_row(left)
+        right_is_up = self._is_up_row(right)
+        if left_is_up and not right_is_up:
+            return True
+        if right_is_up and not left_is_up:
+            return False
+
+        # 2) Folders before files
+        lt = self._item_type(left)
+        rt = self._item_type(right)
+        if lt is not None and rt is not None and lt != rt:
+            return lt == FSObjectType.FOLDER
+
+        # 3) Fallback to normal column-based sort
+        col = left.column()
+        ld = left.data()
+        rd = right.data()
+
+        if col == 0:  # Name
+            return str(ld).lower() < str(rd).lower()
+
+        if col == 1:  # Size
+            try:
+                ln = int(ld)
+            except Exception:
+                ln = -1
+            try:
+                rn = int(rd)
+            except Exception:
+                rn = -1
+            if ln != rn:
+                return ln < rn
+            # tie-break with name
+            l_name = left.sibling(left.row(), 0).data()
+            r_name = right.sibling(right.row(), 0).data()
+            return str(l_name).lower() < str(r_name).lower()
+
+        # Modified (string fallback)
+        return str(ld) < str(rd)
 
 
 class Worker(QObject):
     finished = pyqtSignal()
     progress = pyqtSignal(str)
     refresh = pyqtSignal()
+    file_progress = pyqtSignal(int, int, str)  # (done, total, key)
+    batch_progress = pyqtSignal(int, int)      # (done_all, total_all)
 
     def __init__(self, data_model, job):
+        super().__init__()
         self.data_model = data_model
         self.job = job
-        super().__init__()
 
     def download(self):
-        for i in self.job:
-            key, local_name, size, folder_path = i
+        total_bytes = 0
+        for key, local_name, size, folder_path in self.job:
+            if local_name is not None:
+                total_bytes += int(size or 0)
+            else:
+                for k, s in self.data_model.get_keys(key):
+                    if not k.endswith("/"):
+                        total_bytes += int(s or 0)
+        total_bytes = max(1, int(total_bytes))
+        sofar_all = 0
+
+        def make_cb():
+            last = {"v": 0}
+
+            def _cb(total, cur, key):
+                self.file_progress.emit(int(cur), int(total), key)
+                nonlocal sofar_all
+                delta = max(0, int(cur) - int(last["v"]))
+                last["v"] = int(cur)
+                if delta:
+                    sofar_all += delta
+                    self.batch_progress.emit(int(sofar_all), int(total_bytes))
+
+            return _cb
+
+        for key, local_name, size, folder_path in self.job:
             if local_name:
                 msg = "downloading %s -> %s (%s)" % (key, local_name, size)
             else:
-                msg = "downloading directory: %s ->%s" % (key, folder_path)
+                msg = "downloading directory: %s -> %s" % (key, folder_path)
             self.progress.emit(msg)
-            self.data_model.download_file(key, local_name, folder_path)
+            cb = make_cb()
+            self.data_model.download_file(key, local_name, folder_path, progress_cb=cb)
+
         self.finished.emit()
 
     def delete(self):
@@ -136,23 +235,49 @@ class Worker(QObject):
         self.finished.emit()
 
     def upload(self):
-        for i in self.job:
-            key, local_name = i
+        total_bytes = 0
+        for key, local_name in self.job:
+            if local_name:
+                try:
+                    total_bytes += int(os.path.getsize(local_name))
+                except Exception:
+                    pass
+        total_bytes = max(1, int(total_bytes))
+        sofar_all = 0
+
+        def make_cb():
+            last = {"v": 0}
+
+            def _cb(total, cur, key):
+                self.file_progress.emit(int(cur), int(total or 1), key)
+                nonlocal sofar_all
+                delta = max(0, int(cur) - int(last["v"]))
+                last["v"] = int(cur)
+                if delta:
+                    sofar_all += delta
+                    self.batch_progress.emit(int(sofar_all), int(total_bytes))
+
+            return _cb
+
+        for key, local_name in self.job:
             if local_name is not None:
                 msg = "uploading %s -> %s" % (local_name, key)
             else:
                 msg = "creating folder %s" % key
             self.progress.emit(msg)
-            self.data_model.upload_file(local_name, key)
+
+            cb = make_cb() if local_name else None
+            self.data_model.upload_file(local_name, key, progress_cb=cb)
             self.refresh.emit()
+
         self.finished.emit()
 
 
 class MainWindow(QMainWindow):
     def __init__(self, *args, **kwargs):
         settings = kwargs.pop("settings")
-        super(MainWindow, self).__init__(*args, **kwargs)
-        self.setWindowTitle("S3 Duck 🦆 %s PoC" % __VERSION__)
+        super().__init__(*args, **kwargs)
+        self.setWindowTitle("S3 Duck 🦆 %s" % __VERSION__)
         self.setWindowIcon(QIcon.fromTheme("applications-internet"))
 
         (
@@ -175,18 +300,22 @@ class MainWindow(QMainWindow):
         self.logview = QPlainTextEdit(self)
         self.listview = Tree(self)
         self.clip = QApplication.clipboard()
-        self.splitter = QSplitter()
-        self.splitter.setOrientation(Qt.Vertical)
+        self.splitter = QSplitter(Qt.Vertical)
         self.splitter.addWidget(self.listview)
         self.splitter.addWidget(self.logview)
+        # ~75% top / ~25% bottom
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 1)
+
         self.logview.setReadOnly(True)
+        # NOTE: per request, this one line stays WITHOUT timestamp
         self.logview.appendPlainText(
             "Welcome to S3 Duck 🦆 %s (on %s)"
             % (__VERSION__, OS_FAMILY_MAP.get(DataModel.get_os_family(), "❓"))
         )
+
         hlay = QHBoxLayout()
         hlay.addWidget(self.splitter)
-
         wid = QWidget()
         wid.setLayout(hlay)
         self.setCentralWidget(wid)
@@ -215,20 +344,63 @@ class MainWindow(QMainWindow):
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnAbout)
         self.tBar.setIconSize(QSize(26, 26))
-        self.model = QStandardItemModel()
 
+        # Source model
+        self.model = QStandardItemModel()
         self.model.setHorizontalHeaderLabels(["Name", "Size", "Modified"])
-        self.listview.header().setDefaultSectionSize(180)
-        self.listview.setModel(self.model)
+
+        # Proxy model to pin [..] and keep folders first
+        self.proxy = UpTopProxyModel(UP_ENTRY_LABEL, self)
+        self.proxy.setSourceModel(self.model)
+        self.listview.setModel(self.proxy)
+
+        # ---------- Progress UI & S3 path BEFORE first navigate() ----------
+        self.pb = QProgressBar()
+        self.pb.setMinimum(0)
+        self.pb.setMaximum(100)
+        self.pb.hide()
+        self.status_text = QLabel("")
+        self.statusBar().addPermanentWidget(self.status_text, 2)
+        self.statusBar().addPermanentWidget(self.pb, 1)
+
+        self._smooth_total = 1
+        self._smooth_done = 0
+        self._rate_bytes = 0.0
+        self._last_tick_time = None
+        self._last_tick_done = 0
+        self._tick_timer = QTimer(self)
+        self._tick_timer.setInterval(100)
+        self._tick_timer.timeout.connect(self._on_tick)
+        self._status_prefix = "Transferring…"
+
+        # Read-only S3 path + copy button
+        self.s3PathEdit = QLineEdit()
+        self.s3PathEdit.setReadOnly(True)
+        self.s3PathEdit.setStyleSheet("font-family: monospace; background: #f0f0f0;")
+        self.statusBar().addPermanentWidget(self.s3PathEdit, 3)
+
+        self.actCopyS3Path = QAction(
+            QIcon.fromTheme(
+                "edit-copy", QIcon(os.path.join(self.current_dir, "icons", "copy_24px.svg"))
+            ),
+            "Copy S3 path",
+
+        self,
+        )
+        self.actCopyS3Path.triggered.connect(self.copy_s3_path_to_clipboard)
+        self.tBar.addAction(self.actCopyS3Path)
+        # -------------------------------------------------------------------
+
+        # Initial populate
         self.navigate()
 
+        self.listview.header().setSortIndicatorShown(True)
+        self.listview.setSortingEnabled(True)
         self.listview.header().resizeSection(0, 320)
         self.listview.header().resizeSection(1, 80)
         self.listview.header().resizeSection(2, 80)
+        # self.splitter.setSizes([20, 160])  # old; using stretch factors now
 
-        self.listview.doubleClicked.connect(self.list_doubleClicked)
-        self.listview.setSortingEnabled(True)
-        self.splitter.setSizes([20, 160])
         self.listview.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.listview.setDragDropMode(QAbstractItemView.DragDrop)
         self.listview.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -236,101 +408,135 @@ class MainWindow(QMainWindow):
         self.thread = None
         self.worker = None
         self.map = dict()
-        self.setWindowIcon(
-            QIcon(os.path.join(self.current_dir, "resources", "ducky.ico"))
-        )
+        self.setWindowIcon(QIcon(os.path.join(self.current_dir, "resources", "ducky.ico")))
         self.listview.installEventFilter(self)
         self.restoreSettings()
         self.select_first()
         self.menu = QMenu()
 
+        # Double-click: proxy-aware handler
+        self.listview.doubleClicked.connect(self.list_doubleClicked)
+
+    # ====== tiny logging helper (timestamps) ======
+    def log(self, message: str):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.logview.appendPlainText(f"[{ts}] {message}")
+
+    # ====== progress helpers ======
+    def _on_file_progress(self, cur, total, key):
+        return
+
+    def _on_batch_progress(self, done, total):
+        self._smooth_total = max(1, int(total))
+        self._smooth_done = max(0, int(done))
+
+    def _on_tick(self):
+        now = time.time()
+        if self._last_tick_time is None:
+            self._last_tick_time = now
+            self._last_tick_done = self._smooth_done
+
+        dt = max(1e-6, now - self._last_tick_time)
+        delta = max(0, self._smooth_done - self._last_tick_done)
+        inst_rate = delta / dt
+        self._rate_bytes = (0.7 * self._rate_bytes) + (0.3 * inst_rate)
+        self._last_tick_time = now
+        self._last_tick_done = self._smooth_done
+
+        pct = int((self._smooth_done / self._smooth_total) * 100)
+        self.pb.setMaximum(100)
+        self.pb.setValue(min(100, max(0, pct)))
+
+        eta_txt = ""
+        if self._rate_bytes > 1:
+            remaining = self._smooth_total - self._smooth_done
+            eta_sec = int(remaining / self._rate_bytes)
+            m, s = divmod(eta_sec, 60)
+            h, m = divmod(m, 60)
+            eta_txt = f"  ETA {h:02d}:{m:02d}:{s:02d}"
+
+        self.status_text.setText(
+            f"{self._status_prefix} {_human_bytes(self._smooth_done)} / {_human_bytes(self._smooth_total)}"
+            f"  ({_human_bytes(self._rate_bytes)}/s){eta_txt}"
+        )
+
+    # ====== selection helpers (proxy-aware) ======
     def select_first(self):
-        if self.listview.model().rowCount() > 0:
-            index = self.listview.model().index(0, 0)
+        if self.proxy.rowCount() > 0:
+            index = self.proxy.index(0, 0)
             self.listview.setCurrentIndex(index)
 
     def ix_by_name(self, name):
-        for r in range(self.listview.model().rowCount()):
-            ix = self.listview.model().index(r, 0)
-            if name == self.listview.model().itemFromIndex(ix).text():
-                return ix
+        for r in range(self.model.rowCount()):
+            ix_src = self.model.index(r, 0)
+            if name == self.model.itemFromIndex(ix_src).text():
+                return self.proxy.mapFromSource(ix_src)
+        return None
 
     def name_by_first_ix(self, ixs):
+        """
+        Returns (item, display_name, full_key).
+        For folders we append '/', but NOT for the special UP_ENTRY_LABEL.
+        """
         if ixs:
-            ix = ixs[0]
-            if ix.column() == 0:
-                m = ix.model().itemFromIndex(ix)
+            ix = ixs[0]  # proxy index
+            ix_src = self.proxy.mapToSource(ix)
+            if ix_src.column() == 0:
+                m = ix_src.model().itemFromIndex(ix_src)
                 name = m.text()
-                if m.t == FSObjectType.FOLDER:
+                if m.t == FSObjectType.FOLDER and name != UP_ENTRY_LABEL:
                     name = "%s/" % name
                 return m, name, self.data_model.current_folder + name
         return None, None, None
 
+    # ====== UI / events ======
     def eventFilter(self, obj, event):
         if obj == self.listview:
             if event.type() == QEvent.ContextMenu and obj is self.listview:
-                upload_selected_action = (
-                    delete_action
-                ) = download_action = properties_selected_action = QObject()
+                upload_selected_action = delete_action = download_action = properties_selected_action = QObject()
                 ixs = self.listview.selectedIndexes()
                 m, name, upload_path = self.name_by_first_ix(ixs)
-                if upload_path is None:
+                up_selected = m is not None and m.text() == UP_ENTRY_LABEL
+
+                if upload_path is None or up_selected:
                     upload_path = self.data_model.current_folder
+
                 self.menu.clear()
-                if name:
-                    if m.t == FSObjectType.FOLDER:
-                        upload_selected_action = QAction(
-                            QIcon.fromTheme(
-                                "network-server",
-                                QIcon(
-                                    os.path.join(
-                                        self.current_dir,
-                                        "icons",
-                                        "file_upload_24px.svg",
-                                    )
-                                ),
-                            ),
-                            "Upload -> %s" % upload_path,
-                        )
-                        self.menu.addAction(upload_selected_action)
+
+                if name and m and m.t == FSObjectType.FOLDER and not up_selected:
+                    upload_selected_action = QAction(
+                        QIcon.fromTheme(
+                            "network-server",
+                            QIcon(os.path.join(self.current_dir, "icons", "file_upload_24px.svg")),
+                        ),
+                        "Upload -> %s" % upload_path,
+                    )
+                    self.menu.addAction(upload_selected_action)
+
                 upload_current_action = QAction(
                     QIcon.fromTheme(
                         "network-server",
-                        QIcon(
-                            os.path.join(
-                                self.current_dir, "icons", "file_upload_24px.svg"
-                            )
-                        ),
+                        QIcon(os.path.join(self.current_dir, "icons", "file_upload_24px.svg")),
                     ),
                     "Upload -> %s"
-                    % (
-                        "/"
-                        if not self.data_model.current_folder
-                        else self.data_model.current_folder
-                    ),
+                    % ("/" if not self.data_model.current_folder else self.data_model.current_folder),
                 )
                 self.menu.addAction(upload_current_action)
+
                 create_folder_action = QAction(
                     QIcon.fromTheme(
                         "folder-new",
-                        QIcon(
-                            os.path.join(
-                                self.current_dir, "icons", "create_new_folder_24px.svg"
-                            )
-                        ),
+                        QIcon(os.path.join(self.current_dir, "icons", "create_new_folder_24px.svg")),
                     ),
                     "Create folder",
                 )
                 self.menu.addAction(create_folder_action)
-                if ixs:
+
+                if ixs and not up_selected:
                     download_action = QAction(
                         QIcon.fromTheme(
                             "emblem-downloads",
-                            QIcon(
-                                os.path.join(
-                                    self.current_dir, "icons", "download_24px.svg"
-                                )
-                            ),
+                            QIcon(os.path.join(self.current_dir, "icons", "download_24px.svg")),
                         ),
                         "Download",
                     )
@@ -338,31 +544,25 @@ class MainWindow(QMainWindow):
                     delete_action = QAction(
                         QIcon.fromTheme(
                             "edit-delete",
-                            QIcon(
-                                os.path.join(
-                                    self.current_dir, "icons", "delete_24px.svg"
-                                )
-                            ),
+                            QIcon(os.path.join(self.current_dir, "icons", "delete_24px.svg")),
                         ),
                         "Delete",
                     )
                     self.menu.addAction(delete_action)
-                m, name, key = self.name_by_first_ix(ixs)
+
+                m2, name2, key = self.name_by_first_ix(ixs)
                 if not key:
                     key = self.data_model.current_folder
-                if name:
+                if name2 and m2 and m2.text() != UP_ENTRY_LABEL:
                     properties_selected_action = QAction(
                         QIcon.fromTheme(
                             "document-properties",
-                            QIcon(
-                                os.path.join(
-                                    self.current_dir, "icons", "puzzle_24px.svg"
-                                )
-                            ),
+                            QIcon(os.path.join(self.current_dir, "icons", "puzzle_24px.svg")),
                         ),
                         "Properties",
                     )
                     self.menu.addAction(properties_selected_action)
+
                 clk = self.menu.exec_(event.globalPos())
                 if clk == upload_selected_action:
                     self.upload(upload_path)
@@ -376,9 +576,14 @@ class MainWindow(QMainWindow):
                     self.new_folder()
                 if clk == properties_selected_action:
                     self.properties(self.data_model, key)
+
             if event.type() == QEvent.KeyPress:
                 if event.key() == Qt.Key_Return:
-                    self.list_doubleClicked()
+                    # Let double-click handler logic handle Enter as well
+                    current = self.listview.currentIndex()
+                    if current.isValid():
+                        self.list_doubleClicked(current)
+                    return True
                 if event.key() == Qt.Key_Delete:
                     self.delete()
                 if event.key() == Qt.Key_Backspace:
@@ -395,7 +600,7 @@ class MainWindow(QMainWindow):
                     self.upload()
                 if event.key() == Qt.Key_D:
                     self.download()
-        return super(MainWindow, self).eventFilter(obj, event)
+        return super().eventFilter(obj, event)
 
     def simple(self, title, message):
         QMessageBox(
@@ -409,22 +614,15 @@ class MainWindow(QMainWindow):
 
     def about(self):
         sysinfo = QSysInfo()
-        sys_info = (
-            sysinfo.prettyProductName()
-            + "<br>"
-            + sysinfo.kernelType()
-            + " "
-            + sysinfo.kernelVersion()
-        )
+        sys_info = sysinfo.prettyProductName() + "<br>" + sysinfo.kernelType() + " " + sysinfo.kernelVersion()
         title = "S3 Duck 🦆 %s" % __VERSION__
         message = (
             """
-                    <span style='color: #3465a4; font-size: 20pt;font-weight: bold;text-align: center;'
-                    ></span></p><center><h3>S3 Duck 🦆
-                    </h3></center><a title='Vladislav Ananev' href='https://github.com/nexusriot'
-                     target='_blank'><br><span style='color: #8743e2; font-size: 10pt;'>
-                     ©2022 Vladislav Ananev</a><br><br></strong></span></p>
-                     """
+            <span style='color: #3465a4; font-size: 20pt;font-weight: bold;text-align: center;'></span>
+            <center><h3>S3 Duck 🦆</h3></center>
+            <a title='Vladislav Ananev' href='https://github.com/nexusriot' target='_blank'>
+            <br><span style='color: #8743e2; font-size: 10pt;'>©2022-2025 Vladislav Ananev</a><br><br></strong></span></p>
+            """
             + "version %s" % __VERSION__
             + "<br><br>"
             + sys_info
@@ -432,35 +630,37 @@ class MainWindow(QMainWindow):
         self.simple(title, message)
 
     def properties(self, model, key):
-        properties = PropertiesWindow(self, settings=(model, key))
-        properties.exec_()
+        PropertiesWindow(self, settings=(model, key)).exec_()
 
     def modelToListView(self, model_result):
-        """
-        Converts data mode items to List Items
-        :param model_result:
-        :return:
-        """
-        if not model_result:
-            self.model.setRowCount(0)
-        else:
-            self.model.setRowCount(0)
+        """Populate the view; always inject '[..]' at top."""
+        self.model.setRowCount(0)
+
+        up_icon = QIcon.fromTheme(
+            "go-up",
+            QIcon(os.path.join(self.current_dir, "icons", "arrow_upward_24px.svg")),
+        )
+        self.model.appendRow(
+            [
+                ListItem(0, FSObjectType.FOLDER, up_icon, UP_ENTRY_LABEL),
+                ListItem(0, FSObjectType.FOLDER, ""),
+                ListItem(0, FSObjectType.FOLDER, ""),
+            ]
+        )
+
+        if model_result:
             for i in model_result:
                 if i.type_ == FSObjectType.FILE:
                     icon = QIcon().fromTheme(
                         "go-first",
-                        QIcon(
-                            os.path.join(self.current_dir, "icons", "document_24px.svg")
-                        ),
+                        QIcon(os.path.join(self.current_dir, "icons", "document_24px.svg")),
                     )
                     size = str(i.size)
                     modified = str(i.modified)
                 else:
                     icon = QIcon().fromTheme(
                         "network-server",
-                        QIcon(
-                            os.path.join(self.current_dir, "icons", "folder_24px.svg")
-                        ),
+                        QIcon(os.path.join(self.current_dir, "icons", "folder_24px.svg")),
                     )
                     size = "<DIR>"
                     modified = ""
@@ -480,12 +680,12 @@ class MainWindow(QMainWindow):
     def navigate(self, restore_last_index=False):
         self.modelToListView(self.data_model.list(self.data_model.current_folder))
         self.listview.sortByColumn(0, Qt.AscendingOrder)
-        show_folder = (
-            self.data_model.current_folder if self.data_model.current_folder else "/"
-        )
+        show_folder = self.data_model.current_folder if self.data_model.current_folder else "/"
         self.statusBar().showMessage(
             "[%s][%s] %s" % (self.profile_name, self.data_model.bucket, show_folder), 0
         )
+        self.update_s3_path_label()
+
         if restore_last_index and self.data_model.prev_folder:
             name = self.map.get(self.data_model.current_folder)
             if name:
@@ -494,124 +694,164 @@ class MainWindow(QMainWindow):
                     self.listview.setCurrentIndex(ix)
 
     def get_elem_name(self):
-        index = self.listview.selectionModel().currentIndex()
-        if index.model():
-            i = index.model().itemFromIndex(index)
+        index = self.listview.currentIndex()
+        if index.isValid():
+            ix_src = self.proxy.mapToSource(index)
+            i = ix_src.model().itemFromIndex(ix_src)
             return i.text(), i.t
+        return None, None
 
-    def list_doubleClicked(self):
-        selection = self.listview.selectionModel().selectedIndexes()
-        if selection:
-            name, t = self.get_elem_name()
-            if t == FSObjectType.FOLDER:
-                self.map[self.data_model.current_folder] = name
-                self.change_current_folder(
-                    self.data_model.current_folder + "%s/" % name
-                )
-                self.navigate()
+    def list_doubleClicked(self, proxy_index: QModelIndex):
+        if not proxy_index or not proxy_index.isValid():
+            return
+        ix_src = self.proxy.mapToSource(proxy_index)
+        m = ix_src.model().itemFromIndex(ix_src)
+        name = m.text()
+
+        # Special [..] entry
+        if m.t == FSObjectType.FOLDER and name == UP_ENTRY_LABEL:
+            if self.data_model.current_folder:
+                self.goUp()
+            return
+
+        # Normal folder navigation
+        if m.t == FSObjectType.FOLDER:
+            self.map[self.data_model.current_folder] = name
+            self.change_current_folder(self.data_model.current_folder + "%s/" % name)
+            self.navigate()
 
     def goBack(self):
         self.change_current_folder(self.data_model.prev_folder)
         self.navigate()
 
     def download(self):
-        job = list()
+        job = []
         folder_path = QFileDialog.getExistingDirectory(self, "Select Folder")
         if not folder_path:
-            # nothing selected
             return
         for ix in self.listview.selectionModel().selectedIndexes():
             if ix.column() == 0:
-                m = ix.model().itemFromIndex(ix)
+                ix_src = self.proxy.mapToSource(ix)
+                m = ix_src.model().itemFromIndex(ix_src)
                 name = m.text()
+                if name == UP_ENTRY_LABEL:
+                    continue
                 key = self.data_model.current_folder + name
                 if m.t == FSObjectType.FOLDER:
                     job.append((key, None, None, folder_path))
-                    # got a folder
                     continue
                 local_name = os.path.join(folder_path, name)
                 job.append((key, local_name, m.size, folder_path))
         self.assign_thread_operation("download", job, need_refresh=False)
 
     def assign_thread_operation(self, method, job, need_refresh=True):
-        """
-        Runs jobs in the separate thread
-        :param method:
-        :param job:
-        :param need_refresh:
-        :return:
-        """
         if not job:
             return
-        self.logview.appendPlainText("starting %s" % method)
+        self.log(f"starting {method}")
         self.thread = QThread()
         self.worker = Worker(self.data_model, job)
         self.worker.moveToThread(self.thread)
+
         m = getattr(self.worker, method)
         self.thread.started.connect(m)
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
         self.worker.progress.connect(self.report_logger_progress)
+
         if need_refresh:
             self.worker.refresh.connect(self.navigate)
+
+        if method == "download":
+            self.pb.reset()
+            self.pb.setValue(0)
+            self.pb.show()
+            self._status_prefix = "Downloading…"
+            self.status_text.setText("Preparing…")
+            self._smooth_total = 1
+            self._smooth_done = 0
+            self._rate_bytes = 0.0
+            self._last_tick_time = None
+            self._last_tick_done = 0
+            self._tick_timer.start()
+            self.worker.batch_progress.connect(self._on_batch_progress)
+            self.worker.file_progress.connect(self._on_file_progress)
+
+            def _hide():
+                self._tick_timer.stop()
+                self.pb.hide()
+                self.status_text.setText("Done")
+            self.thread.finished.connect(_hide)
+
+        if method == "upload":
+            self.pb.reset()
+            self.pb.setValue(0)
+            self.pb.show()
+            self._status_prefix = "Uploading…"
+            self.status_text.setText("Preparing…")
+            self._smooth_total = 1
+            self._smooth_done = 0
+            self._rate_bytes = 0.0
+            self._last_tick_time = None
+            self._last_tick_done = 0
+            self._tick_timer.start()
+            self.worker.batch_progress.connect(self._on_batch_progress)
+            self.worker.file_progress.connect(self._on_file_progress)
+
+            def _hide():
+                self._tick_timer.stop()
+                self.pb.hide()
+                self.status_text.setText("Done")
+            self.thread.finished.connect(_hide)
+
         self.thread.start()
         self.disable_action_buttons()
-        self.thread.finished.connect(
-            lambda: self.logview.appendPlainText("%s completed" % method)
-        )
+        self.thread.finished.connect(lambda: self.log(f"{method} completed"))
         self.thread.finished.connect(lambda: self.enable_action_buttons())
 
     def new_folder(self):
         name, ok = QInputDialog.getText(self, "Create folder", "Folder name")
-        # TODO: try to make it better
-        name.replace("/", "")
-        if ok:
+        name = name.replace("/", "")
+        if ok and name:
             key = self.data_model.current_folder + "%s/" % name
             self.data_model.create_folder(key)
-            self.logview.appendPlainText("Created folder %s (%s)" % (name, key))
+            self.log(f"Created folder {name} ({key})")
             self.navigate()
             ix = self.ix_by_name(name)
             if ix:
                 self.listview.setCurrentIndex(ix)
 
     def delete(self):
-        names = list()
-        job = list()
+        names = []
+        job = []
         for ix in self.listview.selectionModel().selectedIndexes():
             if ix.column() == 0:
-                m = ix.model().itemFromIndex(ix)
+                ix_src = self.proxy.mapToSource(ix)
+                m = ix_src.model().itemFromIndex(ix_src)
                 name = m.text()
+                if name == UP_ENTRY_LABEL:
+                    continue
                 key = self.data_model.current_folder + name
-                if m.t == FSObjectType.FOLDER:  # dir
+                if m.t == FSObjectType.FOLDER:
                     key = key + "/"
                 job.append(key)
                 names.append(name)
         if names:
             qm = QMessageBox
-            ret = qm.question(
-                self,
-                "",
-                "Are you sure to delete objects : %s ?" % ",".join(names),
-                qm.Yes | qm.No,
-            )
+            ret = qm.question(self, "", "Are you sure to delete objects : %s ?" % ",".join(names), qm.Yes | qm.No)
             if ret == qm.Yes:
                 self.assign_thread_operation("delete", job)
 
     def upload(self, folder=None):
-        job = list()
-        filter = "All files (*)"
+        job = []
         dialog = QFileDialog()
         dialog.setFileMode(QFileDialog.ExistingFiles)
-        names = dialog.getOpenFileNames(self, "Open files", "", filter)
+        names = dialog.getOpenFileNames(self, "Open files", "", "All files (*)")
         if not all(map(lambda x: x, names)):
             return
         for name in names[0]:
             basename = os.path.basename(name)
-            if folder:
-                key = folder + "/" + basename
-            else:
-                key = self.data_model.current_folder + basename
+            key = (folder + "/" + basename) if folder else (self.data_model.current_folder + basename)
             job.append((key, name))
         self.assign_thread_operation("upload", job)
 
@@ -644,82 +884,70 @@ class MainWindow(QMainWindow):
         self.navigate()
 
     def report_logger_progress(self, msg):
-        self.logview.appendPlainText(msg)
+        # All progress lines from the worker get a timestamp
+        self.log(msg)
+
+    # ---- S3 path helpers + resize hook ----
+    def current_s3_path(self) -> str:
+        prefix = self.data_model.current_folder or ""
+        return f"s3://{self.data_model.bucket}/{prefix}"
+
+    def update_s3_path_label(self):
+        full = self.current_s3_path()
+        self.s3PathEdit.setText(full)
+        self.s3PathEdit.setToolTip(full)
+
+    def copy_s3_path_to_clipboard(self):
+        self.clip.setText(self.current_s3_path())
+        self.statusBar().showMessage("S3 path copied", 2000)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.update_s3_path_label()
 
     def createActions(self):
         self.btnBack = QAction(
-            QIcon.fromTheme(
-                "go-previous",
-                QIcon(os.path.join(self.current_dir, "icons", "arrow_back_24px.svg")),
-            ),
+            QIcon.fromTheme("go-previous", QIcon(os.path.join(self.current_dir, "icons", "arrow_back_24px.svg"))),
             "Back(B)",
             triggered=self.goBack,
         )
         self.btnUp = QAction(
-            QIcon.fromTheme(
-                "go-up",
-                QIcon(os.path.join(self.current_dir, "icons", "arrow_upward_24px.svg")),
-            ),
+            QIcon.fromTheme("go-up", QIcon(os.path.join(self.current_dir, "icons", "arrow_upward_24px.svg"))),
             "Up(Backspace)",
             triggered=self.goUp,
         )
         self.btnHome = QAction(
-            QIcon.fromTheme(
-                "go-home",
-                QIcon(os.path.join(self.current_dir, "icons", "home_24px.svg")),
-            ),
+            QIcon.fromTheme("go-home", QIcon(os.path.join(self.current_dir, "icons", "home_24px.svg"))),
             "Home(Home, H)",
             triggered=self.goHome,
         )
         self.btnDownload = QAction(
-            QIcon.fromTheme(
-                "emblem-downloads",
-                QIcon(os.path.join(self.current_dir, "icons", "download_24px.svg")),
-            ),
+            QIcon.fromTheme("emblem-downloads", QIcon(os.path.join(self.current_dir, "icons", "download_24px.svg"))),
             "Download(D)",
             triggered=self.download,
         )
         self.btnCreateFolder = QAction(
-            QIcon.fromTheme(
-                "folder-new",
-                QIcon(
-                    os.path.join(
-                        self.current_dir, "icons", "create_new_folder_24px.svg"
-                    )
-                ),
-            ),
+            QIcon.fromTheme("folder-new", QIcon(os.path.join(self.current_dir, "icons", "create_new_folder_24px.svg"))),
             "Create folder(Insert, C)",
             triggered=self.new_folder,
         )
         self.btnRemove = QAction(
-            QIcon.fromTheme(
-                "edit-delete",
-                QIcon(os.path.join(self.current_dir, "icons", "delete_24px.svg")),
-            ),
+            QIcon.fromTheme("edit-delete", QIcon(os.path.join(self.current_dir, "icons", "delete_24px.svg"))),
             "Delete(Delete)",
             triggered=self.delete,
         )
         self.btnRefresh = QAction(
-            QIcon.fromTheme(
-                "view-refresh",
-                QIcon(os.path.join(self.current_dir, "icons", "refresh_24px.svg")),
-            ),
+            QIcon.fromTheme("view-refresh", QIcon(os.path.join(self.current_dir, "icons", "refresh_24px.svg"))),
             "Refresh(R)",
             triggered=self.navigate,
         )
         self.btnUpload = QAction(
-            QIcon.fromTheme(
-                "network-server",
-                QIcon(os.path.join(self.current_dir, "icons", "file_upload_24px.svg")),
-            ),
+            QIcon.fromTheme("network-server", QIcon(os.path.join(self.current_dir, "icons", "file_upload_24px.svg"))),
             "Upload(U)",
             triggered=self.upload,
         )
         self.btnAbout = QAction(
-            QIcon.fromTheme(
-                "help-about",
-                QIcon(os.path.join(self.current_dir, "icons", "info_24px.svg")),
-            ),
+            QIcon.fromTheme("help-about", QIcon(os.path.join(self.current_dir, "icons", "info_24px.svg"))),
             "About(F1)",
             triggered=self.about,
         )
@@ -742,7 +970,6 @@ class MainWindow(QMainWindow):
         self.writeSettings()
 
     def writeSettings(self):
-        # save only window geometry
         self.settings.beginGroup("geometry")
         self.settings.setValue("pos", self.pos())
         self.settings.setValue("size", self.size())
