@@ -13,7 +13,7 @@ from properties_window import PropertiesWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.1.1"
+__VERSION__ = "0.1.2"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -122,6 +122,12 @@ class UpTopProxyModel(QSortFilterProxyModel):
     def __init__(self, up_label, parent=None):
         super().__init__(parent)
         self.up_label = up_label
+        self._order = Qt.AscendingOrder  # remember current sort order
+
+    # remember the last requested order so lessThan can compensate
+    def sort(self, column, order=Qt.AscendingOrder):
+        self._order = order
+        super().sort(column, order)
 
     def _is_up_row(self, src_idx: QModelIndex) -> bool:
         base = src_idx.sibling(src_idx.row(), 0)
@@ -130,26 +136,28 @@ class UpTopProxyModel(QSortFilterProxyModel):
     def _item_type(self, src_idx: QModelIndex):
         model = self.sourceModel()
         item = model.itemFromIndex(src_idx.sibling(src_idx.row(), 0))
-        if hasattr(item, "t"):
-            return item.t
-        return None
+        return getattr(item, "t", None)
 
     def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
-        # 1) Keep [..] on top
+        # ----- 1) Keep [..] on top regardless of order -----
         left_is_up = self._is_up_row(left)
         right_is_up = self._is_up_row(right)
-        if left_is_up and not right_is_up:
-            return True
-        if right_is_up and not left_is_up:
-            return False
+        if left_is_up != right_is_up:
+            if self._order == Qt.AscendingOrder:
+                # [..] should be the smallest element
+                return left_is_up and not right_is_up
+            else:
+                # Qt will invert our result for descending; return the opposite
+                # so that after inversion [..] is still the smallest element.
+                return not left_is_up and right_is_up
 
-        # 2) Folders before files
+        # ----- 2) Folders before files -----
         lt = self._item_type(left)
         rt = self._item_type(right)
         if lt is not None and rt is not None and lt != rt:
             return lt == FSObjectType.FOLDER
 
-        # 3) Fallback to normal column-based sort
+        # ----- 3) Column-based compare -----
         col = left.column()
         ld = left.data()
         rd = right.data()
@@ -157,7 +165,7 @@ class UpTopProxyModel(QSortFilterProxyModel):
         if col == 0:  # Name
             return str(ld).lower() < str(rd).lower()
 
-        if col == 1:  # Size
+        if col == 1:  # Size (numeric; tie-break by name)
             try:
                 ln = int(ld)
             except Exception:
@@ -168,12 +176,10 @@ class UpTopProxyModel(QSortFilterProxyModel):
                 rn = -1
             if ln != rn:
                 return ln < rn
-            # tie-break with name
             l_name = left.sibling(left.row(), 0).data()
             r_name = right.sibling(right.row(), 0).data()
             return str(l_name).lower() < str(r_name).lower()
 
-        # Modified (string fallback)
         return str(ld) < str(rd)
 
 
