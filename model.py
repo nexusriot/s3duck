@@ -4,6 +4,8 @@ import uuid
 import os
 import boto3
 import botocore
+import threading
+
 from boto3.s3.transfer import TransferConfig
 
 
@@ -38,12 +40,18 @@ class _BotoProgressAdapter:
         self.key = key
         self.cb = cb
         self._sofar = 0
+        self._lock = threading.Lock()
 
     def __call__(self, bytes_amount):
-        self._sofar += int(bytes_amount or 0)
-        if self.cb:
-            cur = self._sofar if self._sofar <= self.total else self.total
-            self.cb(self.total, cur, self.key)
+        if self.cb is None:
+            return
+        inc = int(bytes_amount or 0)
+        with self._lock:
+            self._sofar += inc
+            cur = self._sofar
+        if cur > self.total:
+            cur = self.total
+        self.cb(self.total, cur, self.key)
 
 
 class Model:
