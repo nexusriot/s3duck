@@ -2,6 +2,7 @@ import os
 import glob
 import pathlib
 import time
+import threading
 from datetime import datetime
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
@@ -13,7 +14,7 @@ from properties_window import PropertiesWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.1.2"
+__VERSION__ = "0.1.3"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -187,8 +188,8 @@ class Worker(QObject):
     finished = pyqtSignal()
     progress = pyqtSignal(str)
     refresh = pyqtSignal()
-    file_progress = pyqtSignal(int, int, str)  # (done, total, key)
-    batch_progress = pyqtSignal(int, int)      # (done_all, total_all)
+    file_progress = pyqtSignal(object, object, str)
+    batch_progress = pyqtSignal(object, object)
 
     def __init__(self, data_model, job):
         super().__init__()
@@ -196,37 +197,54 @@ class Worker(QObject):
         self.job = job
 
     def download(self):
-        total_bytes = 0
+        # total bytes across everything in this batch, including dirs
+        total_bytes_all = 0
         for key, local_name, size, folder_path in self.job:
             if local_name is not None:
-                total_bytes += int(size or 0)
+                # single file
+                total_bytes_all += int(size or 0)
             else:
+                # folder / prefix
                 for k, s in self.data_model.get_keys(key):
                     if not k.endswith("/"):
-                        total_bytes += int(s or 0)
-        total_bytes = max(1, int(total_bytes))
-        sofar_all = 0
+                        total_bytes_all += int(s or 0)
+        total_bytes_all = max(1, int(total_bytes_all))
+
+        done_all = 0
+        done_all_lock = threading.Lock()
 
         def make_cb():
-            last = {"v": 0}
+            # this dict is per-file/prefix, so each callback instance tracks its own last seen value
+            last_sent_for_this_file = {"v": 0}
 
-            def _cb(total, cur, key):
-                self.file_progress.emit(int(cur), int(total), key)
-                nonlocal sofar_all
-                delta = max(0, int(cur) - int(last["v"]))
-                last["v"] = int(cur)
-                if delta:
-                    sofar_all += delta
-                    self.batch_progress.emit(int(sofar_all), int(total_bytes))
+            def _cb(total_file, cur_file, key):
+                nonlocal done_all
 
+                # emit per-file progress immediately
+                self.file_progress.emit(int(cur_file), int(total_file or 1), key)
+
+                # compute delta and update global done_all atomically
+                with done_all_lock:
+                    prev = last_sent_for_this_file["v"]
+                    if cur_file > prev:
+                        delta = int(cur_file) - int(prev)
+                        last_sent_for_this_file["v"] = int(cur_file)
+                        done_all += delta
+                        current_total = done_all
+                    else:
+                        current_total = done_all
+
+                self.batch_progress.emit(int(current_total), int(total_bytes_all))
             return _cb
 
+        # run the actual download(s)
         for key, local_name, size, folder_path in self.job:
             if local_name:
                 msg = "downloading %s -> %s (%s)" % (key, local_name, size)
             else:
                 msg = "downloading directory: %s -> %s" % (key, folder_path)
             self.progress.emit(msg)
+
             cb = make_cb()
             self.data_model.download_file(key, local_name, folder_path, progress_cb=cb)
 
@@ -241,30 +259,46 @@ class Worker(QObject):
         self.finished.emit()
 
     def upload(self):
-        total_bytes = 0
+        # figure out total bytes we plan to upload
+        total_bytes_all = 0
         for key, local_name in self.job:
             if local_name:
                 try:
-                    total_bytes += int(os.path.getsize(local_name))
+                    total_bytes_all += int(os.path.getsize(local_name))
                 except Exception:
                     pass
-        total_bytes = max(1, int(total_bytes))
-        sofar_all = 0
+        total_bytes_all = max(1, int(total_bytes_all))
+
+        done_all = 0
+        done_all_lock = threading.Lock()
 
         def make_cb():
-            last = {"v": 0}
+            # this dict is per FILE we're uploading
+            last_sent_for_this_file = {"v": 0}
 
-            def _cb(total, cur, key):
-                self.file_progress.emit(int(cur), int(total or 1), key)
-                nonlocal sofar_all
-                delta = max(0, int(cur) - int(last["v"]))
-                last["v"] = int(cur)
-                if delta:
-                    sofar_all += delta
-                    self.batch_progress.emit(int(sofar_all), int(total_bytes))
+            def _cb(total_file, cur_file, key):
+                nonlocal done_all
+
+                # tell UI how this single file is doing
+                self.file_progress.emit(int(cur_file), int(total_file or 1), key)
+
+                # update batch aggregate
+                with done_all_lock:
+                    prev = last_sent_for_this_file["v"]
+                    if cur_file > prev:
+                        delta = int(cur_file) - int(prev)
+                        last_sent_for_this_file["v"] = int(cur_file)
+                        done_all += delta
+                        current_total = done_all
+                    else:
+                        current_total = done_all
+
+                # tell UI total batch bytes (outside lock)
+                self.batch_progress.emit(int(current_total), int(total_bytes_all))
 
             return _cb
 
+        # do the actual upload(s)
         for key, local_name in self.job:
             if local_name is not None:
                 msg = "uploading %s -> %s" % (local_name, key)
