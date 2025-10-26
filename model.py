@@ -12,6 +12,7 @@ from boto3.s3.transfer import TransferConfig
 class FSObjectType(Enum):
     FILE = 1
     FOLDER = 2
+    BUCKET = 3  # top-level S3 bucket
 
 
 class Item:
@@ -25,7 +26,9 @@ class Item:
         return "name: %s; type_: %d(%s), modified: %s size: %d" % (
             self.name,
             self.type_,
-            "file" if self.type_ == FSObjectType.FILE else "dir",
+            "file"
+            if self.type_ == FSObjectType.FILE
+            else ("dir" if self.type_ == FSObjectType.FOLDER else "bucket"),
             self.modified,
             self.size,
         )
@@ -75,7 +78,7 @@ class Model:
         self.region_name = region_name
         self.access_key = access_key
         self.secret_key = secret_key
-        self.bucket = bucket
+        self.bucket = bucket or ""  # may now start empty (bucket-list mode)
         self.no_ssl_check = no_ssl_check
         self.use_path = use_path
         self.timeout = timeout
@@ -105,7 +108,11 @@ class Model:
             if self.region_name:
                 params.update({"region_name": self.region_name})
 
-            s3_config = {"addressing_style": "virtual"} if not self.use_path else {"addressing_style": "path"}
+            s3_config = (
+                {"addressing_style": "virtual"}
+                if not self.use_path
+                else {"addressing_style": "path"}
+            )
             if self.no_ssl_check:
                 params.update({"verify": False})
 
@@ -121,10 +128,62 @@ class Model:
             self._client = self.session.client("s3", **params)
         return self._client
 
+    def get_bucket_region(self, bucket_name: str):
+        """
+        Ask S3 which region this bucket is in.
+        AWS quirk: us-east-1 returns None/''.
+        We'll normalize that to 'us-east-1'.
+        """
+        resp = self.client.get_bucket_location(Bucket=bucket_name)
+        loc = resp.get("LocationConstraint")
+        if not loc:
+            # us-east-1 shows up as None
+            loc = "us-east-1"
+        return loc
+
+    def refresh_client_for_bucket(self, bucket_name: str):
+        """
+        Switch active bucket, detect its region, and rebuild client.
+        After this call:
+          - self.bucket = bucket_name
+          - self.region_name = bucket's region (best effort)
+          - self._client is reset so next .client() is fresh
+          - navigation state reset to bucket root
+        """
+        self.bucket = bucket_name
+
+        try:
+            region = self.get_bucket_region(bucket_name)
+        except Exception:
+            # fallback: if region lookup fails (MinIO/non-AWS),
+            # keep whatever region_name we already had
+            region = self.region_name
+
+        self.region_name = region
+        self._client = None  # force rebuild with new region
+        self.current_folder = ""
+        self.prev_folder = ""
+
+    def list_buckets(self):
+        """
+        Top-level "root view": return all buckets visible to creds.
+        Each result is an Item(...) with type_ = FSObjectType.BUCKET.
+        """
+        resp = self.client.list_buckets()
+        items = []
+        for b in resp.get("Buckets", []):
+            items.append(Item(b["Name"], FSObjectType.BUCKET, "", 0))
+        return items
+
     def list(self, fld):
+        """
+        List objects/prefixes in the currently selected bucket under prefix 'fld'.
+        """
         path = fld or ""
         paginator = self.client.get_paginator("list_objects_v2")
-        pages = paginator.paginate(Bucket=self.bucket, Prefix=path, Delimiter="/")
+        pages = paginator.paginate(
+            Bucket=self.bucket, Prefix=path, Delimiter="/"
+        )
 
         items = []
         for page in pages:
@@ -142,7 +201,14 @@ class Model:
                 if key == path:
                     continue
                 filename = key.split("/")[-1]
-                items.append(Item(filename, FSObjectType.FILE, obj["LastModified"], obj["Size"]))
+                items.append(
+                    Item(
+                        filename,
+                        FSObjectType.FILE,
+                        obj["LastModified"],
+                        obj["Size"],
+                    )
+                )
         return items
 
     def download_file(self, key: str, local_name: str, folder_path: str, progress_cb=None):
@@ -241,6 +307,9 @@ class Model:
         )
 
     def check_bucket(self):
+        """
+        Check that the currently set self.bucket exists.
+        """
         try:
             res = self.client.list_buckets()
             for b in res.get("Buckets", []):
@@ -254,6 +323,10 @@ class Model:
         return False, reason
 
     def check_profile(self):
+        """
+        Old 'upload/delete test object' check. This assumes self.bucket is set.
+        We'll still keep it for edit/check-profile dialog.
+        """
         res_c = res_d = False
         reason = None
         key = str(uuid.uuid4())
