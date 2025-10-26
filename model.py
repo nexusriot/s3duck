@@ -78,15 +78,15 @@ class Model:
         self.region_name = region_name
         self.access_key = access_key
         self.secret_key = secret_key
-        self.bucket = bucket or ""  # may now start empty (bucket-list mode)
+        self.bucket = bucket or ""  # may be empty in bucket-list mode
         self.no_ssl_check = no_ssl_check
         self.use_path = use_path
         self.timeout = timeout
         self.retries = retries
 
-        # Smaller chunks -> more frequent callbacks -> smoother progress
+        # Smaller chunks -> smoother progress feedback
         self.transfer_cfg = TransferConfig(
-            multipart_threshold=8 * 1024 * 1024,   # start multipart at 8MB
+            multipart_threshold=8 * 1024 * 1024,   # 8MB
             multipart_chunksize=1 * 1024 * 1024,   # 1MB parts
             io_chunksize=256 * 1024,               # 256KB read size
             max_concurrency=4,
@@ -147,7 +147,7 @@ class Model:
         After this call:
           - self.bucket = bucket_name
           - self.region_name = bucket's region (best effort)
-          - self._client is reset so next .client() is fresh
+          - self._client is reset so next .client is fresh
           - navigation state reset to bucket root
         """
         self.bucket = bucket_name
@@ -155,8 +155,7 @@ class Model:
         try:
             region = self.get_bucket_region(bucket_name)
         except Exception:
-            # fallback: if region lookup fails (MinIO/non-AWS),
-            # keep whatever region_name we already had
+            # fallback: keep whatever region_name we already had
             region = self.region_name
 
         self.region_name = region
@@ -166,14 +165,61 @@ class Model:
 
     def list_buckets(self):
         """
-        Top-level "root view": return all buckets visible to creds.
-        Each result is an Item(...) with type_ = FSObjectType.BUCKET.
+        Return all buckets visible to the credentials.
         """
         resp = self.client.list_buckets()
         items = []
         for b in resp.get("Buckets", []):
             items.append(Item(b["Name"], FSObjectType.BUCKET, "", 0))
         return items
+
+    def create_bucket(self, bucket_name: str):
+        """
+        Create a new bucket.
+        We'll try to put it in self.region_name if that's set.
+        For AWS S3:
+          - us-east-1 is special: you cannot/should not pass LocationConstraint.
+        For MinIO/Ceph: usually any name just works with no LocationConstraint.
+        """
+        params = {"Bucket": bucket_name}
+
+        # try to include region unless it's the classic us-east-1 case
+        region = self.region_name or "us-east-1"
+        if region and region != "us-east-1":
+            params["CreateBucketConfiguration"] = {
+                "LocationConstraint": region
+            }
+
+        self.client.create_bucket(**params)
+
+    def delete_bucket(self, bucket_name: str):
+        """
+        Delete a bucket.
+        S3 requires the bucket to be empty.
+        We enforce that here: if not empty, raise an Exception.
+        """
+        # Check emptiness
+        paginator = self.client.get_paginator("list_objects_v2")
+        pages = paginator.paginate(Bucket=bucket_name, Prefix="", Delimiter="/")
+        for page in pages:
+            # if any Contents exist (non-empty)
+            if page.get("Contents"):
+                raise Exception(
+                    f"Bucket '{bucket_name}' is not empty. Please empty it first."
+                )
+            # if any CommonPrefixes exist, also not empty
+            if page.get("CommonPrefixes"):
+                raise Exception(
+                    f"Bucket '{bucket_name}' is not empty. Please empty it first."
+                )
+
+        # If we're currently "in" that bucket, reset view
+        if self.bucket == bucket_name:
+            self.bucket = ""
+            self.current_folder = ""
+            self.prev_folder = ""
+
+        self.client.delete_bucket(Bucket=bucket_name)
 
     def list(self, fld):
         """
@@ -216,11 +262,8 @@ class Model:
         Download a single file or a whole prefix.
         - If local_name is truthy: download a single object to local_name.
         - Else: treat 'key' as a folder prefix and download whole tree into folder_path.
-
-        progress_cb(total_bytes:int, downloaded_bytes:int, key:str) -> None
         """
         if not local_name:
-            # Preserve the top-level folder: create base_dir/<folder> then put contents inside
             prefix = key if key.endswith("/") else key + "/"
             base_name = os.path.basename(prefix.rstrip("/"))
             base_dir = os.path.join(folder_path, base_name)
@@ -228,7 +271,7 @@ class Model:
 
             for k, size in self.get_keys(prefix):
                 rel = os.path.relpath(k, prefix)
-                if rel == ".":  # placeholder object exactly equal to prefix
+                if rel == ".":
                     continue
                 out_path = os.path.join(base_dir, rel)
                 if k.endswith("/"):
@@ -243,7 +286,6 @@ class Model:
                     Config=self.transfer_cfg,
                 )
         else:
-            # Single file
             size = None
             try:
                 head = self.client.head_object(Bucket=self.bucket, Key=key)
@@ -286,8 +328,6 @@ class Model:
     def upload_file(self, local_file, key, progress_cb=None):
         """
         Upload a file (with progress) or create a folder placeholder if local_file is None.
-
-        progress_cb(total_bytes:int, uploaded_bytes:int, key:str) -> None
         """
         if local_file is None:
             self.create_folder("%s/" % key)
@@ -308,7 +348,7 @@ class Model:
 
     def check_bucket(self):
         """
-        Check that the currently set self.bucket exists.
+        Validate that self.bucket currently exists.
         """
         try:
             res = self.client.list_buckets()
@@ -324,8 +364,7 @@ class Model:
 
     def check_profile(self):
         """
-        Old 'upload/delete test object' check. This assumes self.bucket is set.
-        We'll still keep it for edit/check-profile dialog.
+        Old profile check: write/delete a temp key in self.bucket.
         """
         res_c = res_d = False
         reason = None
@@ -342,7 +381,6 @@ class Model:
         return bool(res_c) and res_d, reason
 
     def get_size(self, key):
-        # Sum sizes across full pagination
         total = 0
         for k, s in self.get_keys(key):
             if not k.endswith("/"):

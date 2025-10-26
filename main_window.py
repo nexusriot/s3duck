@@ -14,7 +14,7 @@ from properties_window import PropertiesWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.1.4"
+__VERSION__ = "0.1.4 preview"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -152,7 +152,7 @@ class UpTopProxyModel(QSortFilterProxyModel):
         return getattr(item, "t", None)
 
     def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
-        # ----- 1) Keep [..] on top regardless of order -----
+        # 1) Keep [..] on top regardless of order
         left_is_up = self._is_up_row(left)
         right_is_up = self._is_up_row(right)
         if left_is_up != right_is_up:
@@ -161,7 +161,7 @@ class UpTopProxyModel(QSortFilterProxyModel):
             else:
                 return not left_is_up and right_is_up
 
-        # ----- 2) Type priority: BUCKET < FOLDER < FILE -----
+        # 2) Type priority: BUCKET < FOLDER < FILE
         lt = self._item_type(left)
         rt = self._item_type(right)
 
@@ -180,7 +180,7 @@ class UpTopProxyModel(QSortFilterProxyModel):
             if rl != rr:
                 return rl < rr
 
-        # ----- 3) Column-based compare -----
+        # 3) Column-based compare
         col = left.column()
         ld = left.data()
         rd = right.data()
@@ -188,7 +188,7 @@ class UpTopProxyModel(QSortFilterProxyModel):
         if col == 0:  # Name
             return str(ld).lower() < str(rd).lower()
 
-        if col == 1:  # Size (numeric; tie-break by name)
+        if col == 1:  # Size
             try:
                 ln = int(ld)
             except Exception:
@@ -431,6 +431,10 @@ class MainWindow(QMainWindow):
         # -------------------------------------------
 
         # Initial populate
+        self.thread = None
+        self.worker = None
+        self.map = dict()
+        self.menu = QMenu()
         self.navigate()
 
         self.listview.header().setSortIndicatorShown(True)
@@ -443,16 +447,13 @@ class MainWindow(QMainWindow):
         self.listview.setDragDropMode(QAbstractItemView.DragDrop)
         self.listview.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.listview.setIndentation(10)
-        self.thread = None
-        self.worker = None
-        self.map = dict()
+
         self.setWindowIcon(
             QIcon(os.path.join(self.current_dir, "resources", "ducky.ico"))
         )
         self.listview.installEventFilter(self)
         self.restoreSettings()
         self.select_first()
-        self.menu = QMenu()
 
         self.listview.doubleClicked.connect(self.list_doubleClicked)
 
@@ -543,65 +544,27 @@ class MainWindow(QMainWindow):
                 )
         return None, None, None
 
-    # ====== events ======
+    # ====== context menu / events ======
     def eventFilter(self, obj, event):
         if obj == self.listview:
+            # Right-click menu
             if event.type() == QEvent.ContextMenu and obj is self.listview:
-                upload_selected_action = delete_action = download_action = properties_selected_action = QObject()
                 ixs = self.listview.selectedIndexes()
                 m, name, upload_path = self.name_by_first_ix(ixs)
                 up_selected = m is not None and m.text() == UP_ENTRY_LABEL
-
                 bucket_list_mode = self.in_bucket_list_mode()
 
+                # In bucket-list mode, upload_path doesn't make sense.
                 if upload_path is None or up_selected:
                     upload_path = self.data_model.current_folder
 
+                # clear old menu
                 self.menu.clear()
 
-                if not bucket_list_mode:
-                    if (
-                        name
-                        and m
-                        and m.t == FSObjectType.FOLDER
-                        and not up_selected
-                    ):
-                        upload_selected_action = QAction(
-                            QIcon.fromTheme(
-                                "network-server",
-                                QIcon(
-                                    os.path.join(
-                                        self.current_dir,
-                                        "icons",
-                                        "file_upload_24px.svg",
-                                    )
-                                ),
-                            ),
-                            "Upload -> %s" % upload_path,
-                        )
-                        self.menu.addAction(upload_selected_action)
-
-                    upload_current_action = QAction(
-                        QIcon.fromTheme(
-                            "network-server",
-                            QIcon(
-                                os.path.join(
-                                    self.current_dir,
-                                    "icons",
-                                    "file_upload_24px.svg",
-                                )
-                            ),
-                        ),
-                        "Upload -> %s"
-                        % (
-                            "/"
-                            if not self.data_model.current_folder
-                            else self.data_model.current_folder
-                        ),
-                    )
-                    self.menu.addAction(upload_current_action)
-
-                    create_folder_action = QAction(
+                # ----- bucket list mode menu -----
+                if bucket_list_mode:
+                    # actions we support at root:
+                    act_new_bucket = QAction(
                         QIcon.fromTheme(
                             "folder-new",
                             QIcon(
@@ -612,26 +575,13 @@ class MainWindow(QMainWindow):
                                 )
                             ),
                         ),
-                        "Create folder",
+                        "Create bucket…",
                     )
-                    self.menu.addAction(create_folder_action)
+                    self.menu.addAction(act_new_bucket)
 
-                    if ixs and not up_selected:
-                        download_action = QAction(
-                            QIcon.fromTheme(
-                                "emblem-downloads",
-                                QIcon(
-                                    os.path.join(
-                                        self.current_dir,
-                                        "icons",
-                                        "download_24px.svg",
-                                    )
-                                ),
-                            ),
-                            "Download",
-                        )
-                        self.menu.addAction(download_action)
-                        delete_action = QAction(
+                    act_del_bucket = None
+                    if ixs and m and m.t == FSObjectType.BUCKET:
+                        act_del_bucket = QAction(
                             QIcon.fromTheme(
                                 "edit-delete",
                                 QIcon(
@@ -642,16 +592,124 @@ class MainWindow(QMainWindow):
                                     )
                                 ),
                             ),
-                            "Delete",
+                            "Delete bucket…",
                         )
-                        self.menu.addAction(delete_action)
+                        self.menu.addAction(act_del_bucket)
 
+                    clk = self.menu.exec_(event.globalPos())
+
+                    if clk == act_new_bucket:
+                        self.new_bucket()
+                    if act_del_bucket and clk == act_del_bucket:
+                        # delete selected bucket(s)
+                        self.delete_bucket_ui()
+
+                    return True  # handled
+
+                # ----- inside a bucket menu -----
+                upload_selected_action = None
+                upload_current_action = None
+                create_folder_action = None
+                download_action = None
+                delete_action = None
+                properties_selected_action = None
+
+                # Upload -> selected folder
+                if (
+                    m
+                    and m.t == FSObjectType.FOLDER
+                    and not up_selected
+                ):
+                    upload_selected_action = QAction(
+                        QIcon.fromTheme(
+                            "network-server",
+                            QIcon(
+                                os.path.join(
+                                    self.current_dir,
+                                    "icons",
+                                    "file_upload_24px.svg",
+                                )
+                            ),
+                        ),
+                        "Upload -> %s" % upload_path,
+                    )
+                    self.menu.addAction(upload_selected_action)
+
+                # Upload -> current folder
+                upload_current_action = QAction(
+                    QIcon.fromTheme(
+                        "network-server",
+                        QIcon(
+                            os.path.join(
+                                self.current_dir,
+                                "icons",
+                                "file_upload_24px.svg",
+                            )
+                        ),
+                    ),
+                    "Upload -> %s"
+                    % (
+                        "/"
+                        if not self.data_model.current_folder
+                        else self.data_model.current_folder
+                    ),
+                )
+                self.menu.addAction(upload_current_action)
+
+                # Create folder
+                create_folder_action = QAction(
+                    QIcon.fromTheme(
+                        "folder-new",
+                        QIcon(
+                            os.path.join(
+                                self.current_dir,
+                                "icons",
+                                "create_new_folder_24px.svg",
+                            )
+                        ),
+                    ),
+                    "Create folder",
+                )
+                self.menu.addAction(create_folder_action)
+
+                # Download / Delete (if something selected and not [..])
+                if ixs and not up_selected:
+                    download_action = QAction(
+                        QIcon.fromTheme(
+                            "emblem-downloads",
+                            QIcon(
+                                os.path.join(
+                                    self.current_dir,
+                                    "icons",
+                                    "download_24px.svg",
+                                )
+                            ),
+                        ),
+                        "Download",
+                    )
+                    self.menu.addAction(download_action)
+
+                    delete_action = QAction(
+                        QIcon.fromTheme(
+                            "edit-delete",
+                            QIcon(
+                                os.path.join(
+                                    self.current_dir,
+                                    "icons",
+                                    "delete_24px.svg",
+                                )
+                            ),
+                        ),
+                        "Delete",
+                    )
+                    self.menu.addAction(delete_action)
+
+                # Properties (for a real object/folder, not [..])
                 m2, name2, key = self.name_by_first_ix(ixs)
                 if not key:
                     key = self.data_model.current_folder
                 if (
-                    not bucket_list_mode
-                    and name2
+                    name2
                     and m2
                     and m2.text() != UP_ENTRY_LABEL
                 ):
@@ -670,20 +728,25 @@ class MainWindow(QMainWindow):
                     )
                     self.menu.addAction(properties_selected_action)
 
+                # Execute and handle
                 clk = self.menu.exec_(event.globalPos())
+
                 if clk == upload_selected_action:
                     self.upload(upload_path)
-                if not bucket_list_mode and clk == upload_current_action:
+                elif clk == upload_current_action:
                     self.upload()
-                if clk == delete_action:
-                    self.delete()
-                if clk == download_action:
-                    self.download()
-                if clk == create_folder_action:
+                elif clk == create_folder_action:
                     self.new_folder()
-                if clk == properties_selected_action:
+                elif clk == download_action:
+                    self.download()
+                elif clk == delete_action:
+                    self.delete()
+                elif clk == properties_selected_action:
                     self.properties(self.data_model, key)
 
+                return True  # handled
+
+            # Keyboard shortcuts
             if event.type() == QEvent.KeyPress:
                 if event.key() == Qt.Key_Return:
                     current = self.listview.currentIndex()
@@ -691,20 +754,26 @@ class MainWindow(QMainWindow):
                         self.list_doubleClicked(current)
                     return True
                 if event.key() == Qt.Key_Delete:
-                    self.delete()
+                    if self.in_bucket_list_mode():
+                        self.delete_bucket_ui()
+                    else:
+                        self.delete()
                 if event.key() == Qt.Key_Backspace:
                     self.goUp()
                 if event.key() in [Qt.Key_Insert, Qt.Key_C]:
-                    self.new_folder()
+                    if self.in_bucket_list_mode():
+                        self.new_bucket()
+                    else:
+                        self.new_folder()
                 if event.key() == Qt.Key_B:
                     self.goBack()
                 if event.key() in [Qt.Key_H, Qt.Key_Home]:
                     self.goHome()
                 if event.key() == Qt.Key_F1:
                     self.about()
-                if event.key() == Qt.Key_U:
+                if event.key() == Qt.Key_U and not self.in_bucket_list_mode():
                     self.upload()
-                if event.key() == Qt.Key_D:
+                if event.key() == Qt.Key_D and not self.in_bucket_list_mode():
                     self.download()
         return super().eventFilter(obj, event)
 
@@ -889,26 +958,25 @@ class MainWindow(QMainWindow):
         m = ix_src.model().itemFromIndex(ix_src)
         name = m.text()
 
-        # If we clicked a BUCKET in bucket-list mode:
+        # Enter bucket
         if m.t == FSObjectType.BUCKET:
-            # rebind client/region for this bucket
             self.data_model.refresh_client_for_bucket(name)
             self.navigate()
             return
 
-        # Special [..] entry
+        # Special [..]
         if m.t == FSObjectType.FOLDER and name == UP_ENTRY_LABEL:
             if self.data_model.current_folder:
                 self.goUp()
             else:
-                # at root of bucket -> go back to bucket list mode
+                # root of bucket -> go back to bucket list
                 self.data_model.bucket = ""
                 self.data_model.current_folder = ""
                 self.data_model.prev_folder = ""
                 self.navigate()
             return
 
-        # Normal folder navigation
+        # Folder navigation
         if m.t == FSObjectType.FOLDER:
             self.map[self.data_model.current_folder] = name
             self.change_current_folder(
@@ -1027,9 +1095,80 @@ class MainWindow(QMainWindow):
             if ix:
                 self.listview.setCurrentIndex(ix)
 
+    def new_bucket(self):
+        # ask user for bucket name
+        bucket_name, ok = QInputDialog.getText(
+            self, "Create bucket", "Bucket name"
+        )
+        bucket_name = bucket_name.strip()
+        if not ok or not bucket_name:
+            return
+        try:
+            self.data_model.create_bucket(bucket_name)
+            self.log(f"Created bucket {bucket_name}")
+            # refresh bucket list
+            self.navigate()
+            # try to select it
+            ix = self.ix_by_name(bucket_name)
+            if ix:
+                self.listview.setCurrentIndex(ix)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Create bucket failed",
+                f"Cannot create bucket '{bucket_name}': {exc}",
+            )
+
+    def delete_bucket_ui(self):
+        # collect selected bucket names
+        if not self.in_bucket_list_mode():
+            return
+        bucket_names = []
+        for ix in self.listview.selectionModel().selectedIndexes():
+            if ix.column() != 0:
+                continue
+            ix_src = self.proxy.mapToSource(ix)
+            m = ix_src.model().itemFromIndex(ix_src)
+            if m.t == FSObjectType.BUCKET:
+                bucket_names.append(m.text())
+
+        if not bucket_names:
+            return
+
+        qm = QMessageBox
+        ret = qm.question(
+            self,
+            "",
+            "Are you sure to delete bucket(s): %s ?\n\nNote: bucket must be EMPTY."
+            % ", ".join(bucket_names),
+            qm.Yes | qm.No,
+        )
+        if ret != qm.Yes:
+            return
+
+        errors = []
+        for bname in bucket_names:
+            try:
+                self.data_model.delete_bucket(bname)
+                self.log(f"Deleted bucket {bname}")
+            except Exception as exc:
+                errors.append(f"{bname}: {exc}")
+
+        self.navigate()
+
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Delete bucket issues",
+                "Some buckets could not be deleted:\n\n" + "\n".join(errors),
+            )
+
     def delete(self):
         if self.in_bucket_list_mode():
+            # in bucket-list mode, this should delegate to delete_bucket_ui
+            self.delete_bucket_ui()
             return
+
         names = []
         job = []
         for ix in self.listview.selectionModel().selectedIndexes():
@@ -1049,8 +1188,7 @@ class MainWindow(QMainWindow):
             ret = qm.question(
                 self,
                 "",
-                "Are you sure to delete objects : %s ?"
-                % ",".join(names),
+                "Are you sure to delete objects : %s ?" % ",".join(names),
                 qm.Yes | qm.No,
             )
             if ret == qm.Yes:
@@ -1079,10 +1217,12 @@ class MainWindow(QMainWindow):
 
     def enable_action_buttons(self):
         at_root = self.in_bucket_list_mode()
+        # Toolbar currently maps to "inside bucket" actions,
+        # so disable most of them at root.
         self.btnCreateFolder.setEnabled(not at_root)
         self.btnUpload.setEnabled(not at_root)
         self.btnDownload.setEnabled(not at_root)
-        self.btnRemove.setEnabled(not at_root)
+        self.btnRemove.setEnabled(True)  # we want Delete to work for buckets too
         self.menu.setEnabled(True)
 
     def disable_action_buttons(self):
