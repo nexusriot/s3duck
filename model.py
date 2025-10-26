@@ -72,15 +72,19 @@ class Model:
     ):
         self.session = boto3.session.Session()
         self._client = None
+
+        # navigation state
         self.current_folder = ""
         self.prev_folder = ""
+
+        # connection state
         self.endpoint_url = endpoint_url
         self.region_name = region_name
         self.access_key = access_key
         self.secret_key = secret_key
-        self.bucket = bucket or ""  # may be empty in bucket-list mode
+        self.bucket = bucket or ""  # may be empty (bucket list mode)
         self.no_ssl_check = no_ssl_check
-        self.use_path = use_path
+        self.use_path = use_path  # True -> path-style, False -> virtual-host style
         self.timeout = timeout
         self.retries = retries
 
@@ -97,35 +101,52 @@ class Model:
     def get_os_family():
         return platform.system()
 
+    def _make_client(
+        self,
+        *,
+        endpoint_url=None,
+        region=None,
+        use_path=None,
+    ):
+        """
+        Build (but do NOT cache) a boto3 S3 client using provided overrides
+        or current object state.
+        """
+        endpoint_url = endpoint_url if endpoint_url is not None else self.endpoint_url
+        region = region if region is not None else self.region_name
+        use_path = self.use_path if use_path is None else use_path
+
+        params = {
+            "endpoint_url": endpoint_url,
+            "aws_access_key_id": self.access_key,
+            "aws_secret_access_key": self.secret_key,
+        }
+        if region:
+            params.update({"region_name": region})
+
+        s3_config = (
+            {"addressing_style": "virtual"}
+            if not use_path
+            else {"addressing_style": "path"}
+        )
+        if self.no_ssl_check:
+            params.update({"verify": False})
+
+        params.update(
+            {
+                "config": botocore.config.Config(
+                    s3=s3_config,
+                    connect_timeout=self.timeout,
+                    retries={"max_attempts": self.retries},
+                ),
+            }
+        )
+        return self.session.client("s3", **params)
+
     @property
     def client(self):
         if self._client is None:
-            params = {
-                "endpoint_url": self.endpoint_url,
-                "aws_access_key_id": self.access_key,
-                "aws_secret_access_key": self.secret_key,
-            }
-            if self.region_name:
-                params.update({"region_name": self.region_name})
-
-            s3_config = (
-                {"addressing_style": "virtual"}
-                if not self.use_path
-                else {"addressing_style": "path"}
-            )
-            if self.no_ssl_check:
-                params.update({"verify": False})
-
-            params.update(
-                {
-                    "config": botocore.config.Config(
-                        s3=s3_config,
-                        connect_timeout=self.timeout,
-                        retries={"max_attempts": self.retries},
-                    ),
-                }
-            )
-            self._client = self.session.client("s3", **params)
+            self._client = self._make_client()
         return self._client
 
     def get_bucket_region(self, bucket_name: str):
@@ -141,25 +162,116 @@ class Model:
             loc = "us-east-1"
         return loc
 
+    def _try_bind_bucket(self, bucket_name: str):
+        """
+        Internal helper:
+        Try different combinations (region, endpoint suggestion, path/virtual style)
+        until ListObjectsV2 works on this bucket.
+
+        This solves 'PermanentRedirect' / wrong endpoint.
+        """
+        # Step 1. get region if possible
+        try:
+            region_guess = self.get_bucket_region(bucket_name)
+        except Exception:
+            # maybe MinIO / custom; keep current region
+            region_guess = self.region_name or "us-east-1"
+
+        # We'll attempt up to 3 strategies:
+        # (A) current endpoint_url, current use_path
+        # (B) same endpoint_url, flipped use_path
+        # (C) if we get a PermanentRedirect with Endpoint in the error -> retry that endpoint (both styles)
+
+        def can_list(c, endpoint_override=None):
+            """
+            Try to list a single page to validate this client for this bucket.
+            Returns (ok:bool, permanent_redirect_endpoint:str|None, error:Exception|None)
+            """
+            paginator = c.get_paginator("list_objects_v2")
+            try:
+                # just attempt first page iterator consumption
+                iterator = paginator.paginate(
+                    Bucket=bucket_name,
+                    Prefix="",
+                    Delimiter="/",
+                    PaginationConfig={"MaxItems": 1},
+                )
+                for _ in iterator:
+                    break
+                return True, None, None
+            except botocore.exceptions.ClientError as exc:
+                # look for PermanentRedirect
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code == "PermanentRedirect":
+                    ep = exc.response.get("Error", {}).get("Endpoint")
+                    return False, ep, exc
+                return False, None, exc
+            except Exception as exc:
+                return False, None, exc
+
+        # A) try current endpoint + current style
+        cA = self._make_client(endpoint_url=self.endpoint_url,
+                               region=region_guess,
+                               use_path=self.use_path)
+        ok, ep_hint, err = can_list(cA)
+        if ok:
+            return (cA, self.endpoint_url, region_guess, self.use_path)
+
+        # B) try current endpoint + flipped style
+        cB = self._make_client(endpoint_url=self.endpoint_url,
+                               region=region_guess,
+                               use_path=(not self.use_path))
+        ok, ep_hint2, err2 = can_list(cB)
+        if ok:
+            return (cB, self.endpoint_url, region_guess, not self.use_path)
+
+        # C) If either error gave us an Endpoint hint, try it.
+        endpoint_candidates = []
+        if ep_hint:
+            endpoint_candidates.append(ep_hint)
+        if ep_hint2 and ep_hint2 not in endpoint_candidates:
+            endpoint_candidates.append(ep_hint2)
+
+        for ep_raw in endpoint_candidates:
+            # We don't know if ep_raw has scheme or not.
+            # If it's just "bucket.s3-region.amazonaws.com", prepend https://
+            if "://" not in ep_raw:
+                endpoint_fixed = "https://" + ep_raw
+            else:
+                endpoint_fixed = ep_raw
+
+            # try hinted endpoint with both addressing styles
+            for style in (self.use_path, not self.use_path):
+                cGuess = self._make_client(
+                    endpoint_url=endpoint_fixed,
+                    region=region_guess,
+                    use_path=style,
+                )
+                ok3, _ep_ignore, _err3 = can_list(cGuess)
+                if ok3:
+                    return (cGuess, endpoint_fixed, region_guess, style)
+
+        # If all failed, just raise last error we saw
+        raise err2 if err2 else (err or Exception("Cannot access bucket"))
+
     def refresh_client_for_bucket(self, bucket_name: str):
         """
-        Switch active bucket, detect its region, and rebuild client.
-        After this call:
-          - self.bucket = bucket_name
-          - self.region_name = bucket's region (best effort)
-          - self._client is reset so next .client is fresh
-          - navigation state reset to bucket root
+        Switch active bucket, detect its region / endpoint / style,
+        rebuild stable client for future calls, and reset navigation.
         """
         self.bucket = bucket_name
 
-        try:
-            region = self.get_bucket_region(bucket_name)
-        except Exception:
-            # fallback: keep whatever region_name we already had
-            region = self.region_name
+        client_ok, new_endpoint, new_region, new_use_path = self._try_bind_bucket(
+            bucket_name
+        )
 
-        self.region_name = region
-        self._client = None  # force rebuild with new region
+        # lock in what worked
+        self.endpoint_url = new_endpoint
+        self.region_name = new_region
+        self.use_path = new_use_path
+        self._client = client_ok  # reuse the proven-good client
+
+        # reset navigation state
         self.current_folder = ""
         self.prev_folder = ""
 
@@ -179,11 +291,10 @@ class Model:
         We'll try to put it in self.region_name if that's set.
         For AWS S3:
           - us-east-1 is special: you cannot/should not pass LocationConstraint.
-        For MinIO/Ceph: usually any name just works with no LocationConstraint.
+        For MinIO/Ceph/etc: usually any name just works with no LocationConstraint.
         """
         params = {"Bucket": bucket_name}
 
-        # try to include region unless it's the classic us-east-1 case
         region = self.region_name or "us-east-1"
         if region and region != "us-east-1":
             params["CreateBucketConfiguration"] = {
@@ -196,24 +307,22 @@ class Model:
         """
         Delete a bucket.
         S3 requires the bucket to be empty.
-        We enforce that here: if not empty, raise an Exception.
+        We enforce that here: if not empty, raise.
         """
         # Check emptiness
         paginator = self.client.get_paginator("list_objects_v2")
         pages = paginator.paginate(Bucket=bucket_name, Prefix="", Delimiter="/")
         for page in pages:
-            # if any Contents exist (non-empty)
             if page.get("Contents"):
                 raise Exception(
                     f"Bucket '{bucket_name}' is not empty. Please empty it first."
                 )
-            # if any CommonPrefixes exist, also not empty
             if page.get("CommonPrefixes"):
                 raise Exception(
                     f"Bucket '{bucket_name}' is not empty. Please empty it first."
                 )
 
-        # If we're currently "in" that bucket, reset view
+        # If we're currently "in" that bucket, reset view first
         if self.bucket == bucket_name:
             self.bucket = ""
             self.current_folder = ""
@@ -260,8 +369,8 @@ class Model:
     def download_file(self, key: str, local_name: str, folder_path: str, progress_cb=None):
         """
         Download a single file or a whole prefix.
-        - If local_name is truthy: download a single object to local_name.
-        - Else: treat 'key' as a folder prefix and download whole tree into folder_path.
+        - If local_name is truthy: single object to local_name.
+        - Else: prefix -> recreate directory tree under folder_path.
         """
         if not local_name:
             prefix = key if key.endswith("/") else key + "/"

@@ -50,7 +50,6 @@ class Tree(QTreeView):
             event.ignore()
             return
         if event.mimeData().hasUrls:
-            # only allow drag/drop if we're actually inside a bucket
             if not self.parent.in_bucket_list_mode():
                 event.accept()
             else:
@@ -80,7 +79,6 @@ class Tree(QTreeView):
             return
 
         if self.parent.in_bucket_list_mode():
-            # can't upload at bucket list root
             event.ignore()
             return
 
@@ -136,7 +134,7 @@ class UpTopProxyModel(QSortFilterProxyModel):
     def __init__(self, up_label, parent=None):
         super().__init__(parent)
         self.up_label = up_label
-        self._order = Qt.AscendingOrder  # remember current sort order
+        self._order = Qt.AscendingOrder
 
     def sort(self, column, order=Qt.AscendingOrder):
         self._order = order
@@ -430,11 +428,13 @@ class MainWindow(QMainWindow):
         self.tBar.addAction(self.actCopyS3Path)
         # -------------------------------------------
 
-        # Initial populate
+        # runtime holders
         self.thread = None
         self.worker = None
         self.map = dict()
         self.menu = QMenu()
+
+        # initial populate
         self.navigate()
 
         self.listview.header().setSortIndicatorShown(True)
@@ -521,7 +521,7 @@ class MainWindow(QMainWindow):
         """
         Returns (item, display_name, full_key).
         For folders, append '/' except for UP_ENTRY_LABEL.
-        For buckets, full_key is the bucket itself.
+        For buckets, full_key is just the bucket name.
         """
         if ixs:
             ix = ixs[0]
@@ -547,23 +547,19 @@ class MainWindow(QMainWindow):
     # ====== context menu / events ======
     def eventFilter(self, obj, event):
         if obj == self.listview:
-            # Right-click menu
             if event.type() == QEvent.ContextMenu and obj is self.listview:
                 ixs = self.listview.selectedIndexes()
                 m, name, upload_path = self.name_by_first_ix(ixs)
                 up_selected = m is not None and m.text() == UP_ENTRY_LABEL
                 bucket_list_mode = self.in_bucket_list_mode()
 
-                # In bucket-list mode, upload_path doesn't make sense.
                 if upload_path is None or up_selected:
                     upload_path = self.data_model.current_folder
 
-                # clear old menu
                 self.menu.clear()
 
-                # ----- bucket list mode menu -----
+                # bucket list mode menu
                 if bucket_list_mode:
-                    # actions we support at root:
                     act_new_bucket = QAction(
                         QIcon.fromTheme(
                             "folder-new",
@@ -601,12 +597,11 @@ class MainWindow(QMainWindow):
                     if clk == act_new_bucket:
                         self.new_bucket()
                     if act_del_bucket and clk == act_del_bucket:
-                        # delete selected bucket(s)
                         self.delete_bucket_ui()
 
-                    return True  # handled
+                    return True
 
-                # ----- inside a bucket menu -----
+                # inside bucket menu
                 upload_selected_action = None
                 upload_current_action = None
                 create_folder_action = None
@@ -614,7 +609,6 @@ class MainWindow(QMainWindow):
                 delete_action = None
                 properties_selected_action = None
 
-                # Upload -> selected folder
                 if (
                     m
                     and m.t == FSObjectType.FOLDER
@@ -635,7 +629,6 @@ class MainWindow(QMainWindow):
                     )
                     self.menu.addAction(upload_selected_action)
 
-                # Upload -> current folder
                 upload_current_action = QAction(
                     QIcon.fromTheme(
                         "network-server",
@@ -656,7 +649,6 @@ class MainWindow(QMainWindow):
                 )
                 self.menu.addAction(upload_current_action)
 
-                # Create folder
                 create_folder_action = QAction(
                     QIcon.fromTheme(
                         "folder-new",
@@ -672,7 +664,6 @@ class MainWindow(QMainWindow):
                 )
                 self.menu.addAction(create_folder_action)
 
-                # Download / Delete (if something selected and not [..])
                 if ixs and not up_selected:
                     download_action = QAction(
                         QIcon.fromTheme(
@@ -704,7 +695,6 @@ class MainWindow(QMainWindow):
                     )
                     self.menu.addAction(delete_action)
 
-                # Properties (for a real object/folder, not [..])
                 m2, name2, key = self.name_by_first_ix(ixs)
                 if not key:
                     key = self.data_model.current_folder
@@ -728,7 +718,6 @@ class MainWindow(QMainWindow):
                     )
                     self.menu.addAction(properties_selected_action)
 
-                # Execute and handle
                 clk = self.menu.exec_(event.globalPos())
 
                 if clk == upload_selected_action:
@@ -744,9 +733,8 @@ class MainWindow(QMainWindow):
                 elif clk == properties_selected_action:
                     self.properties(self.data_model, key)
 
-                return True  # handled
+                return True
 
-            # Keyboard shortcuts
             if event.type() == QEvent.KeyPress:
                 if event.key() == Qt.Key_Return:
                     current = self.listview.currentIndex()
@@ -836,7 +824,7 @@ class MainWindow(QMainWindow):
     def modelToListView(self, model_result):
         """
         Populate the view for objects inside a selected bucket.
-        We inject '[..]' at the top so you can go "up".
+        We inject '[..]' at the top so you can go up/back.
         """
         self.model.setRowCount(0)
 
@@ -914,8 +902,10 @@ class MainWindow(QMainWindow):
                 0,
             )
             self.update_s3_path_label()
+            self.enable_action_buttons()
             return
 
+        # we're in a bucket:
         self.modelToListView(
             self.data_model.list(self.data_model.current_folder)
         )
@@ -935,6 +925,7 @@ class MainWindow(QMainWindow):
             0,
         )
         self.update_s3_path_label()
+        self.enable_action_buttons()
 
         if restore_last_index and self.data_model.prev_folder:
             name = self.map.get(self.data_model.current_folder)
@@ -960,7 +951,15 @@ class MainWindow(QMainWindow):
 
         # Enter bucket
         if m.t == FSObjectType.BUCKET:
-            self.data_model.refresh_client_for_bucket(name)
+            try:
+                self.data_model.refresh_client_for_bucket(name)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Open bucket failed",
+                    f"Cannot open bucket '{name}': {exc}",
+                )
+                return
             self.navigate()
             return
 
@@ -1096,7 +1095,6 @@ class MainWindow(QMainWindow):
                 self.listview.setCurrentIndex(ix)
 
     def new_bucket(self):
-        # ask user for bucket name
         bucket_name, ok = QInputDialog.getText(
             self, "Create bucket", "Bucket name"
         )
@@ -1106,9 +1104,7 @@ class MainWindow(QMainWindow):
         try:
             self.data_model.create_bucket(bucket_name)
             self.log(f"Created bucket {bucket_name}")
-            # refresh bucket list
             self.navigate()
-            # try to select it
             ix = self.ix_by_name(bucket_name)
             if ix:
                 self.listview.setCurrentIndex(ix)
@@ -1120,7 +1116,6 @@ class MainWindow(QMainWindow):
             )
 
     def delete_bucket_ui(self):
-        # collect selected bucket names
         if not self.in_bucket_list_mode():
             return
         bucket_names = []
@@ -1165,7 +1160,6 @@ class MainWindow(QMainWindow):
 
     def delete(self):
         if self.in_bucket_list_mode():
-            # in bucket-list mode, this should delegate to delete_bucket_ui
             self.delete_bucket_ui()
             return
 
@@ -1215,14 +1209,29 @@ class MainWindow(QMainWindow):
             job.append((key, name))
         self.assign_thread_operation("upload", job)
 
+    # ---- toolbar wrappers so buttons work in both modes ----
+    def on_toolbar_create(self):
+        if self.in_bucket_list_mode():
+            self.new_bucket()
+        else:
+            self.new_folder()
+
+    def on_toolbar_delete(self):
+        if self.in_bucket_list_mode():
+            self.delete_bucket_ui()
+        else:
+            self.delete()
+
     def enable_action_buttons(self):
         at_root = self.in_bucket_list_mode()
-        # Toolbar currently maps to "inside bucket" actions,
-        # so disable most of them at root.
-        self.btnCreateFolder.setEnabled(not at_root)
+        # In bucket list mode we want:
+        # - Create (bucket) enabled
+        # - Delete (bucket) enabled
+        # - Upload / Download disabled
+        self.btnCreateFolder.setEnabled(True)  # create bucket OR create folder
+        self.btnRemove.setEnabled(True)        # delete bucket OR delete object
         self.btnUpload.setEnabled(not at_root)
         self.btnDownload.setEnabled(not at_root)
-        self.btnRemove.setEnabled(True)  # we want Delete to work for buckets too
         self.menu.setEnabled(True)
 
     def disable_action_buttons(self):
@@ -1338,8 +1347,9 @@ class MainWindow(QMainWindow):
                     )
                 ),
             ),
-            "Create folder(Insert, C)",
-            triggered=self.new_folder,
+            # dynamic: create bucket (root) OR create folder (inside bucket)
+            "Create (Insert, C)",
+            triggered=self.on_toolbar_create,
         )
         self.btnRemove = QAction(
             QIcon.fromTheme(
@@ -1350,8 +1360,9 @@ class MainWindow(QMainWindow):
                     )
                 ),
             ),
+            # dynamic: delete bucket(s) or delete object(s)
             "Delete(Delete)",
-            triggered=self.delete,
+            triggered=self.on_toolbar_delete,
         )
         self.btnRefresh = QAction(
             QIcon.fromTheme(
