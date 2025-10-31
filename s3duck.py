@@ -9,6 +9,7 @@ from PyQt5.QtGui import QIcon
 from cryptography.fernet import Fernet
 from PyQt5 import QtCore
 from PyQt5.QtCore import *
+from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QListWidget,
     QPushButton,
@@ -131,7 +132,9 @@ class Profiles(QDialog):
         self.show()
 
     def select_last(self):
-        index = self.listWidget.model().index(self.listWidget.count() - 1, 0)
+        index = self.listWidget.model().index(
+            self.listWidget.count() - 1, 0
+        )
         self.listWidget.setCurrentIndex(index)
 
     def copy_profile(self):
@@ -145,6 +148,10 @@ class Profiles(QDialog):
         self.select_last()
 
     def check_profile(self):
+        """
+        Keep old behavior:
+        still checks a specific bucket configured on this profile.
+        """
         index = self.listWidget.selectionModel().currentIndex()
         elem = index.row()
         item = self.items[elem]
@@ -174,7 +181,10 @@ class Profiles(QDialog):
         msgBox.exec()
 
     def eventFilter(self, source, event):
-        if event.type() == QtCore.QEvent.ContextMenu and source is self.listWidget:
+        if (
+            event.type() == QtCore.QEvent.ContextMenu
+            and source is self.listWidget
+        ):
             copy_profile_action = (
                 delete_action
             ) = edit_profile_action = check_action = QObject()
@@ -183,7 +193,11 @@ class Profiles(QDialog):
             add_profile_action = QAction(
                 QIcon.fromTheme(
                     "list-add",
-                    QIcon(os.path.join(self.current_dir, "icons", "plus_24px.svg")),
+                    QIcon(
+                        os.path.join(
+                            self.current_dir, "icons", "plus_24px.svg"
+                        )
+                    ),
                 ),
                 "Add profile",
             )
@@ -192,21 +206,33 @@ class Profiles(QDialog):
                 copy_profile_action = QAction(
                     QIcon.fromTheme(
                         "edit-copy",
-                        QIcon(os.path.join(self.current_dir, "icons", "copy_24px.svg")),
+                        QIcon(
+                            os.path.join(
+                                self.current_dir, "icons", "copy_24px.svg"
+                            )
+                        ),
                     ),
                     "Copy profile",
                 )
                 edit_profile_action = QAction(
                     QIcon.fromTheme(
                         "edit-clear",
-                        QIcon(os.path.join(self.current_dir, "icons", "edit_24px.svg")),
+                        QIcon(
+                            os.path.join(
+                                self.current_dir, "icons", "edit_24px.svg"
+                            )
+                        ),
                     ),
                     "Edit profile",
                 )
                 check_action = QAction(
                     QIcon.fromTheme(
                         "applications-utilities",
-                        QIcon(os.path.join(self.current_dir, "icons", "ok_24px.svg")),
+                        QIcon(
+                            os.path.join(
+                                self.current_dir, "icons", "ok_24px.svg"
+                            )
+                        ),
                     ),
                     "Check profile",
                 )
@@ -214,7 +240,11 @@ class Profiles(QDialog):
                     QIcon.fromTheme(
                         "edit-delete",
                         QIcon(
-                            os.path.join(self.current_dir, "icons", "delete_24px.svg")
+                            os.path.join(
+                                self.current_dir,
+                                "icons",
+                                "delete_24px.svg",
+                            )
                         ),
                     ),
                     "Delete profile",
@@ -275,25 +305,35 @@ class Profiles(QDialog):
         no_ssl_check = str_to_bool(item.no_ssl_check)
         use_path = str_to_bool(item.use_path)
 
-        # try to get bucket
+        # Build DataModel with NO bucket initially.
         dm = DataModel(
             item.url,
             item.region,
             acc_key,
             secret_key,
-            item.bucket_name,
+            "",  # start with no active bucket -> we'll show bucket list
             no_ssl_check,
             use_path,
         )
-        res, reason = dm.check_bucket()
-        if res:
+
+        # Sanity check creds: try to list buckets
+        ok = False
+        reason = None
+        try:
+            dm.list_buckets()
+            ok = True
+        except Exception as exc:
+            reason = str(exc)
+
+        if ok:
+            # Pass empty bucket so MainWindow starts in bucket-list mode
             settings = (
                 self.current_dir,
                 self.settings,
                 item.name,
                 item.url,
                 item.region,
-                item.bucket_name,
+                "",  # no bucket selected at start
                 acc_key,
                 secret_key,
                 no_ssl_check,
@@ -308,7 +348,10 @@ class Profiles(QDialog):
             msgBox.setWindowTitle("Profile check")
             msgBox.setStandardButtons(QMessageBox.Ok)
             msgBox.setIcon(QMessageBox.Critical)
-            msgBox.setText("Check failed: %s" % reason)
+            if reason:
+                msgBox.setText("Cannot list buckets: %s" % reason)
+            else:
+                msgBox.setText("Cannot list buckets")
             msgBox.exec()
 
     def save_settings(self):
@@ -354,7 +397,6 @@ class Profiles(QDialog):
                 no_ssl_check,
                 use_path,
             ) = value
-            # encrypt access & secret key
             crypto = Crypto(key)
             enc_access_key = crypto.encrypt(access_key)
             enc_secret_key = crypto.encrypt(secret_key)
@@ -443,18 +485,30 @@ class Profiles(QDialog):
     @QtCore.pyqtSlot()
     def on_elements_changed(self):
         self.btnRun.setEnabled(
-            self.listWidget.count() > 0 and bool(self.listWidget.selectedIndexes())
+            self.listWidget.count() > 0
+            and bool(self.listWidget.selectedIndexes())
         )
         self.btnEdit.setEnabled(
-            self.listWidget.count() > 0 and bool(self.listWidget.selectedIndexes())
+            self.listWidget.count() > 0
+            and bool(self.listWidget.selectedIndexes())
         )
         self.btnDelete.setEnabled(
-            self.listWidget.count() > 0 and bool(self.listWidget.selectedIndexes())
+            self.listWidget.count() > 0
+            and bool(self.listWidget.selectedIndexes())
         )
 
 
 def main():
     app = QApplication(sys.argv)
+    # Cross-platform font with emoji fallback
+    font = QFont()
+    # prefer system UI font; then add family fallbacks
+    font.setFamilies([
+        "Segoe UI", "Noto Sans", "Helvetica Neue", "Cantarell", "Ubuntu", "San Francisco",
+        "Apple Color Emoji", "Noto Color Emoji", "Segoe UI Emoji"
+    ])
+    font.setPointSize(10)
+    app.setFont(font)
     icon = QIcon(os.path.join(get_current_dir(), "resources", "ducky.ico"))
     app.setWindowIcon(icon)
     profiles = Profiles()
