@@ -983,20 +983,22 @@ class MainWindow(QMainWindow):
                         "go-first",
                         QIcon(os.path.join(self.current_dir, "icons", "document_24px.svg")),
                     )
-                    size = str(i.size)
+                    size_val = int(i.size or 0)
+                    size = _human_bytes(size_val)
                     modified = str(i.modified)
                 else:
                     icon = QIcon().fromTheme(
                         "network-server",
                         QIcon(os.path.join(self.current_dir, "icons", "folder_24px.svg")),
                     )
+                    size_val = 0
                     size = "<DIR>"
                     modified = ""
                 self.model.appendRow(
                     [
-                        ListItem(size, i.type_, icon, i.name),
-                        ListItem(size, i.type_, size),
-                        ListItem(size, i.type_, modified),
+                        ListItem(size_val, i.type_, icon, i.name),
+                        ListItem(size_val, i.type_, size),
+                        ListItem(size_val, i.type_, modified),
                     ]
                 )
 
