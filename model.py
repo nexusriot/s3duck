@@ -709,3 +709,45 @@ class Model:
             return self.bucket_properties()
 
         return self.client.get_object(Bucket=self.bucket, Key=key)
+
+    def get_bucket_hints(self, bucket_name: str):
+        """
+        Best-effort hints when we fail to enter a bucket:
+        - Try HEAD Bucket with both addressing styles to sniff:
+          * x-amz-bucket-region from HTTP headers
+          * Error.Endpoint (some S3-compatible backends include this)
+        Returns: (region_hint:str|None, endpoint_hint:str|None)
+        """
+        region_hint = None
+        endpoint_hint = None
+
+        # try both addressing styles to maximize chances of getting headers back
+        for style in [self.use_path, not self.use_path]:
+            try:
+                c = self._make_client(use_path=style)
+                # This may succeed (rare) or throw ClientError (common on perms);
+                # both paths can give us headers.
+                try:
+                    c.head_bucket(Bucket=bucket_name)
+                    # If it actually succeeds, prefer the client's region
+                    region_hint = region_hint or (
+                                c.meta.region_name or self.region_name)
+                    break
+                except botocore.exceptions.ClientError as e:
+                    resp = e.response or {}
+                    headers = (resp.get("ResponseMetadata", {}) or {}).get(
+                        "HTTPHeaders", {}) or {}
+                    # Standard AWS header
+                    region_hint = region_hint or headers.get(
+                        "x-amz-bucket-region")
+                    # Some implementations also stick hints here
+                    err = resp.get("Error", {}) or {}
+                    endpoint_hint = endpoint_hint or err.get("Endpoint")
+                except Exception:
+                    # ignore and try next style
+                    pass
+            except Exception:
+                # ignore client construction issues and keep going
+                pass
+
+        return region_hint, endpoint_hint

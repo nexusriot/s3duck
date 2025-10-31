@@ -1026,6 +1026,8 @@ class MainWindow(QMainWindow):
                 if ix:
                     self.listview.setCurrentIndex(ix)
                     selected = True
+                else:
+                    self.select_first()
 
             if not selected and buckets:
                 self.select_first()
@@ -1093,6 +1095,23 @@ class MainWindow(QMainWindow):
             try:
                 self.data_model.enter_bucket(name)
             except Exception as exc:
+                self.log(f"Open bucket failed for '{name}': {exc}")
+                try:
+                    region_hint, endpoint_hint = self.data_model.get_bucket_hints(name)
+                except Exception as _hint_exc:
+                    region_hint, endpoint_hint = None, None
+                    self.log(f"While probing hints: {_hint_exc}")
+
+                if region_hint:
+                    self.log(f"Hint: bucket '{name}' region may be '{region_hint}'")
+                else:
+                    self.log(f"Hint: bucket '{name}' region unknown (no header)")
+
+                if endpoint_hint:
+                    self.log(f"Hint: suggested endpoint for '{name}': {endpoint_hint}")
+                else:
+                    self.log(f"Hint: no endpoint suggestion provided by server for '{name}'")
+
                 QMessageBox.critical(
                     self,
                     "Open bucket failed",
