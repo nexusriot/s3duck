@@ -751,3 +751,47 @@ class Model:
                 pass
 
         return region_hint, endpoint_hint
+
+    def build_region_swapped_endpoint(self, base_endpoint: str,
+                                      new_region: str) -> str:
+        """
+        Best-effort rewrite of an AWS-style endpoint to another region.
+        Examples:
+          https://s3.eu-central-1.amazonaws.com   -> https://s3.eu-north-1.amazonaws.com
+          http://s3.us-west-2.amazonaws.com       -> http://s3.eu-north-1.amazonaws.com
+          https://s3.amazonaws.com (no region)    -> https://s3.eu-north-1.amazonaws.com
+        If base_endpoint doesn't look AWS-ish, returns None to signal "don't touch".
+        """
+        try:
+            parsed = urlparse(base_endpoint)
+            scheme = parsed.scheme or "https"
+            host = (parsed.hostname or "").lower()
+            if not host:
+                return None
+
+            # only handle AWS classic patterns
+            # s3.<region>.amazonaws.com OR s3.amazonaws.com
+            if host == "s3.amazonaws.com":
+                new_host = f"s3.{new_region}.amazonaws.com"
+            elif host.startswith("s3.") and host.endswith(".amazonaws.com"):
+                # s3.<something>.amazonaws.com -> replace the middle with new_region
+                parts = host.split(".")
+                # parts: ["s3", "<region>", "amazonaws", "com"] or longer for china/gov (not covered fully)
+                if len(parts) >= 4 and parts[0] == "s3" and parts[-2:] == [
+                    "amazonaws", "com"]:
+                    parts[1] = new_region
+                    new_host = ".".join(parts)
+                else:
+                    return None
+            else:
+                return None
+
+            # preserve port if any
+            netloc = new_host
+            if parsed.port:
+                netloc = f"{new_host}:{parsed.port}"
+
+            # keep path/query/fragment as-is (normally empty for endpoints)
+            return f"{scheme}://{netloc}{parsed.path or ''}"
+        except Exception:
+            return None

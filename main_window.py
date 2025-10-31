@@ -1,4 +1,5 @@
 import os
+import sys
 import glob
 import pathlib
 import time
@@ -7,14 +8,14 @@ import threading
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import QIcon, QStandardItemModel, QStandardItem
-
+from PyQt5.QtGui import QFontDatabase
 from model import Model as DataModel
 from model import FSObjectType
 from properties_window import PropertiesWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.1.6 preview"
+__VERSION__ = "0.2 preview"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -34,7 +35,6 @@ def _human_bytes(n):
         n /= 1024.0
         i += 1
     return f"{n:.1f} {units[i]}"
-
 
 class Tree(QTreeView):
     def __init__(self, parent):
@@ -193,22 +193,23 @@ class UpTopProxyModel(QSortFilterProxyModel):
         if col == 0:  # Name
             return str(ld).lower() < str(rd).lower()
 
-        if col == 1:  # Size (numeric; tie-break by name)
-            try:
-                ln = int(ld)
-            except Exception:
-                ln = -1
-            try:
-                rn = int(rd)
-            except Exception:
-                rn = -1
+        if col == 1:  # Size (use numeric payload; tie-break by name)
+            model = self.sourceModel()
+
+            l_item = model.itemFromIndex(left)
+            r_item = model.itemFromIndex(right)
+
+            # 'size' is set when you build ListItem(size_val, ...)
+            ln = getattr(l_item, "size", 0) or 0
+            rn = getattr(r_item, "size", 0) or 0
+
             if ln != rn:
                 return ln < rn
+
+            # tie-breaker: Name (column 0)
             l_name = left.sibling(left.row(), 0).data()
             r_name = right.sibling(right.row(), 0).data()
             return str(l_name).lower() < str(r_name).lower()
-
-        return str(ld) < str(rd)
 
 
 class Worker(QObject):
@@ -400,6 +401,50 @@ class MainWindow(QMainWindow):
             url, region, access_key, secret_key, bucket, no_ssl_check, use_path
         )
         self.logview = QPlainTextEdit(self)
+
+        def _apply_emoji_safe_font(widget):
+            pt = widget.font().pointSize()
+            db = QFontDatabase()
+
+            def available(cands):
+                return [f for f in cands if f in db.families()]
+
+            if sys.platform.startswith("win"):
+                # Windows
+                base = available(["Consolas", "Segoe UI", "Arial", "Tahoma"])
+                emoji = available(["Segoe UI Emoji"])
+                stack = base[:1] + emoji + base[1:]
+            elif sys.platform == "darwin":
+                # macOS(?)
+
+                # Menlo (default monospace) + Apple Color Emoji
+                base = available(["Menlo", "SF Mono", "Monaco"])
+                emoji = available(["Apple Color Emoji"])
+                stack = base[:1] + emoji + base[1:]
+            else:
+                # Linux
+                base = available([
+                    "DejaVu Sans Mono",
+                    "Ubuntu Mono",
+                    "Liberation Mono",
+                    "Monospace",
+                    "DejaVu Sans",
+                    "Sans Serif",
+                ])
+                emoji = available(
+                    ["Noto Color Emoji", "Emoji One Color", "Segoe UI Emoji"])
+                stack = base[:1] + emoji + base[1:]
+
+            if not stack:
+                stack = ["Sans-Serif"]
+
+            families = ",".join(f"'{f}'" for f in stack)
+            widget.setStyleSheet(
+                f"font-family: {families}; font-size: {pt}pt;")
+
+        # apply to the log view
+        _apply_emoji_safe_font(self.logview)
+
         self.listview = Tree(self)
         self.clip = QApplication.clipboard()
         self.splitter = QSplitter(Qt.Vertical)
@@ -410,7 +455,6 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(1, 1)
 
         self.logview.setReadOnly(True)
-        # NOTE: per request, this one line stays WITHOUT timestamp
         self.logview.appendPlainText(
             "Welcome to S3 Duck 🦆 %s (on %s)"
             % (__VERSION__, OS_FAMILY_MAP.get(DataModel.get_os_family(), "❓"))
@@ -507,6 +551,7 @@ class MainWindow(QMainWindow):
 
         # context menu for listview
         self.menu = QMenu()
+        self.menu.setAttribute(Qt.WA_NoMouseReplay, True)
 
         # remember last bucket we successfully entered
         self._last_selected_bucket = None
@@ -1096,44 +1141,95 @@ class MainWindow(QMainWindow):
                 self.data_model.enter_bucket(name)
             except Exception as exc:
                 self.log(f"Open bucket failed for '{name}': {exc}")
+
+                # Try to fetch hints (region/endpoint)
                 try:
-                    region_hint, endpoint_hint = self.data_model.get_bucket_hints(name)
+                    region_hint, endpoint_hint = self.data_model.get_bucket_hints(
+                        name)
                 except Exception as _hint_exc:
                     region_hint, endpoint_hint = None, None
                     self.log(f"While probing hints: {_hint_exc}")
 
                 if region_hint:
-                    self.log(f"Hint: bucket '{name}' region may be '{region_hint}'")
+                    self.log(
+                        f"Hint: bucket '{name}' region may be '{region_hint}'")
                 else:
-                    self.log(f"Hint: bucket '{name}' region unknown (no header)")
+                    self.log(
+                        f"Hint: bucket '{name}' region unknown (no header)")
 
                 if endpoint_hint:
-                    self.log(f"Hint: suggested endpoint for '{name}': {endpoint_hint}")
-                else:
-                    self.log(f"Hint: no endpoint suggestion provided by server for '{name}'")
+                    self.log(
+                        f"Hint: suggested endpoint for '{name}': {endpoint_hint}")
 
+                retried = False
+                retry_err = None
+                # Only attempt if we actually got a region hint
+                if region_hint:
+                    # derive a candidate endpoint from the *root* endpoint
+                    base_endpoint = self.data_model.profile_endpoint_url or self.data_model.endpoint_url
+                    swapped = self.data_model.build_region_swapped_endpoint(
+                        base_endpoint, region_hint)
+
+                    # If server already gave an explicit endpoint, prefer it
+                    candidate_endpoint = endpoint_hint or swapped
+
+                    if candidate_endpoint:
+                        # Save current connection state
+                        old_endpoint = self.data_model.endpoint_url
+                        old_region = self.data_model.region_name
+                        old_use_path = self.data_model.use_path
+                        old_client = self.data_model._client
+
+                        try:
+                            self.log(
+                                f"Retry: temporarily switching endpoint to '{candidate_endpoint}' "
+                                f"and region to '{region_hint}' for bucket '{name}'"
+                            )
+                            # temporarily seed the client config used by enter_bucket()
+                            self.data_model.endpoint_url = candidate_endpoint
+                            self.data_model.region_name = region_hint
+                            self.data_model._client = None  # rebuild with new seed
+
+                            # Re-try enter (it will still probe styles and may further adjust)
+                            self.data_model.enter_bucket(name)
+                            retried = True
+                        except Exception as rexc:
+                            retry_err = rexc
+                            self.log(f"Retry failed for '{name}': {rexc}")
+                            # restore originals on failure
+                            self.data_model.endpoint_url = old_endpoint
+                            self.data_model.region_name = old_region
+                            self.data_model.use_path = old_use_path
+                            self.data_model._client = old_client
+
+                if retried:
+                    # success after temporary switch
+                    self._last_selected_bucket = name
+                    # Note: when the user exits this bucket, goHome()/goUp() call
+                    # _return_to_bucket_list_mode(), which restores profile endpoint/region.
+                    self.navigate()
+                    self.select_first()
+                    return
+
+                # If we couldn't recover, show the dialog and go back to the bucket list
                 QMessageBox.critical(
                     self,
                     "Open bucket failed",
-                    f"Cannot open bucket '{name}': {exc}",
+                    f"Cannot open bucket '{name}': {exc if retry_err is None else retry_err}",
                 )
 
                 # Return to bucket list mode safely (also restores region & client)
                 self._return_to_bucket_list_mode()
-
                 # re-render bucket list
                 self.navigate()
-
                 # reselect the bucket that failed (don't jump cursor to last success)
                 ix = self.ix_by_name(name)
                 if ix:
                     self.listview.setCurrentIndex(ix)
-
                 return
 
-            # success: remember which bucket we just entered
+            # success (no failure path)
             self._last_selected_bucket = name
-
             self.navigate()
             self.select_first()
             return
