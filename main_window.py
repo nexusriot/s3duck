@@ -261,23 +261,24 @@ class Worker(QObject):
                 self.batch_progress.emit(int(current_total), int(total_bytes_all))
 
         def make_cb():
-            # this dict is per-file/prefix, so each callback instance tracks its own last seen value
-            last_sent_for_this_file = {"v": 0}
+            # Track last sent value PER KEY so multiple files don't interfere.
+            last_sent_per_key = {}
 
             def _cb(total_file, cur_file, key):
                 nonlocal done_all
-                # compute delta and update global done_all atomically
+                key = str(key or "")
                 with done_all_lock:
-                    prev = last_sent_for_this_file["v"]
-                    if cur_file > prev:
-                        delta = int(cur_file) - int(prev)
-                        last_sent_for_this_file["v"] = int(cur_file)
+                    prev = int(last_sent_per_key.get(key, 0))
+                    cur = int(cur_file)
+                    if cur > prev:
+                        delta = cur - prev
+                        last_sent_per_key[key] = cur
                         done_all += delta
-                        current_total = done_all
-                    else:
-                        current_total = done_all
+                    # else: ignore non-monotonic callbacks
+                    current_total = done_all
 
-                emit_throttled(current_total, int(cur_file), int(total_file or 1), key)
+                emit_throttled(current_total, int(cur_file),
+                               int(total_file or 1), key)
 
             return _cb
 
@@ -337,22 +338,23 @@ class Worker(QObject):
                 self.batch_progress.emit(int(current_total), int(total_bytes_all))
 
         def make_cb():
-            # this dict is per FILE we're uploading
-            last_sent_for_this_file = {"v": 0}
+            # Track last sent value PER KEY being uploaded.
+            last_sent_per_key = {}
 
             def _cb(total_file, cur_file, key):
                 nonlocal done_all
+                key = str(key or "")
                 with done_all_lock:
-                    prev = last_sent_for_this_file["v"]
-                    if cur_file > prev:
-                        delta = int(cur_file) - int(prev)
-                        last_sent_for_this_file["v"] = int(cur_file)
+                    prev = int(last_sent_per_key.get(key, 0))
+                    cur = int(cur_file)
+                    if cur > prev:
+                        delta = cur - prev
+                        last_sent_per_key[key] = cur
                         done_all += delta
-                        current_total = done_all
-                    else:
-                        current_total = done_all
+                    current_total = done_all
 
-                emit_throttled(current_total, int(cur_file), int(total_file or 1), key)
+                emit_throttled(current_total, int(cur_file),
+                               int(total_file or 1), key)
 
             return _cb
 
@@ -1016,13 +1018,15 @@ class MainWindow(QMainWindow):
             self.update_s3_path_label()
             self.enable_action_buttons()
 
-            # When we come back to bucket list mode,
-            # try to reselect the last bucket we focused.
+            selected = False
             if self._last_selected_bucket:
                 ix = self.ix_by_name(self._last_selected_bucket)
                 if ix:
                     self.listview.setCurrentIndex(ix)
+                    selected = True
 
+            if not selected and buckets:
+                self.select_first()
             return
 
         # we're in a bucket:
@@ -1110,6 +1114,7 @@ class MainWindow(QMainWindow):
             self._last_selected_bucket = name
 
             self.navigate()
+            self.select_first()
             return
 
         # Special [..] entry
@@ -1128,6 +1133,7 @@ class MainWindow(QMainWindow):
             self.map[self.data_model.current_folder] = name
             self.change_current_folder(self.data_model.current_folder + "%s/" % name)
             self.navigate()
+            self.select_first()
 
     def goBack(self):
         if not self.data_model.bucket:
