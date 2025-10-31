@@ -36,6 +36,55 @@ def _human_bytes(n):
         i += 1
     return f"{n:.1f} {units[i]}"
 
+
+class _OneShotClickGuard(QObject):
+    """
+    Swallows exactly one mouse press+release pair on a target widget.
+    Auto-disarms after the pair or a short timeout.
+    """
+    def __init__(self, target: QWidget, timeout_ms: int = 350):
+        super().__init__(target)
+        self._target = target
+        self._armed = False
+        self._need_press = False
+        self._need_release = False
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.disarm)
+
+    def arm(self):
+        if self._armed:
+            return
+        self._armed = True
+        self._need_press = True
+        self._need_release = True
+        self._target.installEventFilter(self)
+        self._timer.start(350)
+
+    def disarm(self):
+        if not self._armed:
+            return
+        try:
+            self._target.removeEventFilter(self)
+        finally:
+            self._armed = False
+            self._need_press = False
+            self._need_release = False
+
+    def eventFilter(self, obj, event):
+        if not self._armed:
+            return False
+        et = event.type()
+        if et == QEvent.MouseButtonPress and self._need_press:
+            self._need_press = False
+            return True
+        if et == QEvent.MouseButtonRelease and self._need_release:
+            self._need_release = False
+            QTimer.singleShot(0, self.disarm)
+            return True
+        return False
+
+
 class Tree(QTreeView):
     def __init__(self, parent):
         super().__init__()
@@ -446,6 +495,10 @@ class MainWindow(QMainWindow):
         _apply_emoji_safe_font(self.logview)
 
         self.listview = Tree(self)
+        self._menu_click_guard = _OneShotClickGuard(self.listview.viewport())
+        self._suppress_next_activate = False
+
+
         self.clip = QApplication.clipboard()
         self.splitter = QSplitter(Qt.Vertical)
         self.splitter.addWidget(self.listview)
@@ -789,7 +842,10 @@ class MainWindow(QMainWindow):
                         )
                         self.menu.addAction(act_del_bucket)
 
+                    self._menu_click_guard.arm()
                     clk = self.menu.exec_(event.globalPos())
+                    if not clk:
+                        return
 
                     if clk == act_new_bucket:
                         self.new_bucket()
@@ -906,7 +962,10 @@ class MainWindow(QMainWindow):
                     )
                     self.menu.addAction(properties_selected_action)
 
+                self._menu_click_guard.arm()
                 clk = self.menu.exec_(event.globalPos())
+                if not clk:
+                    return False
                 if clk == upload_selected_action:
                     self.upload(upload_path)
                 if clk == upload_current_action:
@@ -1130,6 +1189,9 @@ class MainWindow(QMainWindow):
         return None, None
 
     def list_doubleClicked(self, proxy_index: QModelIndex):
+        if self._suppress_next_activate:
+            self._suppress_next_activate = False
+            return
         # Always interpret based on the row's "Name" column.
         primary_item, name, t = self.get_row_primary_item(proxy_index)
         if primary_item is None:
