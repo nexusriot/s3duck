@@ -3,6 +3,8 @@ S3Duck 🦆
 
 Simple cross-platform client for Simple Storage Service
 
+
+![ListBuckets](resources/buckets.png)
 ![Screenshot](resources/screenshot.png)
 
 How to launch

@@ -9,6 +9,7 @@ from PyQt5.QtGui import QIcon
 from cryptography.fernet import Fernet
 from PyQt5 import QtCore
 from PyQt5.QtCore import *
+from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QListWidget,
     QPushButton,
@@ -499,6 +500,15 @@ class Profiles(QDialog):
 
 def main():
     app = QApplication(sys.argv)
+    # Cross-platform font with emoji fallback
+    font = QFont()
+    # prefer system UI font; then add family fallbacks
+    font.setFamilies([
+        "Segoe UI", "Noto Sans", "Helvetica Neue", "Cantarell", "Ubuntu", "San Francisco",
+        "Apple Color Emoji", "Noto Color Emoji", "Segoe UI Emoji"
+    ])
+    font.setPointSize(10)
+    app.setFont(font)
     icon = QIcon(os.path.join(get_current_dir(), "resources", "ducky.ico"))
     app.setWindowIcon(icon)
     profiles = Profiles()

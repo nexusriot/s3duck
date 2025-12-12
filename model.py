@@ -5,6 +5,7 @@ import os
 import boto3
 import botocore
 import threading
+from urllib.parse import urlparse
 
 from boto3.s3.transfer import TransferConfig
 
@@ -77,9 +78,18 @@ class Model:
         self.current_folder = ""
         self.prev_folder = ""
 
-        # connection state
+        # connection state (mutable while navigating buckets)
         self.endpoint_url = endpoint_url
+
+        # keep original/root settings for when we leave a bucket (used by bucket list view)
+        self.profile_endpoint_url = endpoint_url
+        self.profile_use_path = use_path
+
+        # region that came from the profile (stable "home" region)
+        self.profile_region = region_name
+        # region currently in use (can change per bucket)
         self.region_name = region_name
+
         self.access_key = access_key
         self.secret_key = secret_key
         self.bucket = bucket or ""  # may be empty (bucket list mode)
@@ -88,7 +98,7 @@ class Model:
         self.timeout = timeout
         self.retries = retries
 
-        # Smaller chunks -> smoother progress feedback
+        # Smaller chunks -> smoother progress
         self.transfer_cfg = TransferConfig(
             multipart_threshold=8 * 1024 * 1024,   # 8MB
             multipart_chunksize=1 * 1024 * 1024,   # 1MB parts
@@ -109,8 +119,7 @@ class Model:
         use_path=None,
     ):
         """
-        Build (but do NOT cache) a boto3 S3 client using provided overrides
-        or current object state.
+        Build (but do NOT cache) an S3 client from overrides or current object state.
         """
         endpoint_url = endpoint_url if endpoint_url is not None else self.endpoint_url
         region = region if region is not None else self.region_name
@@ -149,47 +158,54 @@ class Model:
             self._client = self._make_client()
         return self._client
 
-    def get_bucket_region(self, bucket_name: str):
+    def _endpoint_has_bucket(self, endpoint_url: str, bucket_name: str) -> bool:
         """
-        Ask S3 which region this bucket is in.
-        AWS quirk: us-east-1 returns None/''.
-        We'll normalize that to 'us-east-1'.
+        Return True if the hostname in endpoint_url already appears to be
+        bucket-specific (contains *this* bucket name).
         """
-        resp = self.client.get_bucket_location(Bucket=bucket_name)
-        loc = resp.get("LocationConstraint")
-        if not loc:
-            # us-east-1 shows up as None
-            loc = "us-east-1"
-        return loc
+        try:
+            host = urlparse(endpoint_url).hostname or ""
+        except Exception:
+            host = endpoint_url or ""
+        host = host.lower()
+        bucket_name = bucket_name.lower()
+        return host.startswith(bucket_name + ".") or (("." + bucket_name + ".") in ("." + host + "."))
+
+    def _extract_leftmost_label(self, endpoint_url: str) -> str:
+        """
+        Best-effort extraction of the leftmost DNS label from endpoint host.
+        Used only for diagnostics / mismatch error messages.
+        """
+        try:
+            host = (urlparse(endpoint_url).hostname or "").strip().lower()
+        except Exception:
+            host = (endpoint_url or "").strip().lower()
+        if not host:
+            return ""
+        return host.split(".")[0]
 
     def _try_bind_bucket(self, bucket_name: str):
         """
-        Internal helper:
-        Try different combinations (region, endpoint suggestion, path/virtual style)
-        until ListObjectsV2 works on this bucket.
+        Try different combinations (endpoint_url, path/virtual style) until
+        ListObjectsV2 works on this bucket.
 
-        This solves 'PermanentRedirect' / wrong endpoint.
+        Returns (client_ok, endpoint_url, region, use_path)
+
+        Raises last seen error on total failure.
         """
-        # Step 1. get region if possible
-        try:
-            region_guess = self.get_bucket_region(bucket_name)
-        except Exception:
-            # maybe MinIO / custom; keep current region
-            region_guess = self.region_name or "us-east-1"
 
-        # We'll attempt up to 3 strategies:
-        # (A) current endpoint_url, current use_path
-        # (B) same endpoint_url, flipped use_path
-        # (C) if we get a PermanentRedirect with Endpoint in the error -> retry that endpoint (both styles)
-
-        def can_list(c, endpoint_override=None):
+        def can_list(c):
             """
             Try to list a single page to validate this client for this bucket.
             Returns (ok:bool, permanent_redirect_endpoint:str|None, error:Exception|None)
+
+            Logic:
+            - If it lists fine: ok=True
+            - If we get PermanentRedirect: ok=False + endpoint hint
+            - Any other ClientError is treated as a real failure (ok=False + error)
             """
             paginator = c.get_paginator("list_objects_v2")
             try:
-                # just attempt first page iterator consumption
                 iterator = paginator.paginate(
                     Bucket=bucket_name,
                     Prefix="",
@@ -200,32 +216,43 @@ class Model:
                     break
                 return True, None, None
             except botocore.exceptions.ClientError as exc:
-                # look for PermanentRedirect
-                code = exc.response.get("Error", {}).get("Code", "")
-                if code == "PermanentRedirect":
+                err_code = exc.response.get("Error", {}).get("Code", "")
+
+                # Region/endpoint redirect from S3
+                if err_code == "PermanentRedirect":
                     ep = exc.response.get("Error", {}).get("Endpoint")
                     return False, ep, exc
+
                 return False, None, exc
+
             except Exception as exc:
                 return False, None, exc
 
-        # A) try current endpoint + current style
-        cA = self._make_client(endpoint_url=self.endpoint_url,
-                               region=region_guess,
-                               use_path=self.use_path)
+        last_err = None
+
+        # Strategy A: current endpoint + current style
+        cA = self._make_client(
+            endpoint_url=self.endpoint_url,
+            region=self.region_name,
+            use_path=self.use_path,
+        )
         ok, ep_hint, err = can_list(cA)
         if ok:
-            return (cA, self.endpoint_url, region_guess, self.use_path)
+            return (cA, self.endpoint_url, self.region_name, self.use_path)
+        last_err = err
 
-        # B) try current endpoint + flipped style
-        cB = self._make_client(endpoint_url=self.endpoint_url,
-                               region=region_guess,
-                               use_path=(not self.use_path))
+        # Strategy B: current endpoint + flipped style
+        cB = self._make_client(
+            endpoint_url=self.endpoint_url,
+            region=self.region_name,
+            use_path=(not self.use_path),
+        )
         ok, ep_hint2, err2 = can_list(cB)
         if ok:
-            return (cB, self.endpoint_url, region_guess, not self.use_path)
+            return (cB, self.endpoint_url, self.region_name, not self.use_path)
+        last_err = err2 or last_err
 
-        # C) If either error gave us an Endpoint hint, try it.
+        # Strategy C: endpoint hint(s) from PermanentRedirect
         endpoint_candidates = []
         if ep_hint:
             endpoint_candidates.append(ep_hint)
@@ -233,83 +260,159 @@ class Model:
             endpoint_candidates.append(ep_hint2)
 
         for ep_raw in endpoint_candidates:
-            # We don't know if ep_raw has scheme or not.
-            # If it's just "bucket.s3-region.amazonaws.com", prepend https://
+            # If it's bare hostname, prepend scheme
             if "://" not in ep_raw:
                 endpoint_fixed = "https://" + ep_raw
             else:
                 endpoint_fixed = ep_raw
 
-            # try hinted endpoint with both addressing styles
-            for style in (self.use_path, not self.use_path):
+            # If the hinted endpoint looks bucket-bound but to a DIFFERENT bucket, error out explicitly.
+            leftmost = self._extract_leftmost_label(endpoint_fixed)
+            if leftmost and leftmost != bucket_name.lower() and self._endpoint_has_bucket(endpoint_fixed, leftmost):
+                raise RuntimeError(
+                    f"Endpoint redirect '{endpoint_fixed}' appears bound to bucket '{leftmost}', "
+                    f"which does not match requested bucket '{bucket_name}'. "
+                    f"Please verify endpoint and addressing style."
+                )
+
+            has_bucket_already = self._endpoint_has_bucket(endpoint_fixed, bucket_name)
+
+            styles_to_try = (
+                [True] if has_bucket_already else [self.use_path, not self.use_path]
+            )
+
+            for style in styles_to_try:
                 cGuess = self._make_client(
                     endpoint_url=endpoint_fixed,
-                    region=region_guess,
+                    region=self.region_name,
                     use_path=style,
                 )
                 ok3, _ep_ignore, _err3 = can_list(cGuess)
                 if ok3:
-                    return (cGuess, endpoint_fixed, region_guess, style)
+                    return (cGuess, endpoint_fixed, self.region_name, style)
+                last_err = _err3 or last_err
 
-        # If all failed, just raise last error we saw
-        raise err2 if err2 else (err or Exception("Cannot access bucket"))
+        # nothing worked
+        if last_err:
+            raise last_err
+        raise Exception("Cannot access bucket")
 
-    def refresh_client_for_bucket(self, bucket_name: str):
+    def enter_bucket(self, bucket_name: str):
         """
-        Switch active bucket, detect its region / endpoint / style,
-        rebuild stable client for future calls, and reset navigation.
+        Transactional bucket entry:
+        - Probe working combo for this bucket.
+        - If probe succeeds, commit new client + nav state.
+        - If it fails, raise without touching current state.
         """
-        self.bucket = bucket_name
-
         client_ok, new_endpoint, new_region, new_use_path = self._try_bind_bucket(
             bucket_name
         )
 
-        # lock in what worked
+        # Success -> commit new working config for THIS bucket
+        self.bucket = bucket_name
         self.endpoint_url = new_endpoint
-        self.region_name = new_region
+        self.region_name = new_region          # region_name may become bucket-specific
         self.use_path = new_use_path
-        self._client = client_ok  # reuse the proven-good client
+        self._client = client_ok               # working client for this bucket
 
-        # reset navigation state
+        # reset navigation inside bucket
         self.current_folder = ""
         self.prev_folder = ""
 
     def list_buckets(self):
         """
         Return all buckets visible to the credentials.
+
+        Adaptive region logic for ListBuckets:
+        - Some backends demand a specific signing region and tell us via
+          AuthorizationHeaderMalformed "... expecting '<region>'".
+        - We'll chase that hint before giving up.
+
+        IMPORTANT: always use the *profile/root* endpoint for ListBuckets so we
+        don't accidentally call a bucket-scoped host after leaving a bucket.
         """
-        resp = self.client.list_buckets()
+        # build initial region candidates, dedupe while preserving order
+        initial_candidates = ["us-east-1", self.profile_region, self.region_name]
+        queue = []
+        for r in initial_candidates:
+            if r and r not in queue:
+                queue.append(r)
+
+        tried = set()
+        last_err = None
+        buckets_resp = None
+
+        ATTEMPT_LIMIT = 10
+        attempts = 0
+
+        while queue and attempts < ATTEMPT_LIMIT:
+            attempts += 1
+            candidate_region = queue.pop(0)
+            if candidate_region in tried:
+                continue
+            tried.add(candidate_region)
+
+            try:
+                # Pin to the saved root endpoint
+                tmp_client = self._make_client(
+                    region=candidate_region,
+                    endpoint_url=self.profile_endpoint_url
+                )
+                buckets_resp = tmp_client.list_buckets()
+                last_err = None
+                break  # success
+            except botocore.exceptions.ClientError as exc:
+                last_err = exc
+                err_code = exc.response.get("Error", {}).get("Code", "")
+                if err_code == "AuthorizationHeaderMalformed":
+                    msg = exc.response.get("Error", {}).get("Message", "") or str(exc)
+                    expecting_region = None
+                    marker = "expecting '"
+                    idx = msg.find(marker)
+                    if idx != -1:
+                        rest = msg[idx + len(marker):]
+                        endq = rest.find("'")
+                        if endq != -1:
+                            expecting_region = rest[:endq].strip()
+                    if expecting_region and expecting_region not in tried and expecting_region not in queue:
+                        queue.append(expecting_region)
+            except Exception as exc:
+                last_err = exc
+
+        if buckets_resp is None:
+            raise last_err if last_err else Exception("Cannot list buckets")
+
         items = []
-        for b in resp.get("Buckets", []):
+        for b in buckets_resp.get("Buckets", []):
             items.append(Item(b["Name"], FSObjectType.BUCKET, "", 0))
         return items
 
     def create_bucket(self, bucket_name: str):
         """
         Create a new bucket.
-        We'll try to put it in self.region_name if that's set.
+        We'll try to create it in the profile_region.
         For AWS S3:
           - us-east-1 is special: you cannot/should not pass LocationConstraint.
-        For MinIO/Ceph/etc: usually any name just works with no LocationConstraint.
         """
         params = {"Bucket": bucket_name}
 
-        region = self.region_name or "us-east-1"
+        region = self.profile_region or "us-east-1"
         if region and region != "us-east-1":
             params["CreateBucketConfiguration"] = {
                 "LocationConstraint": region
             }
 
-        self.client.create_bucket(**params)
+        root_client = self._make_client(region=region)
+        root_client.create_bucket(**params)
 
     def delete_bucket(self, bucket_name: str):
         """
-        Delete a bucket.
-        S3 requires the bucket to be empty.
-        We enforce that here: if not empty, raise.
+        Delete a bucket. Must be empty.
+
+        We'll check emptiness with the current (possibly bucket-tuned) client,
+        then actually call DeleteBucket using a client bound to profile_region.
         """
-        # Check emptiness
+        # emptiness check
         paginator = self.client.get_paginator("list_objects_v2")
         pages = paginator.paginate(Bucket=bucket_name, Prefix="", Delimiter="/")
         for page in pages:
@@ -328,43 +431,134 @@ class Model:
             self.current_folder = ""
             self.prev_folder = ""
 
-        self.client.delete_bucket(Bucket=bucket_name)
+        root_client = self._make_client(region=self.profile_region or "us-east-1")
+        root_client.delete_bucket(Bucket=bucket_name)
+
+    # ---- helper for adaptive per-bucket object listing ----
+    def _list_bucket_once(self, client_obj, bucket_name, prefix):
+        """
+        Try to list 'prefix' in 'bucket_name' using client_obj once.
+
+        Returns tuple: (ok, items, expecting_region, fatal_exc)
+
+        ok=True  -> listing succeeded
+        items    -> list[Item] if ok
+        expecting_region -> str or None; if not None, server hinted "use this region instead"
+        fatal_exc -> Exception or None if this attempt should be considered a hard failure
+        """
+        paginator = client_obj.get_paginator("list_objects_v2")
+        try:
+            pages = paginator.paginate(
+                Bucket=bucket_name,
+                Prefix=prefix or "",
+                Delimiter="/",
+            )
+        except botocore.exceptions.ClientError as exc:
+            err_code = exc.response.get("Error", {}).get("Code", "")
+
+            # AuthorizationHeaderMalformed: maybe wrong region
+            if err_code == "AuthorizationHeaderMalformed":
+                msg = exc.response.get("Error", {}).get("Message", "") or str(exc)
+                expecting_region = None
+                marker = "expecting '"
+                idx = msg.find(marker)
+                if idx != -1:
+                    rest = msg[idx + len(marker):]
+                    endq = rest.find("'")
+                    if endq != -1:
+                        expecting_region = rest[:endq].strip()
+                return False, [], expecting_region, None
+
+            # Access/NoSuchKey/etc: treat as **fatal** now (surface real boto3 message)
+            if err_code in ("NoSuchKey", "AccessDenied", "AllAccessDisabled"):
+                return False, [], None, exc
+
+            # other real failure
+            return False, [], None, exc
+
+        except Exception as exc:
+            # unknown non-ClientError; treat as fatal
+            return False, [], None, exc
+
+        # We got a paginator successfully. Now accumulate.
+        items = []
+        try:
+            for page in pages:
+                folders = [fld2["Prefix"] for fld2 in page.get("CommonPrefixes", [])]
+                objects = [obj for obj in page.get("Contents", [])]
+
+                for folder in folders:
+                    s = folder.split("/")
+                    if len(s) > 1:
+                        folder_name = s[-2]
+                    else:
+                        folder_name = folder.rstrip("/")
+                    items.append(Item(folder_name, FSObjectType.FOLDER, "", 0))
+
+                for obj in objects:
+                    key = obj["Key"]
+                    if key == (prefix or ""):
+                        continue
+                    filename = key.split("/")[-1]
+                    items.append(
+                        Item(
+                            filename,
+                            FSObjectType.FILE,
+                            obj["LastModified"],
+                            obj["Size"],
+                        )
+                    )
+        except botocore.exceptions.ClientError as exc:
+            err_code = exc.response.get("Error", {}).get("Code", "")
+            if err_code in ("NoSuchKey", "AccessDenied", "AllAccessDisabled"):
+                return False, [], None, exc
+            return False, [], None, exc
+        except Exception as exc:
+            return False, [], None, exc
+
+        return True, items, None, None
 
     def list(self, fld):
         """
         List objects/prefixes in the currently selected bucket under prefix 'fld'.
+
+        Adaptive region logic like list_buckets(), but bucket-scoped:
+        - First try with the current active client/region.
+        - If we get "AuthorizationHeaderMalformed ... expecting '<region>'",
+          we retry with that region.
+        - If that retry succeeds, we *promote* that region/client to become
+          our active client for this bucket so the rest of the UI keeps working.
         """
-        path = fld or ""
-        paginator = self.client.get_paginator("list_objects_v2")
-        pages = paginator.paginate(
-            Bucket=self.bucket, Prefix=path, Delimiter="/"
+        prefix = fld or ""
+
+        # 1. Try with the current live client
+        ok, items, expecting_region, fatal_exc = self._list_bucket_once(
+            self.client, self.bucket, prefix
         )
+        if ok:
+            return items
+        if fatal_exc:
+            # true fatal -> raise original error with details
+            raise fatal_exc
 
-        items = []
-        for page in pages:
-            folders = [fld["Prefix"] for fld in page.get("CommonPrefixes", [])]
-            objects = [obj for obj in page.get("Contents", [])]
+        # 2. If server told us a better region, try that region
+        if expecting_region:
+            tmp_client = self._make_client(region=expecting_region)
+            ok2, items2, expecting_region2, fatal_exc2 = self._list_bucket_once(
+                tmp_client, self.bucket, prefix
+            )
+            if ok2:
+                # success in new region -> adopt it permanently for this bucket
+                self.region_name = expecting_region
+                self._client = tmp_client
+                return items2
+            if fatal_exc2:
+                raise fatal_exc2
 
-            for folder in folders:
-                s = folder.split("/")
-                if len(s) > 1:
-                    folder = s[-2]
-                items.append(Item(folder, FSObjectType.FOLDER, "", 0))
-
-            for obj in objects:
-                key = obj["Key"]
-                if key == path:
-                    continue
-                filename = key.split("/")[-1]
-                items.append(
-                    Item(
-                        filename,
-                        FSObjectType.FILE,
-                        obj["LastModified"],
-                        obj["Size"],
-                    )
-                )
-        return items
+        # 3. Nothing worked
+        raise Exception(
+            f"Cannot list bucket '{self.bucket}' at prefix '{prefix}' with available regions."
+        )
 
     def download_file(self, key: str, local_name: str, folder_path: str, progress_cb=None):
         """
@@ -496,5 +690,108 @@ class Model:
                 total += int(s or 0)
         return total
 
+    def bucket_properties(self):
+        """
+        Return lightweight info about the current bucket for Properties
+        when no concrete key is selected.
+        """
+        return {
+            "Bucket": self.bucket,
+            "SizeBytes": None,
+            "ETag": None,
+            "Key": "",
+            "IsBucketRoot": True,
+        }
+
     def object_properties(self, key):
+        # key may be "" if user invoked Properties on bucket root
+        if not key:
+            return self.bucket_properties()
+
         return self.client.get_object(Bucket=self.bucket, Key=key)
+
+    def get_bucket_hints(self, bucket_name: str):
+        """
+        Best-effort hints when we fail to enter a bucket:
+        - Try HEAD Bucket with both addressing styles to sniff:
+          * x-amz-bucket-region from HTTP headers
+          * Error.Endpoint (some S3-compatible backends include this)
+        Returns: (region_hint:str|None, endpoint_hint:str|None)
+        """
+        region_hint = None
+        endpoint_hint = None
+
+        # try both addressing styles to maximize chances of getting headers back
+        for style in [self.use_path, not self.use_path]:
+            try:
+                c = self._make_client(use_path=style)
+                # This may succeed (rare) or throw ClientError (common on perms);
+                # both paths can give us headers.
+                try:
+                    c.head_bucket(Bucket=bucket_name)
+                    # If it actually succeeds, prefer the client's region
+                    region_hint = region_hint or (
+                                c.meta.region_name or self.region_name)
+                    break
+                except botocore.exceptions.ClientError as e:
+                    resp = e.response or {}
+                    headers = (resp.get("ResponseMetadata", {}) or {}).get(
+                        "HTTPHeaders", {}) or {}
+                    # Standard AWS header
+                    region_hint = region_hint or headers.get(
+                        "x-amz-bucket-region")
+                    # Some implementations also stick hints here
+                    err = resp.get("Error", {}) or {}
+                    endpoint_hint = endpoint_hint or err.get("Endpoint")
+                except Exception:
+                    # ignore and try next style
+                    pass
+            except Exception:
+                # ignore client construction issues and keep going
+                pass
+
+        return region_hint, endpoint_hint
+
+    def build_region_swapped_endpoint(self, base_endpoint: str,
+                                      new_region: str) -> str:
+        """
+        Best-effort rewrite of an AWS-style endpoint to another region.
+        Examples:
+          https://s3.eu-central-1.amazonaws.com   -> https://s3.eu-north-1.amazonaws.com
+          http://s3.us-west-2.amazonaws.com       -> http://s3.eu-north-1.amazonaws.com
+          https://s3.amazonaws.com (no region)    -> https://s3.eu-north-1.amazonaws.com
+        If base_endpoint doesn't look AWS-ish, returns None to signal "don't touch".
+        """
+        try:
+            parsed = urlparse(base_endpoint)
+            scheme = parsed.scheme or "https"
+            host = (parsed.hostname or "").lower()
+            if not host:
+                return None
+
+            # only handle AWS classic patterns
+            # s3.<region>.amazonaws.com OR s3.amazonaws.com
+            if host == "s3.amazonaws.com":
+                new_host = f"s3.{new_region}.amazonaws.com"
+            elif host.startswith("s3.") and host.endswith(".amazonaws.com"):
+                # s3.<something>.amazonaws.com -> replace the middle with new_region
+                parts = host.split(".")
+                # parts: ["s3", "<region>", "amazonaws", "com"] or longer for china/gov (not covered fully)
+                if len(parts) >= 4 and parts[0] == "s3" and parts[-2:] == [
+                    "amazonaws", "com"]:
+                    parts[1] = new_region
+                    new_host = ".".join(parts)
+                else:
+                    return None
+            else:
+                return None
+
+            # preserve port if any
+            netloc = new_host
+            if parsed.port:
+                netloc = f"{new_host}:{parsed.port}"
+
+            # keep path/query/fragment as-is (normally empty for endpoints)
+            return f"{scheme}://{netloc}{parsed.path or ''}"
+        except Exception:
+            return None

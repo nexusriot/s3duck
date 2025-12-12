@@ -31,15 +31,50 @@ class PropertiesWindow(QDialog):
         self.setLayout(mainLayout)
         btn_apply = self.buttonBox.button(QDialogButtonBox.Ok)
         btn_apply.clicked.connect(self.exit)
-        self.keyName.setText(key)
-        self.e_tag = ""
+
+        # defaults
+        display_key = key if key else "<bucket root>"
+        display_size = ""
+        display_etag = ""
+
+        is_bucket_root = False
+
         try:
             resp = self.model.object_properties(key)
-            self.e_tag = resp.get("ETag", "").replace('"', "")
+            # resp is either:
+            #   - dict from bucket_properties()
+            #   - real get_object() response (boto3 dict-like)
+            if isinstance(resp, dict) and resp.get("IsBucketRoot"):
+                # bucket root props
+                is_bucket_root = True
+                display_key = f"s3://{resp.get('Bucket','')}/"
+                display_size = "N/A"
+                display_etag = ""
+            else:
+                # normal object
+                # get ETag safely
+                et = ""
+                try:
+                    et = resp.get("ETag", "").replace('"', "")
+                except Exception:
+                    pass
+                display_etag = et
+
+                # compute size using get_size (handles folders/prefix too)
+                display_size = str(self.model.get_size(key)) + " Bytes"
+
         except botocore.exceptions.ClientError:
-            pass
-        self.size.setText(str(self.model.get_size(key)) + " Bytes")
-        self.eTag.setText(self.e_tag)
+            # fallback on access errors
+            display_size = "N/A"
+            display_etag = ""
+        except Exception:
+            display_size = "N/A"
+            display_etag = ""
+
+        # fill widgets
+        self.keyName.setText(display_key)
+        self.size.setText(display_size)
+        self.eTag.setText(display_etag)
 
     def exit(self):
         self.close()
@@ -49,7 +84,7 @@ class PropertiesWindow(QDialog):
 
     def createForm(self):
         layout = QFormLayout()
-        layout.addRow(QLabel("Key"), self.keyName)
+        layout.addRow(QLabel("Key / Bucket"), self.keyName)
         layout.addRow(QLabel("Size"), self.size)
         layout.addRow(QLabel("ETag"), self.eTag)
         self.formGroupBox.setLayout(layout)
