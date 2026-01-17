@@ -15,7 +15,7 @@ from properties_window import PropertiesWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.2.1 preview"
+__VERSION__ = "0.2.5"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
