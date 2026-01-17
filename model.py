@@ -667,8 +667,17 @@ class Model:
 
     def check_profile(self):
         """
-        Old profile check: write/delete a temp key in self.bucket.
+        Profile check.
+        - If bucket is empty: verify credentials by listing buckets.
+        - If bucket is set: verify write/delete by creating a temp folder key.
         """
+        if not self.bucket:
+            try:
+                self.list_buckets()
+                return True, None
+            except Exception as exc:
+                return False, str(exc)
+
         res_c = res_d = False
         reason = None
         key = str(uuid.uuid4())

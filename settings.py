@@ -70,7 +70,6 @@ class SettingsWindow(QDialog):
         btn_apply.setEnabled(
             bool(self.nameLineEdit.text())
             and bool(self.urlLineEdit.text())
-            and bool(self.bucketName.text())
             and bool(self.accessKeyEdit.text())
             and bool(self.secretKeyEdit.text())
         )
