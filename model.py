@@ -692,6 +692,49 @@ class Model:
             reason = str(exc)
         return bool(res_c) and res_d, reason
 
+    def presigned_get_url(self, key: str, expires_sec: int = 3600) -> str:
+        """Return a temporary download URL for an object."""
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        return self.client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self.bucket, "Key": key},
+            ExpiresIn=expires_sec,
+        )
+
+    def make_object_public(self, key: str) -> tuple[bool, str | None]:
+        """
+        Try to make the object publicly readable.
+
+        Returns:
+          (True, None) if ACL applied
+          (False, reason) if ACL could not be applied (e.g., MinIO NotImplemented)
+        """
+        if not self.bucket:
+            return False, "Bucket is empty; select a bucket first"
+
+        try:
+            self.client.put_object_acl(Bucket=self.bucket, Key=key, ACL="public-read")
+            return True, None
+        except botocore.exceptions.ClientError as exc:
+            err = exc.response.get("Error", {})
+            code = err.get("Code") or ""
+            msg = err.get("Message") or str(exc)
+
+            # MinIO commonly returns NotImplemented for PutObjectAcl
+            if code == "NotImplemented":
+                return False, "Storage backend does not support ACLs (MinIO NotImplemented)."
+            return False, f"{code}: {msg}".strip(": ")
+        except Exception as exc:
+            return False, str(exc)
+
+    def direct_object_url(self, key: str) -> str:
+        """Construct a direct (unsigned) URL for an object (path-style)."""
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        ep = self.endpoint_url.rstrip("/")
+        return f"{ep}/{self.bucket}/{key}"
+
     def get_size(self, key):
         total = 0
         for k, s in self.get_keys(key):
@@ -712,12 +755,14 @@ class Model:
             "IsBucketRoot": True,
         }
 
-    def object_properties(self, key):
-        # key may be "" if user invoked Properties on bucket root
-        if not key:
-            return self.bucket_properties()
+    def object_properties(self, key: str):
+        """
+        Return object metadata without opening a body stream.
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty")
 
-        return self.client.get_object(Bucket=self.bucket, Key=key)
+        return self.client.head_object(Bucket=self.bucket, Key=key)
 
     def get_bucket_hints(self, bucket_name: str):
         """

@@ -5,6 +5,8 @@ import pathlib
 import time
 from datetime import datetime
 import threading
+
+from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import QIcon, QStandardItemModel, QStandardItem
@@ -112,7 +114,7 @@ class Tree(QTreeView):
                 event.ignore()
         else:
             event.ignore()
-        event.accept()
+        return
 
     def dragMoveEvent(self, event):
         widget = event.source()
@@ -928,6 +930,19 @@ class MainWindow(QMainWindow):
                         "Download",
                     )
                     self.menu.addAction(download_action)
+                    if m and getattr(m, 't', None) == FSObjectType.FILE:
+                        share_tmp_action = QAction(
+                            QIcon.fromTheme('insert-link'),
+                            'Copy share link…',
+                        )
+                        self.menu.addAction(share_tmp_action)
+
+                        share_public_action = QAction(
+                            QIcon.fromTheme('insert-link'),
+                            'Make public + copy URL…',
+                        )
+                        self.menu.addAction(share_public_action)
+
                     delete_action = QAction(
                         QIcon.fromTheme(
                             "edit-delete",
@@ -974,6 +989,10 @@ class MainWindow(QMainWindow):
                     self.new_folder()
                 if clk == download_action:
                     self.download()
+                if clk == share_tmp_action:
+                    self.copy_presigned_link(key)
+                if clk == share_public_action:
+                    self.make_public_and_copy(key)
                 if clk == delete_action:
                     self.delete()
                 if clk == properties_selected_action:
@@ -1707,3 +1726,39 @@ class MainWindow(QMainWindow):
         self.settings.setValue("pos", self.pos())
         self.settings.setValue("size", self.size())
         self.settings.endGroup()
+
+    def copy_presigned_link(self, key: str):
+        """Copy a temporary presigned URL for the selected object."""
+        if not key or key.rstrip("/") == UP_ENTRY_LABEL:
+            return
+        try:
+            url = self.data_model.presigned_get_url(key, 3600)  # 1 hour
+            QtWidgets.QApplication.clipboard().setText(url)
+            self.statusBar().showMessage("Share link copied", 3000)
+        except Exception as exc:
+            QMessageBox.warning(self, "Share link", str(exc))
+
+    def make_public_and_copy(self, key: str):
+        """Try to make object public-read and copy the direct URL anyway."""
+        if not key or key.rstrip("/") == UP_ENTRY_LABEL:
+            return
+        try:
+            ok, reason = self.data_model.make_object_public(key)
+
+            # Always copy the direct URL
+            url = self.data_model.direct_object_url(key)
+            QtWidgets.QApplication.clipboard().setText(url)
+
+            if ok:
+                self.statusBar().showMessage("Public URL copied", 3000)
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Public link",
+                    f"Could not change ACL.\n\n{reason}\n\nDirect URL copied anyway "
+                    "(will work only if bucket/object is already public).",
+                )
+                self.statusBar().showMessage("Direct URL copied (ACL not changed)", 4000)
+
+        except Exception as exc:
+            QMessageBox.warning(self, "Public URL", str(exc))
