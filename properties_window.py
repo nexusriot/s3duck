@@ -22,6 +22,8 @@ class PropertiesWindow(QDialog):
         self.keyName = QLabel()
         self.size = QLabel()
         self.eTag = QLabel()
+        self.publicUrl = QLineEdit()
+        self.publicUrl.setReadOnly(True)
 
         self.createForm()
         self.buttonBox = QDialogButtonBox(QDialogButtonBox.Ok)
@@ -34,25 +36,22 @@ class PropertiesWindow(QDialog):
 
         # defaults
         display_key = key if key else "<bucket root>"
-        display_size = ""
-        display_etag = ""
 
-        is_bucket_root = False
+        display_public_url = ""
+
 
         try:
             resp = self.model.object_properties(key)
             # resp is either:
             #   - dict from bucket_properties()
             #   - real get_object() response (boto3 dict-like)
-            if isinstance(resp, dict) and resp.get("IsBucketRoot"):
+            is_bucket_root =  isinstance(resp, dict) and resp.get("IsBucketRoot")
+            if is_bucket_root:
                 # bucket root props
-                is_bucket_root = True
                 display_key = f"s3://{resp.get('Bucket','')}/"
                 display_size = "N/A"
                 display_etag = ""
             else:
-                # normal object
-                # get ETag safely
                 et = ""
                 try:
                     et = resp.get("ETag", "").replace('"', "")
@@ -62,6 +61,23 @@ class PropertiesWindow(QDialog):
 
                 # compute size using get_size (handles folders/prefix too)
                 display_size = str(self.model.get_size(key)) + " Bytes"
+            try:
+                if is_bucket_root or not key:
+                    # bucket root URL
+                    ep = self.model.endpoint.rstrip("/")
+                    b = (self.model.bucket or "").strip("/")
+                    display_public_url = f"{ep}/{b}/" if b else ep
+                else:
+                    # object URL (preferred: use helper if you added it)
+                    if hasattr(self.model, "direct_object_url"):
+                        display_public_url = self.model.direct_object_url(key)
+                    else:
+                        # fallback: path-style
+                        ep = self.model.endpoint.rstrip("/")
+                        display_public_url = f"{ep}/{self.model.bucket}/{key}"
+            except Exception:
+                # TODO warning
+                pass
 
         except botocore.exceptions.ClientError:
             # fallback on access errors
@@ -71,10 +87,11 @@ class PropertiesWindow(QDialog):
             display_size = "N/A"
             display_etag = ""
 
-        # fill widgets
+
         self.keyName.setText(display_key)
         self.size.setText(display_size)
         self.eTag.setText(display_etag)
+        self.publicUrl.setText(display_public_url)
 
     def exit(self):
         self.close()
@@ -87,4 +104,5 @@ class PropertiesWindow(QDialog):
         layout.addRow(QLabel("Key / Bucket"), self.keyName)
         layout.addRow(QLabel("Size"), self.size)
         layout.addRow(QLabel("ETag"), self.eTag)
+        layout.addRow(QLabel("Public URL"), self.publicUrl)
         self.formGroupBox.setLayout(layout)
