@@ -6,6 +6,12 @@ import time
 from datetime import datetime
 import threading
 
+try:
+    import sip
+except ImportError:
+    sip = None
+
+
 from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
@@ -636,6 +642,15 @@ class MainWindow(QMainWindow):
     def transfers_active(self) -> bool:
         if self.thread is None:
             return False
+
+        if sip is not None:
+            try:
+                if sip.isdeleted(self.thread):
+                    self.thread = None
+                    self.worker = None
+                    return False
+            except Exception:
+                pass
         try:
             return self.thread.isRunning()
         except RuntimeError:
