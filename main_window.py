@@ -14,6 +14,7 @@ from PyQt5.QtGui import QFontDatabase
 from model import Model as DataModel
 from model import FSObjectType
 from properties_window import PropertiesWindow
+from profile_switcher import ProfileSwitchWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
@@ -431,7 +432,8 @@ class MainWindow(QMainWindow):
     def __init__(self, *args, **kwargs):
         settings = kwargs.pop("settings")
         super().__init__(*args, **kwargs)
-        self.setWindowTitle("S3 Duck 🦆 %s" % __VERSION__)
+        self.title = "S3 Duck 🦆 %s" % __VERSION__
+        # self.setWindowTitle(self.title)
         self.setWindowIcon(QIcon.fromTheme("applications-internet"))
 
         (
@@ -522,10 +524,13 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(wid)
         self.setGeometry(0, 26, 900, 500)
         self.profile_name = profile_name
+        self.update_window_title()
         self.copyPath = ""
         self.copyList = []
         self.copyListNew = ""
         self.createActions()
+
+
 
         self.tBar = self.addToolBar("Tools")
         self.tBar.setContextMenuPolicy(Qt.PreventContextMenu)
@@ -536,12 +541,15 @@ class MainWindow(QMainWindow):
         self.tBar.addAction(self.btnBack)
         self.tBar.addAction(self.btnUp)
         self.tBar.addAction(self.btnRefresh)
+        self.tBar.addAction(self.actCopyS3Path)
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnDownload)
         self.tBar.addAction(self.btnUpload)
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnCreateFolder)
         self.tBar.addAction(self.btnRemove)
+        self.tBar.addSeparator()
+        self.tBar.addAction(self.btnSwitchProfile)
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnAbout)
         self.tBar.setIconSize(QSize(26, 26))
@@ -588,16 +596,6 @@ class MainWindow(QMainWindow):
         self.s3PathEdit.setStyleSheet("font-family: monospace; background: #f0f0f0;")
         self.statusBar().addPermanentWidget(self.s3PathEdit, 3)
 
-        self.actCopyS3Path = QAction(
-            QIcon.fromTheme(
-                "edit-copy", QIcon(os.path.join(self.current_dir, "icons", "copy_24px.svg"))
-            ),
-            "Copy S3 path",
-            self,
-        )
-        self.actCopyS3Path.triggered.connect(self.copy_s3_path_to_clipboard)
-        self.tBar.addAction(self.actCopyS3Path)
-
         self.thread = None
         self.worker = None
         self.map = dict()
@@ -631,10 +629,19 @@ class MainWindow(QMainWindow):
         # Double-click: proxy-aware handler
         self.listview.doubleClicked.connect(self.list_doubleClicked)
 
-    # ====== tiny logging helper (timestamps) ======
     def log(self, message: str):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.logview.appendPlainText(f"[{ts}] {message}")
+
+    def transfers_active(self) -> bool:
+        return self.thread is not None and self.thread.isRunning()
+
+    def update_window_title(self):
+        profile = getattr(self, "profile_name", "")
+        if profile:
+            self.setWindowTitle(f"{self.title} — {profile}")
+        else:
+            self.setWindowTitle(self.title)
 
     def in_bucket_list_mode(self) -> bool:
         return not bool(self.data_model.bucket)
@@ -792,7 +799,6 @@ class MainWindow(QMainWindow):
 
         return None, None, None
 
-    # ====== UI / events ======
     def eventFilter(self, obj, event):
         if obj == self.listview:
             if event.type() == QEvent.ContextMenu and obj is self.listview:
@@ -1040,6 +1046,59 @@ class MainWindow(QMainWindow):
             self,
             Qt.Dialog | Qt.NoDropShadowWindowHint,
         ).show()
+
+    def switch_profile(self):
+
+        if self.transfers_active():
+            QMessageBox.information(
+                self,
+                "Switch profile",
+                "Profile switching is disabled while uploads/downloads are active.",
+            )
+            return
+        dlg = ProfileSwitchWindow(self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        prof = dlg.get_selected_profile()
+        if not prof:
+            return
+
+        self.apply_profile(prof)
+
+    def apply_profile(self, prof):
+        """
+        Apply a new profile without restarting the app.
+        """
+        # Update UI-visible profile name
+        self.profile_name = prof.name
+
+        # Update datamodel "root/profile" fields (important for bucket list mode)
+        self.data_model.profile_endpoint_url = prof.url
+        self.data_model.profile_use_path = prof.use_path
+        self.data_model.profile_region = prof.region
+
+        # Update current connection fields
+        self.data_model.endpoint_url = prof.url
+        self.data_model.use_path = prof.use_path
+        self.data_model.region_name = prof.region
+        self.data_model.access_key = prof.access_key
+        self.data_model.secret_key = prof.secret_key
+        self.data_model.no_ssl_check = prof.no_ssl_check
+
+        # Reset cached client so it reconnects with new creds
+        self.data_model._client = None
+
+        # Reset navigation
+        self.data_model.current_folder = ""
+        self.data_model.prev_folder = ""
+        # Start either in bucket list mode OR inside selected bucket (if profile has bucket)
+        self.data_model.bucket = ""
+        self.statusBar().showMessage(f"[{self.profile_name}][all buckets]", 3000)
+
+        # Refresh view
+        self.navigate()
+        self.update_window_title()
 
     def about(self):
         sysinfo = QSysInfo()
@@ -1589,6 +1648,7 @@ class MainWindow(QMainWindow):
         #  - Upload/Download disabled
         self.btnCreateFolder.setEnabled(True)  # create bucket OR create folder
         self.btnRemove.setEnabled(True)        # delete bucket OR delete object
+        self.btnSwitchProfile.setEnabled(True)
         self.btnUpload.setEnabled(not at_root)
         self.btnDownload.setEnabled(not at_root)
         if hasattr(self, "menu"):
@@ -1601,6 +1661,8 @@ class MainWindow(QMainWindow):
         self.btnUpload.setEnabled(False)
         self.btnDownload.setEnabled(False)
         self.btnRemove.setEnabled(False)
+        self.btnSwitchProfile.setEnabled(False)
+
 
     def goUp(self):
         if not self.data_model.bucket:
@@ -1703,6 +1765,20 @@ class MainWindow(QMainWindow):
             "About(F1)",
             triggered=self.about,
         )
+        self.btnSwitchProfile = QAction(
+            QIcon.fromTheme("system-switch-user", QIcon(os.path.join(self.current_dir, "icons", "account-switch_24px.svg"))),
+            "Switch profile…",
+            triggered=self.switch_profile,
+        )
+        self.actCopyS3Path = QAction(
+            QIcon.fromTheme(
+                "edit-copy", QIcon(os.path.join(self.current_dir, "icons", "copy_24px.svg"))
+            ),
+            "Copy S3 path",
+            self,
+        )
+        self.actCopyS3Path.triggered.connect(self.copy_s3_path_to_clipboard)
+
 
     def restoreSettings(self):
         self.settings.beginGroup("geometry")
