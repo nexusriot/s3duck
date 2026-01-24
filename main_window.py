@@ -18,7 +18,7 @@ from profile_switcher import ProfileSwitchWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.2.5"
+__VERSION__ = "0.3.0"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -634,7 +634,14 @@ class MainWindow(QMainWindow):
         self.logview.appendPlainText(f"[{ts}] {message}")
 
     def transfers_active(self) -> bool:
-        return self.thread is not None and self.thread.isRunning()
+        if self.thread is None:
+            return False
+        try:
+            return self.thread.isRunning()
+        except RuntimeError:
+            self.thread = None
+            self.worker = None
+            return False
 
     def update_window_title(self):
         profile = getattr(self, "profile_name", "")
@@ -732,7 +739,6 @@ class MainWindow(QMainWindow):
         if display_rate_bps < 1:
             display_rate_bps = 0.0
 
-        # --- % done ---
         pct = 0
         if self._smooth_total > 0:
             pct = int((self._smooth_done / self._smooth_total) * 100)
@@ -741,7 +747,6 @@ class MainWindow(QMainWindow):
         self.pb.setMaximum(100)
         self.pb.setValue(pct)
 
-        # --- ETA using smoothed rate ---
         remaining = max(0, self._smooth_total - self._smooth_done)
         eta_txt = ""
         if display_rate_bps > 1 and remaining > 0 and pct < 100:
@@ -869,6 +874,8 @@ class MainWindow(QMainWindow):
                 download_action = None
                 delete_action = None
                 properties_selected_action = None
+                share_tmp_action = None
+                share_public_action = None
 
                 if (
                     m
@@ -987,6 +994,8 @@ class MainWindow(QMainWindow):
                 clk = self.menu.exec_(event.globalPos())
                 if not clk:
                     return False
+
+
                 if clk == upload_selected_action:
                     self.upload(upload_path)
                 if clk == upload_current_action:
@@ -1070,6 +1079,8 @@ class MainWindow(QMainWindow):
         """
         Apply a new profile without restarting the app.
         """
+        old_profile = getattr(self, "profile_name", None)
+
         # Update UI-visible profile name
         self.profile_name = prof.name
 
@@ -1099,6 +1110,10 @@ class MainWindow(QMainWindow):
         # Refresh view
         self.navigate()
         self.update_window_title()
+        if old_profile and old_profile != self.profile_name:
+            self.log(f"Profile switched: {old_profile} → {self.profile_name}")
+        else:
+            self.log(f"Profile switched to: {self.profile_name}")
 
     def about(self):
         sysinfo = QSysInfo()
@@ -1429,10 +1444,15 @@ class MainWindow(QMainWindow):
         self.worker = Worker(self.data_model, job)
         self.worker.moveToThread(self.thread)
 
+        def _clear_thread_refs():
+            self.thread = None
+            self.worker = None
+
         m = getattr(self.worker, method)
         self.thread.started.connect(m)
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(_clear_thread_refs)
         self.thread.finished.connect(self.thread.deleteLater)
         self.worker.progress.connect(self.report_logger_progress)
 
@@ -1628,7 +1648,6 @@ class MainWindow(QMainWindow):
             job.append((key, name))
         self.assign_thread_operation("upload", job)
 
-    # ---- toolbar wrappers so buttons work in both modes ----
     def on_toolbar_create(self):
         if self.in_bucket_list_mode():
             self.new_bucket()
@@ -1694,7 +1713,6 @@ class MainWindow(QMainWindow):
         # All progress lines from the worker get a timestamp
         self.log(msg)
 
-    # ---- S3 path helpers + resize hook ----
     def current_s3_path(self) -> str:
         if not self.data_model.bucket:
             return "s3://"

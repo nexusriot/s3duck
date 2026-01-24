@@ -434,7 +434,6 @@ class Model:
         root_client = self._make_client(region=self.profile_region or "us-east-1")
         root_client.delete_bucket(Bucket=bucket_name)
 
-    # ---- helper for adaptive per-bucket object listing ----
     def _list_bucket_once(self, client_obj, bucket_name, prefix):
         """
         Try to list 'prefix' in 'bucket_name' using client_obj once.
