@@ -24,7 +24,7 @@ from profile_switcher import ProfileSwitchWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.3.3"
+__VERSION__ = "0.3.5"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -281,6 +281,19 @@ class Worker(QObject):
         super().__init__()
         self.data_model = data_model
         self.job = job
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def _should_cancel(self) -> bool:
+        try:
+            t = QThread.currentThread()
+            if t is not None and t.isInterruptionRequested():
+                return True
+        except Exception:
+            pass
+        return bool(self._cancel)
 
     def download(self):
         STALL_TIMEOUT_SEC = 90.0  # abort if no byte-progress for this long
@@ -295,6 +308,10 @@ class Worker(QObject):
             # total bytes across everything in this batch, including dirs
             total_bytes_all = 0
             for key, local_name, size, folder_path in self.job:
+                if self._should_cancel():
+                    self.progress.emit("cancel requested")
+                    break
+
                 if local_name is not None:
                     # single file
                     total_bytes_all += int(size or 0)
@@ -334,6 +351,10 @@ class Worker(QObject):
 
                 def _cb(total_file, cur_file, key):
                     nonlocal done_all
+
+                    if self._should_cancel():
+                        raise RuntimeError("Canceled")
+
                     key = str(key or "")
 
                     # Any monotonic progress => reset stall timer
@@ -372,9 +393,14 @@ class Worker(QObject):
                 if (time.time() - last_progress_ts) > STALL_TIMEOUT_SEC:
                     raise TimeoutError(
                         "Download stalled (no progress for %.0fs)" % STALL_TIMEOUT_SEC)
-
-                self.data_model.download_file(key, local_name, folder_path,
-                                              progress_cb=cb)
+                try:
+                     self.data_model.download_file(key, local_name, folder_path,
+                                                   progress_cb=cb)
+                except RuntimeError as exc:
+                    if "Canceled" in str(exc):
+                        self.progress.emit("download canceled")
+                        break
+                    raise
 
             # final emit to ensure 100%
             self.batch_progress.emit(int(done_all), int(total_bytes_all))
@@ -584,6 +610,7 @@ class MainWindow(QMainWindow):
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnCreateFolder)
         self.tBar.addAction(self.btnRemove)
+        self.tBar.addAction(self.btnCancel)
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnSwitchProfile)
         self.tBar.addSeparator()
@@ -1061,6 +1088,9 @@ class MainWindow(QMainWindow):
                 return True
 
             if event.type() == QEvent.KeyPress:
+                if event.key() == Qt.Key_Escape:
+                    self.cancel_transfers()
+                    return True
                 if event.key() == Qt.Key_Return:
                     # Let double-click handler logic handle Enter as well
                     current = self.listview.currentIndex()
@@ -1705,6 +1735,28 @@ class MainWindow(QMainWindow):
         else:
             self.delete()
 
+    def cancel_transfers(self):
+        if not self.transfers_active():
+            return
+        self.log("cancel requested by user")
+        self.statusBar().showMessage("Canceling…", 2000)
+
+        try:
+            if self.worker is not None:
+                self.worker.cancel()
+        except Exception:
+            pass
+
+        try:
+            if self.thread is not None:
+                self.thread.requestInterruption()
+        except Exception:
+            pass
+        try:
+            self.btnCancel.setEnabled(False)
+        except Exception:
+            pass
+
     def enable_action_buttons(self):
         at_root = self.in_bucket_list_mode()
         # In bucket list mode:
@@ -1715,6 +1767,7 @@ class MainWindow(QMainWindow):
         self.btnSwitchProfile.setEnabled(True)
         self.btnUpload.setEnabled(not at_root)
         self.btnDownload.setEnabled(not at_root)
+        self.btnCancel.setEnabled(False)
         if hasattr(self, "menu"):
             self.menu.setEnabled(True)
 
@@ -1726,6 +1779,7 @@ class MainWindow(QMainWindow):
         self.btnDownload.setEnabled(False)
         self.btnRemove.setEnabled(False)
         self.btnSwitchProfile.setEnabled(False)
+        self.btnCancel.setEnabled(True)
 
 
     def goUp(self):
@@ -1823,6 +1877,12 @@ class MainWindow(QMainWindow):
             "Upload(U)",
             triggered=self.upload,
         )
+        self.btnCancel = QAction(
+            QIcon.fromTheme("process-stop",  QIcon(os.path.join(self.current_dir, "icons", "cancel_24px.svg"))),
+            "Cancel(Esc)",
+            triggered=self.cancel_transfers,
+        )
+        self.btnCancel.setEnabled(False)
         self.btnAbout = QAction(
             QIcon.fromTheme("help-about", QIcon(os.path.join(self.current_dir, "icons", "info_24px.svg"))),
             "About(F1)",
