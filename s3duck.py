@@ -87,7 +87,7 @@ class Profiles(QDialog):
     def __init__(self):
         super().__init__()
         self.current_dir = get_current_dir()
-        # store settings in ~/config/s3duck
+        # store settings in ~/.config/s3duck
         self.settings = QSettings("s3duck", "s3duck")
         self.items = []
         vbox = QVBoxLayout(self)
