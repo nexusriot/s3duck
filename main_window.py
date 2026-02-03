@@ -283,78 +283,108 @@ class Worker(QObject):
         self.job = job
 
     def download(self):
-        # total bytes across everything in this batch, including dirs
-        total_bytes_all = 0
-        for key, local_name, size, folder_path in self.job:
-            if local_name is not None:
-                # single file
-                total_bytes_all += int(size or 0)
-            else:
-                # folder / prefix
-                for k, s in self.data_model.get_keys(key):
-                    if not k.endswith("/"):
-                        total_bytes_all += int(s or 0)
-        total_bytes_all = max(1, int(total_bytes_all))
+        STALL_TIMEOUT_SEC = 90.0  # abort if no byte-progress for this long
 
-        done_all = 0
-        done_all_lock = threading.Lock()
+        last_progress_ts = time.time()
 
-        throttle_state = {"t": 0.0, "b": 0}
+        def touch_progress():
+            nonlocal last_progress_ts
+            last_progress_ts = time.time()
 
-        def emit_throttled(current_total, file_cur, file_total, key):
-            now = time.time()
-            should_emit = False
-            if (now - throttle_state["t"]) >= PROGRESS_EMIT_INTERVAL_SEC:
-                should_emit = True
-            elif (current_total - throttle_state["b"]) >= PROGRESS_MIN_BYTE_DELTA:
-                should_emit = True
-            elif current_total >= total_bytes_all:
-                should_emit = True
+        try:
+            # total bytes across everything in this batch, including dirs
+            total_bytes_all = 0
+            for key, local_name, size, folder_path in self.job:
+                if local_name is not None:
+                    # single file
+                    total_bytes_all += int(size or 0)
+                else:
+                    # folder / prefix
+                    for k, s in self.data_model.get_keys(key):
+                        if not k.endswith("/"):
+                            total_bytes_all += int(s or 0)
+            total_bytes_all = max(1, int(total_bytes_all))
 
-            if should_emit:
-                throttle_state["t"] = now
-                throttle_state["b"] = current_total
-                # per-file first (keeps last file bar responsive enough)
-                self.file_progress.emit(int(file_cur), int(file_total or 1), key)
-                # then aggregate
-                self.batch_progress.emit(int(current_total), int(total_bytes_all))
+            done_all = 0
+            done_all_lock = threading.Lock()
 
-        def make_cb():
-            # Track last sent value PER KEY so multiple files don't interfere.
-            last_sent_per_key = {}
+            throttle_state = {"t": 0.0, "b": 0}
 
-            def _cb(total_file, cur_file, key):
-                nonlocal done_all
-                key = str(key or "")
-                with done_all_lock:
-                    prev = int(last_sent_per_key.get(key, 0))
-                    cur = int(cur_file)
-                    if cur > prev:
-                        delta = cur - prev
-                        last_sent_per_key[key] = cur
-                        done_all += delta
-                    # else: ignore non-monotonic callbacks
-                    current_total = done_all
+            def emit_throttled(current_total, file_cur, file_total, key):
+                now = time.time()
+                should_emit = False
+                if (now - throttle_state["t"]) >= PROGRESS_EMIT_INTERVAL_SEC:
+                    should_emit = True
+                elif (current_total - throttle_state[
+                    "b"]) >= PROGRESS_MIN_BYTE_DELTA:
+                    should_emit = True
+                elif current_total >= total_bytes_all:
+                    should_emit = True
 
-                emit_throttled(current_total, int(cur_file),
-                               int(total_file or 1), key)
+                if should_emit:
+                    throttle_state["t"] = now
+                    throttle_state["b"] = current_total
+                    self.file_progress.emit(int(file_cur),
+                                            int(file_total or 1), key)
+                    self.batch_progress.emit(int(current_total),
+                                             int(total_bytes_all))
 
-            return _cb
+            def make_cb():
+                last_sent_per_key = {}
 
-        # run the actual download(s)
-        for key, local_name, size, folder_path in self.job:
-            if local_name:
-                msg = "downloading %s -> %s (%s)" % (key, local_name, size)
-            else:
-                msg = "downloading directory: %s -> %s" % (key, folder_path)
-            self.progress.emit(msg)
+                def _cb(total_file, cur_file, key):
+                    nonlocal done_all
+                    key = str(key or "")
 
-            cb = make_cb()
-            self.data_model.download_file(key, local_name, folder_path, progress_cb=cb)
+                    # Any monotonic progress => reset stall timer
+                    try:
+                        cur = int(cur_file)
+                    except Exception:
+                        cur = 0
 
-        # final emit to ensure 100%
-        self.batch_progress.emit(int(done_all), int(total_bytes_all))
-        self.finished.emit()
+                    with done_all_lock:
+                        prev = int(last_sent_per_key.get(key, 0))
+                        if cur > prev:
+                            delta = cur - prev
+                            last_sent_per_key[key] = cur
+                            done_all += delta
+                            touch_progress()
+                        current_total = done_all
+
+                    emit_throttled(current_total, int(cur_file),
+                                   int(total_file or 1), key)
+
+                return _cb
+
+            # run the actual download(s)
+            for key, local_name, size, folder_path in self.job:
+                if local_name:
+                    msg = "downloading %s -> %s (%s)" % (key, local_name, size)
+                else:
+                    msg = "downloading directory: %s -> %s" % (key,
+                                                               folder_path)
+                self.progress.emit(msg)
+
+                cb = make_cb()
+
+                # If boto3 stalls and stops calling callbacks, this will trip
+                # once we regain control (between files/folders).
+                if (time.time() - last_progress_ts) > STALL_TIMEOUT_SEC:
+                    raise TimeoutError(
+                        "Download stalled (no progress for %.0fs)" % STALL_TIMEOUT_SEC)
+
+                self.data_model.download_file(key, local_name, folder_path,
+                                              progress_cb=cb)
+
+            # final emit to ensure 100%
+            self.batch_progress.emit(int(done_all), int(total_bytes_all))
+
+        except Exception as exc:
+            # Ensure the UI gets *something* instead of hanging forever
+            self.progress.emit("ERROR: %s" % (str(exc) or repr(exc)))
+
+        finally:
+            self.finished.emit()
 
     def delete(self):
         for key in self.job:

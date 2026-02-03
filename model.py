@@ -98,12 +98,11 @@ class Model:
         self.timeout = timeout
         self.retries = retries
 
-        # Smaller chunks -> smoother progress
         self.transfer_cfg = TransferConfig(
             multipart_threshold=8 * 1024 * 1024,   # 8MB
             multipart_chunksize=1 * 1024 * 1024,   # 1MB parts
             io_chunksize=256 * 1024,               # 256KB read size
-            max_concurrency=4,
+            max_concurrency=2,
             use_threads=True,
         )
 
@@ -146,7 +145,11 @@ class Model:
                 "config": botocore.config.Config(
                     s3=s3_config,
                     connect_timeout=self.timeout,
-                    retries={"max_attempts": self.retries},
+                    read_timeout=self.timeout,
+                    retries={
+                        "max_attempts": self.retries,
+                        "mode": "standard",
+                    },
                 ),
             }
         )
