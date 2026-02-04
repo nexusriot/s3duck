@@ -674,6 +674,7 @@ class MainWindow(QMainWindow):
         self.listview.header().resizeSection(2, 80)
 
         self.listview.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.listview.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.listview.setDragDropMode(QAbstractItemView.DragDrop)
         self.listview.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.listview.setIndentation(10)
