@@ -686,6 +686,29 @@ class MainWindow(QMainWindow):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.logview.appendPlainText(f"[{ts}] {message}")
 
+    def _begin_model_reset_ui(self):
+        self.listview.setUpdatesEnabled(False)
+
+        try:
+            self.listview.setSortingEnabled(False)
+        except Exception:
+            pass
+
+        sm = self.listview.selectionModel()
+        if sm is not None:
+            blocker = QSignalBlocker(sm)
+            sm.clearSelection()
+            sm.clearCurrentIndex()
+            return blocker
+        return None
+
+    def _end_model_reset_ui(self):
+        try:
+            self.listview.setSortingEnabled(True)
+        except Exception:
+            pass
+        self.listview.setUpdatesEnabled(True)
+
     def transfers_active(self) -> bool:
         if self.thread is None:
             return False
@@ -1202,21 +1225,26 @@ class MainWindow(QMainWindow):
 
     def modelToListView_bucket_mode(self, bucket_items):
         """Populate the view with buckets only (no [..])."""
-        self.model.setRowCount(0)
-
-        bucket_icon = QIcon.fromTheme(
-            "drive-harddisk",
-            QIcon(os.path.join(self.current_dir, "icons", "bucket_24px.svg")),
-        )
-
-        for b in bucket_items:
-            self.model.appendRow(
-                [
-                    ListItem(0, FSObjectType.BUCKET, bucket_icon, b.name),
-                    ListItem(0, FSObjectType.BUCKET, "<BUCKET>"),
-                    ListItem(0, FSObjectType.BUCKET, ""),
-                ]
+        blocker = self._begin_model_reset_ui()
+        try:
+            self.model.setRowCount(0)
+            bucket_icon = QIcon.fromTheme(
+                "drive-harddisk",
+                QIcon(os.path.join(self.current_dir, "icons", "bucket_24px.svg")),
             )
+
+            for b in bucket_items:
+                self.model.appendRow(
+                    [
+                        ListItem(0, FSObjectType.BUCKET, bucket_icon, b.name),
+                        ListItem(0, FSObjectType.BUCKET, "<BUCKET>"),
+                        ListItem(0, FSObjectType.BUCKET, ""),
+                    ]
+                )
+        finally:
+            # ensure blocker is released before re-enabling updates
+            blocker = None
+            self._end_model_reset_ui()
 
     def modelToListView(self, model_result):
         """
