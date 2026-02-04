@@ -19,6 +19,7 @@ from PyQt5.QtGui import QIcon, QStandardItemModel, QStandardItem
 from PyQt5.QtGui import QFontDatabase
 from model import Model as DataModel
 from model import FSObjectType
+from model import TransferCancelled
 from properties_window import PropertiesWindow
 from profile_switcher import ProfileSwitchWindow
 
@@ -277,54 +278,39 @@ class Worker(QObject):
     file_progress = pyqtSignal(object, object, str)
     batch_progress = pyqtSignal(object, object)
 
+    error = pyqtSignal(str)
+
     def __init__(self, data_model, job):
         super().__init__()
         self.data_model = data_model
         self.job = job
-        self._cancel = False
+        self._cancel_event = threading.Event()
 
+    @pyqtSlot()
     def cancel(self):
-        self._cancel = True
-
-    def _should_cancel(self) -> bool:
-        try:
-            t = QThread.currentThread()
-            if t is not None and t.isInterruptionRequested():
-                return True
-        except Exception:
-            pass
-        return bool(self._cancel)
+        self._cancel_event.set()
+        self.progress.emit("cancel requested…")
 
     def download(self):
-        STALL_TIMEOUT_SEC = 90.0  # abort if no byte-progress for this long
-
-        last_progress_ts = time.time()
-
-        def touch_progress():
-            nonlocal last_progress_ts
-            last_progress_ts = time.time()
-
         try:
             # total bytes across everything in this batch, including dirs
             total_bytes_all = 0
             for key, local_name, size, folder_path in self.job:
-                if self._should_cancel():
-                    self.progress.emit("cancel requested")
-                    break
+                if self._cancel_event.is_set():
+                    raise Exception("cancelled")
 
                 if local_name is not None:
-                    # single file
                     total_bytes_all += int(size or 0)
                 else:
-                    # folder / prefix
                     for k, s in self.data_model.get_keys(key):
-                        if not k.endswith("/"):
+                        if self._cancel_event.is_set():
+                            raise Exception("cancelled")
+                        if k and not k.endswith("/"):
                             total_bytes_all += int(s or 0)
             total_bytes_all = max(1, int(total_bytes_all))
 
             done_all = 0
             done_all_lock = threading.Lock()
-
             throttle_state = {"t": 0.0, "b": 0}
 
             def emit_throttled(current_total, file_cur, file_total, key):
@@ -351,25 +337,17 @@ class Worker(QObject):
 
                 def _cb(total_file, cur_file, key):
                     nonlocal done_all
-
-                    if self._should_cancel():
-                        raise RuntimeError("Canceled")
+                    if self._cancel_event.is_set():
+                        raise TransferCancelled("cancelled")
 
                     key = str(key or "")
-
-                    # Any monotonic progress => reset stall timer
-                    try:
-                        cur = int(cur_file)
-                    except Exception:
-                        cur = 0
-
                     with done_all_lock:
                         prev = int(last_sent_per_key.get(key, 0))
+                        cur = int(cur_file)
                         if cur > prev:
                             delta = cur - prev
                             last_sent_per_key[key] = cur
                             done_all += delta
-                            touch_progress()
                         current_total = done_all
 
                     emit_throttled(current_total, int(cur_file),
@@ -377,8 +355,10 @@ class Worker(QObject):
 
                 return _cb
 
-            # run the actual download(s)
             for key, local_name, size, folder_path in self.job:
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+
                 if local_name:
                     msg = "downloading %s -> %s (%s)" % (key, local_name, size)
                 else:
@@ -387,27 +367,21 @@ class Worker(QObject):
                 self.progress.emit(msg)
 
                 cb = make_cb()
+                self.data_model.download_file(
+                    key, local_name, folder_path,
+                    progress_cb=cb,
+                    cancel_event=self._cancel_event,
+                )
 
-                # If boto3 stalls and stops calling callbacks, this will trip
-                # once we regain control (between files/folders).
-                if (time.time() - last_progress_ts) > STALL_TIMEOUT_SEC:
-                    raise TimeoutError(
-                        "Download stalled (no progress for %.0fs)" % STALL_TIMEOUT_SEC)
-                try:
-                     self.data_model.download_file(key, local_name, folder_path,
-                                                   progress_cb=cb)
-                except RuntimeError as exc:
-                    if "Canceled" in str(exc):
-                        self.progress.emit("download canceled")
-                        break
-                    raise
-
-            # final emit to ensure 100%
             self.batch_progress.emit(int(done_all), int(total_bytes_all))
 
         except Exception as exc:
-            # Ensure the UI gets *something* instead of hanging forever
-            self.progress.emit("ERROR: %s" % (str(exc) or repr(exc)))
+            msg = str(exc) or exc.__class__.__name__
+            if "cancelled" in msg.lower():
+                self.progress.emit("download cancelled")
+            else:
+                self.progress.emit(f"download failed: {msg}")
+                self.error.emit(msg)
 
         finally:
             self.finished.emit()
@@ -421,73 +395,94 @@ class Worker(QObject):
         self.finished.emit()
 
     def upload(self):
-        # figure out total bytes we plan to upload
-        total_bytes_all = 0
-        for key, local_name in self.job:
-            if local_name:
-                try:
-                    total_bytes_all += int(os.path.getsize(local_name))
-                except Exception:
-                    pass
-        total_bytes_all = max(1, int(total_bytes_all))
+        try:
+            total_bytes_all = 0
+            for key, local_name in self.job:
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                if local_name:
+                    try:
+                        total_bytes_all += int(os.path.getsize(local_name))
+                    except Exception:
+                        pass
+            total_bytes_all = max(1, int(total_bytes_all))
 
-        done_all = 0
-        done_all_lock = threading.Lock()
+            done_all = 0
+            done_all_lock = threading.Lock()
+            throttle_state = {"t": 0.0, "b": 0}
 
-        throttle_state = {"t": 0.0, "b": 0}
+            def emit_throttled(current_total, file_cur, file_total, key):
+                now = time.time()
+                should_emit = False
+                if (now - throttle_state["t"]) >= PROGRESS_EMIT_INTERVAL_SEC:
+                    should_emit = True
+                elif (current_total - throttle_state[
+                    "b"]) >= PROGRESS_MIN_BYTE_DELTA:
+                    should_emit = True
+                elif current_total >= total_bytes_all:
+                    should_emit = True
 
-        def emit_throttled(current_total, file_cur, file_total, key):
-            now = time.time()
-            should_emit = False
-            if (now - throttle_state["t"]) >= PROGRESS_EMIT_INTERVAL_SEC:
-                should_emit = True
-            elif (current_total - throttle_state["b"]) >= PROGRESS_MIN_BYTE_DELTA:
-                should_emit = True
-            elif current_total >= total_bytes_all:
-                should_emit = True
+                if should_emit:
+                    throttle_state["t"] = now
+                    throttle_state["b"] = current_total
+                    self.file_progress.emit(int(file_cur),
+                                            int(file_total or 1), key)
+                    self.batch_progress.emit(int(current_total),
+                                             int(total_bytes_all))
 
-            if should_emit:
-                throttle_state["t"] = now
-                throttle_state["b"] = current_total
-                self.file_progress.emit(int(file_cur), int(file_total or 1), key)
-                self.batch_progress.emit(int(current_total), int(total_bytes_all))
+            def make_cb():
+                last_sent_per_key = {}
 
-        def make_cb():
-            # Track last sent value PER KEY being uploaded.
-            last_sent_per_key = {}
+                def _cb(total_file, cur_file, key):
+                    nonlocal done_all
+                    if self._cancel_event.is_set():
+                        raise TransferCancelled("cancelled")
 
-            def _cb(total_file, cur_file, key):
-                nonlocal done_all
-                key = str(key or "")
-                with done_all_lock:
-                    prev = int(last_sent_per_key.get(key, 0))
-                    cur = int(cur_file)
-                    if cur > prev:
-                        delta = cur - prev
-                        last_sent_per_key[key] = cur
-                        done_all += delta
-                    current_total = done_all
+                    key = str(key or "")
+                    with done_all_lock:
+                        prev = int(last_sent_per_key.get(key, 0))
+                        cur = int(cur_file)
+                        if cur > prev:
+                            delta = cur - prev
+                            last_sent_per_key[key] = cur
+                            done_all += delta
+                        current_total = done_all
 
-                emit_throttled(current_total, int(cur_file),
-                               int(total_file or 1), key)
+                    emit_throttled(current_total, int(cur_file),
+                                   int(total_file or 1), key)
 
-            return _cb
+                return _cb
 
-        # do the actual upload(s)
-        for key, local_name in self.job:
-            if local_name is not None:
-                msg = "uploading %s -> %s" % (local_name, key)
+            for key, local_name in self.job:
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+
+                if local_name is not None:
+                    msg = "uploading %s -> %s" % (local_name, key)
+                else:
+                    msg = "creating folder %s" % key
+                self.progress.emit(msg)
+
+                cb = make_cb() if local_name else None
+                self.data_model.upload_file(
+                    local_name, key,
+                    progress_cb=cb,
+                    cancel_event=self._cancel_event,  # NEW
+                )
+                self.refresh.emit()
+
+            self.batch_progress.emit(int(done_all), int(total_bytes_all))
+
+        except Exception as exc:
+            msg = str(exc) or exc.__class__.__name__
+            if "cancelled" in msg.lower():
+                self.progress.emit("upload cancelled")
             else:
-                msg = "creating folder %s" % key
-            self.progress.emit(msg)
+                self.progress.emit(f"upload failed: {msg}")
+                self.error.emit(msg)
 
-            cb = make_cb() if local_name else None
-            self.data_model.upload_file(local_name, key, progress_cb=cb)
-            self.refresh.emit()
-
-        # final emit to ensure 100%
-        self.batch_progress.emit(int(done_all), int(total_bytes_all))
-        self.finished.emit()
+        finally:
+            self.finished.emit()
 
 
 class MainWindow(QMainWindow):
@@ -1522,6 +1517,9 @@ class MainWindow(QMainWindow):
         def _clear_thread_refs():
             self.thread = None
             self.worker = None
+            # todo: remove getattr
+            if getattr(self, "btnCancel", None) is not None:
+                self.btnCancel.setEnabled(False)
 
         m = getattr(self.worker, method)
         self.thread.started.connect(m)
@@ -1736,13 +1734,15 @@ class MainWindow(QMainWindow):
             self.delete()
 
     def cancel_transfers(self):
-        if not self.transfers_active():
+
+        if not self.transfers_active() or self.worker is None:
             return
-        self.log("cancel requested by user")
+
         self.statusBar().showMessage("Canceling…", 2000)
 
         try:
             if self.worker is not None:
+                # QMetaObject.invokeMethod(self.worker, "cancel", Qt.QueuedConnection)
                 self.worker.cancel()
         except Exception:
             pass
