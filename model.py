@@ -113,13 +113,22 @@ class Model:
         self.retries = retries
         self.read_timeout = read_timeout
 
-        self.transfer_cfg = TransferConfig(
-            multipart_threshold=8 * 1024 * 1024,   # 8MB
-            multipart_chunksize=1 * 1024 * 1024,   # 1MB parts
-            io_chunksize=256 * 1024,               # 256KB read size
+        self.transfer_cfg_download = TransferConfig(
+            multipart_threshold=16 * 1024 * 1024,  # 16MB
+            multipart_chunksize=8 * 1024 * 1024,  # 8MB
+            io_chunksize=256 * 1024,
+            max_concurrency=1,
+            use_threads=True,
+        )
+
+        self.transfer_cfg_upload = TransferConfig(
+            multipart_threshold=16 * 1024 * 1024,
+            multipart_chunksize=8 * 1024 * 1024,
+            io_chunksize=256 * 1024,
             max_concurrency=2,
             use_threads=True,
         )
+
 
     @staticmethod
     def get_os_family():
@@ -600,7 +609,6 @@ class Model:
                 if cancel_event is not None and cancel_event.is_set():
                     raise TransferCancelled("cancelled")
 
-                # keep your original relative layout
                 rel = os.path.relpath(k, prefix)
                 if rel == ".":
                     continue
@@ -617,9 +625,8 @@ class Model:
                     self.bucket,
                     k,
                     out_path,
-                    Callback=_BotoProgressAdapter(size, k, progress_cb,
-                                                  cancel_event=cancel_event),
-                    Config=self.transfer_cfg,
+                    Callback=_BotoProgressAdapter(size, k, progress_cb, cancel_event=cancel_event),
+                    Config=self.transfer_cfg_download,
                 )
             return
 
@@ -638,13 +645,20 @@ class Model:
         if cancel_event is not None and cancel_event.is_set():
             raise TransferCancelled("cancelled")
 
+        # ensure parent dir exists (cheap safety)
+        try:
+            parent = os.path.dirname(local_name)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+        except Exception:
+            pass
+
         self.client.download_file(
             self.bucket,
             key,
             local_name,
-            Callback=_BotoProgressAdapter(size, key, progress_cb,
-                                          cancel_event=cancel_event),
-            Config=self.transfer_cfg,
+            Callback=_BotoProgressAdapter(size, key, progress_cb, cancel_event=cancel_event),
+            Config=self.transfer_cfg_download,
         )
 
     def create_folder(self, key):
@@ -672,8 +686,7 @@ class Model:
             self.client.delete_object(Bucket=self.bucket, Key=key)
         return True
 
-    def upload_file(self, local_file, key, progress_cb=None,
-                    cancel_event=None):
+    def upload_file(self, local_file, key, progress_cb=None, cancel_event=None):
         """
         Upload a file (with progress) or create a folder placeholder if local_file is None.
         """
@@ -693,9 +706,8 @@ class Model:
             local_file,
             self.bucket,
             key,
-            Callback=_BotoProgressAdapter(total, key, progress_cb,
-                                          cancel_event=cancel_event),
-            Config=self.transfer_cfg,
+            Callback=_BotoProgressAdapter(total, key, progress_cb, cancel_event=cancel_event),
+            Config=self.transfer_cfg_upload,  # IMPORTANT
         )
 
     def check_bucket(self):

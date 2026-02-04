@@ -25,7 +25,7 @@ from profile_switcher import ProfileSwitchWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.3.5"
+__VERSION__ = "0.3.9"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -272,7 +272,7 @@ class UpTopProxyModel(QSortFilterProxyModel):
 
 
 class Worker(QObject):
-    finished = pyqtSignal()
+    finished = pyqtSignal(bool) # cancelled?
     progress = pyqtSignal(str)
     refresh = pyqtSignal()
     file_progress = pyqtSignal(object, object, str)
@@ -292,19 +292,20 @@ class Worker(QObject):
         self.progress.emit("cancel requested…")
 
     def download(self):
+        cancelled = False
         try:
             # total bytes across everything in this batch, including dirs
             total_bytes_all = 0
             for key, local_name, size, folder_path in self.job:
                 if self._cancel_event.is_set():
-                    raise Exception("cancelled")
+                    raise TransferCancelled("cancelled")
 
                 if local_name is not None:
                     total_bytes_all += int(size or 0)
                 else:
                     for k, s in self.data_model.get_keys(key):
                         if self._cancel_event.is_set():
-                            raise Exception("cancelled")
+                            raise TransferCancelled("cancelled")
                         if k and not k.endswith("/"):
                             total_bytes_all += int(s or 0)
             total_bytes_all = max(1, int(total_bytes_all))
@@ -318,8 +319,7 @@ class Worker(QObject):
                 should_emit = False
                 if (now - throttle_state["t"]) >= PROGRESS_EMIT_INTERVAL_SEC:
                     should_emit = True
-                elif (current_total - throttle_state[
-                    "b"]) >= PROGRESS_MIN_BYTE_DELTA:
+                elif (current_total - throttle_state["b"]) >= PROGRESS_MIN_BYTE_DELTA:
                     should_emit = True
                 elif current_total >= total_bytes_all:
                     should_emit = True
@@ -327,10 +327,8 @@ class Worker(QObject):
                 if should_emit:
                     throttle_state["t"] = now
                     throttle_state["b"] = current_total
-                    self.file_progress.emit(int(file_cur),
-                                            int(file_total or 1), key)
-                    self.batch_progress.emit(int(current_total),
-                                             int(total_bytes_all))
+                    self.file_progress.emit(int(file_cur), int(file_total or 1), key)
+                    self.batch_progress.emit(int(current_total), int(total_bytes_all))
 
             def make_cb():
                 last_sent_per_key = {}
@@ -350,8 +348,7 @@ class Worker(QObject):
                             done_all += delta
                         current_total = done_all
 
-                    emit_throttled(current_total, int(cur_file),
-                                   int(total_file or 1), key)
+                    emit_throttled(current_total, int(cur_file), int(total_file or 1), key)
 
                 return _cb
 
@@ -362,8 +359,7 @@ class Worker(QObject):
                 if local_name:
                     msg = "downloading %s -> %s (%s)" % (key, local_name, size)
                 else:
-                    msg = "downloading directory: %s -> %s" % (key,
-                                                               folder_path)
+                    msg = "downloading directory: %s -> %s" % (key, folder_path)
                 self.progress.emit(msg)
 
                 cb = make_cb()
@@ -378,13 +374,13 @@ class Worker(QObject):
         except Exception as exc:
             msg = str(exc) or exc.__class__.__name__
             if "cancelled" in msg.lower():
-                self.progress.emit("download cancelled")
+                cancelled = True
             else:
                 self.progress.emit(f"download failed: {msg}")
                 self.error.emit(msg)
 
         finally:
-            self.finished.emit()
+            self.finished.emit(cancelled)
 
     def delete(self):
         for key in self.job:
@@ -392,9 +388,10 @@ class Worker(QObject):
             self.progress.emit(msg)
             self.data_model.delete(key)
             self.refresh.emit()
-        self.finished.emit()
+        self.finished.emit(False)
 
     def upload(self):
+        cancelled = False
         try:
             total_bytes_all = 0
             for key, local_name in self.job:
@@ -416,8 +413,7 @@ class Worker(QObject):
                 should_emit = False
                 if (now - throttle_state["t"]) >= PROGRESS_EMIT_INTERVAL_SEC:
                     should_emit = True
-                elif (current_total - throttle_state[
-                    "b"]) >= PROGRESS_MIN_BYTE_DELTA:
+                elif (current_total - throttle_state["b"]) >= PROGRESS_MIN_BYTE_DELTA:
                     should_emit = True
                 elif current_total >= total_bytes_all:
                     should_emit = True
@@ -425,10 +421,8 @@ class Worker(QObject):
                 if should_emit:
                     throttle_state["t"] = now
                     throttle_state["b"] = current_total
-                    self.file_progress.emit(int(file_cur),
-                                            int(file_total or 1), key)
-                    self.batch_progress.emit(int(current_total),
-                                             int(total_bytes_all))
+                    self.file_progress.emit(int(file_cur), int(file_total or 1), key)
+                    self.batch_progress.emit(int(current_total), int(total_bytes_all))
 
             def make_cb():
                 last_sent_per_key = {}
@@ -448,8 +442,7 @@ class Worker(QObject):
                             done_all += delta
                         current_total = done_all
 
-                    emit_throttled(current_total, int(cur_file),
-                                   int(total_file or 1), key)
+                    emit_throttled(current_total, int(cur_file), int(total_file or 1), key)
 
                 return _cb
 
@@ -467,7 +460,7 @@ class Worker(QObject):
                 self.data_model.upload_file(
                     local_name, key,
                     progress_cb=cb,
-                    cancel_event=self._cancel_event,  # NEW
+                    cancel_event=self._cancel_event,
                 )
                 self.refresh.emit()
 
@@ -476,13 +469,13 @@ class Worker(QObject):
         except Exception as exc:
             msg = str(exc) or exc.__class__.__name__
             if "cancelled" in msg.lower():
-                self.progress.emit("upload cancelled")
+                cancelled = True
             else:
                 self.progress.emit(f"upload failed: {msg}")
                 self.error.emit(msg)
 
         finally:
-            self.finished.emit()
+            self.finished.emit(cancelled)
 
 
 class MainWindow(QMainWindow):
@@ -511,6 +504,7 @@ class MainWindow(QMainWindow):
             url, region, access_key, secret_key, bucket, no_ssl_check, use_path
         )
         self.logview = QPlainTextEdit(self)
+        self.logview.setMaximumBlockCount(3000)  # prevents UI freeze on huge logs
 
         def _apply_emoji_safe_font(widget):
             pt = widget.font().pointSize()
@@ -1509,7 +1503,9 @@ class MainWindow(QMainWindow):
     def assign_thread_operation(self, method, job, need_refresh=True):
         if not job:
             return
+
         self.log(f"starting {method}")
+
         self.thread = QThread()
         self.worker = Worker(self.data_model, job)
         self.worker.moveToThread(self.thread)
@@ -1517,18 +1513,21 @@ class MainWindow(QMainWindow):
         def _clear_thread_refs():
             self.thread = None
             self.worker = None
-            # todo: remove getattr
             if getattr(self, "btnCancel", None) is not None:
                 self.btnCancel.setEnabled(False)
 
+        # start worker method
         m = getattr(self.worker, method)
         self.thread.started.connect(m)
+
+        # cleanup plumbing
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(_clear_thread_refs)
         self.thread.finished.connect(self.thread.deleteLater)
-        self.worker.progress.connect(self.report_logger_progress)
 
+        # log/progress wiring
+        self.worker.progress.connect(self.report_logger_progress)
         if need_refresh:
             self.worker.refresh.connect(self.navigate)
 
@@ -1551,10 +1550,10 @@ class MainWindow(QMainWindow):
             self.worker.file_progress.connect(self._on_file_progress)
 
             def _hide():
-                # final UI update so it says Done
                 self._on_tick()
                 self._tick_timer.stop()
                 self.pb.hide()
+
             self.thread.finished.connect(_hide)
 
         if method == "upload":
@@ -1581,10 +1580,17 @@ class MainWindow(QMainWindow):
                 self.pb.hide()
             self.thread.finished.connect(_hide)
 
+        def _on_worker_finished(cancelled: bool):
+            if cancelled:
+                self.log(f"{method} cancelled")
+            else:
+                self.log(f"{method} completed")
+            self.enable_action_buttons()
+
+        self.worker.finished.connect(_on_worker_finished)
+
         self.thread.start()
         self.disable_action_buttons()
-        self.thread.finished.connect(lambda: self.log(f"{method} completed"))
-        self.thread.finished.connect(lambda: self.enable_action_buttons())
 
     def new_folder(self):
         if self.in_bucket_list_mode():
