@@ -19,12 +19,13 @@ from PyQt5.QtGui import QIcon, QStandardItemModel, QStandardItem
 from PyQt5.QtGui import QFontDatabase
 from model import Model as DataModel
 from model import FSObjectType
+from model import TransferCancelled
 from properties_window import PropertiesWindow
 from profile_switcher import ProfileSwitchWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.3.0"
+__VERSION__ = "0.4.1"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -271,90 +272,115 @@ class UpTopProxyModel(QSortFilterProxyModel):
 
 
 class Worker(QObject):
-    finished = pyqtSignal()
+    finished = pyqtSignal(bool) # cancelled?
     progress = pyqtSignal(str)
     refresh = pyqtSignal()
     file_progress = pyqtSignal(object, object, str)
     batch_progress = pyqtSignal(object, object)
 
+    error = pyqtSignal(str)
+
     def __init__(self, data_model, job):
         super().__init__()
         self.data_model = data_model
         self.job = job
+        self._cancel_event = threading.Event()
+
+    @pyqtSlot()
+    def cancel(self):
+        self._cancel_event.set()
+        self.progress.emit("cancel requested…")
 
     def download(self):
-        # total bytes across everything in this batch, including dirs
-        total_bytes_all = 0
-        for key, local_name, size, folder_path in self.job:
-            if local_name is not None:
-                # single file
-                total_bytes_all += int(size or 0)
+        cancelled = False
+        try:
+            # total bytes across everything in this batch, including dirs
+            total_bytes_all = 0
+            for key, local_name, size, folder_path in self.job:
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+
+                if local_name is not None:
+                    total_bytes_all += int(size or 0)
+                else:
+                    for k, s in self.data_model.get_keys(key):
+                        if self._cancel_event.is_set():
+                            raise TransferCancelled("cancelled")
+                        if k and not k.endswith("/"):
+                            total_bytes_all += int(s or 0)
+            total_bytes_all = max(1, int(total_bytes_all))
+
+            done_all = 0
+            done_all_lock = threading.Lock()
+            throttle_state = {"t": 0.0, "b": 0}
+
+            def emit_throttled(current_total, file_cur, file_total, key):
+                now = time.time()
+                should_emit = False
+                if (now - throttle_state["t"]) >= PROGRESS_EMIT_INTERVAL_SEC:
+                    should_emit = True
+                elif (current_total - throttle_state["b"]) >= PROGRESS_MIN_BYTE_DELTA:
+                    should_emit = True
+                elif current_total >= total_bytes_all:
+                    should_emit = True
+
+                if should_emit:
+                    throttle_state["t"] = now
+                    throttle_state["b"] = current_total
+                    self.file_progress.emit(int(file_cur), int(file_total or 1), key)
+                    self.batch_progress.emit(int(current_total), int(total_bytes_all))
+
+            def make_cb():
+                last_sent_per_key = {}
+
+                def _cb(total_file, cur_file, key):
+                    nonlocal done_all
+                    if self._cancel_event.is_set():
+                        raise TransferCancelled("cancelled")
+
+                    key = str(key or "")
+                    with done_all_lock:
+                        prev = int(last_sent_per_key.get(key, 0))
+                        cur = int(cur_file)
+                        if cur > prev:
+                            delta = cur - prev
+                            last_sent_per_key[key] = cur
+                            done_all += delta
+                        current_total = done_all
+
+                    emit_throttled(current_total, int(cur_file), int(total_file or 1), key)
+
+                return _cb
+
+            for key, local_name, size, folder_path in self.job:
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+
+                if local_name:
+                    msg = "downloading %s -> %s (%s)" % (key, local_name, size)
+                else:
+                    msg = "downloading directory: %s -> %s" % (key, folder_path)
+                self.progress.emit(msg)
+
+                cb = make_cb()
+                self.data_model.download_file(
+                    key, local_name, folder_path,
+                    progress_cb=cb,
+                    cancel_event=self._cancel_event,
+                )
+
+            self.batch_progress.emit(int(done_all), int(total_bytes_all))
+
+        except Exception as exc:
+            msg = str(exc) or exc.__class__.__name__
+            if "cancelled" in msg.lower():
+                cancelled = True
             else:
-                # folder / prefix
-                for k, s in self.data_model.get_keys(key):
-                    if not k.endswith("/"):
-                        total_bytes_all += int(s or 0)
-        total_bytes_all = max(1, int(total_bytes_all))
+                self.progress.emit(f"download failed: {msg}")
+                self.error.emit(msg)
 
-        done_all = 0
-        done_all_lock = threading.Lock()
-
-        throttle_state = {"t": 0.0, "b": 0}
-
-        def emit_throttled(current_total, file_cur, file_total, key):
-            now = time.time()
-            should_emit = False
-            if (now - throttle_state["t"]) >= PROGRESS_EMIT_INTERVAL_SEC:
-                should_emit = True
-            elif (current_total - throttle_state["b"]) >= PROGRESS_MIN_BYTE_DELTA:
-                should_emit = True
-            elif current_total >= total_bytes_all:
-                should_emit = True
-
-            if should_emit:
-                throttle_state["t"] = now
-                throttle_state["b"] = current_total
-                # per-file first (keeps last file bar responsive enough)
-                self.file_progress.emit(int(file_cur), int(file_total or 1), key)
-                # then aggregate
-                self.batch_progress.emit(int(current_total), int(total_bytes_all))
-
-        def make_cb():
-            # Track last sent value PER KEY so multiple files don't interfere.
-            last_sent_per_key = {}
-
-            def _cb(total_file, cur_file, key):
-                nonlocal done_all
-                key = str(key or "")
-                with done_all_lock:
-                    prev = int(last_sent_per_key.get(key, 0))
-                    cur = int(cur_file)
-                    if cur > prev:
-                        delta = cur - prev
-                        last_sent_per_key[key] = cur
-                        done_all += delta
-                    # else: ignore non-monotonic callbacks
-                    current_total = done_all
-
-                emit_throttled(current_total, int(cur_file),
-                               int(total_file or 1), key)
-
-            return _cb
-
-        # run the actual download(s)
-        for key, local_name, size, folder_path in self.job:
-            if local_name:
-                msg = "downloading %s -> %s (%s)" % (key, local_name, size)
-            else:
-                msg = "downloading directory: %s -> %s" % (key, folder_path)
-            self.progress.emit(msg)
-
-            cb = make_cb()
-            self.data_model.download_file(key, local_name, folder_path, progress_cb=cb)
-
-        # final emit to ensure 100%
-        self.batch_progress.emit(int(done_all), int(total_bytes_all))
-        self.finished.emit()
+        finally:
+            self.finished.emit(cancelled)
 
     def delete(self):
         for key in self.job:
@@ -362,76 +388,94 @@ class Worker(QObject):
             self.progress.emit(msg)
             self.data_model.delete(key)
             self.refresh.emit()
-        self.finished.emit()
+        self.finished.emit(False)
 
     def upload(self):
-        # figure out total bytes we plan to upload
-        total_bytes_all = 0
-        for key, local_name in self.job:
-            if local_name:
-                try:
-                    total_bytes_all += int(os.path.getsize(local_name))
-                except Exception:
-                    pass
-        total_bytes_all = max(1, int(total_bytes_all))
+        cancelled = False
+        try:
+            total_bytes_all = 0
+            for key, local_name in self.job:
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                if local_name:
+                    try:
+                        total_bytes_all += int(os.path.getsize(local_name))
+                    except Exception:
+                        pass
+            total_bytes_all = max(1, int(total_bytes_all))
 
-        done_all = 0
-        done_all_lock = threading.Lock()
+            done_all = 0
+            done_all_lock = threading.Lock()
+            throttle_state = {"t": 0.0, "b": 0}
 
-        throttle_state = {"t": 0.0, "b": 0}
+            def emit_throttled(current_total, file_cur, file_total, key):
+                now = time.time()
+                should_emit = False
+                if (now - throttle_state["t"]) >= PROGRESS_EMIT_INTERVAL_SEC:
+                    should_emit = True
+                elif (current_total - throttle_state["b"]) >= PROGRESS_MIN_BYTE_DELTA:
+                    should_emit = True
+                elif current_total >= total_bytes_all:
+                    should_emit = True
 
-        def emit_throttled(current_total, file_cur, file_total, key):
-            now = time.time()
-            should_emit = False
-            if (now - throttle_state["t"]) >= PROGRESS_EMIT_INTERVAL_SEC:
-                should_emit = True
-            elif (current_total - throttle_state["b"]) >= PROGRESS_MIN_BYTE_DELTA:
-                should_emit = True
-            elif current_total >= total_bytes_all:
-                should_emit = True
+                if should_emit:
+                    throttle_state["t"] = now
+                    throttle_state["b"] = current_total
+                    self.file_progress.emit(int(file_cur), int(file_total or 1), key)
+                    self.batch_progress.emit(int(current_total), int(total_bytes_all))
 
-            if should_emit:
-                throttle_state["t"] = now
-                throttle_state["b"] = current_total
-                self.file_progress.emit(int(file_cur), int(file_total or 1), key)
-                self.batch_progress.emit(int(current_total), int(total_bytes_all))
+            def make_cb():
+                last_sent_per_key = {}
 
-        def make_cb():
-            # Track last sent value PER KEY being uploaded.
-            last_sent_per_key = {}
+                def _cb(total_file, cur_file, key):
+                    nonlocal done_all
+                    if self._cancel_event.is_set():
+                        raise TransferCancelled("cancelled")
 
-            def _cb(total_file, cur_file, key):
-                nonlocal done_all
-                key = str(key or "")
-                with done_all_lock:
-                    prev = int(last_sent_per_key.get(key, 0))
-                    cur = int(cur_file)
-                    if cur > prev:
-                        delta = cur - prev
-                        last_sent_per_key[key] = cur
-                        done_all += delta
-                    current_total = done_all
+                    key = str(key or "")
+                    with done_all_lock:
+                        prev = int(last_sent_per_key.get(key, 0))
+                        cur = int(cur_file)
+                        if cur > prev:
+                            delta = cur - prev
+                            last_sent_per_key[key] = cur
+                            done_all += delta
+                        current_total = done_all
 
-                emit_throttled(current_total, int(cur_file),
-                               int(total_file or 1), key)
+                    emit_throttled(current_total, int(cur_file), int(total_file or 1), key)
 
-            return _cb
+                return _cb
 
-        # do the actual upload(s)
-        for key, local_name in self.job:
-            if local_name is not None:
-                msg = "uploading %s -> %s" % (local_name, key)
+            for key, local_name in self.job:
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+
+                if local_name is not None:
+                    msg = "uploading %s -> %s" % (local_name, key)
+                else:
+                    msg = "creating folder %s" % key
+                self.progress.emit(msg)
+
+                cb = make_cb() if local_name else None
+                self.data_model.upload_file(
+                    local_name, key,
+                    progress_cb=cb,
+                    cancel_event=self._cancel_event,
+                )
+                self.refresh.emit()
+
+            self.batch_progress.emit(int(done_all), int(total_bytes_all))
+
+        except Exception as exc:
+            msg = str(exc) or exc.__class__.__name__
+            if "cancelled" in msg.lower():
+                cancelled = True
             else:
-                msg = "creating folder %s" % key
-            self.progress.emit(msg)
+                self.progress.emit(f"upload failed: {msg}")
+                self.error.emit(msg)
 
-            cb = make_cb() if local_name else None
-            self.data_model.upload_file(local_name, key, progress_cb=cb)
-            self.refresh.emit()
-
-        # final emit to ensure 100%
-        self.batch_progress.emit(int(done_all), int(total_bytes_all))
-        self.finished.emit()
+        finally:
+            self.finished.emit(cancelled)
 
 
 class MainWindow(QMainWindow):
@@ -460,6 +504,7 @@ class MainWindow(QMainWindow):
             url, region, access_key, secret_key, bucket, no_ssl_check, use_path
         )
         self.logview = QPlainTextEdit(self)
+        self.logview.setMaximumBlockCount(3000)  # prevents UI freeze on huge logs
 
         def _apply_emoji_safe_font(widget):
             pt = widget.font().pointSize()
@@ -554,6 +599,7 @@ class MainWindow(QMainWindow):
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnCreateFolder)
         self.tBar.addAction(self.btnRemove)
+        self.tBar.addAction(self.btnCancel)
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnSwitchProfile)
         self.tBar.addSeparator()
@@ -628,6 +674,7 @@ class MainWindow(QMainWindow):
         self.listview.header().resizeSection(2, 80)
 
         self.listview.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.listview.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.listview.setDragDropMode(QAbstractItemView.DragDrop)
         self.listview.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.listview.setIndentation(10)
@@ -638,6 +685,29 @@ class MainWindow(QMainWindow):
     def log(self, message: str):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.logview.appendPlainText(f"[{ts}] {message}")
+
+    def _begin_model_reset_ui(self):
+        self.listview.setUpdatesEnabled(False)
+
+        try:
+            self.listview.setSortingEnabled(False)
+        except Exception:
+            pass
+
+        sm = self.listview.selectionModel()
+        if sm is not None:
+            blocker = QSignalBlocker(sm)
+            sm.clearSelection()
+            sm.clearCurrentIndex()
+            return blocker
+        return None
+
+    def _end_model_reset_ui(self):
+        try:
+            self.listview.setSortingEnabled(True)
+        except Exception:
+            pass
+        self.listview.setUpdatesEnabled(True)
 
     def transfers_active(self) -> bool:
         if self.thread is None:
@@ -1031,11 +1101,13 @@ class MainWindow(QMainWindow):
                 return True
 
             if event.type() == QEvent.KeyPress:
+                if event.key() == Qt.Key_Escape:
+                    self.cancel_transfers()
+                    return True
                 if event.key() == Qt.Key_Return:
-                    # Let double-click handler logic handle Enter as well
-                    current = self.listview.currentIndex()
-                    if current.isValid():
-                        self.list_doubleClicked(current)
+                    ix = self.listview.currentIndex()
+                    if ix.isValid():
+                        self.list_doubleClicked(ix)
                     return True
                 if event.key() == Qt.Key_Delete:
                     if self.in_bucket_list_mode():
@@ -1152,67 +1224,92 @@ class MainWindow(QMainWindow):
 
     def modelToListView_bucket_mode(self, bucket_items):
         """Populate the view with buckets only (no [..])."""
-        self.model.setRowCount(0)
-
-        bucket_icon = QIcon.fromTheme(
-            "drive-harddisk",
-            QIcon(os.path.join(self.current_dir, "icons", "bucket_24px.svg")),
-        )
-
-        for b in bucket_items:
-            self.model.appendRow(
-                [
-                    ListItem(0, FSObjectType.BUCKET, bucket_icon, b.name),
-                    ListItem(0, FSObjectType.BUCKET, "<BUCKET>"),
-                    ListItem(0, FSObjectType.BUCKET, ""),
-                ]
+        blocker = self._begin_model_reset_ui()
+        try:
+            self.model.setRowCount(0)
+            bucket_icon = QIcon.fromTheme(
+                "drive-harddisk",
+                QIcon(os.path.join(self.current_dir, "icons", "bucket_24px.svg")),
             )
+
+            for b in bucket_items:
+                self.model.appendRow(
+                    [
+                        ListItem(0, FSObjectType.BUCKET, bucket_icon, b.name),
+                        ListItem(0, FSObjectType.BUCKET, "<BUCKET>"),
+                        ListItem(0, FSObjectType.BUCKET, ""),
+                    ]
+                )
+        finally:
+            # ensure blocker is released before re-enabling updates
+            blocker = None
+            self._end_model_reset_ui()
 
     def modelToListView(self, model_result):
         """
         Populate the view for objects inside a selected bucket.
         We inject '[..]' at top.
         """
-        self.model.setRowCount(0)
+        self.listview.setUpdatesEnabled(False)
+        self.listview.setSortingEnabled(False)
 
-        if self.data_model.bucket:
-            up_icon = QIcon.fromTheme(
-                "go-up",
-                QIcon(os.path.join(self.current_dir, "icons", "arrow_upward_24px.svg")),
-            )
-            self.model.appendRow(
-                [
-                    ListItem(0, FSObjectType.FOLDER, up_icon, UP_ENTRY_LABEL),
-                    ListItem(0, FSObjectType.FOLDER, ""),
-                    ListItem(0, FSObjectType.FOLDER, ""),
-                ]
-            )
+        sm = self.listview.selectionModel()
+        blocker = QSignalBlocker(sm) if sm is not None else None
+        if sm is not None:
+            sm.clearSelection()
+            sm.clearCurrentIndex()
 
-        if model_result:
-            for i in model_result:
-                if i.type_ == FSObjectType.FILE:
-                    icon = QIcon().fromTheme(
-                        "go-first",
-                        QIcon(os.path.join(self.current_dir, "icons", "document_24px.svg")),
-                    )
-                    size_val = int(i.size or 0)
-                    size = _human_bytes(size_val)
-                    modified = str(i.modified)
-                else:
-                    icon = QIcon().fromTheme(
-                        "network-server",
-                        QIcon(os.path.join(self.current_dir, "icons", "folder_24px.svg")),
-                    )
-                    size_val = 0
-                    size = "<DIR>"
-                    modified = ""
+        try:
+            self.model.setRowCount(0)
+
+            if self.data_model.bucket:
+                up_icon = QIcon.fromTheme(
+                    "go-up",
+                    QIcon(os.path.join(self.current_dir, "icons",
+                                       "arrow_upward_24px.svg")),
+                )
                 self.model.appendRow(
                     [
-                        ListItem(size_val, i.type_, icon, i.name),
-                        ListItem(size_val, i.type_, size),
-                        ListItem(size_val, i.type_, modified),
+                        ListItem(0, FSObjectType.FOLDER, up_icon,
+                                 UP_ENTRY_LABEL),
+                        ListItem(0, FSObjectType.FOLDER, ""),
+                        ListItem(0, FSObjectType.FOLDER, ""),
                     ]
                 )
+
+            if model_result:
+                for i in model_result:
+                    if i.type_ == FSObjectType.FILE:
+                        icon = QIcon().fromTheme(
+                            "go-first",
+                            QIcon(os.path.join(self.current_dir, "icons",
+                                               "document_24px.svg")),
+                        )
+                        size_val = int(i.size or 0)
+                        size = _human_bytes(size_val)
+                        modified = str(i.modified)
+                    else:
+                        icon = QIcon().fromTheme(
+                            "network-server",
+                            QIcon(os.path.join(self.current_dir, "icons",
+                                               "folder_24px.svg")),
+                        )
+                        size_val = 0
+                        size = "<DIR>"
+                        modified = ""
+
+                    self.model.appendRow(
+                        [
+                            ListItem(size_val, i.type_, icon, i.name),
+                            ListItem(size_val, i.type_, size),
+                            ListItem(size_val, i.type_, modified),
+                        ]
+                    )
+
+        finally:
+            blocker = None  # release QSignalBlocker
+            self.listview.setSortingEnabled(True)
+            self.listview.setUpdatesEnabled(True)
 
     def change_current_folder(self, new_folder):
         self.data_model.prev_folder = self.data_model.current_folder
@@ -1297,9 +1394,25 @@ class MainWindow(QMainWindow):
         return None, None
 
     def list_doubleClicked(self, proxy_index: QModelIndex):
-        if self._suppress_next_activate:
+        if not proxy_index.isValid():
+            return
+
+        # If we just closed a context menu, ignore one activation
+        if getattr(self, "_suppress_next_activate", False):
             self._suppress_next_activate = False
             return
+
+        # Normalize selection
+        sm = self.listview.selectionModel()
+        if sm is not None:
+            sm.blockSignals(True)
+            sm.clearSelection()
+            sm.setCurrentIndex(
+                proxy_index,
+                QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+            )
+            sm.blockSignals(False)
+
         # Always interpret based on the row's "Name" column.
         primary_item, name, t = self.get_row_primary_item(proxy_index)
         if primary_item is None:
@@ -1410,7 +1523,6 @@ class MainWindow(QMainWindow):
                 self.goUp()
             else:
                 # root of bucket -> go back to bucket list
-                # keep _last_selected_bucket
                 self._return_to_bucket_list_mode()
                 self.navigate()
             return
@@ -1418,9 +1530,11 @@ class MainWindow(QMainWindow):
         # Normal folder navigation
         if t == FSObjectType.FOLDER:
             self.map[self.data_model.current_folder] = name
-            self.change_current_folder(self.data_model.current_folder + "%s/" % name)
+            self.change_current_folder(
+                self.data_model.current_folder + f"{name}/")
             self.navigate()
             self.select_first()
+            return
 
     def goBack(self):
         if not self.data_model.bucket:
@@ -1454,7 +1568,9 @@ class MainWindow(QMainWindow):
     def assign_thread_operation(self, method, job, need_refresh=True):
         if not job:
             return
+
         self.log(f"starting {method}")
+
         self.thread = QThread()
         self.worker = Worker(self.data_model, job)
         self.worker.moveToThread(self.thread)
@@ -1462,15 +1578,21 @@ class MainWindow(QMainWindow):
         def _clear_thread_refs():
             self.thread = None
             self.worker = None
+            if getattr(self, "btnCancel", None) is not None:
+                self.btnCancel.setEnabled(False)
 
+        # start worker method
         m = getattr(self.worker, method)
         self.thread.started.connect(m)
+
+        # cleanup plumbing
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(_clear_thread_refs)
         self.thread.finished.connect(self.thread.deleteLater)
-        self.worker.progress.connect(self.report_logger_progress)
 
+        # log/progress wiring
+        self.worker.progress.connect(self.report_logger_progress)
         if need_refresh:
             self.worker.refresh.connect(self.navigate)
 
@@ -1493,10 +1615,10 @@ class MainWindow(QMainWindow):
             self.worker.file_progress.connect(self._on_file_progress)
 
             def _hide():
-                # final UI update so it says Done
                 self._on_tick()
                 self._tick_timer.stop()
                 self.pb.hide()
+
             self.thread.finished.connect(_hide)
 
         if method == "upload":
@@ -1523,10 +1645,17 @@ class MainWindow(QMainWindow):
                 self.pb.hide()
             self.thread.finished.connect(_hide)
 
+        def _on_worker_finished(cancelled: bool):
+            if cancelled:
+                self.log(f"{method} cancelled")
+            else:
+                self.log(f"{method} completed")
+            self.enable_action_buttons()
+
+        self.worker.finished.connect(_on_worker_finished)
+
         self.thread.start()
         self.disable_action_buttons()
-        self.thread.finished.connect(lambda: self.log(f"{method} completed"))
-        self.thread.finished.connect(lambda: self.enable_action_buttons())
 
     def new_folder(self):
         if self.in_bucket_list_mode():
@@ -1675,6 +1804,30 @@ class MainWindow(QMainWindow):
         else:
             self.delete()
 
+    def cancel_transfers(self):
+
+        if not self.transfers_active() or self.worker is None:
+            return
+
+        self.statusBar().showMessage("Canceling…", 2000)
+
+        try:
+            if self.worker is not None:
+                # QMetaObject.invokeMethod(self.worker, "cancel", Qt.QueuedConnection)
+                self.worker.cancel()
+        except Exception:
+            pass
+
+        try:
+            if self.thread is not None:
+                self.thread.requestInterruption()
+        except Exception:
+            pass
+        try:
+            self.btnCancel.setEnabled(False)
+        except Exception:
+            pass
+
     def enable_action_buttons(self):
         at_root = self.in_bucket_list_mode()
         # In bucket list mode:
@@ -1685,6 +1838,7 @@ class MainWindow(QMainWindow):
         self.btnSwitchProfile.setEnabled(True)
         self.btnUpload.setEnabled(not at_root)
         self.btnDownload.setEnabled(not at_root)
+        self.btnCancel.setEnabled(False)
         if hasattr(self, "menu"):
             self.menu.setEnabled(True)
 
@@ -1696,6 +1850,7 @@ class MainWindow(QMainWindow):
         self.btnDownload.setEnabled(False)
         self.btnRemove.setEnabled(False)
         self.btnSwitchProfile.setEnabled(False)
+        self.btnCancel.setEnabled(True)
 
 
     def goUp(self):
@@ -1793,6 +1948,12 @@ class MainWindow(QMainWindow):
             "Upload(U)",
             triggered=self.upload,
         )
+        self.btnCancel = QAction(
+            QIcon.fromTheme("process-stop",  QIcon(os.path.join(self.current_dir, "icons", "cancel_24px.svg"))),
+            "Cancel(Esc)",
+            triggered=self.cancel_transfers,
+        )
+        self.btnCancel.setEnabled(False)
         self.btnAbout = QAction(
             QIcon.fromTheme("help-about", QIcon(os.path.join(self.current_dir, "icons", "info_24px.svg"))),
             "About(F1)",

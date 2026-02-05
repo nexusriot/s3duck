@@ -10,6 +10,10 @@ from urllib.parse import urlparse
 from boto3.s3.transfer import TransferConfig
 
 
+class TransferCancelled(Exception):
+    pass
+
+
 class FSObjectType(Enum):
     FILE = 1
     FOLDER = 2
@@ -38,23 +42,32 @@ class Item:
 class _BotoProgressAdapter:
     """
     Adapt boto3 Callback(bytes_amount) -> progress_cb(total, current, key).
+    Also supports cooperative cancellation.
     """
-    def __init__(self, total, key, cb):
+    def __init__(self, total, key, cb, cancel_event=None):
         self.total = max(1, int(total or 0))
         self.key = key
         self.cb = cb
+        self.cancel_event = cancel_event
         self._sofar = 0
         self._lock = threading.Lock()
 
     def __call__(self, bytes_amount):
+        # If Cancel, abort transfer ASAP.
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise TransferCancelled("cancelled")
+
         if self.cb is None:
             return
+
         inc = int(bytes_amount or 0)
         with self._lock:
             self._sofar += inc
             cur = self._sofar
+
         if cur > self.total:
             cur = self.total
+
         self.cb(self.total, cur, self.key)
 
 
@@ -70,6 +83,7 @@ class Model:
         use_path,
         timeout=3,
         retries=3,
+        read_timeout=60,
     ):
         self.session = boto3.session.Session()
         self._client = None
@@ -97,15 +111,24 @@ class Model:
         self.use_path = use_path  # True -> path-style, False -> virtual-host style
         self.timeout = timeout
         self.retries = retries
+        self.read_timeout = read_timeout
 
-        # Smaller chunks -> smoother progress
-        self.transfer_cfg = TransferConfig(
-            multipart_threshold=8 * 1024 * 1024,   # 8MB
-            multipart_chunksize=1 * 1024 * 1024,   # 1MB parts
-            io_chunksize=256 * 1024,               # 256KB read size
-            max_concurrency=4,
+        self.transfer_cfg_download = TransferConfig(
+            multipart_threshold=16 * 1024 * 1024,  # 16MB
+            multipart_chunksize=8 * 1024 * 1024,  # 8MB
+            io_chunksize=256 * 1024,
+            max_concurrency=1,
             use_threads=True,
         )
+
+        self.transfer_cfg_upload = TransferConfig(
+            multipart_threshold=16 * 1024 * 1024,
+            multipart_chunksize=8 * 1024 * 1024,
+            io_chunksize=256 * 1024,
+            max_concurrency=2,
+            use_threads=True,
+        )
+
 
     @staticmethod
     def get_os_family():
@@ -146,7 +169,11 @@ class Model:
                 "config": botocore.config.Config(
                     s3=s3_config,
                     connect_timeout=self.timeout,
-                    retries={"max_attempts": self.retries},
+                    read_timeout=self.read_timeout,
+                    retries={
+                        "max_attempts": self.retries,
+                        "mode": "standard",
+                    },
                 ),
             }
         )
@@ -559,48 +586,80 @@ class Model:
             f"Cannot list bucket '{self.bucket}' at prefix '{prefix}' with available regions."
         )
 
-    def download_file(self, key: str, local_name: str, folder_path: str, progress_cb=None):
+    def download_file(self, key: str, local_name: str, folder_path: str,
+                      progress_cb=None, cancel_event=None):
         """
         Download a single file or a whole prefix.
-        - If local_name is truthy: single object to local_name.
-        - Else: prefix -> recreate directory tree under folder_path.
+        - If local_name is truthy: single object -> local_name
+        - Else: prefix -> recreate directory tree under folder_path/<basename(prefix)>/
+        Supports cancellation via cancel_event (threading.Event).
         """
+
+        # folder/prefix download mode
         if not local_name:
-            prefix = key if key.endswith("/") else key + "/"
+            prefix = key if str(key).endswith("/") else (str(key) + "/")
             base_name = os.path.basename(prefix.rstrip("/"))
             base_dir = os.path.join(folder_path, base_name)
             os.makedirs(base_dir, exist_ok=True)
 
             for k, size in self.get_keys(prefix):
+                if not k:
+                    continue
+
+                if cancel_event is not None and cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+
                 rel = os.path.relpath(k, prefix)
                 if rel == ".":
                     continue
+
                 out_path = os.path.join(base_dir, rel)
+
                 if k.endswith("/"):
                     os.makedirs(out_path, exist_ok=True)
                     continue
+
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
                 self.client.download_file(
                     self.bucket,
                     k,
                     out_path,
-                    Callback=_BotoProgressAdapter(size, k, progress_cb),
-                    Config=self.transfer_cfg,
+                    Callback=_BotoProgressAdapter(size, k, progress_cb, cancel_event=cancel_event),
+                    Config=self.transfer_cfg_download,
                 )
-        else:
-            size = None
-            try:
-                head = self.client.head_object(Bucket=self.bucket, Key=key)
-                size = head.get("ContentLength")
-            except Exception:
-                pass
-            self.client.download_file(
-                self.bucket,
-                key,
-                local_name,
-                Callback=_BotoProgressAdapter(size, key, progress_cb),
-                Config=self.transfer_cfg,
-            )
+            return
+
+        # single object download mode
+        size = None
+        try:
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+            head = self.client.head_object(Bucket=self.bucket, Key=key)
+            size = head.get("ContentLength")
+        except TransferCancelled:
+            raise
+        except Exception:
+            pass
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise TransferCancelled("cancelled")
+
+        # ensure parent dir exists (cheap safety)
+        try:
+            parent = os.path.dirname(local_name)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+        except Exception:
+            pass
+
+        self.client.download_file(
+            self.bucket,
+            key,
+            local_name,
+            Callback=_BotoProgressAdapter(size, key, progress_cb, cancel_event=cancel_event),
+            Config=self.transfer_cfg_download,
+        )
 
     def create_folder(self, key):
         return self.client.put_object(Bucket=self.bucket, Key=key)
@@ -627,13 +686,16 @@ class Model:
             self.client.delete_object(Bucket=self.bucket, Key=key)
         return True
 
-    def upload_file(self, local_file, key, progress_cb=None):
+    def upload_file(self, local_file, key, progress_cb=None, cancel_event=None):
         """
         Upload a file (with progress) or create a folder placeholder if local_file is None.
         """
         if local_file is None:
             self.create_folder("%s/" % key)
             return
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise TransferCancelled("cancelled")
 
         try:
             total = os.path.getsize(local_file)
@@ -644,8 +706,8 @@ class Model:
             local_file,
             self.bucket,
             key,
-            Callback=_BotoProgressAdapter(total, key, progress_cb),
-            Config=self.transfer_cfg,
+            Callback=_BotoProgressAdapter(total, key, progress_cb, cancel_event=cancel_event),
+            Config=self.transfer_cfg_upload,  # IMPORTANT
         )
 
     def check_bucket(self):
