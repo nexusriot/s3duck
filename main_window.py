@@ -25,7 +25,7 @@ from profile_switcher import ProfileSwitchWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.3.9"
+__VERSION__ = "0.4.1"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
