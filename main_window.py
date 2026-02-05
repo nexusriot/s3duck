@@ -1105,10 +1105,9 @@ class MainWindow(QMainWindow):
                     self.cancel_transfers()
                     return True
                 if event.key() == Qt.Key_Return:
-                    # Let double-click handler logic handle Enter as well
-                    current = self.listview.currentIndex()
-                    if current.isValid():
-                        self.list_doubleClicked(current)
+                    ix = self.listview.currentIndex()
+                    if ix.isValid():
+                        self.list_doubleClicked(ix)
                     return True
                 if event.key() == Qt.Key_Delete:
                     if self.in_bucket_list_mode():
@@ -1251,46 +1250,66 @@ class MainWindow(QMainWindow):
         Populate the view for objects inside a selected bucket.
         We inject '[..]' at top.
         """
-        self.model.setRowCount(0)
+        self.listview.setUpdatesEnabled(False)
+        self.listview.setSortingEnabled(False)
 
-        if self.data_model.bucket:
-            up_icon = QIcon.fromTheme(
-                "go-up",
-                QIcon(os.path.join(self.current_dir, "icons", "arrow_upward_24px.svg")),
-            )
-            self.model.appendRow(
-                [
-                    ListItem(0, FSObjectType.FOLDER, up_icon, UP_ENTRY_LABEL),
-                    ListItem(0, FSObjectType.FOLDER, ""),
-                    ListItem(0, FSObjectType.FOLDER, ""),
-                ]
-            )
+        sm = self.listview.selectionModel()
+        blocker = QSignalBlocker(sm) if sm is not None else None
+        if sm is not None:
+            sm.clearSelection()
+            sm.clearCurrentIndex()
 
-        if model_result:
-            for i in model_result:
-                if i.type_ == FSObjectType.FILE:
-                    icon = QIcon().fromTheme(
-                        "go-first",
-                        QIcon(os.path.join(self.current_dir, "icons", "document_24px.svg")),
-                    )
-                    size_val = int(i.size or 0)
-                    size = _human_bytes(size_val)
-                    modified = str(i.modified)
-                else:
-                    icon = QIcon().fromTheme(
-                        "network-server",
-                        QIcon(os.path.join(self.current_dir, "icons", "folder_24px.svg")),
-                    )
-                    size_val = 0
-                    size = "<DIR>"
-                    modified = ""
+        try:
+            self.model.setRowCount(0)
+
+            if self.data_model.bucket:
+                up_icon = QIcon.fromTheme(
+                    "go-up",
+                    QIcon(os.path.join(self.current_dir, "icons",
+                                       "arrow_upward_24px.svg")),
+                )
                 self.model.appendRow(
                     [
-                        ListItem(size_val, i.type_, icon, i.name),
-                        ListItem(size_val, i.type_, size),
-                        ListItem(size_val, i.type_, modified),
+                        ListItem(0, FSObjectType.FOLDER, up_icon,
+                                 UP_ENTRY_LABEL),
+                        ListItem(0, FSObjectType.FOLDER, ""),
+                        ListItem(0, FSObjectType.FOLDER, ""),
                     ]
                 )
+
+            if model_result:
+                for i in model_result:
+                    if i.type_ == FSObjectType.FILE:
+                        icon = QIcon().fromTheme(
+                            "go-first",
+                            QIcon(os.path.join(self.current_dir, "icons",
+                                               "document_24px.svg")),
+                        )
+                        size_val = int(i.size or 0)
+                        size = _human_bytes(size_val)
+                        modified = str(i.modified)
+                    else:
+                        icon = QIcon().fromTheme(
+                            "network-server",
+                            QIcon(os.path.join(self.current_dir, "icons",
+                                               "folder_24px.svg")),
+                        )
+                        size_val = 0
+                        size = "<DIR>"
+                        modified = ""
+
+                    self.model.appendRow(
+                        [
+                            ListItem(size_val, i.type_, icon, i.name),
+                            ListItem(size_val, i.type_, size),
+                            ListItem(size_val, i.type_, modified),
+                        ]
+                    )
+
+        finally:
+            blocker = None  # release QSignalBlocker
+            self.listview.setSortingEnabled(True)
+            self.listview.setUpdatesEnabled(True)
 
     def change_current_folder(self, new_folder):
         self.data_model.prev_folder = self.data_model.current_folder
@@ -1375,9 +1394,25 @@ class MainWindow(QMainWindow):
         return None, None
 
     def list_doubleClicked(self, proxy_index: QModelIndex):
-        if self._suppress_next_activate:
+        if not proxy_index.isValid():
+            return
+
+        # If we just closed a context menu, ignore one activation
+        if getattr(self, "_suppress_next_activate", False):
             self._suppress_next_activate = False
             return
+
+        # Normalize selection
+        sm = self.listview.selectionModel()
+        if sm is not None:
+            sm.blockSignals(True)
+            sm.clearSelection()
+            sm.setCurrentIndex(
+                proxy_index,
+                QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+            )
+            sm.blockSignals(False)
+
         # Always interpret based on the row's "Name" column.
         primary_item, name, t = self.get_row_primary_item(proxy_index)
         if primary_item is None:
@@ -1488,7 +1523,6 @@ class MainWindow(QMainWindow):
                 self.goUp()
             else:
                 # root of bucket -> go back to bucket list
-                # keep _last_selected_bucket
                 self._return_to_bucket_list_mode()
                 self.navigate()
             return
@@ -1496,9 +1530,11 @@ class MainWindow(QMainWindow):
         # Normal folder navigation
         if t == FSObjectType.FOLDER:
             self.map[self.data_model.current_folder] = name
-            self.change_current_folder(self.data_model.current_folder + "%s/" % name)
+            self.change_current_folder(
+                self.data_model.current_folder + f"{name}/")
             self.navigate()
             self.select_first()
+            return
 
     def goBack(self):
         if not self.data_model.bucket:
