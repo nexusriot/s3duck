@@ -686,6 +686,25 @@ class Model:
             self.client.delete_object(Bucket=self.bucket, Key=key)
         return True
 
+    def bucket_total_size_bytes(self, cancel_event=None) -> int:
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+
+        paginator = self.client.get_paginator("list_objects_v2")
+        total = 0
+
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=""):
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+            for obj in page.get("Contents", []) or []:
+                key = obj.get("Key") or ""
+                # ignore folder placeholders
+                if key.endswith("/"):
+                    continue
+                total += int(obj.get("Size") or 0)
+
+        return int(total)
+
     def upload_file(self, local_file, key, progress_cb=None, cancel_event=None):
         """
         Upload a file (with progress) or create a folder placeholder if local_file is None.
