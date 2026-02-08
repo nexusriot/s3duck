@@ -678,6 +678,80 @@ class Model:
                 result.append((obj.get("Key"), obj.get("Size")))
         return result
 
+    def get_keys_for_bucket(self, bucket_name: str, prefix: str = ""):
+        """
+        Return [(Key, Size), ...] for objects under 'prefix' in *bucket_name*.
+
+        Unlike get_keys(), this does NOT require (and does not modify) the
+        current navigation state (self.bucket / current_folder).
+
+        It uses the same adaptive endpoint/region logic as open-bucket, and
+        it also retries with region/endpoint hints like the UI does when entering a bucket.
+        """
+        if not bucket_name:
+            return []
+
+        def _list_with_client(client_obj):
+            result = []
+            paginator = client_obj.get_paginator("list_objects_v2")
+            pages = paginator.paginate(Bucket=bucket_name, Prefix=prefix or "")
+            for page in pages:
+                for obj in page.get("Contents", []) or []:
+                    key = obj.get("Key")
+                    if not key:
+                        continue
+                    size = int(obj.get("Size") or 0)
+                    result.append((key, size))
+            return result
+
+        # First attempt: existing logic
+        try:
+            client_obj, _endpoint, _region, _use_path = self._try_bind_bucket(bucket_name)
+            return _list_with_client(client_obj)
+        except Exception as first_exc:
+            # Retry using the same “hints” approach as entering buckets in UI
+            try:
+                region_hint, endpoint_hint = self.get_bucket_hints(bucket_name)
+            except Exception:
+                region_hint, endpoint_hint = None, None
+
+            # If we got nothing useful, keep original error
+            if not region_hint and not endpoint_hint:
+                raise first_exc
+
+            base_endpoint = self.profile_endpoint_url or self.endpoint_url
+
+            candidate_endpoint = endpoint_hint
+            if not candidate_endpoint and region_hint:
+                try:
+                    candidate_endpoint = self.build_region_swapped_endpoint(base_endpoint, region_hint)
+                except Exception:
+                    candidate_endpoint = None
+
+            # If we still have no endpoint, we can still try with region-only (some setups ignore endpoint)
+            old_endpoint = self.endpoint_url
+            old_region = self.region_name
+            old_use_path = self.use_path
+            old_client = self._client
+
+            try:
+                if candidate_endpoint:
+                    self.endpoint_url = candidate_endpoint
+                if region_hint:
+                    self.region_name = region_hint
+                self._client = None  # force rebuild with seeded values
+
+                client_obj, _endpoint, _region, _use_path = self._try_bind_bucket(bucket_name)
+                return _list_with_client(client_obj)
+            except Exception as retry_exc:
+                # Preserve the most useful message
+                raise retry_exc
+            finally:
+                self.endpoint_url = old_endpoint
+                self.region_name = old_region
+                self.use_path = old_use_path
+                self._client = old_client
+
     def delete(self, key) -> bool:
         if key.endswith("/"):
             for k, _ in self.get_keys(key):

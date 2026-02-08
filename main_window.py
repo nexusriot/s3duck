@@ -25,7 +25,7 @@ from profile_switcher import ProfileSwitchWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.4.8"
+__VERSION__ = "0.5.1"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -34,6 +34,30 @@ PROGRESS_MIN_BYTE_DELTA = 1 * 1024 * 1024  # also emit if at least 1MB progresse
 TICK_INTERVAL_MS = 600             # UI tick
 EMA_ALPHA = 0.15                   # smoother rate
 RATE_WINDOW_SEC = 2.0              # window for instantaneous rate
+
+
+class NavigationWorker(QObject):
+    finished = pyqtSignal(int, object, str)  # seq, payload, err_str
+
+    def __init__(self, data_model, seq: int, bucket: str, prefix: str):
+        super().__init__()
+        self._dm = data_model
+        self._seq = seq
+        self._bucket = bucket or ""
+        self._prefix = prefix or ""
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            if not self._bucket:
+                buckets = self._dm.list_buckets()
+                payload = {"mode": "bucket_list", "buckets": buckets}
+            else:
+                items = self._dm.list(self._prefix)
+                payload = {"mode": "bucket_items", "items": items, "bucket": self._bucket, "prefix": self._prefix}
+            self.finished.emit(self._seq, payload, "")
+        except Exception as exc:
+            self.finished.emit(self._seq, None, str(exc))
 STALL_DECAY_INTERVAL_SEC = 2.0     # when no progress, decay displayed rate
 
 DOC_EXT = {
@@ -47,15 +71,41 @@ MEDIA_EXT = {
 }
 
 
-def top_group_from_key(key: str) -> str:
-    k = (key or "").lstrip("/")
-    if not k:
-        return "(root)"
-    parts = k.split("/", 1)
-    if len(parts) == 1:
-        return "(root)"
-    return parts[0] or "(root)"
+def _to_epoch(v) -> int:
+    """
+    Conversion of various 'modified' representations to epoch seconds.
 
+    Supports:
+      - int/float epoch
+      - datetime
+      - ISO-like strings: "2026-02-08 18:59:33", "2026-02-08T18:59:33", etc.
+    """
+    if v is None:
+        return 0
+    if isinstance(v, (int, float)):
+        return int(v)
+    if isinstance(v, datetime):
+        try:
+            return int(v.timestamp())
+        except Exception:
+            return 0
+    s = str(v).strip()
+    if not s:
+        return 0
+    # Try common formats
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return int(datetime.strptime(s, fmt).timestamp())
+        except Exception:
+            pass
+    # If it has microseconds: 2026-02-08 18:59:33.123
+    try:
+        if "." in s:
+            s2 = s.split(".", 1)[0]
+            return int(datetime.strptime(s2, "%Y-%m-%d %H:%M:%S").timestamp())
+    except Exception:
+        pass
+    return 0
 
 def categorize_key(key: str) -> str:
     k = (key or "").lower()
@@ -249,12 +299,9 @@ class UpTopProxyModel(QSortFilterProxyModel):
         right_is_up = self._is_up_row(right)
         if left_is_up != right_is_up:
             if self._order == Qt.AscendingOrder:
-                # [..] should be the smallest element
                 return left_is_up and not right_is_up
             else:
-                # Qt will invert our result for descending; return the opposite
-                # so that after inversion [..] is still the smallest element.
-                return not left_is_up and right_is_up
+                return (not left_is_up) and right_is_up
 
         lt = self._item_type(left)
         rt = self._item_type(right)
@@ -275,29 +322,37 @@ class UpTopProxyModel(QSortFilterProxyModel):
                 return rl < rr
 
         col = left.column()
-        ld = left.data()
-        rd = right.data()
+        model = self.sourceModel()
 
-        if col == 0:  # Name
-            return str(ld).lower() < str(rd).lower()
+        def _name(idx: QModelIndex) -> str:
+            n = idx.sibling(idx.row(), 0).data()
+            return str(n or "").lower()
 
-        if col == 1:  # Size (use numeric payload; tie-break by name)
-            model = self.sourceModel()
+        # Name
+        if col == 0:
+            return _name(left) < _name(right)
 
+        # Size
+        if col == 1:
             l_item = model.itemFromIndex(left)
             r_item = model.itemFromIndex(right)
-
-            # 'size' is set when you build ListItem(size_val, ...)
             ln = getattr(l_item, "size", 0) or 0
             rn = getattr(r_item, "size", 0) or 0
-
             if ln != rn:
-                return ln < rn
+                return int(ln) < int(rn)
+            return _name(left) < _name(right)
 
-            # tie-breaker: Name (column 0)
-            l_name = left.sibling(left.row(), 0).data()
-            r_name = right.sibling(right.row(), 0).data()
-            return str(l_name).lower() < str(r_name).lower()
+        # Modified
+        if col == 2:
+            ld = left.data()
+            rd = right.data()
+            le = _to_epoch(ld)
+            re = _to_epoch(rd)
+            if le != re:
+                return le < re
+            return _name(left) < _name(right)
+
+        return str(left.data() or "").lower() < str(right.data() or "").lower()
 
 
 class Worker(QObject):
@@ -506,40 +561,46 @@ class Worker(QObject):
         finally:
             self.finished.emit(cancelled)
 
-class BucketUsageWorker(QObject):
-    finished = pyqtSignal(str, object)  # bucket_name, result_dict_or_exc
 
-    def __init__(self, data_model, bucket_name):
+class UsageWorker(QObject):
+    finished = pyqtSignal(str, str, object)  # bucket, prefix, result_or_exc
+
+    def __init__(self, data_model, bucket_name: str, prefix: str):
         super().__init__()
         self.data_model = data_model
         self.bucket_name = bucket_name
+        self.prefix = prefix or ""
 
     @pyqtSlot()
     def run(self):
         try:
             total = 0
             by_cat = {"Documents": 0, "Media": 0, "Other": 0}
-            by_top = {}  # top-level folder -> bytes
+            by_top = {}
 
-            for k, s in self.data_model.get_keys(""):  # whole bucket
+            pref = self.prefix or ""
+            pref_len = len(pref)
+
+            for k, s in self.data_model.get_keys_for_bucket(self.bucket_name, pref):
                 if not k or str(k).endswith("/"):
                     continue
-
                 key = str(k)
                 sz = int(s or 0)
-
                 total += sz
-                by_cat[categorize_key(key)] = by_cat.get(categorize_key(key), 0) + sz
 
-                top = top_group_from_key(key)
+                cat = categorize_key(key)
+                by_cat[cat] = by_cat.get(cat, 0) + sz
+
+                rel = key[pref_len:] if key.startswith(pref) else key
+                top = rel.split("/", 1)[0] if "/" in rel else "(files)"
                 by_top[top] = by_top.get(top, 0) + sz
 
-            top_sorted = sorted(by_top.items(), key=lambda kv: kv[1], reverse=True)
-            by_top = dict(top_sorted[:12])
+            by_top = dict(sorted(by_top.items(), key=lambda kv: kv[1], reverse=True)[:12])
 
-            self.finished.emit(self.bucket_name, {"total": total, "by_cat": by_cat, "by_top": by_top})
+            self.finished.emit(self.bucket_name, self.prefix, {"total": total, "by_cat": by_cat, "by_top": by_top})
         except Exception as exc:
-            self.finished.emit(self.bucket_name, exc)
+            self.finished.emit(self.bucket_name, self.prefix, exc)
+
 
 class PieWidget(QWidget):
     def __init__(self, by_cat: dict, parent=None):
@@ -583,14 +644,16 @@ class PieWidget(QWidget):
 
 
 class BucketUsageDialog(QDialog):
-    def __init__(self, bucket_name: str, parent=None):
+
+    def __init__(self, bucket_name: str, prefix: str = "", parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Bucket usage")
+        self.setWindowTitle("Usage")
         self.setModal(False)
 
         self._bucket = bucket_name
+        self._prefix = prefix or ""
 
-        self.title = QLabel(f"<b>{bucket_name}</b>")
+        self.title = QLabel(self._title_html(bucket_name, self._prefix))
         self.total_lbl = QLabel("Total: <b>Calculating…</b>")
 
         self.pie = PieWidget({"Documents": 0, "Media": 0, "Other": 0}, self)
@@ -618,53 +681,65 @@ class BucketUsageDialog(QDialog):
         layout.addWidget(self.total_lbl)
         layout.addLayout(top)
         layout.addWidget(self.top_groups)
-        layout.addWidget(btn, alignment=Qt.AlignRight)
+        layout.addWidget(btn)
         self.setLayout(layout)
-        self.resize(520, 380)
 
-    def set_calculating(self, bucket_name: str):
+    def _title_html(self, bucket: str, prefix: str) -> str:
+        if prefix:
+            return f"<b>{bucket}</b><br><span style='color:#666;'>/{prefix}</span>"
+        return f"<b>{bucket}</b>"
+
+    def set_calculating(self, bucket_name: str, prefix: str = ""):
         self._bucket = bucket_name
-        self.title.setText(f"<b>{bucket_name}</b>")
+        title = f"<b>{bucket_name}</b>" + (f"<br><span style='color:#666'>/{prefix}</span>" if prefix else "")
+        self.title.setText(title)
+
         self.total_lbl.setText("Total: <b>Calculating…</b>")
         self.pie.set_data({"Documents": 0, "Media": 0, "Other": 0})
         for k in ["Documents", "Media", "Other"]:
             self.legend_labels[k].setText(f"{k}: Calculating…")
         self.top_groups.setText("<b>Top groups</b><br><pre>Calculating…</pre>")
 
-    def set_error(self, bucket_name: str, err: Exception):
+    def set_error(self, bucket_name: str, prefix: str, err: Exception):
         self._bucket = bucket_name
-        self.title.setText(f"<b>{bucket_name}</b>")
+        title = f"<b>{bucket_name}</b>" + (f"<br><span style='color:#666'>/{prefix}</span>" if prefix else "")
+        self.title.setText(title)
+
         self.total_lbl.setText("Total: <b>n/a</b>")
         for k in ["Documents", "Media", "Other"]:
             self.legend_labels[k].setText(f"{k}: n/a")
         self.top_groups.setText(f"<b>Top groups</b><br><pre>n/a\n{err}</pre>")
 
-    def set_result(self, bucket_name: str, total: int, by_cat: dict, by_top: dict):
+    def set_result(self, bucket_name: str, prefix: str, total: int, by_cat: dict, by_top: dict):
         self._bucket = bucket_name
-        self.title.setText(f"<b>{bucket_name}</b>")
+        title = f"<b>{bucket_name}</b>" + (f"<br><span style='color:#666'>/{prefix}</span>" if prefix else "")
+        self.title.setText(title)
+
         self.total_lbl.setText(f"Total: <b>{_human_bytes(int(total))}</b>")
 
-        # normalize categories
         norm_cat = {"Documents": 0, "Media": 0, "Other": 0}
         for k, v in (by_cat or {}).items():
-            norm_cat[k] = int(v or 0)
+            if k in norm_cat:
+                norm_cat[k] = int(v or 0)
 
         self.pie.set_data(norm_cat)
         for k in ["Documents", "Media", "Other"]:
-            self.legend_labels[k].setText(f"{k}: {_human_bytes(int(norm_cat.get(k, 0)))}")
+            self.legend_labels[k].setText(f"{k}: {_human_bytes(norm_cat[k])}")
 
-        txt = "\n".join(
-            f"{k}: {_human_bytes(int(v))}"
-            for k, v in (by_top or {}).items()
-        ) or "(no folders)"
-        self.top_groups.setText(f"<b>Top groups</b><br><pre>{txt}</pre>")
+        lines = []
+        for k, v in (by_top or {}).items():
+            lines.append(f"{k:24s}  {_human_bytes(int(v or 0))}")
+        if not lines:
+            lines = ["(empty)"]
+
+        self.top_groups.setText("<b>Top groups</b><br><pre>" + "\n".join(lines) + "</pre>")
+
 
 class MainWindow(QMainWindow):
     def __init__(self, *args, **kwargs):
         settings = kwargs.pop("settings")
         super().__init__(*args, **kwargs)
-        self.title = "S3 Duck 🦆 %s" % __VERSION__
-        # self.setWindowTitle(self.title)
+        self.title = "S3 Duck 🦆 %s Experimental" % __VERSION__
         self.setWindowIcon(QIcon.fromTheme("applications-internet"))
 
         (
@@ -756,13 +831,20 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(wid)
         self.setGeometry(0, 26, 900, 500)
         self.profile_name = profile_name
+
+        self._nav_seq = 0
+        self._nav_thread = None
+        self._nav_worker = None
+        self._nav_pending_restore_name = None  # name to reselect after navigation
+        self._nav_select_up_entry = False      # select [..] if present after navigation
+        self._loading_dialog = None
+
+        self._last_selected_in_prefix = {}  # key: (bucket, prefix) -> name
         self.update_window_title()
         self.copyPath = ""
         self.copyList = []
         self.copyListNew = ""
         self.createActions()
-
-
 
         self.tBar = self.addToolBar("Tools")
         self.tBar.setContextMenuPolicy(Qt.PreventContextMenu)
@@ -797,6 +879,26 @@ class MainWindow(QMainWindow):
         self.proxy.setSourceModel(self.model)
         self.listview.setModel(self.proxy)
 
+        # Enable Σ + refresh open usage dialog when selection changes
+        try:
+            sm = self.listview.selectionModel()
+            if sm is not None:
+                try:
+                    sm.currentChanged.disconnect(self._on_current_changed_for_usage)
+                except Exception:
+                    pass
+                sm.currentChanged.connect(self._on_current_changed_for_usage)
+        except Exception:
+            pass
+
+        sm = self.listview.selectionModel()
+        if sm is not None:
+            try:
+                sm.currentChanged.disconnect(self._on_usage_selection_changed)
+            except Exception:
+                pass
+            sm.currentChanged.connect(self._on_usage_selection_changed)
+
         self.pb = QProgressBar()
         self.pb.setMinimum(0)
         self.pb.setMaximum(100)
@@ -830,9 +932,6 @@ class MainWindow(QMainWindow):
         self.s3PathEdit.setStyleSheet("font-family: monospace; background: #f0f0f0;")
         self.statusBar().addPermanentWidget(self.s3PathEdit, 3)
 
-        self.bucketUsageLabel = QLabel("Bucket usage: —")
-        self.bucketUsageLabel.setToolTip("Click Bucket usage (Σ) to calculate total size")
-        self.statusBar().addPermanentWidget(self.bucketUsageLabel, 1)
         self._bucket_usage_token = 0
         self._bucket_usage_bucket = ""
         self._bucket_usage_thread = None
@@ -857,7 +956,7 @@ class MainWindow(QMainWindow):
         self.select_first()
 
         # Initial populate
-        self.navigate()
+        self.navigate(show_loading=True)
 
         self.listview.header().setSortIndicatorShown(True)
         self.listview.setSortingEnabled(True)
@@ -873,6 +972,58 @@ class MainWindow(QMainWindow):
 
         # Double-click: proxy-aware handler
         self.listview.doubleClicked.connect(self.list_doubleClicked)
+
+    def _show_loading(self, title: str = "Loading...", text: str = "Please wait..."):
+        try:
+            if self._loading_dialog is None:
+                dlg = QProgressDialog(text, None, 0, 0, self)
+                dlg.setWindowTitle(title)
+                dlg.setWindowModality(Qt.ApplicationModal)
+                dlg.setCancelButton(None)
+                dlg.setMinimumDuration(0)
+                dlg.setAutoClose(False)
+                dlg.setAutoReset(False)
+                self._loading_dialog = dlg
+            else:
+                self._loading_dialog.setLabelText(text)
+                self._loading_dialog.setWindowTitle(title)
+            self._loading_dialog.show()
+            self._loading_dialog.raise_()
+        except Exception:
+            self._loading_dialog = None
+
+    def _hide_loading(self):
+        try:
+            if self._loading_dialog is not None:
+                self._loading_dialog.hide()
+        except Exception:
+            pass
+
+    def _select_by_name(self, name: str) -> bool:
+        ix = self.ix_by_name(name)
+        if ix:
+            self._normalize_selection_to_index(ix)
+            return True
+        return False
+
+    def select_up_entry(self) -> bool:
+        return self._select_by_name(UP_ENTRY_LABEL)
+
+    def _remember_current_selection(self):
+        try:
+            if self.in_bucket_list_mode():
+                _, name, t = self.get_row_primary_item(self.listview.currentIndex())
+                if name and t == FSObjectType.BUCKET:
+                    self._last_selected_bucket = name
+                return
+            _, name, _t = self.get_row_primary_item(self.listview.currentIndex())
+            if name:
+                key = (self.data_model.bucket or "", self.data_model.current_folder or "")
+                self._last_selected_in_prefix[key] = name
+        except Exception:
+            pass
+
+
 
     def log(self, message: str):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -905,12 +1056,10 @@ class MainWindow(QMainWindow):
         finally:
             blocker = None
 
-    def _show_bucket_usage_dialog(self, bucket_name: str):
+    def _show_bucket_usage_dialog(self, bucket_name: str, prefix: str = ""):
         if self._bucket_usage_dialog is None:
             self._bucket_usage_dialog = BucketUsageDialog(bucket_name, self)
-        else:
-            self._bucket_usage_dialog.set_calculating(bucket_name)
-
+        self._bucket_usage_dialog.set_calculating(bucket_name, prefix)
         self._bucket_usage_dialog.show()
         self._bucket_usage_dialog.raise_()
         self._bucket_usage_dialog.activateWindow()
@@ -921,6 +1070,14 @@ class MainWindow(QMainWindow):
         sm = self.listview.selectionModel()
         if sm is None:
             self.listview.setCurrentIndex(proxy_index)
+            try:
+                self.listview.scrollTo(proxy_index)
+            except Exception:
+                pass
+            try:
+                self.listview.setFocus(Qt.OtherFocusReason)
+            except Exception:
+                pass
             return
         sm.blockSignals(True)
         sm.clearSelection()
@@ -929,6 +1086,14 @@ class MainWindow(QMainWindow):
             QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
         )
         sm.blockSignals(False)
+        try:
+            self.listview.scrollTo(proxy_index)
+        except Exception:
+            pass
+        try:
+            self.listview.setFocus(Qt.OtherFocusReason)
+        except Exception:
+            pass
 
     def _end_model_reset_ui(self):
         try:
@@ -1115,18 +1280,58 @@ class MainWindow(QMainWindow):
 
         return None, None, None
 
-    def reset_bucket_usage(self):
-        if self.in_bucket_list_mode() or not self.data_model.bucket:
-            self._bucket_usage_bucket = ""
-            self.bucketUsageLabel.setText("Bucket usage: —")
-            return
+    def _usage_target_from_selection(self):
+        """
+        Returns (bucket_name, prefix_for_usage).
+        - In bucket list mode: bucket_name comes from selection, prefix=""
+        - In bucket mode: bucket_name is current bucket, prefix is selected folder prefix (or "")
+        """
+        sel = self.listview.selectionModel()
+        if sel is None:
+            return "", ""
 
-        b = self.data_model.bucket
-        self._bucket_usage_bucket = b
-        self.bucketUsageLabel.setText(f"Bucket usage: {b}: —")
+        # Bucket list mode: selected row is a bucket
+        if self.in_bucket_list_mode():
+            ix = sel.currentIndex()
+            if not ix.isValid():
+                return "", ""
+            primary_item, name, t = self.get_row_primary_item(ix)
+            if primary_item is None or not name:
+                return "", ""
+            if name == UP_ENTRY_LABEL:
+                return "", ""
+            if t != FSObjectType.BUCKET:
+                return "", ""
+            return name, ""  # bucket, no prefix
+
+        # Inside a bucket
+        if not self.data_model.bucket:
+            return "", ""
+
+        ix = sel.currentIndex()
+        if not ix.isValid():
+            return self.data_model.bucket, ""
+
+        primary_item, name, t = self.get_row_primary_item(ix)
+        if primary_item is None or not name or name == UP_ENTRY_LABEL:
+            return self.data_model.bucket, ""
+
+        # If folder selected -> usage for that folder prefix
+        if t == FSObjectType.FOLDER:
+            prefix = (self.data_model.current_folder or "") + name + "/"
+            return self.data_model.bucket, prefix
+
+        # If file selected -> usage for current folder
+        return self.data_model.bucket, (self.data_model.current_folder or "")
+
+    def reset_bucket_usage(self):
+        # statusbar element removed; keep internal state only
+        self._bucket_usage_bucket = ""
+        self._bucket_usage_prefix = ""
 
     def request_bucket_usage(self):
-        if self.in_bucket_list_mode() or not self.data_model.bucket:
+        bucket_name, prefix = self._usage_target_from_selection()
+        if not bucket_name:
             self.statusBar().showMessage("Select a bucket first", 2000)
             return
 
@@ -1134,27 +1339,20 @@ class MainWindow(QMainWindow):
         if getattr(self, "_bucket_usage_thread", None) is not None:
             try:
                 if self._bucket_usage_thread.isRunning():
-                    self.statusBar().showMessage("Bucket usage calculation already running…", 2000)
+                    self.statusBar().showMessage("Usage calculation already running…", 2000)
                     return
             except Exception:
                 pass
 
-        bucket_name = self.data_model.bucket
-
         self._bucket_usage_token = getattr(self, "_bucket_usage_token", 0) + 1
         token = self._bucket_usage_token
 
-        self._bucket_usage_bucket = bucket_name
-        self.bucketUsageLabel.setText(f"Bucket usage: {bucket_name}: …")
-        self.statusBar().showMessage("Calculating bucket usage…", 2000)
-
-        # ✅ open summary immediately
-        self._show_bucket_usage_dialog(bucket_name)
-
+        self.statusBar().showMessage("Calculating usage…", 2000)
+        self._show_bucket_usage_dialog(bucket_name, prefix)
         self.btnBucketUsage.setEnabled(False)
 
         t = QThread(self)
-        w = BucketUsageWorker(self.data_model, bucket_name)
+        w = UsageWorker(self.data_model, bucket_name, prefix)
         w.moveToThread(t)
 
         def _clear_refs():
@@ -1162,39 +1360,25 @@ class MainWindow(QMainWindow):
             self._bucket_usage_worker = None
 
         def reenable():
-            self.btnBucketUsage.setEnabled(not self.in_bucket_list_mode())
+            self.btnBucketUsage.setEnabled(True)
 
-        def apply_result(bname, result):
-            # ignore stale results
+        def apply_result(bname, pref, result):
             if token != self._bucket_usage_token:
-                return
-            if self.data_model.bucket != bname:
                 return
 
             if isinstance(result, Exception):
-                self.bucketUsageLabel.setText(f"Bucket usage: {bname}: n/a")
-                self.statusBar().showMessage(f"Bucket usage failed: {result}", 4000)
+                self.statusBar().showMessage(f"Usage failed: {result}", 4000)
                 if self._bucket_usage_dialog is not None:
-                    self._bucket_usage_dialog.set_error(bname, result)
+                    self._bucket_usage_dialog.set_error(bname, pref, result)
                 return
 
-            # dict from worker
-            if isinstance(result, dict):
-                total = int(result.get("total", 0) or 0)
-                by_cat = dict(result.get("by_cat", {}) or {})
-                by_top = dict(result.get("by_top", {}) or {})
-                self._last_bucket_usage_breakdown = result
-            else:
-                total = int(result or 0)
-                by_cat = {"Documents": 0, "Media": 0, "Other": 0}
-                by_top = {}
-                self._last_bucket_usage_breakdown = None
+            total = int(result.get("total", 0) or 0)
+            by_cat = dict(result.get("by_cat", {}) or {})
+            by_top = dict(result.get("by_top", {}) or {})
 
-            self.bucketUsageLabel.setText(f"Bucket usage: {bname}: {_human_bytes(total)}")
-            self.statusBar().showMessage("Bucket usage calculated", 2000)
-
+            self.statusBar().showMessage("Usage calculated", 2000)
             if self._bucket_usage_dialog is not None:
-                self._bucket_usage_dialog.set_result(bname, total, by_cat, by_top)
+                self._bucket_usage_dialog.set_result(bname, pref, total, by_cat, by_top)
 
         w.finished.connect(apply_result)
         w.finished.connect(t.quit)
@@ -1203,14 +1387,33 @@ class MainWindow(QMainWindow):
         t.finished.connect(t.deleteLater)
         t.finished.connect(_clear_refs)
         t.finished.connect(reenable)
-
         t.started.connect(w.run)
 
         self._bucket_usage_thread = t
         self._bucket_usage_worker = w
         t.start()
 
+    def _on_usage_selection_changed(self, current: QModelIndex, previous: QModelIndex):
+        dlg = getattr(self, "_bucket_usage_dialog", None)
+        if dlg is None:
+            return
+        try:
+            if not dlg.isVisible():
+                return
+        except Exception:
+            return
+
+        t = getattr(self, "_bucket_usage_thread", None)
+        try:
+            if t is not None and t.isRunning():
+                return
+        except Exception:
+            pass
+
+        self.request_bucket_usage()
+
     def eventFilter(self, obj, event):
+
         if obj == self.listview:
             if event.type() == QEvent.ContextMenu and obj is self.listview:
                 ixs = self.listview.selectedIndexes()
@@ -1401,6 +1604,19 @@ class MainWindow(QMainWindow):
                 if not clk:
                     return False
 
+                # block navigation keys during transfers
+                if self.transfers_active():
+
+                    if event.key() in (
+                            Qt.Key_Return, Qt.Key_Enter,
+                            Qt.Key_Backspace,  # Up
+                            Qt.Key_B,  # Back
+                            Qt.Key_H, Qt.Key_Home,  # Home
+                            Qt.Key_R,  # Refresh shortcut if you use it
+                    ):
+                        self.statusBar().showMessage("Transfers active — navigation is disabled", 2000)
+                        return True
+
 
                 if clk == upload_selected_action:
                     self.upload(upload_path)
@@ -1422,6 +1638,7 @@ class MainWindow(QMainWindow):
                 return True
 
             if event.type() == QEvent.KeyPress:
+
                 if event.key() == Qt.Key_Escape:
                     self.cancel_transfers()
                     return True
@@ -1492,7 +1709,7 @@ class MainWindow(QMainWindow):
         # Update UI-visible profile name
         self.profile_name = prof.name
 
-        # Update datamodel "root/profile" fields (important for bucket list mode)
+        # Update datamodel "root/profile" fields
         self.data_model.profile_endpoint_url = prof.url
         self.data_model.profile_use_path = prof.use_path
         self.data_model.profile_region = prof.region
@@ -1511,13 +1728,29 @@ class MainWindow(QMainWindow):
         # Reset navigation
         self.data_model.current_folder = ""
         self.data_model.prev_folder = ""
-        # Start either in bucket list mode OR inside selected bucket (if profile has bucket)
         self.data_model.bucket = ""
+        self._disable_restore_last_bucket_once = True
+
         self.statusBar().showMessage(f"[{self.profile_name}][all buckets]", 3000)
+        self._disable_restore_last_bucket_once = True
+        try:
+            self._last_selected_bucket = None
+            if hasattr(self, "_last_selected_in_prefix") and isinstance(self._last_selected_in_prefix, dict):
+                self._last_selected_in_prefix.clear()
+        except Exception:
+            pass
 
         # Refresh view
-        self.navigate()
+        self.navigate(show_loading=True)
         self.update_window_title()
+
+        # Select first element after navigation populates the view
+        try:
+            QTimer.singleShot(0, self.select_first)
+            QTimer.singleShot(200, self.select_first)  # second attempt after model fills
+        except Exception:
+            pass
+
         if old_profile and old_profile != self.profile_name:
             self.log(f"Profile switched: {old_profile} → {self.profile_name}")
         else:
@@ -1637,79 +1870,22 @@ class MainWindow(QMainWindow):
         self.data_model.current_folder = new_folder
         return self.data_model.current_folder
 
-    def navigate(self, restore_last_index=False):
-        """
-        If no active bucket: show list of buckets.
-        Else: show objects in that bucket/prefix.
-        """
-        if not self.data_model.bucket:
-            buckets = self.data_model.list_buckets()
-            self.modelToListView_bucket_mode(buckets)
-            self.listview.sortByColumn(0, Qt.AscendingOrder)
-            self.statusBar().showMessage("[%s][all buckets]" % (self.profile_name,), 0)
-            self.reset_bucket_usage()
-            self.update_s3_path_label()
-            self.enable_action_buttons()
-
-            selected = False
-            if self._last_selected_bucket:
-                ix = self.ix_by_name(self._last_selected_bucket)
-                if ix:
-                    self._normalize_selection_to_index(ix)
-                    selected = True
-                else:
-                    self.select_first()
-
-            if not selected and buckets:
-                self.select_first()
-            return
-
-        # we're in a bucket:
+    def _on_current_changed_for_usage(self, current: QModelIndex, previous: QModelIndex):
+        # enable/disable Σ based on whether we can compute a target
         try:
-            items = self.data_model.list(self.data_model.current_folder)
-        except Exception as exc:
-            # Surface boto3/botocore error details and jump back to buckets
-            QMessageBox.critical(
-                self,
-                "List failed",
-                f"Cannot list '{self.data_model.bucket}'"
-                f"{' at ' + self.data_model.current_folder if self.data_model.current_folder else ''}:\n\n{exc}",
-            )
+            b, _p = self._usage_target_from_selection()
+            self.btnBucketUsage.setEnabled(bool(b) and not self.transfers_active())
+        except Exception:
+            pass
 
-            # Return to bucket list mode safely (also restores region & client)
-            self._return_to_bucket_list_mode()
-            self.reset_bucket_usage()
-            self.navigate()
-            # Try to reselect the bucket we failed in, for user convenience
-            if self._last_selected_bucket:
-                ix = self.ix_by_name(self._last_selected_bucket)
-                if ix:
-                    self._normalize_selection_to_index(ix)
-            return
-
-        self.modelToListView(items)
-        self.listview.sortByColumn(0, Qt.AscendingOrder)
-        show_folder = self.data_model.current_folder if self.data_model.current_folder else "/"
-        self.statusBar().showMessage(
-            "[%s][%s] %s"
-            % (
-                self.profile_name,
-                self.data_model.bucket,
-                show_folder,
-            ),
-            0,
-        )
-        self.update_s3_path_label()
-        self.enable_action_buttons()
-
-        if restore_last_index and self.data_model.prev_folder:
-            name = self.map.get(self.data_model.current_folder)
-            if name:
-                ix = self.ix_by_name(name)
-                if ix:
-                    self._normalize_selection_to_index(ix)
-
-        self.reset_bucket_usage()
+        # If usage window is open, refresh on selection changes (but don't stack threads)
+        try:
+            if self._bucket_usage_dialog is not None and self._bucket_usage_dialog.isVisible():
+                t = getattr(self, "_bucket_usage_thread", None)
+                if t is None or not t.isRunning():
+                    self.request_bucket_usage()
+        except Exception:
+            pass
 
     def get_elem_name(self):
         index = self.listview.currentIndex()
@@ -1719,6 +1895,11 @@ class MainWindow(QMainWindow):
         return None, None
 
     def list_doubleClicked(self, proxy_index: QModelIndex):
+
+        if self.transfers_active():
+            self.statusBar().showMessage("Transfers active — navigation is disabled", 2000)
+            return
+
         if not proxy_index.isValid():
             return
 
@@ -1838,8 +2019,7 @@ class MainWindow(QMainWindow):
 
             # success (no failure path)
             self._last_selected_bucket = name
-            self.navigate()
-            self.select_first()
+            self.navigate(select_up_entry=True)
             return
 
         # Special [..] entry
@@ -1849,20 +2029,153 @@ class MainWindow(QMainWindow):
             else:
                 # root of bucket -> go back to bucket list
                 self._return_to_bucket_list_mode()
-                self.navigate()
+                self.navigate(restore_name=self._last_selected_bucket)
             return
 
         # Normal folder navigation
         if t == FSObjectType.FOLDER:
             self.map[self.data_model.current_folder] = name
+            self._last_selected_in_prefix[(self.data_model.bucket or '', self.data_model.current_folder or '')] = name
             self.change_current_folder(
                 self.data_model.current_folder + f"{name}/")
-            self.navigate()
+            self.navigate(select_up_entry=True)
+            return
+
+    def navigate(self, restore_last_index=False, restore_name: str = None,
+                 select_up_entry: bool = False, show_loading: bool = False,
+                 force: bool = False):
+        """Asynchronous navigation (bucket list / bucket objects) to keep UI responsive."""
+
+        if (not force) and self.transfers_active():
+            self.statusBar().showMessage("Transfers active — navigation is disabled", 2000)
+            return
+
+        self._remember_current_selection()
+
+        self._nav_seq += 1
+        seq = self._nav_seq
+        self._nav_pending_restore_name = restore_name
+        self._nav_select_up_entry = bool(select_up_entry)
+
+        bucket = self.data_model.bucket or ""
+        prefix = self.data_model.current_folder or ""
+
+        self.listview.setEnabled(False)
+        if show_loading:
+            self._show_loading("Loading", "Loading…")
+        else:
+            self.statusBar().showMessage("Loading…", 0)
+
+        if self._nav_thread is not None:
+            try:
+                self._nav_thread.quit()
+                self._nav_thread.wait(50)
+            except Exception:
+                pass
+            self._nav_thread = None
+            self._nav_worker = None
+
+        th = QThread(self)
+        wk = NavigationWorker(self.data_model, seq, bucket, prefix)
+        wk.moveToThread(th)
+        th.started.connect(wk.run)
+        wk.finished.connect(self._on_navigation_finished)
+        wk.finished.connect(th.quit)
+        wk.finished.connect(wk.deleteLater)
+        th.finished.connect(th.deleteLater)
+
+        self._nav_thread = th
+        self._nav_worker = wk
+        th.start()
+
+    @pyqtSlot(int, object, str)
+    def _on_navigation_finished(self, seq: int, payload: object, err_str: str):
+        if seq != self._nav_seq:
+            return
+
+        self._hide_loading()
+        self.listview.setEnabled(True)
+
+        try:
+            self.activateWindow()
+            self.raise_()
+        except Exception:
+            pass
+        try:
+            self.listview.setFocus(Qt.OtherFocusReason)
+        except Exception:
+            pass
+
+        if err_str:
+            self.statusBar().showMessage(f"Navigation error: {err_str}", 8000)
+            self.log(f"Navigation error: {err_str}")
+            return
+
+        mode = payload.get("mode") if isinstance(payload, dict) else None
+
+        if mode == "bucket_list":
+            buckets = payload.get("buckets") or []
+            self.modelToListView_bucket_mode(buckets)
+            self.listview.setSortingEnabled(True)
+            self.listview.sortByColumn(0, Qt.AscendingOrder)
+            self.statusBar().showMessage("[%s][all buckets]" % (self.profile_name,), 0)
+            self.reset_bucket_usage()
+            self.update_s3_path_label()
+            self.enable_action_buttons()
+
+            if self._nav_pending_restore_name and self._select_by_name(self._nav_pending_restore_name):
+                return
+
+            if getattr(self, "_disable_restore_last_bucket_once", False):
+                self._disable_restore_last_bucket_once = False
+                self.select_first()
+                return
+
+            if self._last_selected_bucket and self._select_by_name(self._last_selected_bucket):
+                return
+
             self.select_first()
             return
 
+        if mode == "bucket_items":
+            items = payload.get("items") or []
+            # Remember current sort state (so it persists across refresh/navigation)
+            hdr = self.listview.header()
+            sort_col = hdr.sortIndicatorSection()
+            sort_order = hdr.sortIndicatorOrder()
+
+            self.modelToListView(items)
+
+            # Re-enable sorting + re-apply last sort
+            self.listview.setSortingEnabled(True)
+            self.listview.sortByColumn(sort_col, sort_order)
+
+            if not self.data_model.bucket:
+                self.statusBar().showMessage(f"[{self.profile_name}][all buckets]", 0)
+            else:
+                show_folder = self.data_model.current_folder if self.data_model.current_folder else "/"
+                self.statusBar().showMessage(f"[{self.profile_name}][{self.data_model.bucket}] {show_folder}", 0)
+            self.update_s3_path_label()
+            self.enable_action_buttons()
+
+            if self._nav_pending_restore_name and self._select_by_name(self._nav_pending_restore_name):
+                return
+            if self._nav_select_up_entry and self.select_up_entry():
+                return
+
+            key = (self.data_model.bucket or "", self.data_model.current_folder or "")
+            last = self._last_selected_in_prefix.get(key)
+            if last and self._select_by_name(last):
+                return
+            self.select_first()
+            return
+
+
     def goBack(self):
         if not self.data_model.bucket:
+            return
+        if self.transfers_active():
+            self.statusBar().showMessage("Transfers active — navigation is disabled", 2000)
             return
         self.change_current_folder(self.data_model.prev_folder)
         self.navigate()
@@ -1892,96 +2205,98 @@ class MainWindow(QMainWindow):
 
         b = self.data_model.bucket
         self._bucket_usage_bucket = b
-        self.bucketUsageLabel.setText(f"Bucket usage: {b}: —")
 
     def assign_thread_operation(self, method, job, need_refresh=True):
+
         if not job:
             return
 
         self.log(f"starting {method}")
 
-        self.thread = QThread()
+        # Parent the thread to MainWindow so Qt owns it.
+        self.thread = QThread(self)
         self.worker = Worker(self.data_model, job)
         self.worker.moveToThread(self.thread)
-
-        def _clear_thread_refs():
-            self.thread = None
-            self.worker = None
-            if getattr(self, "btnCancel", None) is not None:
-                self.btnCancel.setEnabled(False)
 
         # start worker method
         m = getattr(self.worker, method)
         self.thread.started.connect(m)
 
-        # cleanup plumbing
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(_clear_thread_refs)
-        self.thread.finished.connect(self.thread.deleteLater)
-
-        # log/progress wiring
         self.worker.progress.connect(self.report_logger_progress)
         if need_refresh:
-            self.worker.refresh.connect(self.navigate)
+            self.worker.refresh.connect(lambda: self.navigate(force=True))
+
+        def _transfer_ui_start(prefix_text: str):
+            self.pb.reset()
+            self.pb.setValue(0)
+            self.pb.show()
+            self._status_prefix = prefix_text
+            self.status_text.setText("Preparing…")
+
+            self._smooth_total = 1
+            self._smooth_done = 0
+            self._rate_samples = []
+            self._smooth_rate_bps = 0.0
+            self._last_tick_time = 0.0
+            self._last_tick_bytes = 0
+
+            self._tick_timer.start()
+            self.worker.batch_progress.connect(self._on_batch_progress)
+            self.worker.file_progress.connect(self._on_file_progress)
+
+        def _transfer_ui_stop():
+            try:
+                self._on_tick()
+            except Exception:
+                pass
+            try:
+                self._tick_timer.stop()
+            except Exception:
+                pass
+            self.pb.hide()
 
         if method == "download":
-            self.pb.reset()
-            self.pb.setValue(0)
-            self.pb.show()
-            self._status_prefix = "Downloading…"
-            self.status_text.setText("Preparing…")
-
-            self._smooth_total = 1
-            self._smooth_done = 0
-            self._rate_samples = []
-            self._smooth_rate_bps = 0.0
-            self._last_tick_time = 0.0
-            self._last_tick_bytes = 0
-
-            self._tick_timer.start()
-            self.worker.batch_progress.connect(self._on_batch_progress)
-            self.worker.file_progress.connect(self._on_file_progress)
-
-            def _hide():
-                self._on_tick()
-                self._tick_timer.stop()
-                self.pb.hide()
-
-            self.thread.finished.connect(_hide)
+            _transfer_ui_start("Downloading…")
+            self.thread.finished.connect(_transfer_ui_stop)
 
         if method == "upload":
-            self.pb.reset()
-            self.pb.setValue(0)
-            self.pb.show()
-            self._status_prefix = "Uploading…"
-            self.status_text.setText("Preparing…")
+            _transfer_ui_start("Uploading…")
+            self.thread.finished.connect(_transfer_ui_stop)
 
-            self._smooth_total = 1
-            self._smooth_done = 0
-            self._rate_samples = []
-            self._smooth_rate_bps = 0.0
-            self._last_tick_time = 0.0
-            self._last_tick_bytes = 0
+        def _reenable_after_thread():
+            # next event loop tick => thread is no longer running, transfers_active() becomes False
+            QTimer.singleShot(0, self.enable_action_buttons)
 
-            self._tick_timer.start()
-            self.worker.batch_progress.connect(self._on_batch_progress)
-            self.worker.file_progress.connect(self._on_file_progress)
-
-            def _hide():
-                self._on_tick()
-                self._tick_timer.stop()
-                self.pb.hide()
-            self.thread.finished.connect(_hide)
+        def _clear_thread_refs():
+            # clear refs first
+            self.thread = None
+            self.worker = None
+            try:
+                if getattr(self, "btnCancel", None) is not None:
+                    self.btnCancel.setEnabled(False)
+            except Exception:
+                pass
+            _reenable_after_thread()
 
         def _on_worker_finished(cancelled: bool):
             if cancelled:
                 self.log(f"{method} cancelled")
             else:
                 self.log(f"{method} completed")
-            self.enable_action_buttons()
+
+            if need_refresh:
+                QTimer.singleShot(0, lambda: self.navigate(force=True))
+
 
         self.worker.finished.connect(_on_worker_finished)
+        self.worker.finished.connect(self.thread.quit)
+
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(_clear_thread_refs)
+        self.thread.finished.connect(self.thread.deleteLater)
+
+        # Safety: if something else emits finished early, still re-enable after thread end
+        self.thread.finished.connect(_reenable_after_thread)
 
         self.thread.start()
         self.disable_action_buttons()
@@ -2159,40 +2474,55 @@ class MainWindow(QMainWindow):
 
     def enable_action_buttons(self):
         at_root = self.in_bucket_list_mode()
-        # In bucket list mode:
-        #  - Create/Delete are for buckets,
-        #  - Upload/Download disabled
-        self.btnCreateFolder.setEnabled(True)  # create bucket OR create folder
-        self.btnRemove.setEnabled(True)        # delete bucket OR delete object
-        self.btnSwitchProfile.setEnabled(True)
-        self.btnUpload.setEnabled(not at_root)
-        self.btnDownload.setEnabled(not at_root)
-        self.btnCancel.setEnabled(False)
+        active = self.transfers_active()
+
+        self.btnSwitchProfile.setEnabled(not active)
+
+        self.btnCreateFolder.setEnabled(not active)
+        self.btnRemove.setEnabled(not active)
+
+        self.btnUpload.setEnabled((not at_root) and (not active))
+        self.btnDownload.setEnabled((not at_root) and (not active))
+        self.btnCancel.setEnabled(active)
+
+        # Σ should be disabled during transfers; enabled only if a target exists
+        try:
+            b, _p = self._usage_target_from_selection()
+            self.btnBucketUsage.setEnabled(bool(b) and (not active))
+        except Exception:
+            self.btnBucketUsage.setEnabled(not active and (not at_root))
+
+        # Menu should be disabled during transfers
         if hasattr(self, "menu"):
-            self.menu.setEnabled(True)
-        self.btnBucketUsage.setEnabled(not at_root)
-        if at_root:
-            self.bucketUsageLabel.setText("Bucket usage: —")
+            self.menu.setEnabled(not active)
 
     def disable_action_buttons(self):
         if hasattr(self, "menu"):
             self.menu.setEnabled(False)
+
         self.btnCreateFolder.setEnabled(False)
         self.btnUpload.setEnabled(False)
         self.btnDownload.setEnabled(False)
         self.btnRemove.setEnabled(False)
         self.btnSwitchProfile.setEnabled(False)
-        self.btnCancel.setEnabled(True)
+        self.btnBucketUsage.setEnabled(False)
+
+        # Cancel should be enabled only if transfers are active
+        self.btnCancel.setEnabled(self.transfers_active())
 
     def goUp(self):
+
         if not self.data_model.bucket:
+            return
+
+        if self.transfers_active():
+            self.statusBar().showMessage("Transfers active — navigation is disabled", 2000)
             return
 
         self._clear_selection()
 
         was_sorting = self.listview.isSortingEnabled()
         self.listview.setSortingEnabled(False)
-
         self.listview.setUpdatesEnabled(False)
         try:
             if not self.data_model.current_folder:
@@ -2207,13 +2537,14 @@ class MainWindow(QMainWindow):
                 return
 
             p = self.data_model.current_folder
+            leaving = p.rstrip("/").split("/")[-1] if p else ""
             new_path_list = p.split("/")[:-2]
             new_path = "/".join(new_path_list)
             if new_path:
                 new_path = new_path + "/"
 
             self.change_current_folder(new_path)
-            self.navigate(True)
+            self.navigate(True, restore_name=leaving)
             self.map.pop(p, None)
 
             ix = self.listview.currentIndex()
@@ -2227,6 +2558,9 @@ class MainWindow(QMainWindow):
             self.listview.setSortingEnabled(was_sorting)
 
     def goHome(self):
+        if self.transfers_active():
+            self.statusBar().showMessage("Transfers active — navigation is disabled", 2000)
+            return
         self._return_to_bucket_list_mode()
         self.reset_bucket_usage()
         self.navigate()

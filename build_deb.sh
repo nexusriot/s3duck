@@ -1,6 +1,6 @@
 #!/bin/env bash
 
-version=0.4.8
+version=0.5.1
 
 echo "building deb for s3duck $version"
 
