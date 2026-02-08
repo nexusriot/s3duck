@@ -25,7 +25,7 @@ from profile_switcher import ProfileSwitchWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.5.1"
+__VERSION__ = "0.5.3"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -1058,7 +1058,7 @@ class MainWindow(QMainWindow):
 
     def _show_bucket_usage_dialog(self, bucket_name: str, prefix: str = ""):
         if self._bucket_usage_dialog is None:
-            self._bucket_usage_dialog = BucketUsageDialog(bucket_name, self)
+            self._bucket_usage_dialog = BucketUsageDialog(bucket_name, prefix, self)
         self._bucket_usage_dialog.set_calculating(bucket_name, prefix)
         self._bucket_usage_dialog.show()
         self._bucket_usage_dialog.raise_()
@@ -1282,15 +1282,23 @@ class MainWindow(QMainWindow):
 
     def _usage_target_from_selection(self):
         """
-        Returns (bucket_name, prefix_for_usage).
-        - In bucket list mode: bucket_name comes from selection, prefix=""
-        - In bucket mode: bucket_name is current bucket, prefix is selected folder prefix (or "")
+        Returns (bucket_name, prefix_for_usage) according to container rules:
+
+        Bucket list:
+          - bucket row -> (bucket, "")
+
+        Inside a bucket:
+          - [..] at bucket root -> (bucket, "")
+          - [..] inside folder -> (bucket, parent_prefix(current_folder))
+          - folder selected -> (bucket, current_folder + folder + "/")
+          - file selected -> (bucket, current_folder)
+          - no/invalid selection -> (bucket, current_folder)
         """
         sel = self.listview.selectionModel()
         if sel is None:
             return "", ""
 
-        # Bucket list mode: selected row is a bucket
+        # Bucket list mode
         if self.in_bucket_list_mode():
             ix = sel.currentIndex()
             if not ix.isValid():
@@ -1302,27 +1310,37 @@ class MainWindow(QMainWindow):
                 return "", ""
             if t != FSObjectType.BUCKET:
                 return "", ""
-            return name, ""  # bucket, no prefix
+            return name, ""  # bucket stats
 
         # Inside a bucket
         if not self.data_model.bucket:
             return "", ""
 
+        cur_folder = (self.data_model.current_folder or "")
+
         ix = sel.currentIndex()
         if not ix.isValid():
-            return self.data_model.bucket, ""
+            return self.data_model.bucket, cur_folder
 
         primary_item, name, t = self.get_row_primary_item(ix)
-        if primary_item is None or not name or name == UP_ENTRY_LABEL:
-            return self.data_model.bucket, ""
+        if primary_item is None or not name:
+            return self.data_model.bucket, cur_folder
 
-        # If folder selected -> usage for that folder prefix
+        # Special [..]
+        if name == UP_ENTRY_LABEL:
+            if not cur_folder:
+                # [..] at bucket root -> bucket stats
+                return self.data_model.bucket, ""
+            # [..] inside folder -> stats for current folder
+            return self.data_model.bucket, cur_folder
+
+        # Folder selected -> folder stats for that folder
         if t == FSObjectType.FOLDER:
-            prefix = (self.data_model.current_folder or "") + name + "/"
+            prefix = cur_folder + name + "/"
             return self.data_model.bucket, prefix
 
-        # If file selected -> usage for current folder
-        return self.data_model.bucket, (self.data_model.current_folder or "")
+        # File selected -> stats for current container
+        return self.data_model.bucket, cur_folder
 
     def reset_bucket_usage(self):
         # statusbar element removed; keep internal state only
@@ -2121,32 +2139,33 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("[%s][all buckets]" % (self.profile_name,), 0)
             self.reset_bucket_usage()
             self.update_s3_path_label()
-            self.enable_action_buttons()
 
             if self._nav_pending_restore_name and self._select_by_name(self._nav_pending_restore_name):
+                self.enable_action_buttons()
                 return
 
             if getattr(self, "_disable_restore_last_bucket_once", False):
                 self._disable_restore_last_bucket_once = False
                 self.select_first()
+                self.enable_action_buttons()
                 return
 
             if self._last_selected_bucket and self._select_by_name(self._last_selected_bucket):
+                self.enable_action_buttons()
                 return
 
             self.select_first()
+            self.enable_action_buttons()
             return
 
         if mode == "bucket_items":
             items = payload.get("items") or []
-            # Remember current sort state (so it persists across refresh/navigation)
             hdr = self.listview.header()
             sort_col = hdr.sortIndicatorSection()
             sort_order = hdr.sortIndicatorOrder()
 
             self.modelToListView(items)
 
-            # Re-enable sorting + re-apply last sort
             self.listview.setSortingEnabled(True)
             self.listview.sortByColumn(sort_col, sort_order)
 
@@ -2155,21 +2174,26 @@ class MainWindow(QMainWindow):
             else:
                 show_folder = self.data_model.current_folder if self.data_model.current_folder else "/"
                 self.statusBar().showMessage(f"[{self.profile_name}][{self.data_model.bucket}] {show_folder}", 0)
+
             self.update_s3_path_label()
-            self.enable_action_buttons()
 
             if self._nav_pending_restore_name and self._select_by_name(self._nav_pending_restore_name):
+                self.enable_action_buttons()
                 return
+
             if self._nav_select_up_entry and self.select_up_entry():
+                self.enable_action_buttons()
                 return
 
             key = (self.data_model.bucket or "", self.data_model.current_folder or "")
             last = self._last_selected_in_prefix.get(key)
             if last and self._select_by_name(last):
+                self.enable_action_buttons()
                 return
-            self.select_first()
-            return
 
+            self.select_first()
+            self.enable_action_buttons()
+            return
 
     def goBack(self):
         if not self.data_model.bucket:
@@ -2310,10 +2334,9 @@ class MainWindow(QMainWindow):
             key = self.data_model.current_folder + "%s/" % name
             self.data_model.create_folder(key)
             self.log(f"Created folder {name} ({key})")
-            self.navigate()
-            ix = self.ix_by_name(name)
-            if ix:
-                self.listview.setCurrentIndex(ix)
+
+            self._nav_pending_restore_name = name
+            self.navigate(force=True, restore_name=name)
 
     def new_bucket(self):
         bucket_name, ok = QInputDialog.getText(self, "Create bucket", "Bucket name")
@@ -2323,12 +2346,13 @@ class MainWindow(QMainWindow):
         try:
             self.data_model.create_bucket(bucket_name)
             self.log(f"Created bucket {bucket_name}")
+
             # remember this new bucket as "last focused"
             self._last_selected_bucket = bucket_name
-            self.navigate()
-            ix = self.ix_by_name(bucket_name)
-            if ix:
-                self.listview.setCurrentIndex(ix)
+
+            self._nav_pending_restore_name = bucket_name
+            self.navigate(force=True, restore_name=bucket_name)
+
         except Exception as exc:
             QMessageBox.critical(
                 self,
