@@ -432,6 +432,59 @@ class Model:
         root_client = self._make_client(region=region)
         root_client.create_bucket(**params)
 
+    def delete_bucket_recursive(self, bucket_name: str, *, batch_size: int = 1000):
+        """
+        Delete bucket even if non-empty: first remove all objects (recursive),
+        then delete the bucket itself.
+
+        Notes:
+          - This deletes *current* object versions only. If bucket has versioning enabled,
+            older versions / delete markers may remain and AWS will still refuse DeleteBucket.
+            (Supporting versioned buckets requires list_object_versions + delete by VersionId.)
+        """
+        bucket_name = (bucket_name or "").strip()
+        if not bucket_name:
+            raise ValueError("bucket_name is empty")
+
+        # Use a client that can actually access this bucket (endpoint/style probing)
+        bucket_client, _endpoint, _region, _use_path = self._try_bind_bucket(bucket_name)
+
+        paginator = bucket_client.get_paginator("list_objects_v2")
+
+        pending = []
+
+        def flush():
+            nonlocal pending
+            if not pending:
+                return
+            bucket_client.delete_objects(
+                Bucket=bucket_name,
+                Delete={"Objects": pending, "Quiet": True},
+            )
+            pending = []
+
+        # List everything
+        for page in paginator.paginate(Bucket=bucket_name, Prefix=""):
+            for obj in (page.get("Contents", []) or []):
+                k = obj.get("Key")
+                if not k:
+                    continue
+                pending.append({"Key": k})
+                if len(pending) >= int(batch_size or 1000):
+                    flush()
+
+        flush()
+
+        # If we're currently "in" that bucket, reset view state first
+        if self.bucket == bucket_name:
+            self.bucket = ""
+            self.current_folder = ""
+            self.prev_folder = ""
+
+        # Delete bucket using a root/profile client
+        root_client = self._make_client(region=self.profile_region or "us-east-1")
+        root_client.delete_bucket(Bucket=bucket_name)
+
     def delete_bucket(self, bucket_name: str):
         """
         Delete a bucket. Must be empty.
