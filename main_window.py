@@ -25,7 +25,7 @@ from profile_switcher import ProfileSwitchWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.5.3"
+__VERSION__ = "0.5.7"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -2376,24 +2376,43 @@ class MainWindow(QMainWindow):
         if not bucket_names:
             return
 
-        qm = QMessageBox
-        ret = qm.question(
-            self,
-            "",
-            "Are you sure to delete bucket(s): %s ?\n\nNote: bucket must be EMPTY."
-            % ", ".join(bucket_names),
-            qm.Yes | qm.No,
+        # Custom confirm box with a checkbox
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Delete bucket(s)")
+        box.setText("Are you sure you want to delete bucket(s):\n\n  %s" % ", ".join(bucket_names))
+
+        cb = QCheckBox("Delete non-empty buckets (recursive delete all objects)")
+        cb.setChecked(False)
+        box.setCheckBox(cb)
+
+        box.setInformativeText(
+            "If unchecked, bucket must be EMPTY.\n"
+            "If checked, ALL objects inside the bucket(s) will be deleted first."
         )
-        if ret != qm.Yes:
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+
+        ret = box.exec_()
+        if ret != QMessageBox.Yes:
             return
+
+        recursive = cb.isChecked()
 
         errors = []
         for bname in bucket_names:
             try:
-                self.data_model.delete_bucket(bname)
-                self.log(f"Deleted bucket {bname}")
+                if recursive:
+                    self.log(f"Deleting bucket {bname} (recursive)…")
+                    self.data_model.delete_bucket_recursive(bname)
+                    self.log(f"Deleted bucket {bname} (recursive)")
+                else:
+                    self.data_model.delete_bucket(bname)
+                    self.log(f"Deleted bucket {bname}")
+
                 if self._last_selected_bucket == bname:
                     self._last_selected_bucket = None
+
             except Exception as exc:
                 errors.append(f"{bname}: {exc}")
 
@@ -2406,8 +2425,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Delete bucket issues",
-                "Some buckets could not be deleted:\n\n"
-                + "\n".join(errors),
+                "Some buckets could not be deleted:\n\n" + "\n".join(errors),
             )
 
     def delete(self):
