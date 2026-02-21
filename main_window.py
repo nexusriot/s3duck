@@ -25,7 +25,7 @@ from profile_switcher import ProfileSwitchWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.5.7"
+__VERSION__ = "0.5.9"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -546,8 +546,6 @@ class Worker(QObject):
                     progress_cb=cb,
                     cancel_event=self._cancel_event,
                 )
-                self.refresh.emit()
-
             self.batch_progress.emit(int(done_all), int(total_bytes_all))
 
         except Exception as exc:
@@ -938,6 +936,9 @@ class MainWindow(QMainWindow):
         self._bucket_usage_worker = None
         self._last_bucket_usage_breakdown = None
         self._bucket_usage_dialog = None
+
+        # coalesce multiple refresh requests into a single navigate()
+        self._refresh_scheduled = False
 
         self.thread = None
         self.worker = None
@@ -2248,7 +2249,9 @@ class MainWindow(QMainWindow):
 
         self.worker.progress.connect(self.report_logger_progress)
         if need_refresh:
-            self.worker.refresh.connect(lambda: self.navigate(force=True))
+            # refresh can be emitted many times (e.g. delete loop, old upload loop).
+            # Navigating rebuilds the whole model and can freeze the UI if spammed.
+            self.worker.refresh.connect(self._schedule_refresh)
 
         def _transfer_ui_start(prefix_text: str):
             self.pb.reset()
@@ -2323,6 +2326,21 @@ class MainWindow(QMainWindow):
         self.thread.finished.connect(_reenable_after_thread)
 
         self.thread.start()
+
+    def _schedule_refresh(self, delay_ms: int = 200):
+        """Debounce refresh requests to avoid UI stalls."""
+        if self._refresh_scheduled:
+            return
+        self._refresh_scheduled = True
+
+        def _do():
+            self._refresh_scheduled = False
+            try:
+                self.navigate(force=True)
+            except Exception:
+                pass
+
+        QTimer.singleShot(int(delay_ms), _do)
         self.disable_action_buttons()
 
     def new_folder(self):
