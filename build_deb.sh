@@ -2,13 +2,25 @@
 
 version=0.6.0
 
-echo "building deb for s3duck $version"
+# Detect or accept architecture
+if [ -n "$1" ]; then
+  arch="$1"
+else
+  machine=$(uname -m)
+  case "$machine" in
+    x86_64)  arch="amd64" ;;
+    aarch64) arch="arm64" ;;
+    *)       echo "unsupported architecture: $machine"; exit 1 ;;
+  esac
+fi
+
+echo "building deb for s3duck $version ($arch)"
 
 if ! type "dpkg-deb" > /dev/null; then
   echo "please install required build tools first"
 fi
 
-project="s3duck_${version}_amd64"
+project="s3duck_${version}_${arch}"
 folder_name="build/$project"
 echo "crating $folder_name"
 mkdir -p $folder_name
@@ -29,5 +41,6 @@ cp *.py $lib_dir
 
 
 sed -i "s/_version_/$version/g" $folder_name/DEBIAN/control
+sed -i "s/_arch_/$arch/g" $folder_name/DEBIAN/control
 
 cd build/ && dpkg-deb --build -Z gzip --root-owner-group $project
