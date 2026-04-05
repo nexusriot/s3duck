@@ -25,7 +25,7 @@ from profile_switcher import ProfileSwitchWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.5.7"
+__VERSION__ = "0.6.0"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -58,6 +58,83 @@ class NavigationWorker(QObject):
             self.finished.emit(self._seq, payload, "")
         except Exception as exc:
             self.finished.emit(self._seq, None, str(exc))
+
+
+class BucketEnterWorker(QObject):
+    """Runs enter_bucket (+ endpoint retry) off the main thread."""
+    success = pyqtSignal(str)         # bucket_name
+    failure = pyqtSignal(str, str)    # bucket_name, error_message
+    log_msg = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, data_model, name: str):
+        super().__init__()
+        self._dm = data_model
+        self._name = name
+
+    @pyqtSlot()
+    def run(self):
+        name = self._name
+        first_exc = None
+        try:
+            self._dm.enter_bucket(name)
+            self.success.emit(name)
+            self.finished.emit()
+            return
+        except Exception as exc:
+            first_exc = exc
+            self.log_msg.emit(f"Open bucket failed for '{name}': {exc}")
+
+        # Try to fetch hints (region/endpoint)
+        region_hint, endpoint_hint = None, None
+        try:
+            region_hint, endpoint_hint = self._dm.get_bucket_hints(name)
+        except Exception as hint_exc:
+            self.log_msg.emit(f"While probing hints: {hint_exc}")
+
+        if region_hint:
+            self.log_msg.emit(f"Hint: bucket '{name}' region may be '{region_hint}'")
+        else:
+            self.log_msg.emit(f"Hint: bucket '{name}' region unknown (no header)")
+        if endpoint_hint:
+            self.log_msg.emit(f"Hint: suggested endpoint for '{name}': {endpoint_hint}")
+
+        retried = False
+        retry_err = None
+        if region_hint:
+            base_endpoint = self._dm.profile_endpoint_url or self._dm.endpoint_url
+            swapped = self._dm.build_region_swapped_endpoint(base_endpoint, region_hint)
+            candidate_endpoint = endpoint_hint or swapped
+            if candidate_endpoint:
+                old_endpoint = self._dm.endpoint_url
+                old_region = self._dm.region_name
+                old_use_path = self._dm.use_path
+                old_client = self._dm._client
+                try:
+                    self.log_msg.emit(
+                        f"Retry: temporarily switching endpoint to '{candidate_endpoint}' "
+                        f"and region to '{region_hint}' for bucket '{name}'"
+                    )
+                    self._dm.endpoint_url = candidate_endpoint
+                    self._dm.region_name = region_hint
+                    self._dm._client = None
+                    self._dm.enter_bucket(name)
+                    retried = True
+                except Exception as rexc:
+                    retry_err = rexc
+                    self.log_msg.emit(f"Retry failed for '{name}': {rexc}")
+                    self._dm.endpoint_url = old_endpoint
+                    self._dm.region_name = old_region
+                    self._dm.use_path = old_use_path
+                    self._dm._client = old_client
+
+        if retried:
+            self.success.emit(name)
+        else:
+            self.failure.emit(name, str(retry_err or first_exc))
+        self.finished.emit()
+
+
 STALL_DECAY_INTERVAL_SEC = 2.0     # when no progress, decay displayed rate
 
 DOC_EXT = {
@@ -358,7 +435,6 @@ class UpTopProxyModel(QSortFilterProxyModel):
 class Worker(QObject):
     finished = pyqtSignal(bool) # cancelled?
     progress = pyqtSignal(str)
-    refresh = pyqtSignal()
     file_progress = pyqtSignal(object, object, str)
     batch_progress = pyqtSignal(object, object)
 
@@ -471,7 +547,6 @@ class Worker(QObject):
             msg = "moving %s -> /dev/null" % key
             self.progress.emit(msg)
             self.data_model.delete(key)
-            self.refresh.emit()
         self.finished.emit(False)
 
     def upload(self):
@@ -546,7 +621,6 @@ class Worker(QObject):
                     progress_cb=cb,
                     cancel_event=self._cancel_event,
                 )
-                self.refresh.emit()
 
             self.batch_progress.emit(int(done_all), int(total_bytes_all))
 
@@ -838,6 +912,8 @@ class MainWindow(QMainWindow):
         self._nav_pending_restore_name = None  # name to reselect after navigation
         self._nav_select_up_entry = False      # select [..] if present after navigation
         self._loading_dialog = None
+        self._bucket_enter_thread = None
+        self._bucket_enter_worker = None
 
         self._last_selected_in_prefix = {}  # key: (bucket, prefix) -> name
         self.update_window_title()
@@ -1942,102 +2018,52 @@ class MainWindow(QMainWindow):
         if primary_item is None:
             return
 
-        # Enter bucket
+        # Enter bucket (async — enter_bucket makes S3 API calls, must not block main thread)
         if t == FSObjectType.BUCKET:
-            try:
-                self.data_model.enter_bucket(name)
-            except Exception as exc:
-                self.log(f"Open bucket failed for '{name}': {exc}")
+            if self._bucket_enter_thread is not None and self._bucket_enter_thread.isRunning():
+                return  # already entering a bucket
 
-                # Try to fetch hints (region/endpoint)
-                try:
-                    region_hint, endpoint_hint = self.data_model.get_bucket_hints(
-                        name)
-                except Exception as _hint_exc:
-                    region_hint, endpoint_hint = None, None
-                    self.log(f"While probing hints: {_hint_exc}")
+            self.listview.setEnabled(False)
+            self.statusBar().showMessage(f"Opening bucket '{name}'…", 0)
 
-                if region_hint:
-                    self.log(
-                        f"Hint: bucket '{name}' region may be '{region_hint}'")
-                else:
-                    self.log(
-                        f"Hint: bucket '{name}' region unknown (no header)")
+            th = QThread(self)
+            wk = BucketEnterWorker(self.data_model, name)
+            wk.moveToThread(th)
+            th.started.connect(wk.run)
+            wk.log_msg.connect(self.log)
 
-                if endpoint_hint:
-                    self.log(
-                        f"Hint: suggested endpoint for '{name}': {endpoint_hint}")
+            def _on_enter_success(bucket_name: str):
+                self._last_selected_bucket = bucket_name
+                self.listview.setEnabled(True)
+                self.navigate(select_up_entry=True)
 
-                retried = False
-                retry_err = None
-                # Only attempt if we actually got a region hint
-                if region_hint:
-                    # derive a candidate endpoint from the *root* endpoint
-                    base_endpoint = self.data_model.profile_endpoint_url or self.data_model.endpoint_url
-                    swapped = self.data_model.build_region_swapped_endpoint(
-                        base_endpoint, region_hint)
-
-                    # If server already gave an explicit endpoint, prefer it
-                    candidate_endpoint = endpoint_hint or swapped
-
-                    if candidate_endpoint:
-                        # Save current connection state
-                        old_endpoint = self.data_model.endpoint_url
-                        old_region = self.data_model.region_name
-                        old_use_path = self.data_model.use_path
-                        old_client = self.data_model._client
-
-                        try:
-                            self.log(
-                                f"Retry: temporarily switching endpoint to '{candidate_endpoint}' "
-                                f"and region to '{region_hint}' for bucket '{name}'"
-                            )
-                            # temporarily seed the client config used by enter_bucket()
-                            self.data_model.endpoint_url = candidate_endpoint
-                            self.data_model.region_name = region_hint
-                            self.data_model._client = None  # rebuild with new seed
-
-                            # Re-try enter (it will still probe styles and may further adjust)
-                            self.data_model.enter_bucket(name)
-                            retried = True
-                        except Exception as rexc:
-                            retry_err = rexc
-                            self.log(f"Retry failed for '{name}': {rexc}")
-                            # restore originals on failure
-                            self.data_model.endpoint_url = old_endpoint
-                            self.data_model.region_name = old_region
-                            self.data_model.use_path = old_use_path
-                            self.data_model._client = old_client
-
-                if retried:
-                    # success after temporary switch
-                    self._last_selected_bucket = name
-                    # Note: when the user exits this bucket, goHome()/goUp() call
-                    # _return_to_bucket_list_mode(), which restores profile endpoint/region.
-                    self.navigate()
-                    self.select_first()
-                    return
-
-                # If we couldn't recover, show the dialog and go back to the bucket list
+            def _on_enter_failure(bucket_name: str, err_msg: str):
+                self.listview.setEnabled(True)
                 QMessageBox.critical(
                     self,
                     "Open bucket failed",
-                    f"Cannot open bucket '{name}': {exc if retry_err is None else retry_err}",
+                    f"Cannot open bucket '{bucket_name}': {err_msg}",
                 )
-
-                # Return to bucket list mode safely (also restores region & client)
                 self._return_to_bucket_list_mode()
-                # re-render bucket list
                 self.navigate()
-                # reselect the bucket that failed (don't jump cursor to last success)
-                ix = self.ix_by_name(name)
+                ix = self.ix_by_name(bucket_name)
                 if ix:
                     self.listview.setCurrentIndex(ix)
-                return
 
-            # success (no failure path)
-            self._last_selected_bucket = name
-            self.navigate(select_up_entry=True)
+            def _clear_enter_refs():
+                self._bucket_enter_thread = None
+                self._bucket_enter_worker = None
+
+            wk.success.connect(_on_enter_success)
+            wk.failure.connect(_on_enter_failure)
+            wk.finished.connect(th.quit)
+            wk.finished.connect(wk.deleteLater)
+            th.finished.connect(_clear_enter_refs)
+            th.finished.connect(th.deleteLater)
+
+            self._bucket_enter_thread = th
+            self._bucket_enter_worker = wk
+            th.start()
             return
 
         # Special [..] entry
@@ -2247,8 +2273,6 @@ class MainWindow(QMainWindow):
         self.thread.started.connect(m)
 
         self.worker.progress.connect(self.report_logger_progress)
-        if need_refresh:
-            self.worker.refresh.connect(lambda: self.navigate(force=True))
 
         def _transfer_ui_start(prefix_text: str):
             self.pb.reset()
