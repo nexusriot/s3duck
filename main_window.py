@@ -25,7 +25,7 @@ from profile_switcher import ProfileSwitchWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.6.0"
+__VERSION__ = "0.6.2"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -39,22 +39,42 @@ RATE_WINDOW_SEC = 2.0              # window for instantaneous rate
 class NavigationWorker(QObject):
     finished = pyqtSignal(int, object, str)  # seq, payload, err_str
 
-    def __init__(self, data_model, seq: int, bucket: str, prefix: str):
+    def __init__(self, data_model_clone, seq: int, bucket: str, prefix: str):
         super().__init__()
-        self._dm = data_model
+        # Private model clone — the worker owns its own boto3 client so it
+        # cannot race the main thread or other navigation workers on shared
+        # client/region/endpoint state.
+        self._dm = data_model_clone
         self._seq = seq
         self._bucket = bucket or ""
         self._prefix = prefix or ""
+
+    def _capture_state(self):
+        return {
+            "endpoint_url": self._dm.endpoint_url,
+            "region_name": self._dm.region_name,
+            "use_path": self._dm.use_path,
+        }
 
     @pyqtSlot()
     def run(self):
         try:
             if not self._bucket:
                 buckets = self._dm.list_buckets()
-                payload = {"mode": "bucket_list", "buckets": buckets}
+                payload = {
+                    "mode": "bucket_list",
+                    "buckets": buckets,
+                    "promoted": self._capture_state(),
+                }
             else:
                 items = self._dm.list(self._prefix)
-                payload = {"mode": "bucket_items", "items": items, "bucket": self._bucket, "prefix": self._prefix}
+                payload = {
+                    "mode": "bucket_items",
+                    "items": items,
+                    "bucket": self._bucket,
+                    "prefix": self._prefix,
+                    "promoted": self._capture_state(),
+                }
             self.finished.emit(self._seq, payload, "")
         except Exception as exc:
             self.finished.emit(self._seq, None, str(exc))
@@ -955,7 +975,9 @@ class MainWindow(QMainWindow):
         self.proxy.setSourceModel(self.model)
         self.listview.setModel(self.proxy)
 
-        # Enable Σ + refresh open usage dialog when selection changes
+        # Enable Σ + refresh open usage dialog when selection changes.
+        # Single handler — connecting twice was causing duplicate work and
+        # could stack if the disconnect() failed silently after a model swap.
         try:
             sm = self.listview.selectionModel()
             if sm is not None:
@@ -966,14 +988,6 @@ class MainWindow(QMainWindow):
                 sm.currentChanged.connect(self._on_current_changed_for_usage)
         except Exception:
             pass
-
-        sm = self.listview.selectionModel()
-        if sm is not None:
-            try:
-                sm.currentChanged.disconnect(self._on_usage_selection_changed)
-            except Exception:
-                pass
-            sm.currentChanged.connect(self._on_usage_selection_changed)
 
         self.pb = QProgressBar()
         self.pb.setMinimum(0)
@@ -1115,22 +1129,20 @@ class MainWindow(QMainWindow):
 
         sm = self.listview.selectionModel()
         if sm is not None:
-            blocker = QSignalBlocker(sm)
+            sm.blockSignals(True)
             sm.clearSelection()
             sm.clearCurrentIndex()
-            return blocker
-        return None
 
     def _clear_selection(self):
         sm = self.listview.selectionModel()
         if sm is None:
             return
-        blocker = QSignalBlocker(sm)
+        sm.blockSignals(True)
         try:
             sm.clearSelection()
             sm.clearCurrentIndex()
         finally:
-            blocker = None
+            sm.blockSignals(False)
 
     def _show_bucket_usage_dialog(self, bucket_name: str, prefix: str = ""):
         if self._bucket_usage_dialog is None:
@@ -1172,6 +1184,9 @@ class MainWindow(QMainWindow):
             pass
 
     def _end_model_reset_ui(self):
+        sm = self.listview.selectionModel()
+        if sm is not None:
+            sm.blockSignals(False)
         try:
             self.listview.setSortingEnabled(True)
         except Exception:
@@ -1245,9 +1260,6 @@ class MainWindow(QMainWindow):
         if primary_item is None:
             return None, None, None
         return primary_item, primary_item.text(), getattr(primary_item, "t", None)
-
-    def _on_file_progress(self, cur, total, key):
-        return
 
     def _on_batch_progress(self, done, total):
         self._smooth_total = max(1, int(total))
@@ -1430,13 +1442,18 @@ class MainWindow(QMainWindow):
             return
 
         # already running?
-        if getattr(self, "_bucket_usage_thread", None) is not None:
+        existing = getattr(self, "_bucket_usage_thread", None)
+        if existing is not None:
             try:
-                if self._bucket_usage_thread.isRunning():
+                if existing.isRunning():
                     self.statusBar().showMessage("Usage calculation already running…", 2000)
                     return
             except Exception:
                 pass
+            # Drop the stale reference; the QThread is parented to self and
+            # will deleteLater itself via its finished signal.
+            self._bucket_usage_thread = None
+            self._bucket_usage_worker = None
 
         self._bucket_usage_token = getattr(self, "_bucket_usage_token", 0) + 1
         token = self._bucket_usage_token
@@ -1486,25 +1503,6 @@ class MainWindow(QMainWindow):
         self._bucket_usage_thread = t
         self._bucket_usage_worker = w
         t.start()
-
-    def _on_usage_selection_changed(self, current: QModelIndex, previous: QModelIndex):
-        dlg = getattr(self, "_bucket_usage_dialog", None)
-        if dlg is None:
-            return
-        try:
-            if not dlg.isVisible():
-                return
-        except Exception:
-            return
-
-        t = getattr(self, "_bucket_usage_thread", None)
-        try:
-            if t is not None and t.isRunning():
-                return
-        except Exception:
-            pass
-
-        self.request_bucket_usage()
 
     def eventFilter(self, obj, event):
 
@@ -1826,7 +1824,6 @@ class MainWindow(QMainWindow):
         self._disable_restore_last_bucket_once = True
 
         self.statusBar().showMessage(f"[{self.profile_name}][all buckets]", 3000)
-        self._disable_restore_last_bucket_once = True
         try:
             self._last_selected_bucket = None
             if hasattr(self, "_last_selected_in_prefix") and isinstance(self._last_selected_in_prefix, dict):
@@ -1834,16 +1831,9 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # Refresh view
+        # Refresh view — _on_navigation_finished will pick the initial selection.
         self.navigate(show_loading=True)
         self.update_window_title()
-
-        # Select first element after navigation populates the view
-        try:
-            QTimer.singleShot(0, self.select_first)
-            QTimer.singleShot(200, self.select_first)  # second attempt after model fills
-        except Exception:
-            pass
 
         if old_profile and old_profile != self.profile_name:
             self.log(f"Profile switched: {old_profile} → {self.profile_name}")
@@ -1859,7 +1849,7 @@ class MainWindow(QMainWindow):
             <span style='color: #3465a4; font-size: 20pt;font-weight: bold;text-align: center;'></span>
             <center><h3>S3 Duck 🦆</h3></center>
             <a title='Vladislav Ananev' href='https://github.com/nexusriot' target='_blank'>
-            <br><span style='color: #8743e2; font-size: 10pt;'>©2022-2025 Vladislav Ananev</a><br><br></strong></span></p>
+            <br><span style='color: #8743e2; font-size: 10pt;'>©2022-2026 Vladislav Ananev</a><br><br></strong></span></p>
             """
             + "version %s" % __VERSION__
             + "<br><br>"
@@ -1872,7 +1862,7 @@ class MainWindow(QMainWindow):
 
     def modelToListView_bucket_mode(self, bucket_items):
         """Populate the view with buckets only (no [..])."""
-        blocker = self._begin_model_reset_ui()
+        self._begin_model_reset_ui()
         try:
             self.model.setRowCount(0)
             bucket_icon = QIcon.fromTheme(
@@ -1889,8 +1879,6 @@ class MainWindow(QMainWindow):
                     ]
                 )
         finally:
-            # ensure blocker is released before re-enabling updates
-            blocker = None
             self._end_model_reset_ui()
 
     def modelToListView(self, model_result):
@@ -1898,15 +1886,7 @@ class MainWindow(QMainWindow):
         Populate the view for objects inside a selected bucket.
         We inject '[..]' at top.
         """
-        self.listview.setUpdatesEnabled(False)
-        self.listview.setSortingEnabled(False)
-
-        sm = self.listview.selectionModel()
-        blocker = QSignalBlocker(sm) if sm is not None else None
-        if sm is not None:
-            sm.clearSelection()
-            sm.clearCurrentIndex()
-
+        self._begin_model_reset_ui()
         try:
             self.model.setRowCount(0)
 
@@ -1955,9 +1935,7 @@ class MainWindow(QMainWindow):
                     )
 
         finally:
-            blocker = None  # release QSignalBlocker
-            self.listview.setSortingEnabled(True)
-            self.listview.setUpdatesEnabled(True)
+            self._end_model_reset_ui()
 
     def change_current_folder(self, new_folder):
         self.data_model.prev_folder = self.data_model.current_folder
@@ -2085,7 +2063,7 @@ class MainWindow(QMainWindow):
             self.navigate(select_up_entry=True)
             return
 
-    def navigate(self, restore_last_index=False, restore_name: str = None,
+    def navigate(self, restore_name: str = None,
                  select_up_entry: bool = False, show_loading: bool = False,
                  force: bool = False):
         """Asynchronous navigation (bucket list / bucket objects) to keep UI responsive."""
@@ -2110,17 +2088,17 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Loading…", 0)
 
-        if self._nav_thread is not None:
-            try:
-                self._nav_thread.quit()
-                self._nav_thread.wait(50)
-            except Exception:
-                pass
-            self._nav_thread = None
-            self._nav_worker = None
+        # don't try to interrupt a previous navigation worker: it may be
+        # blocked inside an S3 call that quit() can't cancel. Instead each
+        # worker uses its own model clone (private boto3 client), so an
+        # orphaned worker cannot race us. Stale results are discarded by the
+        # _nav_seq check in _on_navigation_finished. The previous QThread is
+        # parented to self and will deleteLater itself when its run() returns.
+        self._nav_thread = None
+        self._nav_worker = None
 
         th = QThread(self)
-        wk = NavigationWorker(self.data_model, seq, bucket, prefix)
+        wk = NavigationWorker(self.data_model.clone_for_worker(), seq, bucket, prefix)
         wk.moveToThread(th)
         th.started.connect(wk.run)
         wk.finished.connect(self._on_navigation_finished)
@@ -2154,6 +2132,23 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Navigation error: {err_str}", 8000)
             self.log(f"Navigation error: {err_str}")
             return
+
+        # Adopt any region/endpoint promotion the worker discovered on its
+        # private client clone, so the next operation on the shared model
+        # starts from the same adapted state.
+        if isinstance(payload, dict):
+            promoted = payload.get("promoted")
+            if promoted:
+                changed = (
+                    self.data_model.endpoint_url != promoted.get("endpoint_url")
+                    or self.data_model.region_name != promoted.get("region_name")
+                    or self.data_model.use_path != promoted.get("use_path")
+                )
+                if changed:
+                    self.data_model.endpoint_url = promoted.get("endpoint_url")
+                    self.data_model.region_name = promoted.get("region_name")
+                    self.data_model.use_path = promoted.get("use_path")
+                    self.data_model._client = None
 
         mode = payload.get("mode") if isinstance(payload, dict) else None
 
@@ -2290,7 +2285,6 @@ class MainWindow(QMainWindow):
 
             self._tick_timer.start()
             self.worker.batch_progress.connect(self._on_batch_progress)
-            self.worker.file_progress.connect(self._on_file_progress)
 
         def _transfer_ui_stop():
             try:
@@ -2593,7 +2587,7 @@ class MainWindow(QMainWindow):
         try:
             if not self.data_model.current_folder:
                 self._return_to_bucket_list_mode()
-                self.navigate(True)
+                self.navigate()
 
                 ix = self.listview.currentIndex()
                 if not ix.isValid() and self.proxy.rowCount() > 0:
@@ -2610,7 +2604,7 @@ class MainWindow(QMainWindow):
                 new_path = new_path + "/"
 
             self.change_current_folder(new_path)
-            self.navigate(True, restore_name=leaving)
+            self.navigate(restore_name=leaving)
             self.map.pop(p, None)
 
             ix = self.listview.currentIndex()
