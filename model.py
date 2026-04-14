@@ -130,6 +130,38 @@ class Model:
         )
 
 
+    def clone_for_worker(self):
+        """
+        Build a lightweight copy of this model that owns its own boto3 session
+        and client cache, so background workers can call list()/list_buckets()
+        without racing the main thread on shared client/region/endpoint state.
+
+        Connection state and current navigation state are snapshotted by value;
+        the cached _client is intentionally not shared.
+        """
+        cls = type(self)
+        m = cls.__new__(cls)
+        m.session = boto3.session.Session()
+        m._client = None
+        m.current_folder = self.current_folder
+        m.prev_folder = self.prev_folder
+        m.endpoint_url = self.endpoint_url
+        m.profile_endpoint_url = self.profile_endpoint_url
+        m.profile_use_path = self.profile_use_path
+        m.profile_region = self.profile_region
+        m.region_name = self.region_name
+        m.access_key = self.access_key
+        m.secret_key = self.secret_key
+        m.bucket = self.bucket
+        m.no_ssl_check = self.no_ssl_check
+        m.use_path = self.use_path
+        m.timeout = self.timeout
+        m.retries = self.retries
+        m.read_timeout = self.read_timeout
+        m.transfer_cfg_download = self.transfer_cfg_download
+        m.transfer_cfg_upload = self.transfer_cfg_upload
+        return m
+
     @staticmethod
     def get_os_family():
         return platform.system()
