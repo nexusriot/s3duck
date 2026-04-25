@@ -483,7 +483,7 @@ class Worker(QObject):
                 if local_name is not None:
                     total_bytes_all += int(size or 0)
                 else:
-                    for k, s in self.data_model.get_keys(key):
+                    for k, s in self.data_model.get_keys(key, log_fn=self.progress.emit):
                         if self._cancel_event.is_set():
                             raise TransferCancelled("cancelled")
                         if k and not k.endswith("/"):
@@ -547,6 +547,7 @@ class Worker(QObject):
                     key, local_name, folder_path,
                     progress_cb=cb,
                     cancel_event=self._cancel_event,
+                    log_fn=self.progress.emit,
                 )
 
             self.batch_progress.emit(int(done_all), int(total_bytes_all))
@@ -566,7 +567,7 @@ class Worker(QObject):
         for key in self.job:
             msg = "moving %s -> /dev/null" % key
             self.progress.emit(msg)
-            self.data_model.delete(key)
+            self.data_model.delete(key, log_fn=self.progress.emit)
         self.finished.emit(False)
 
     def upload(self):
@@ -640,6 +641,7 @@ class Worker(QObject):
                     local_name, key,
                     progress_cb=cb,
                     cancel_event=self._cancel_event,
+                    log_fn=self.progress.emit,
                 )
 
             self.batch_progress.emit(int(done_all), int(total_bytes_all))
@@ -2349,7 +2351,7 @@ class MainWindow(QMainWindow):
         name = name.replace("/", "")
         if ok and name:
             key = self.data_model.current_folder + "%s/" % name
-            self.data_model.create_folder(key)
+            self.data_model.create_folder(key, log_fn=self.log)
             self.log(f"Created folder {name} ({key})")
 
             self._nav_pending_restore_name = name
