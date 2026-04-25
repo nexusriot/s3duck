@@ -2473,9 +2473,9 @@ class MainWindow(QMainWindow):
                 self,
                 "",
                 "Are you sure to delete objects : %s ?" % ",".join(names),
-                qm.Yes | qm.No,
+                qm.StandardButton.Yes | qm.StandardButton.No,
             )
-            if ret == qm.Yes:
+            if ret == qm.StandardButton.Yes:
                 self.assign_thread_operation("delete", job)
 
     def upload(self, folder=None):
