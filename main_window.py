@@ -25,7 +25,7 @@ from profile_switcher import ProfileSwitchWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.6.2"
+__VERSION__ = "0.8.0"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -835,7 +835,7 @@ class MainWindow(QMainWindow):
     def __init__(self, *args, **kwargs):
         settings = kwargs.pop("settings")
         super().__init__(*args, **kwargs)
-        self.title = "S3 Duck 🦆 %s Experimental" % __VERSION__
+        self.title = "S3 Duck 🦆 %s" % __VERSION__
         self.setWindowIcon(QIcon.fromTheme("applications-internet"))
 
         (
