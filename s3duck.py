@@ -5,12 +5,11 @@ import os
 import pathlib
 import urllib3
 from copy import deepcopy
-from PyQt5.QtGui import QIcon
+from PyQt6.QtGui import QIcon, QFont, QAction
 from cryptography.fernet import Fernet
-from PyQt5 import QtCore
-from PyQt5.QtCore import *
-from PyQt5.QtGui import QFont
-from PyQt5.QtWidgets import (
+from PyQt6 import QtCore
+from PyQt6.QtCore import *
+from PyQt6.QtWidgets import (
     QListWidget,
     QPushButton,
     QHBoxLayout,
@@ -20,7 +19,6 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QDialog,
     QMenu,
-    QAction,
 )
 
 from model import Model as DataModel
@@ -171,18 +169,18 @@ class Profiles(QDialog):
         ok, reason = dm.check_profile()
         msgBox = QMessageBox()
         msgBox.setWindowTitle("Profile check")
-        msgBox.setStandardButtons(QMessageBox.Ok)
+        msgBox.setStandardButtons(QMessageBox.StandardButton.Ok)
         if ok:
-            msgBox.setIcon(QMessageBox.Information)
+            msgBox.setIcon(QMessageBox.Icon.Information)
             msgBox.setText("Check result OK")
         else:
-            msgBox.setIcon(QMessageBox.Critical)
+            msgBox.setIcon(QMessageBox.Icon.Critical)
             msgBox.setText("Check failed: %s" % reason)
         msgBox.exec()
 
     def eventFilter(self, source, event):
         if (
-            event.type() == QtCore.QEvent.ContextMenu
+            event.type() == QtCore.QEvent.Type.ContextMenu
             and source is self.listWidget
         ):
             copy_profile_action = (
@@ -254,7 +252,7 @@ class Profiles(QDialog):
                 menu.addAction(check_action)
                 menu.addAction(delete_action)
 
-            clk = menu.exec_(event.globalPos())
+            clk = menu.exec(event.globalPos())
             if clk == copy_profile_action:
                 self.copy_profile()
             if clk == edit_profile_action:
@@ -346,8 +344,8 @@ class Profiles(QDialog):
         else:
             msgBox = QMessageBox()
             msgBox.setWindowTitle("Profile check")
-            msgBox.setStandardButtons(QMessageBox.Ok)
-            msgBox.setIcon(QMessageBox.Critical)
+            msgBox.setStandardButtons(QMessageBox.StandardButton.Ok)
+            msgBox.setIcon(QMessageBox.Icon.Critical)
             if reason:
                 msgBox.setText("Cannot list buckets: %s" % reason)
             else:
@@ -377,7 +375,7 @@ class Profiles(QDialog):
 
     def onAdd(self):
         settings = SettingsWindow(self)
-        value = settings.exec_()
+        value = settings.exec()
         if value:
             self.settings.beginGroup("common")
             key = self.settings.value("key")
@@ -437,7 +435,7 @@ class Profiles(QDialog):
             item.use_path,
         )
         settings = SettingsWindow(self, settings=settings)
-        value = settings.exec_()
+        value = settings.exec()
         if value:
             (
                 name,
@@ -475,9 +473,9 @@ class Profiles(QDialog):
             self,
             "",
             "Are you sure to delete objects : %s ?" % self.items[elem].name,
-            qm.Yes | qm.No,
+            qm.StandardButton.Yes | qm.StandardButton.No,
         )
-        if ret == qm.Yes:
+        if ret == qm.StandardButton.Yes:
             del self.items[elem]
             self.save_settings()
             self.populate_list()
@@ -512,7 +510,7 @@ def main():
     icon = QIcon(os.path.join(get_current_dir(), "resources", "ducky.ico"))
     app.setWindowIcon(icon)
     profiles = Profiles()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

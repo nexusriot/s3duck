@@ -2,8 +2,8 @@
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from PyQt5.QtCore import QSettings
-from PyQt5.QtWidgets import (
+from PyQt6.QtCore import QSettings
+from PyQt6.QtWidgets import (
     QDialog, QListWidget, QPushButton, QHBoxLayout, QVBoxLayout,
     QMessageBox, QLabel
 )
