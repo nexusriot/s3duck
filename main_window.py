@@ -11,7 +11,7 @@ try:
 except ImportError:
     sip = None
 
-
+from PyQt6 import QtCore
 from PyQt6 import QtWidgets
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
@@ -1844,6 +1844,7 @@ class MainWindow(QMainWindow):
     def about(self):
         sysinfo = QSysInfo()
         sys_info = sysinfo.prettyProductName() + "<br>" + sysinfo.kernelType() + " " + sysinfo.kernelVersion()
+        qt_version = QtCore.qVersion()
         title = "S3 Duck 🦆 %s" % __VERSION__
         message = (
             """
@@ -1853,6 +1854,7 @@ class MainWindow(QMainWindow):
             <br><span style='color: #8743e2; font-size: 10pt;'>©2022-2026 Vladislav Ananev</a><br><br></strong></span></p>
             """
             + "version %s" % __VERSION__
+            + "<br>Qt %s" % qt_version
             + "<br><br>"
             + sys_info
         )
