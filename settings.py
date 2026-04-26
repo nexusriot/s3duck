@@ -1,6 +1,7 @@
-from PyQt5 import QtCore
-from PyQt5.QtCore import *
-from PyQt5.QtWidgets import *
+from PyQt6 import QtCore
+from PyQt6.QtCore import *
+from PyQt6.QtWidgets import *
+from PyQt6.QtGui import *
 
 from utils import str_to_bool
 
@@ -22,10 +23,10 @@ class SettingsWindow(QDialog):
         self.setWindowTitle("Profile settings")
         self.setGeometry(140, 140, 600, 250)
         qtRectangle = self.frameGeometry()
-        centerPoint = QDesktopWidget().availableGeometry().center()
+        centerPoint = QApplication.primaryScreen().availableGeometry().center()
         qtRectangle.moveCenter(centerPoint)
         self.move(qtRectangle.topLeft())
-        self.setWindowModality(Qt.ApplicationModal)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
 
         self.formGroupBox = QGroupBox("Connection settings")
         self.nameLineEdit = QLineEdit()
@@ -38,7 +39,9 @@ class SettingsWindow(QDialog):
         self.usePath = QCheckBox()
 
         self.createForm()
-        self.buttonBox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttonBox = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
         self.buttonBox.accepted.connect(self.setRetVal)
         self.buttonBox.rejected.connect(self.reject)
         mainLayout = QVBoxLayout()
@@ -50,7 +53,7 @@ class SettingsWindow(QDialog):
         self.regionEdit.textChanged.connect(self.on_text_changed)
         self.accessKeyEdit.textChanged.connect(self.on_text_changed)
         self.secretKeyEdit.textChanged.connect(self.on_text_changed)
-        btn_apply = self.buttonBox.button(QDialogButtonBox.Ok)
+        btn_apply = self.buttonBox.button(QDialogButtonBox.StandardButton.Ok)
         btn_apply.clicked.connect(self.setRetVal)
         btn_apply.setEnabled(False)
         self.retrunVal = None
@@ -60,13 +63,13 @@ class SettingsWindow(QDialog):
         self.bucketName.setText(bucket)
         self.accessKeyEdit.setText(access_key)
         self.secretKeyEdit.setText(secret_key)
-        self.secretKeyEdit.setEchoMode(QLineEdit.Password)
+        self.secretKeyEdit.setEchoMode(QLineEdit.EchoMode.Password)
         self.noSslCheck.setChecked(str_to_bool(no_ssl_check))
         self.usePath.setChecked(str_to_bool(use_path))
 
     @QtCore.pyqtSlot()
     def on_text_changed(self):
-        btn_apply = self.buttonBox.button(QDialogButtonBox.Ok)
+        btn_apply = self.buttonBox.button(QDialogButtonBox.StandardButton.Ok)
         btn_apply.setEnabled(
             bool(self.nameLineEdit.text())
             and bool(self.urlLineEdit.text())
@@ -87,8 +90,8 @@ class SettingsWindow(QDialog):
         )
         self.close()
 
-    def exec_(self):
-        super().exec_()
+    def exec(self):
+        super().exec()
         return self.retrunVal
 
     def createForm(self):
