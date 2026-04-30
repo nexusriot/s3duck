@@ -1,6 +1,7 @@
 import botocore.exceptions
-from PyQt5.QtCore import *
-from PyQt5.QtWidgets import *
+from PyQt6.QtCore import *
+from PyQt6.QtWidgets import *
+from PyQt6.QtGui import *
 
 
 class PropertiesWindow(QDialog):
@@ -11,10 +12,10 @@ class PropertiesWindow(QDialog):
         self.setWindowTitle("Object properties")
         self.setGeometry(140, 140, 600, 200)
         qtRectangle = self.frameGeometry()
-        centerPoint = QDesktopWidget().availableGeometry().center()
+        centerPoint = QApplication.primaryScreen().availableGeometry().center()
         qtRectangle.moveCenter(centerPoint)
         self.move(qtRectangle.topLeft())
-        self.setWindowModality(Qt.ApplicationModal)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.key = key
         self.model = model
 
@@ -26,12 +27,12 @@ class PropertiesWindow(QDialog):
         self.publicUrl.setReadOnly(True)
 
         self.createForm()
-        self.buttonBox = QDialogButtonBox(QDialogButtonBox.Ok)
+        self.buttonBox = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
         mainLayout = QVBoxLayout()
         mainLayout.addWidget(self.formGroupBox)
         mainLayout.addWidget(self.buttonBox)
         self.setLayout(mainLayout)
-        btn_apply = self.buttonBox.button(QDialogButtonBox.Ok)
+        btn_apply = self.buttonBox.button(QDialogButtonBox.StandardButton.Ok)
         btn_apply.clicked.connect(self.exit)
 
         # defaults
@@ -96,8 +97,8 @@ class PropertiesWindow(QDialog):
     def exit(self):
         self.close()
 
-    def exec_(self):
-        super().exec_()
+    def exec(self):
+        super().exec()
 
     def createForm(self):
         layout = QFormLayout()

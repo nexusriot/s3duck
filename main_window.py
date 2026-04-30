@@ -7,16 +7,16 @@ from datetime import datetime
 import threading
 
 try:
-    import sip
+    from PyQt6 import sip
 except ImportError:
     sip = None
 
-
-from PyQt5 import QtWidgets
-from PyQt5.QtWidgets import *
-from PyQt5.QtCore import *
-from PyQt5.QtGui import QIcon, QStandardItemModel, QStandardItem
-from PyQt5.QtGui import QFontDatabase
+from PyQt6 import QtCore
+from PyQt6 import QtWidgets
+from PyQt6.QtWidgets import *
+from PyQt6.QtCore import *
+from PyQt6.QtGui import QIcon, QStandardItemModel, QStandardItem, QAction
+from PyQt6.QtGui import QFontDatabase
 from model import Model as DataModel
 from model import FSObjectType
 from model import TransferCancelled
@@ -25,7 +25,7 @@ from profile_switcher import ProfileSwitchWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.6.2"
+__VERSION__ = "0.8.0"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -261,10 +261,10 @@ class _OneShotClickGuard(QObject):
         if not self._armed:
             return False
         et = event.type()
-        if et == QEvent.MouseButtonPress and self._need_press:
+        if et == QEvent.Type.MouseButtonPress and self._need_press:
             self._need_press = False
             return True
-        if et == QEvent.MouseButtonRelease and self._need_release:
+        if et == QEvent.Type.MouseButtonRelease and self._need_release:
             self._need_release = False
             QTimer.singleShot(0, self.disarm)
             return True
@@ -275,7 +275,7 @@ class Tree(QTreeView):
     def __init__(self, parent):
         super().__init__()
         self.parent = parent
-        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.enable_drag_drop()
 
     def enable_drag_drop(self):
@@ -307,7 +307,7 @@ class Tree(QTreeView):
             return
         if event.mimeData().hasUrls:
             if not self.parent.in_bucket_list_mode():
-                event.setDropAction(Qt.MoveAction)
+                event.setDropAction(Qt.DropAction.MoveAction)
                 event.accept()
             else:
                 event.ignore()
@@ -325,7 +325,7 @@ class Tree(QTreeView):
             return
 
         if event.mimeData().hasUrls:
-            event.setDropAction(Qt.CopyAction)
+            event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
 
             job = []
@@ -376,9 +376,9 @@ class UpTopProxyModel(QSortFilterProxyModel):
     def __init__(self, up_label, parent=None):
         super().__init__(parent)
         self.up_label = up_label
-        self._order = Qt.AscendingOrder  # remember current sort order
+        self._order = Qt.SortOrder.AscendingOrder  # remember current sort order
 
-    def sort(self, column, order=Qt.AscendingOrder):
+    def sort(self, column, order=Qt.SortOrder.AscendingOrder):
         self._order = order
         super().sort(column, order)
 
@@ -395,7 +395,7 @@ class UpTopProxyModel(QSortFilterProxyModel):
         left_is_up = self._is_up_row(left)
         right_is_up = self._is_up_row(right)
         if left_is_up != right_is_up:
-            if self._order == Qt.AscendingOrder:
+            if self._order == Qt.SortOrder.AscendingOrder:
                 return left_is_up and not right_is_up
             else:
                 return (not left_is_up) and right_is_up
@@ -483,7 +483,7 @@ class Worker(QObject):
                 if local_name is not None:
                     total_bytes_all += int(size or 0)
                 else:
-                    for k, s in self.data_model.get_keys(key):
+                    for k, s in self.data_model.get_keys(key, log_fn=self.progress.emit):
                         if self._cancel_event.is_set():
                             raise TransferCancelled("cancelled")
                         if k and not k.endswith("/"):
@@ -547,6 +547,7 @@ class Worker(QObject):
                     key, local_name, folder_path,
                     progress_cb=cb,
                     cancel_event=self._cancel_event,
+                    log_fn=self.progress.emit,
                 )
 
             self.batch_progress.emit(int(done_all), int(total_bytes_all))
@@ -566,7 +567,7 @@ class Worker(QObject):
         for key in self.job:
             msg = "moving %s -> /dev/null" % key
             self.progress.emit(msg)
-            self.data_model.delete(key)
+            self.data_model.delete(key, log_fn=self.progress.emit)
         self.finished.emit(False)
 
     def upload(self):
@@ -640,6 +641,7 @@ class Worker(QObject):
                     local_name, key,
                     progress_cb=cb,
                     cancel_event=self._cancel_event,
+                    log_fn=self.progress.emit,
                 )
 
             self.batch_progress.emit(int(done_all), int(total_bytes_all))
@@ -707,8 +709,8 @@ class PieWidget(QWidget):
         self.update()
 
     def paintEvent(self, e):
-        from PyQt5.QtGui import QPainter, QPen, QColor
-        from PyQt5.QtCore import QRectF
+        from PyQt6.QtGui import QPainter, QPen, QColor
+        from PyQt6.QtCore import QRectF
 
         total = sum(max(0, int(v)) for v in self.by_cat.values()) or 1
 
@@ -723,7 +725,7 @@ class PieWidget(QWidget):
         rect = QRectF((self.width() - r) / 2, (self.height() - r) / 2, r, r)
 
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setPen(QPen(QColor(40, 40, 40), 1))
 
         start = 0.0
@@ -761,7 +763,7 @@ class BucketUsageDialog(QDialog):
         legend.addStretch(1)
 
         self.top_groups = QLabel("<b>Top groups</b><br><pre>Calculating…</pre>")
-        self.top_groups.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.top_groups.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
         top = QHBoxLayout()
         top.addWidget(self.pie, 0)
@@ -833,7 +835,7 @@ class MainWindow(QMainWindow):
     def __init__(self, *args, **kwargs):
         settings = kwargs.pop("settings")
         super().__init__(*args, **kwargs)
-        self.title = "S3 Duck 🦆 %s Experimental" % __VERSION__
+        self.title = "S3 Duck 🦆 %s" % __VERSION__
         self.setWindowIcon(QIcon.fromTheme("applications-internet"))
 
         (
@@ -858,10 +860,9 @@ class MainWindow(QMainWindow):
 
         def _apply_emoji_safe_font(widget):
             pt = widget.font().pointSize()
-            db = QFontDatabase()
 
             def available(cands):
-                return [f for f in cands if f in db.families()]
+                return [f for f in cands if f in QFontDatabase.families()]
 
             if sys.platform.startswith("win"):
                 # Windows
@@ -905,7 +906,7 @@ class MainWindow(QMainWindow):
 
 
         self.clip = QApplication.clipboard()
-        self.splitter = QSplitter(Qt.Vertical)
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
         self.splitter.addWidget(self.listview)
         self.splitter.addWidget(self.logview)
         # ~75% top / ~25% bottom
@@ -943,7 +944,7 @@ class MainWindow(QMainWindow):
         self.createActions()
 
         self.tBar = self.addToolBar("Tools")
-        self.tBar.setContextMenuPolicy(Qt.PreventContextMenu)
+        self.tBar.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
         self.tBar.setMovable(True)
         self.tBar.setIconSize(QSize(16, 16))
         self.tBar.addSeparator()
@@ -1037,7 +1038,7 @@ class MainWindow(QMainWindow):
 
         # context menu for listview
         self.menu = QMenu()
-        self.menu.setAttribute(Qt.WA_NoMouseReplay, True)
+        self.menu.setAttribute(Qt.WidgetAttribute.WA_NoMouseReplay, True)
 
         # remember last bucket we successfully entered
         self._last_selected_bucket = None
@@ -1054,10 +1055,10 @@ class MainWindow(QMainWindow):
         self.listview.header().resizeSection(1, 80)
         self.listview.header().resizeSection(2, 80)
 
-        self.listview.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.listview.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.listview.setDragDropMode(QAbstractItemView.DragDrop)
-        self.listview.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.listview.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.listview.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.listview.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.listview.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.listview.setIndentation(10)
 
         # Double-click: proxy-aware handler
@@ -1068,7 +1069,7 @@ class MainWindow(QMainWindow):
             if self._loading_dialog is None:
                 dlg = QProgressDialog(text, None, 0, 0, self)
                 dlg.setWindowTitle(title)
-                dlg.setWindowModality(Qt.ApplicationModal)
+                dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
                 dlg.setCancelButton(None)
                 dlg.setMinimumDuration(0)
                 dlg.setAutoClose(False)
@@ -1163,7 +1164,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             try:
-                self.listview.setFocus(Qt.OtherFocusReason)
+                self.listview.setFocus(Qt.FocusReason.OtherFocusReason)
             except Exception:
                 pass
             return
@@ -1171,7 +1172,7 @@ class MainWindow(QMainWindow):
         sm.clearSelection()
         sm.setCurrentIndex(
             proxy_index,
-            QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+            QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows,
         )
         sm.blockSignals(False)
         try:
@@ -1179,7 +1180,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
-            self.listview.setFocus(Qt.OtherFocusReason)
+            self.listview.setFocus(Qt.FocusReason.OtherFocusReason)
         except Exception:
             pass
 
@@ -1507,7 +1508,7 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, event):
 
         if obj == self.listview:
-            if event.type() == QEvent.ContextMenu and obj is self.listview:
+            if event.type() == QEvent.Type.ContextMenu and obj is self.listview:
                 ixs = self.listview.selectedIndexes()
 
                 # Use row-primary instead of raw clicked column
@@ -1557,7 +1558,7 @@ class MainWindow(QMainWindow):
                         self.menu.addAction(act_del_bucket)
 
                     self._menu_click_guard.arm()
-                    clk = self.menu.exec_(event.globalPos())
+                    clk = self.menu.exec(event.globalPos())
                     if not clk:
                         return False
 
@@ -1692,7 +1693,7 @@ class MainWindow(QMainWindow):
                     self.menu.addAction(properties_selected_action)
 
                 self._menu_click_guard.arm()
-                clk = self.menu.exec_(event.globalPos())
+                clk = self.menu.exec(event.globalPos())
                 if not clk:
                     return False
 
@@ -1700,11 +1701,11 @@ class MainWindow(QMainWindow):
                 if self.transfers_active():
 
                     if event.key() in (
-                            Qt.Key_Return, Qt.Key_Enter,
-                            Qt.Key_Backspace,  # Up
-                            Qt.Key_B,  # Back
-                            Qt.Key_H, Qt.Key_Home,  # Home
-                            Qt.Key_R,  # Refresh shortcut if you use it
+                            Qt.Key.Key_Return, Qt.Key.Key_Enter,
+                            Qt.Key.Key_Backspace,  # Up
+                            Qt.Key.Key_B,  # Back
+                            Qt.Key.Key_H, Qt.Key.Key_Home,  # Home
+                            Qt.Key.Key_R,  # Refresh shortcut if you use it
                     ):
                         self.statusBar().showMessage("Transfers active — navigation is disabled", 2000)
                         return True
@@ -1729,48 +1730,48 @@ class MainWindow(QMainWindow):
 
                 return True
 
-            if event.type() == QEvent.KeyPress:
+            if event.type() == QEvent.Type.KeyPress:
 
-                if event.key() == Qt.Key_Escape:
+                if event.key() == Qt.Key.Key_Escape:
                     self.cancel_transfers()
                     return True
-                if event.key() == Qt.Key_Return:
+                if event.key() == Qt.Key.Key_Return:
                     ix = self.listview.currentIndex()
                     if ix.isValid():
                         self.list_doubleClicked(ix)
                     return True
-                if event.key() == Qt.Key_Delete:
+                if event.key() == Qt.Key.Key_Delete:
                     if self.in_bucket_list_mode():
                         self.delete_bucket_ui()
                     else:
                         self.delete()
-                if event.key() == Qt.Key_Backspace:
+                if event.key() == Qt.Key.Key_Backspace:
                     self.goUp()
-                if event.key() in [Qt.Key_Insert, Qt.Key_C]:
+                if event.key() in [Qt.Key.Key_Insert, Qt.Key.Key_C]:
                     if self.in_bucket_list_mode():
                         self.new_bucket()
                     else:
                         self.new_folder()
-                if event.key() == Qt.Key_B:
+                if event.key() == Qt.Key.Key_B:
                     self.goBack()
-                if event.key() in [Qt.Key_H, Qt.Key_Home]:
+                if event.key() in [Qt.Key.Key_H, Qt.Key.Key_Home]:
                     self.goHome()
-                if event.key() == Qt.Key_F1:
+                if event.key() == Qt.Key.Key_F1:
                     self.about()
-                if event.key() == Qt.Key_U and not self.in_bucket_list_mode():
+                if event.key() == Qt.Key.Key_U and not self.in_bucket_list_mode():
                     self.upload()
-                if event.key() == Qt.Key_D and not self.in_bucket_list_mode():
+                if event.key() == Qt.Key.Key_D and not self.in_bucket_list_mode():
                     self.download()
         return super().eventFilter(obj, event)
 
     def simple(self, title, message):
         QMessageBox(
-            QMessageBox.Information,
+            QMessageBox.Icon.Information,
             title,
             message,
-            QMessageBox.NoButton,
+            QMessageBox.StandardButton.NoButton,
             self,
-            Qt.Dialog | Qt.NoDropShadowWindowHint,
+            Qt.WindowType.Dialog | Qt.WindowType.NoDropShadowWindowHint,
         ).show()
 
     def switch_profile(self):
@@ -1783,7 +1784,7 @@ class MainWindow(QMainWindow):
             )
             return
         dlg = ProfileSwitchWindow(self)
-        if dlg.exec_() != QDialog.Accepted:
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
         prof = dlg.get_selected_profile()
@@ -1843,6 +1844,7 @@ class MainWindow(QMainWindow):
     def about(self):
         sysinfo = QSysInfo()
         sys_info = sysinfo.prettyProductName() + "<br>" + sysinfo.kernelType() + " " + sysinfo.kernelVersion()
+        qt_version = QtCore.qVersion()
         title = "S3 Duck 🦆 %s" % __VERSION__
         message = (
             """
@@ -1852,13 +1854,14 @@ class MainWindow(QMainWindow):
             <br><span style='color: #8743e2; font-size: 10pt;'>©2022-2026 Vladislav Ananev</a><br><br></strong></span></p>
             """
             + "version %s" % __VERSION__
+            + "<br>Qt %s" % qt_version
             + "<br><br>"
             + sys_info
         )
         self.simple(title, message)
 
     def properties(self, model, key):
-        PropertiesWindow(self, settings=(model, key)).exec_()
+        PropertiesWindow(self, settings=(model, key)).exec()
 
     def modelToListView_bucket_mode(self, bucket_items):
         """Populate the view with buckets only (no [..])."""
@@ -1987,7 +1990,7 @@ class MainWindow(QMainWindow):
             sm.clearSelection()
             sm.setCurrentIndex(
                 proxy_index,
-                QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+                QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows,
             )
             sm.blockSignals(False)
 
@@ -2124,7 +2127,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
-            self.listview.setFocus(Qt.OtherFocusReason)
+            self.listview.setFocus(Qt.FocusReason.OtherFocusReason)
         except Exception:
             pass
 
@@ -2156,7 +2159,7 @@ class MainWindow(QMainWindow):
             buckets = payload.get("buckets") or []
             self.modelToListView_bucket_mode(buckets)
             self.listview.setSortingEnabled(True)
-            self.listview.sortByColumn(0, Qt.AscendingOrder)
+            self.listview.sortByColumn(0, Qt.SortOrder.AscendingOrder)
             self.statusBar().showMessage("[%s][all buckets]" % (self.profile_name,), 0)
             self.reset_bucket_usage()
             self.update_s3_path_label()
@@ -2350,7 +2353,7 @@ class MainWindow(QMainWindow):
         name = name.replace("/", "")
         if ok and name:
             key = self.data_model.current_folder + "%s/" % name
-            self.data_model.create_folder(key)
+            self.data_model.create_folder(key, log_fn=self.log)
             self.log(f"Created folder {name} ({key})")
 
             self._nav_pending_restore_name = name
@@ -2396,7 +2399,7 @@ class MainWindow(QMainWindow):
 
         # Custom confirm box with a checkbox
         box = QMessageBox(self)
-        box.setIcon(QMessageBox.Warning)
+        box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("Delete bucket(s)")
         box.setText("Are you sure you want to delete bucket(s):\n\n  %s" % ", ".join(bucket_names))
 
@@ -2408,11 +2411,11 @@ class MainWindow(QMainWindow):
             "If unchecked, bucket must be EMPTY.\n"
             "If checked, ALL objects inside the bucket(s) will be deleted first."
         )
-        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        box.setDefaultButton(QMessageBox.No)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
 
-        ret = box.exec_()
-        if ret != QMessageBox.Yes:
+        ret = box.exec()
+        if ret != QMessageBox.StandardButton.Yes:
             return
 
         recursive = cb.isChecked()
@@ -2472,9 +2475,9 @@ class MainWindow(QMainWindow):
                 self,
                 "",
                 "Are you sure to delete objects : %s ?" % ",".join(names),
-                qm.Yes | qm.No,
+                qm.StandardButton.Yes | qm.StandardButton.No,
             )
-            if ret == qm.Yes:
+            if ret == qm.StandardButton.Yes:
                 self.assign_thread_operation("delete", job)
 
     def upload(self, folder=None):
@@ -2482,7 +2485,7 @@ class MainWindow(QMainWindow):
             return
         job = []
         dialog = QFileDialog()
-        dialog.setFileMode(QFileDialog.ExistingFiles)
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
         names = dialog.getOpenFileNames(self, "Open files", "", "All files (*)")
         if not all(map(lambda x: x, names)):
             return

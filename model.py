@@ -356,6 +356,81 @@ class Model:
             raise last_err
         raise Exception("Cannot access bucket")
 
+    @staticmethod
+    def _is_region_error(exc: Exception) -> bool:
+        """
+        Return True if *exc* is a recoverable region/endpoint mismatch that
+        can be fixed by re-probing the bucket for the right endpoint/region.
+        """
+        if not isinstance(exc, botocore.exceptions.ClientError):
+            return False
+        code = (exc.response.get("Error") or {}).get("Code", "")
+        if code in ("AuthorizationHeaderMalformed", "PermanentRedirect"):
+            return True
+        msg = ((exc.response.get("Error") or {}).get("Message") or "").lower()
+        return "expecting" in msg and "region" in msg
+
+    def rebind_bucket(self, log_fn=None):
+        """
+        Re-probe the current bucket to find the correct endpoint/region combo
+        and update self in-place.  Mirrors the retry logic in BucketEnterWorker
+        so all operations (upload/download/delete/list) benefit from the same
+        automatic region correction.
+
+        log_fn: optional callable(str) — receives progress messages
+                (e.g. Worker.progress.emit).
+        Raises on total failure.
+        """
+        bucket = self.bucket
+        if not bucket:
+            return
+
+        region_hint = endpoint_hint = None
+        try:
+            region_hint, endpoint_hint = self.get_bucket_hints(bucket)
+        except Exception as hint_exc:
+            if log_fn:
+                log_fn(f"While probing hints for '{bucket}': {hint_exc}")
+
+        if log_fn:
+            if region_hint:
+                log_fn(f"Hint: bucket '{bucket}' region may be '{region_hint}'")
+            else:
+                log_fn(f"Hint: bucket '{bucket}' region unknown (no header)")
+            if endpoint_hint:
+                log_fn(f"Hint: suggested endpoint for '{bucket}': {endpoint_hint}")
+
+        if region_hint:
+            base_endpoint = self.profile_endpoint_url or self.endpoint_url
+            swapped = self.build_region_swapped_endpoint(base_endpoint, region_hint)
+            candidate_endpoint = endpoint_hint or swapped
+            if candidate_endpoint:
+                old = (self.endpoint_url, self.region_name, self.use_path, self._client)
+                try:
+                    if log_fn:
+                        log_fn(
+                            f"Retry: temporarily switching endpoint to "
+                            f"'{candidate_endpoint}' and region to "
+                            f"'{region_hint}' for bucket '{bucket}'"
+                        )
+                    self.endpoint_url = candidate_endpoint
+                    self.region_name = region_hint
+                    self._client = None
+                    self.enter_bucket(bucket)   # validates + commits new state
+                    return                      # ← success
+                except Exception as rexc:
+                    if log_fn:
+                        log_fn(f"Retry failed for '{bucket}': {rexc}")
+                    self.endpoint_url, self.region_name, self.use_path, self._client = old
+
+        client_ok, new_ep, new_region, new_use_path = self._try_bind_bucket(bucket)
+        self.endpoint_url = new_ep
+        self.region_name = new_region
+        self.use_path = new_use_path
+        self._client = client_ok
+        if log_fn:
+            log_fn(f"Re-bound: endpoint={new_ep} region={new_region}")
+
     def enter_bucket(self, bucket_name: str):
         """
         Transactional bucket entry:
@@ -672,22 +747,44 @@ class Model:
         )
 
     def download_file(self, key: str, local_name: str, folder_path: str,
-                      progress_cb=None, cancel_event=None):
+                      progress_cb=None, cancel_event=None, log_fn=None):
         """
         Download a single file or a whole prefix.
         - If local_name is truthy: single object -> local_name
         - Else: prefix -> recreate directory tree under folder_path/<basename(prefix)>/
         Supports cancellation via cancel_event (threading.Event).
+        Automatically retries once per file on region/endpoint errors.
         """
 
-        # folder/prefix download mode
+        def _download_one(bucket, k, out_path, size):
+            """Download a single object, retrying once on region errors."""
+            def _do():
+                self.client.download_file(
+                    bucket,
+                    k,
+                    out_path,
+                    Callback=_BotoProgressAdapter(size, k, progress_cb, cancel_event=cancel_event),
+                    Config=self.transfer_cfg_download,
+                )
+            try:
+                _do()
+            except TransferCancelled:
+                raise
+            except Exception as exc:
+                if not self._is_region_error(exc):
+                    raise
+                if log_fn:
+                    log_fn(f"Region error downloading '{k}': {exc}")
+                self.rebind_bucket(log_fn=log_fn)
+                _do()
+
         if not local_name:
             prefix = key if str(key).endswith("/") else (str(key) + "/")
             base_name = os.path.basename(prefix.rstrip("/"))
             base_dir = os.path.join(folder_path, base_name)
             os.makedirs(base_dir, exist_ok=True)
 
-            for k, size in self.get_keys(prefix):
+            for k, size in self.get_keys(prefix, log_fn=log_fn):
                 if not k:
                     continue
 
@@ -705,17 +802,9 @@ class Model:
                     continue
 
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-                self.client.download_file(
-                    self.bucket,
-                    k,
-                    out_path,
-                    Callback=_BotoProgressAdapter(size, k, progress_cb, cancel_event=cancel_event),
-                    Config=self.transfer_cfg_download,
-                )
+                _download_one(self.bucket, k, out_path, size)
             return
 
-        # single object download mode
         size = None
         try:
             if cancel_event is not None and cancel_event.is_set():
@@ -724,8 +813,16 @@ class Model:
             size = head.get("ContentLength")
         except TransferCancelled:
             raise
-        except Exception:
-            pass
+        except Exception as exc:
+            if self._is_region_error(exc):
+                if log_fn:
+                    log_fn(f"Region error on head_object for '{key}': {exc}")
+                self.rebind_bucket(log_fn=log_fn)
+                try:
+                    head = self.client.head_object(Bucket=self.bucket, Key=key)
+                    size = head.get("ContentLength")
+                except Exception:
+                    pass  # non-fatal; proceed without size
 
         if cancel_event is not None and cancel_event.is_set():
             raise TransferCancelled("cancelled")
@@ -738,30 +835,43 @@ class Model:
         except Exception:
             pass
 
-        self.client.download_file(
-            self.bucket,
-            key,
-            local_name,
-            Callback=_BotoProgressAdapter(size, key, progress_cb, cancel_event=cancel_event),
-            Config=self.transfer_cfg_download,
-        )
+        _download_one(self.bucket, key, local_name, size)
 
-    def create_folder(self, key):
-        return self.client.put_object(Bucket=self.bucket, Key=key)
+    def create_folder(self, key, log_fn=None):
+        try:
+            return self.client.put_object(Bucket=self.bucket, Key=key)
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error creating folder '{key}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            return self.client.put_object(Bucket=self.bucket, Key=key)
 
-    def get_keys(self, prefix):
+    def get_keys(self, prefix, log_fn=None):
         """
         Return [(Key, Size), ...] for ALL objects under 'prefix', paginated.
         Includes 'folder placeholder' keys (ending with '/').
+        Automatically retries once after rebinding on region/endpoint errors.
         """
-        paginator = self.client.get_paginator("list_objects_v2")
-        pages = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
+        def _fetch():
+            paginator = self.client.get_paginator("list_objects_v2")
+            pages = paginator.paginate(Bucket=self.bucket, Prefix=prefix)
+            result = []
+            for page in pages:
+                for obj in page.get("Contents", []) or []:
+                    result.append((obj.get("Key"), obj.get("Size")))
+            return result
 
-        result = []
-        for page in pages:
-            for obj in page.get("Contents", []) or []:
-                result.append((obj.get("Key"), obj.get("Size")))
-        return result
+        try:
+            return _fetch()
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error listing '{prefix}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            return _fetch()
 
     def get_keys_for_bucket(self, bucket_name: str, prefix: str = ""):
         """
@@ -837,12 +947,23 @@ class Model:
                 self.use_path = old_use_path
                 self._client = old_client
 
-    def delete(self, key) -> bool:
-        if key.endswith("/"):
-            for k, _ in self.get_keys(key):
+    def delete(self, key, log_fn=None) -> bool:
+        def _delete_one(k):
+            try:
                 self.client.delete_object(Bucket=self.bucket, Key=k)
+            except Exception as exc:
+                if not self._is_region_error(exc):
+                    raise
+                if log_fn:
+                    log_fn(f"Region error deleting '{k}': {exc}")
+                self.rebind_bucket(log_fn=log_fn)
+                self.client.delete_object(Bucket=self.bucket, Key=k)
+
+        if key.endswith("/"):
+            for k, _ in self.get_keys(key, log_fn=log_fn):
+                _delete_one(k)
         else:
-            self.client.delete_object(Bucket=self.bucket, Key=key)
+            _delete_one(key)
         return True
 
     def bucket_total_size_bytes(self, cancel_event=None) -> int:
@@ -864,12 +985,13 @@ class Model:
 
         return int(total)
 
-    def upload_file(self, local_file, key, progress_cb=None, cancel_event=None):
+    def upload_file(self, local_file, key, progress_cb=None, cancel_event=None, log_fn=None):
         """
         Upload a file (with progress) or create a folder placeholder if local_file is None.
+        Automatically retries once on region/endpoint errors.
         """
         if local_file is None:
-            self.create_folder("%s/" % key)
+            self.create_folder("%s/" % key, log_fn=log_fn)
             return
 
         if cancel_event is not None and cancel_event.is_set():
@@ -880,13 +1002,26 @@ class Model:
         except Exception:
             total = None
 
-        self.client.upload_file(
-            local_file,
-            self.bucket,
-            key,
-            Callback=_BotoProgressAdapter(total, key, progress_cb, cancel_event=cancel_event),
-            Config=self.transfer_cfg_upload,  # IMPORTANT
-        )
+        def _do_upload():
+            self.client.upload_file(
+                local_file,
+                self.bucket,
+                key,
+                Callback=_BotoProgressAdapter(total, key, progress_cb, cancel_event=cancel_event),
+                Config=self.transfer_cfg_upload,
+            )
+
+        try:
+            _do_upload()
+        except TransferCancelled:
+            raise
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error uploading '{key}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            _do_upload()
 
     def check_bucket(self):
         """
