@@ -65,7 +65,7 @@ class PropertiesWindow(QDialog):
             try:
                 if is_bucket_root or not key:
                     # bucket root URL
-                    ep = self.model.endpoint.rstrip("/")
+                    ep = self.model.endpoint_url.rstrip("/")
                     b = (self.model.bucket or "").strip("/")
                     display_public_url = f"{ep}/{b}/" if b else ep
                 else:
@@ -74,7 +74,7 @@ class PropertiesWindow(QDialog):
                         display_public_url = self.model.direct_object_url(key)
                     else:
                         # fallback: path-style
-                        ep = self.model.endpoint.rstrip("/")
+                        ep = self.model.endpoint_url.rstrip("/")
                         display_public_url = f"{ep}/{self.model.bucket}/{key}"
             except Exception:
                 # TODO warning
