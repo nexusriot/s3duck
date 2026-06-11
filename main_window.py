@@ -15,7 +15,8 @@ from PyQt6 import QtWidgets
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
 from PyQt6.QtGui import QIcon, QStandardItemModel, QStandardItem, QAction
-from PyQt6.QtGui import QFontDatabase, QShortcut, QKeySequence
+from PyQt6.QtGui import QFontDatabase, QShortcut, QKeySequence, QPainter, QPen, QColor
+from PyQt6.QtCore import QRectF
 from model import Model as DataModel
 from model import FSObjectType
 from model import TransferCancelled
@@ -24,7 +25,7 @@ from profile_switcher import ProfileSwitchWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.8.0"
+__VERSION__ = "0.8.6"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -755,9 +756,6 @@ class PieWidget(QWidget):
         self.update()
 
     def paintEvent(self, e):
-        from PyQt6.QtGui import QPainter, QPen, QColor
-        from PyQt6.QtCore import QRectF
-
         total = sum(max(0, int(v)) for v in self.by_cat.values()) or 1
 
         # simple, fixed colors
