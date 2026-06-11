@@ -1,6 +1,5 @@
 import os
 import sys
-import glob
 import pathlib
 import time
 from datetime import datetime
@@ -16,7 +15,8 @@ from PyQt6 import QtWidgets
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
 from PyQt6.QtGui import QIcon, QStandardItemModel, QStandardItem, QAction
-from PyQt6.QtGui import QFontDatabase
+from PyQt6.QtGui import QFontDatabase, QShortcut, QKeySequence, QPainter, QPen, QColor
+from PyQt6.QtCore import QRectF
 from model import Model as DataModel
 from model import FSObjectType
 from model import TransferCancelled
@@ -25,7 +25,7 @@ from profile_switcher import ProfileSwitchWindow
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.8.0"
+__VERSION__ = "0.8.6"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -202,6 +202,15 @@ def _to_epoch(v) -> int:
             return int(datetime.strptime(s2, "%Y-%m-%d %H:%M:%S").timestamp())
     except Exception:
         pass
+    # ISO 8601 with timezone offset / microseconds
+    # (e.g. boto3 LastModified -> "2026-02-08 18:59:33+00:00")
+    try:
+        norm = s.replace("T", " ")
+        if norm.endswith("Z"):
+            norm = norm[:-1] + "+00:00"
+        return int(datetime.fromisoformat(norm).timestamp())
+    except Exception:
+        pass
     return 0
 
 def categorize_key(key: str) -> str:
@@ -333,17 +342,25 @@ class Tree(QTreeView):
                 path = str(url.toLocalFile())
                 base_path, tail = os.path.split(path)
                 if os.path.isdir(path):
-                    for filename in glob.iglob(path + "**/**", recursive=True):
-                        key = pathlib.Path(
+                    # os.walk stays inside 'path'; a glob on path + "**/**"
+                    # also matched sibling dirs sharing the name prefix.
+                    for dirpath, dirnames, filenames in os.walk(path):
+                        dir_key = pathlib.Path(
                             os.path.join(
                                 self.parent.data_model.current_folder,
-                                os.path.relpath(filename, base_path),
+                                os.path.relpath(dirpath, base_path),
                             )
                         ).as_posix()
-                        if os.path.isdir(filename):
-                            job.append((key, None))
-                        else:
-                            job.append((key, filename))
+                        job.append((dir_key, None))
+                        for filename in filenames:
+                            full = os.path.join(dirpath, filename)
+                            key = pathlib.Path(
+                                os.path.join(
+                                    self.parent.data_model.current_folder,
+                                    os.path.relpath(full, base_path),
+                                )
+                            ).as_posix()
+                            job.append((key, full))
                 else:
                     key = pathlib.Path(
                         os.path.join(
@@ -352,6 +369,8 @@ class Tree(QTreeView):
                         )
                     ).as_posix()
                     job.append((key, path))
+            if not job:
+                return
             self.disable_drag_drop()
             self.parent.assign_thread_operation("upload", job)
             self.parent.thread.finished.connect(lambda: self.enable_drag_drop())
@@ -377,6 +396,22 @@ class UpTopProxyModel(QSortFilterProxyModel):
         super().__init__(parent)
         self.up_label = up_label
         self._order = Qt.SortOrder.AscendingOrder  # remember current sort order
+        self._filter_text = ""
+
+    def set_filter_text(self, text):
+        self._filter_text = (text or "").strip().lower()
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        if not self._filter_text:
+            return True
+        model = self.sourceModel()
+        idx = model.index(source_row, 0, source_parent)
+        name = str(model.data(idx) or "")
+        # Always keep the "[..]" up-entry visible while filtering.
+        if name == self.up_label:
+            return True
+        return self._filter_text in name.lower()
 
     def sort(self, column, order=Qt.SortOrder.AscendingOrder):
         self._order = order
@@ -564,11 +599,23 @@ class Worker(QObject):
             self.finished.emit(cancelled)
 
     def delete(self):
-        for key in self.job:
-            msg = "moving %s -> /dev/null" % key
-            self.progress.emit(msg)
-            self.data_model.delete(key, log_fn=self.progress.emit)
-        self.finished.emit(False)
+        cancelled = False
+        try:
+            for key in self.job:
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                msg = "moving %s -> /dev/null" % key
+                self.progress.emit(msg)
+                self.data_model.delete(key, log_fn=self.progress.emit)
+        except Exception as exc:
+            msg = str(exc) or exc.__class__.__name__
+            if "cancelled" in msg.lower():
+                cancelled = True
+            else:
+                self.progress.emit(f"delete failed: {msg}")
+                self.error.emit(msg)
+        finally:
+            self.finished.emit(cancelled)
 
     def upload(self):
         cancelled = False
@@ -709,9 +756,6 @@ class PieWidget(QWidget):
         self.update()
 
     def paintEvent(self, e):
-        from PyQt6.QtGui import QPainter, QPen, QColor
-        from PyQt6.QtCore import QRectF
-
         total = sum(max(0, int(v)) for v in self.by_cat.values()) or 1
 
         # simple, fixed colors
@@ -905,9 +949,25 @@ class MainWindow(QMainWindow):
         self._suppress_next_activate = False
 
 
+        # Quick-find search bar (hidden until Ctrl+F). Filters the current
+        # bucket/folder listing by name via the proxy model.
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Filter by name…  (just type, or Ctrl+F; Esc to close)")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self._on_search_text_changed)
+        self.search_edit.installEventFilter(self)
+        self.search_edit.hide()
+
+        self._list_container = QWidget()
+        _list_lay = QVBoxLayout(self._list_container)
+        _list_lay.setContentsMargins(0, 0, 0, 0)
+        _list_lay.setSpacing(2)
+        _list_lay.addWidget(self.search_edit)
+        _list_lay.addWidget(self.listview)
+
         self.clip = QApplication.clipboard()
         self.splitter = QSplitter(Qt.Orientation.Vertical)
-        self.splitter.addWidget(self.listview)
+        self.splitter.addWidget(self._list_container)
         self.splitter.addWidget(self.logview)
         # ~75% top / ~25% bottom
         self.splitter.setStretchFactor(0, 3)
@@ -1035,6 +1095,9 @@ class MainWindow(QMainWindow):
         self.map = dict()
         self.setWindowIcon(QIcon(os.path.join(self.current_dir, "resources", "ducky.ico")))
         self.listview.installEventFilter(self)
+
+        self._search_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
+        self._search_shortcut.activated.connect(self._toggle_search)
 
         # context menu for listview
         self.menu = QMenu()
@@ -1330,6 +1393,43 @@ class MainWindow(QMainWindow):
             f"  ({_human_bytes(display_rate_bps)}/s){eta_txt}"
         )
 
+    def _toggle_search(self):
+        if self.search_edit.isVisible() and self.search_edit.hasFocus():
+            self._hide_search()
+        else:
+            self.search_edit.show()
+            self.search_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
+            self.search_edit.selectAll()
+
+    def _open_search_with_text(self, text: str):
+        """Open the quick-find bar and append typed text (type-to-search)."""
+        self.search_edit.show()
+        self.search_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.search_edit.setText(self.search_edit.text() + text)
+
+    def _hide_search(self):
+        self.search_edit.blockSignals(True)
+        self.search_edit.clear()
+        self.search_edit.blockSignals(False)
+        self.search_edit.hide()
+        self.proxy.set_filter_text("")
+        self.listview.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _on_search_text_changed(self, text):
+        self.proxy.set_filter_text(text)
+        # Keep a valid selection among the visible (filtered) rows.
+        if self.proxy.rowCount() > 0 and not self.listview.currentIndex().isValid():
+            self.listview.setCurrentIndex(self.proxy.index(0, 0))
+
+    def _reset_search_on_navigate(self):
+        # The filter is per-listing; clear it whenever the listing changes.
+        if self.search_edit.text() or self.search_edit.isVisible():
+            self.search_edit.blockSignals(True)
+            self.search_edit.clear()
+            self.search_edit.blockSignals(False)
+            self.search_edit.hide()
+            self.proxy.set_filter_text("")
+
     def select_first(self):
         if self.proxy.rowCount() > 0:
             index = self.proxy.index(0, 0)
@@ -1339,7 +1439,9 @@ class MainWindow(QMainWindow):
         for r in range(self.model.rowCount()):
             ix_src = self.model.index(r, 0)
             if name == self.model.itemFromIndex(ix_src).text():
-                return self.proxy.mapFromSource(ix_src)
+                ix = self.proxy.mapFromSource(ix_src)
+                # mapFromSource yields an invalid index for filtered-out rows
+                return ix if ix.isValid() else None
         return None
 
     def name_by_first_ix(self, ixs):
@@ -1464,7 +1566,7 @@ class MainWindow(QMainWindow):
         self.btnBucketUsage.setEnabled(False)
 
         t = QThread(self)
-        w = UsageWorker(self.data_model, bucket_name, prefix)
+        w = UsageWorker(self.data_model.clone_for_worker(), bucket_name, prefix)
         w.moveToThread(t)
 
         def _clear_refs():
@@ -1506,6 +1608,19 @@ class MainWindow(QMainWindow):
         t.start()
 
     def eventFilter(self, obj, event):
+
+        if obj is self.search_edit and event.type() == QEvent.Type.KeyPress:
+            k = event.key()
+            if k == Qt.Key.Key_Escape:
+                self._hide_search()
+                return True
+            if k in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Down):
+                # Move focus into the (filtered) list to navigate/activate.
+                self.listview.setFocus(Qt.FocusReason.OtherFocusReason)
+                if self.proxy.rowCount() > 0 and not self.listview.currentIndex().isValid():
+                    self.listview.setCurrentIndex(self.proxy.index(0, 0))
+                return True
+            return False
 
         if obj == self.listview:
             if event.type() == QEvent.Type.ContextMenu and obj is self.listview:
@@ -1697,20 +1812,6 @@ class MainWindow(QMainWindow):
                 if not clk:
                     return False
 
-                # block navigation keys during transfers
-                if self.transfers_active():
-
-                    if event.key() in (
-                            Qt.Key.Key_Return, Qt.Key.Key_Enter,
-                            Qt.Key.Key_Backspace,  # Up
-                            Qt.Key.Key_B,  # Back
-                            Qt.Key.Key_H, Qt.Key.Key_Home,  # Home
-                            Qt.Key.Key_R,  # Refresh shortcut if you use it
-                    ):
-                        self.statusBar().showMessage("Transfers active — navigation is disabled", 2000)
-                        return True
-
-
                 if clk == upload_selected_action:
                     self.upload(upload_path)
                 if clk == upload_current_action:
@@ -1731,37 +1832,61 @@ class MainWindow(QMainWindow):
                 return True
 
             if event.type() == QEvent.Type.KeyPress:
+                key = event.key()
+                mods = event.modifiers()
 
-                if event.key() == Qt.Key.Key_Escape:
-                    self.cancel_transfers()
+                # Each handled key returns True so the event does not also fall
+                # through to QTreeView's built-in type-ahead search, which would
+                # otherwise fire a second, unrelated action on the same press.
+                if key == Qt.Key.Key_Escape:
+                    # First Esc clears an active quick-find filter, second
+                    # (or with no filter) cancels transfers.
+                    if self.search_edit.isVisible() or self.search_edit.text():
+                        self._hide_search()
+                    else:
+                        self.cancel_transfers()
                     return True
-                if event.key() == Qt.Key.Key_Return:
+                if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                     ix = self.listview.currentIndex()
                     if ix.isValid():
                         self.list_doubleClicked(ix)
                     return True
-                if event.key() == Qt.Key.Key_Delete:
-                    if self.in_bucket_list_mode():
-                        self.delete_bucket_ui()
-                    else:
-                        self.delete()
-                if event.key() == Qt.Key.Key_Backspace:
+                if key == Qt.Key.Key_Delete:
+                    self.on_toolbar_delete()
+                    return True
+                if key == Qt.Key.Key_Backspace:
                     self.goUp()
-                if event.key() in [Qt.Key.Key_Insert, Qt.Key.Key_C]:
-                    if self.in_bucket_list_mode():
-                        self.new_bucket()
-                    else:
-                        self.new_folder()
-                if event.key() == Qt.Key.Key_B:
-                    self.goBack()
-                if event.key() in [Qt.Key.Key_H, Qt.Key.Key_Home]:
+                    return True
+                if key == Qt.Key.Key_Insert:
+                    self.on_toolbar_create()
+                    return True
+                if key == Qt.Key.Key_Home:
                     self.goHome()
-                if event.key() == Qt.Key.Key_F1:
+                    return True
+                if key == Qt.Key.Key_F1:
                     self.about()
-                if event.key() == Qt.Key.Key_U and not self.in_bucket_list_mode():
-                    self.upload()
-                if event.key() == Qt.Key.Key_D and not self.in_bucket_list_mode():
-                    self.download()
+                    return True
+
+                # Plain printable characters start the quick-find filter
+                # instead of triggering actions. Single-letter actions
+                # (refresh, usage, upload, …) live on modifier shortcuts
+                # attached to the toolbar QActions — see createActions().
+                text = event.text()
+                if (
+                    text
+                    and text.isprintable()
+                    and not text.isspace()
+                    and not (
+                        mods
+                        & (
+                            Qt.KeyboardModifier.ControlModifier
+                            | Qt.KeyboardModifier.AltModifier
+                            | Qt.KeyboardModifier.MetaModifier
+                        )
+                    )
+                ):
+                    self._open_search_with_text(text)
+                    return True
         return super().eventFilter(obj, event)
 
     def simple(self, title, message):
@@ -2026,10 +2151,9 @@ class MainWindow(QMainWindow):
                     f"Cannot open bucket '{bucket_name}': {err_msg}",
                 )
                 self._return_to_bucket_list_mode()
-                self.navigate()
-                ix = self.ix_by_name(bucket_name)
-                if ix:
-                    self.listview.setCurrentIndex(ix)
+                # navigate() is async — the model is still empty here, so the
+                # selection must be restored by the navigation-finished handler.
+                self.navigate(restore_name=bucket_name)
 
             def _clear_enter_refs():
                 self._bucket_enter_thread = None
@@ -2075,6 +2199,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Transfers active — navigation is disabled", 2000)
             return
 
+        self._reset_search_on_navigate()
         self._remember_current_selection()
 
         self._nav_seq += 1
@@ -2245,7 +2370,9 @@ class MainWindow(QMainWindow):
                 continue
             key = self.data_model.current_folder + name
             if t == FSObjectType.FOLDER:
-                job.append((key, None, None, folder_path))
+                # Trailing "/" so size accounting doesn't also match sibling
+                # prefixes sharing the name (e.g. "photo" vs "photo-old").
+                job.append((key + "/", None, None, folder_path))
                 continue
             local_name = os.path.join(folder_path, name)
             job.append((key, local_name, primary_item.size, folder_path))
@@ -2271,6 +2398,7 @@ class MainWindow(QMainWindow):
         self.thread.started.connect(m)
 
         self.worker.progress.connect(self.report_logger_progress)
+        self.worker.error.connect(self._on_transfer_error)
 
         def _transfer_ui_start(prefix_text: str):
             self.pb.reset()
@@ -2492,7 +2620,7 @@ class MainWindow(QMainWindow):
         for name in names[0]:
             basename = os.path.basename(name)
             key = (
-                (folder + "/" + basename)
+                (folder.rstrip("/") + "/" + basename)
                 if folder
                 else (self.data_model.current_folder + basename)
             )
@@ -2632,6 +2760,11 @@ class MainWindow(QMainWindow):
         # All progress lines from the worker get a timestamp
         self.log(msg)
 
+    @pyqtSlot(str)
+    def _on_transfer_error(self, msg: str):
+        self.statusBar().showMessage(f"Transfer failed: {msg}", 6000)
+        QMessageBox.critical(self, "Transfer failed", msg)
+
     def current_s3_path(self) -> str:
         if not self.data_model.bucket:
             return "s3://"
@@ -2652,62 +2785,71 @@ class MainWindow(QMainWindow):
         self.update_s3_path_label()
 
     def createActions(self):
+        # NOTE: plain letters are reserved for type-to-search in the list view,
+        # so all letter shortcuts here carry a modifier.
         self.btnBack = QAction(
             QIcon.fromTheme("go-previous", QIcon(os.path.join(self.current_dir, "icons", "arrow_back_24px.svg"))),
-            "Back(B)",
+            "Back (Alt+Left)",
             triggered=self.goBack,
         )
+        self.btnBack.setShortcut(QKeySequence("Alt+Left"))
         self.btnUp = QAction(
             QIcon.fromTheme("go-up", QIcon(os.path.join(self.current_dir, "icons", "arrow_upward_24px.svg"))),
-            "Up(Backspace)",
+            "Up (Backspace, Alt+Up)",
             triggered=self.goUp,
         )
+        self.btnUp.setShortcut(QKeySequence("Alt+Up"))
         self.btnHome = QAction(
             QIcon.fromTheme("go-home", QIcon(os.path.join(self.current_dir, "icons", "home_24px.svg"))),
-            "Home(Home, H)",
+            "Home (Home, Alt+Home)",
             triggered=self.goHome,
         )
+        self.btnHome.setShortcut(QKeySequence("Alt+Home"))
         self.btnDownload = QAction(
             QIcon.fromTheme("emblem-downloads", QIcon(os.path.join(self.current_dir, "icons", "download_24px.svg"))),
-            "Download(D)",
+            "Download (Ctrl+D)",
             triggered=self.download,
         )
+        self.btnDownload.setShortcut(QKeySequence("Ctrl+D"))
         self.btnCreateFolder = QAction(
             QIcon.fromTheme(
                 "folder-new",
                 QIcon(os.path.join(self.current_dir, "icons", "create_new_folder_24px.svg")),
             ),
             # dynamic: create bucket (root) OR create folder (inside bucket)
-            "Create (Insert, C)",
+            "Create (Insert, Ctrl+N)",
             triggered=self.on_toolbar_create,
         )
+        self.btnCreateFolder.setShortcut(QKeySequence("Ctrl+N"))
         self.btnRemove = QAction(
             QIcon.fromTheme("edit-delete", QIcon(os.path.join(self.current_dir, "icons", "delete_24px.svg"))),
             # dynamic: delete bucket(s) or delete object(s)
-            "Delete(Delete)",
+            "Delete (Del)",
             triggered=self.on_toolbar_delete,
         )
         self.btnRefresh = QAction(
             QIcon.fromTheme("view-refresh", QIcon(os.path.join(self.current_dir, "icons", "refresh_24px.svg"))),
-            "Refresh(R)",
+            "Refresh (F5, Ctrl+R)",
             triggered=self.navigate,
         )
+        self.btnRefresh.setShortcuts([QKeySequence("F5"), QKeySequence("Ctrl+R")])
         self.btnUpload = QAction(
             QIcon.fromTheme("network-server", QIcon(os.path.join(self.current_dir, "icons", "file_upload_24px.svg"))),
-            "Upload(U)",
+            "Upload (Ctrl+U)",
             triggered=self.upload,
         )
+        self.btnUpload.setShortcut(QKeySequence("Ctrl+U"))
         self.btnCancel = QAction(
             QIcon.fromTheme("process-stop",  QIcon(os.path.join(self.current_dir, "icons", "cancel_24px.svg"))),
-            "Cancel(Esc)",
+            "Cancel (Esc)",
             triggered=self.cancel_transfers,
         )
         self.btnBucketUsage = QAction(
             QIcon.fromTheme("view-statistics", QIcon(os.path.join(self.current_dir, "icons", "pie_24px.svg"))),
-            "Bucket usage (Σ)",
+            "Bucket usage Σ (Ctrl+S)",
             triggered=self.request_bucket_usage,
         )
-        self.btnBucketUsage.setShortcut("S")
+        self.btnBucketUsage.setShortcut(QKeySequence("Ctrl+S"))
         self.btnBucketUsage.setEnabled(False)
         self.btnCancel.setEnabled(False)
         self.btnAbout = QAction(
