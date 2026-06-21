@@ -596,11 +596,16 @@ class Model:
         """
         Delete a bucket. Must be empty.
 
-        We'll check emptiness with the current (possibly bucket-tuned) client,
-        then actually call DeleteBucket using a client bound to profile_region.
+        Probe the bucket for its real endpoint/region first (like every other
+        bucket op), then use that bound client for BOTH the emptiness check and
+        the DeleteBucket call. Using the profile-default client here failed for
+        buckets that live in a non-default region (PermanentRedirect).
         """
+        # Bind to a client that can actually reach this bucket.
+        bucket_client, _endpoint, _region, _use_path = self._try_bind_bucket(bucket_name)
+
         # emptiness check
-        paginator = self.client.get_paginator("list_objects_v2")
+        paginator = bucket_client.get_paginator("list_objects_v2")
         pages = paginator.paginate(Bucket=bucket_name, Prefix="", Delimiter="/")
         for page in pages:
             if page.get("Contents"):
@@ -618,8 +623,7 @@ class Model:
             self.current_folder = ""
             self.prev_folder = ""
 
-        root_client = self._make_client(region=self.profile_region or "us-east-1")
-        root_client.delete_bucket(Bucket=bucket_name)
+        bucket_client.delete_bucket(Bucket=bucket_name)
 
     def _list_bucket_once(self, client_obj, bucket_name, prefix):
         """
@@ -1103,10 +1107,21 @@ class Model:
             return False, str(exc)
 
     def direct_object_url(self, key: str) -> str:
-        """Construct a direct (unsigned) URL for an object (path-style)."""
+        """
+        Construct a direct (unsigned) URL for an object.
+
+        After binding a bucket, self.endpoint_url may be virtual-host style
+        (e.g. https://mybucket.s3.region.amazonaws.com) — in that case the
+        bucket name is already part of the host, so we must NOT add it again
+        as a path segment (that produced .../mybucket/mybucket/key).
+        """
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
         ep = self.endpoint_url.rstrip("/")
+        key = (key or "").lstrip("/")
+        if self._endpoint_has_bucket(ep, self.bucket):
+            # virtual-host style: bucket already in the hostname
+            return f"{ep}/{key}"
         return f"{ep}/{self.bucket}/{key}"
 
     def get_size(self, key):

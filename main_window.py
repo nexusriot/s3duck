@@ -2888,6 +2888,45 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         self.writeSettings()
+        self._shutdown_threads()
+        e.accept()
+
+    def _shutdown_threads(self):
+        """
+        Stop background threads before the window (and its data_model) are torn
+        down. A worker still touching data_model after teardown can crash on
+        exit. We signal cancellation, then quit()+wait() each QThread with a
+        bounded timeout (a worker may be blocked inside an S3 call that quit()
+        cannot interrupt; we don't want to hang the close indefinitely).
+        """
+        # Ask any active transfer worker to stop ASAP.
+        try:
+            if self.worker is not None:
+                self.worker.cancel()
+        except Exception:
+            pass
+
+        for attr in (
+            "thread",
+            "_nav_thread",
+            "_bucket_enter_thread",
+            "_bucket_usage_thread",
+        ):
+            th = getattr(self, attr, None)
+            if th is None:
+                continue
+            if sip is not None:
+                try:
+                    if sip.isdeleted(th):
+                        continue
+                except Exception:
+                    pass
+            try:
+                if th.isRunning():
+                    th.quit()
+                    th.wait(3000)
+            except Exception:
+                pass
 
     def writeSettings(self):
         self.settings.beginGroup("geometry")

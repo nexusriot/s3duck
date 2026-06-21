@@ -37,56 +37,64 @@ class PropertiesWindow(QDialog):
 
         # defaults
         display_key = key if key else "<bucket root>"
-
+        display_size = "N/A"
+        display_etag = ""
         display_public_url = ""
 
+        is_folder = bool(key) and key.endswith("/")
 
-        try:
-            resp = self.model.object_properties(key)
-            # resp is either:
-            #   - dict from bucket_properties()
-            #   - real get_object() response (boto3 dict-like)
-            is_bucket_root =  isinstance(resp, dict) and resp.get("IsBucketRoot")
-            if is_bucket_root:
-                # bucket root props
-                display_key = f"s3://{resp.get('Bucket','')}/"
-                display_size = "N/A"
-                display_etag = ""
-            else:
-                et = ""
-                try:
-                    et = resp.get("ETag", "").replace('"', "")
-                except Exception:
-                    pass
-                display_etag = et
-
-                # compute size using get_size (handles folders/prefix too)
-                display_size = str(self.model.get_size(key)) + " Bytes"
+        # ETag + bucket-root detection come from head_object, which only
+        # exists for real objects. Folders (prefixes) and implicit folders
+        # have no object to HEAD, so don't let a 404 there abort the rest.
+        is_bucket_root = False
+        if not is_folder:
             try:
-                if is_bucket_root or not key:
-                    # bucket root URL
-                    ep = self.model.endpoint_url.rstrip("/")
-                    b = (self.model.bucket or "").strip("/")
-                    display_public_url = f"{ep}/{b}/" if b else ep
+                resp = self.model.object_properties(key)
+                # resp is either:
+                #   - dict from bucket_properties()
+                #   - real head_object() response (boto3 dict-like)
+                is_bucket_root = isinstance(resp, dict) and resp.get("IsBucketRoot")
+                if is_bucket_root:
+                    display_key = f"s3://{resp.get('Bucket','')}/"
                 else:
-                    # object URL (preferred: use helper if you added it)
-                    if hasattr(self.model, "direct_object_url"):
-                        display_public_url = self.model.direct_object_url(key)
-                    else:
-                        # fallback: path-style
-                        ep = self.model.endpoint_url.rstrip("/")
-                        display_public_url = f"{ep}/{self.model.bucket}/{key}"
+                    try:
+                        display_etag = resp.get("ETag", "").replace('"', "")
+                    except Exception:
+                        pass
+            except botocore.exceptions.ClientError:
+                pass
             except Exception:
-                # TODO warning
                 pass
 
-        except botocore.exceptions.ClientError:
-            # fallback on access errors
-            display_size = "N/A"
-            display_etag = ""
+        # Size: always computable from get_size (handles objects, folders and
+        # implicit prefixes), independent of whether head_object succeeded.
+        if not is_bucket_root:
+            try:
+                display_size = str(self.model.get_size(key)) + " Bytes"
+            except Exception:
+                display_size = "N/A"
+
+        try:
+            if is_bucket_root or not key:
+                # bucket root URL — respect virtual-host endpoints
+                ep = self.model.endpoint_url.rstrip("/")
+                b = (self.model.bucket or "").strip("/")
+                if b and hasattr(self.model, "_endpoint_has_bucket") \
+                        and self.model._endpoint_has_bucket(ep, b):
+                    display_public_url = f"{ep}/"
+                else:
+                    display_public_url = f"{ep}/{b}/" if b else ep
+            else:
+                # object/folder URL (preferred: use helper if available)
+                if hasattr(self.model, "direct_object_url"):
+                    display_public_url = self.model.direct_object_url(key)
+                else:
+                    # fallback: path-style
+                    ep = self.model.endpoint_url.rstrip("/")
+                    display_public_url = f"{ep}/{self.model.bucket}/{key}"
         except Exception:
-            display_size = "N/A"
-            display_etag = ""
+            # TODO warning
+            pass
 
 
         self.keyName.setText(display_key)
