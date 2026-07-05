@@ -1195,6 +1195,52 @@ class Model:
 
         return region_hint, endpoint_hint
 
+    def copy_object(self, src_key: str, dst_key: str, dst_bucket: str = None, log_fn=None):
+        """Copy a single S3 object server-side (no data transfer)."""
+        dst_bucket = dst_bucket or self.bucket
+        copy_source = {"Bucket": self.bucket, "Key": src_key}
+
+        def _do():
+            self.client.copy_object(CopySource=copy_source, Bucket=dst_bucket, Key=dst_key)
+
+        try:
+            _do()
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error copying '{src_key}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            _do()
+
+    def copy_prefix(self, src_prefix: str, dst_prefix: str, dst_bucket: str = None,
+                    log_fn=None, cancel_event=None):
+        """Server-side recursive copy of all objects under src_prefix to dst_prefix."""
+        dst_bucket = dst_bucket or self.bucket
+        for key, _ in self.get_keys(src_prefix, log_fn=log_fn):
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+            if not key:
+                continue
+            rel = key[len(src_prefix):]
+            dst_key = dst_prefix + rel
+            if log_fn:
+                log_fn(f"copying {key} -> {dst_key}")
+            self.copy_object(key, dst_key, dst_bucket=dst_bucket, log_fn=log_fn)
+
+    def get_object_tags(self, key: str) -> list:
+        """Return the TagSet for an object as a list of {'Key': k, 'Value': v} dicts."""
+        resp = self.client.get_object_tagging(Bucket=self.bucket, Key=key)
+        return resp.get("TagSet", [])
+
+    def put_object_tags(self, key: str, tags: list):
+        """Replace the full TagSet for an object."""
+        self.client.put_object_tagging(
+            Bucket=self.bucket,
+            Key=key,
+            Tagging={"TagSet": tags},
+        )
+
     def build_region_swapped_endpoint(self, base_endpoint: str,
                                       new_region: str) -> str:
         """

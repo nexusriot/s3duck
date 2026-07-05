@@ -93,7 +93,6 @@ class PropertiesWindow(QDialog):
                     ep = self.model.endpoint_url.rstrip("/")
                     display_public_url = f"{ep}/{self.model.bucket}/{key}"
         except Exception:
-            # TODO warning
             pass
 
 

@@ -16,7 +16,7 @@ from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils import str_to_bool
-from main_window import _to_epoch, categorize_key, _human_bytes
+from main_window import _to_epoch, categorize_key, _human_bytes, _scaled_bar_values
 from model import Model
 
 
@@ -125,6 +125,44 @@ class HumanBytesTests(unittest.TestCase):
 
     def test_caps_at_tb(self):
         self.assertTrue(_human_bytes(1024 ** 5).endswith(" TB"))
+
+
+class ScaledBarValuesTests(unittest.TestCase):
+    INT32_MAX = 2147483647
+
+    def test_normal_progress_halfway(self):
+        self.assertEqual(_scaled_bar_values(50, 100), (1000, 500))
+
+    def test_zero_and_complete(self):
+        self.assertEqual(_scaled_bar_values(0, 100), (1000, 0))
+        self.assertEqual(_scaled_bar_values(100, 100), (1000, 1000))
+
+    def test_unknown_total_is_indeterminate(self):
+        self.assertEqual(_scaled_bar_values(0, 0), (0, 0))
+        self.assertEqual(_scaled_bar_values(123, -1), (0, 0))
+
+    def test_value_never_exceeds_range(self):
+        # done > total (e.g. slightly over-reported) must still clamp to full
+        self.assertEqual(_scaled_bar_values(150, 100), (1000, 1000))
+
+    def test_large_transfer_stays_within_int32(self):
+        """REGRESSION: a multi-file download whose byte total exceeds ~2.1 GB
+        overflowed QProgressBar.setRange (C++ int), raising OverflowError.
+        The scaled range and value must always fit in a 32-bit signed int."""
+        done = 3 * 1024 ** 3          # 3 GB downloaded
+        total = 10 * 1024 ** 3        # 10 GB total  (> INT32_MAX)
+        range_max, value = _scaled_bar_values(done, total)
+        self.assertLessEqual(range_max, self.INT32_MAX)
+        self.assertLessEqual(value, self.INT32_MAX)
+        self.assertEqual((range_max, value), (1000, 300))
+
+    def test_petabyte_scale_does_not_overflow(self):
+        done = 5 * 1024 ** 5          # 5 PB
+        total = 8 * 1024 ** 5         # 8 PB
+        range_max, value = _scaled_bar_values(done, total)
+        self.assertLessEqual(range_max, self.INT32_MAX)
+        self.assertLessEqual(value, self.INT32_MAX)
+        self.assertEqual((range_max, value), (1000, 625))
 
 
 class BuildRegionSwappedEndpointTests(unittest.TestCase):

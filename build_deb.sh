@@ -1,6 +1,6 @@
 #!/bin/env bash
 
-version=0.8.6
+version=0.9.4
 
 # Detect or accept architecture
 if [ -n "$1" ]; then
