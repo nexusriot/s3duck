@@ -582,6 +582,32 @@ class Model:
 
         flush()
 
+        # Second pass: purge any remaining noncurrent versions and delete
+        # markers. On a versioning-enabled bucket these survive the pass above
+        # and AWS refuses DeleteBucket until they are gone. Backends that do
+        # not implement the versions API (some S3-compatible stores) simply
+        # report NotImplemented, which we ignore.
+        try:
+            vpaginator = bucket_client.get_paginator("list_object_versions")
+            for page in vpaginator.paginate(Bucket=bucket_name):
+                for v in (page.get("Versions", []) or []):
+                    if not v.get("Key") or not v.get("VersionId"):
+                        continue
+                    pending.append({"Key": v["Key"], "VersionId": v["VersionId"]})
+                    if len(pending) >= int(batch_size or 1000):
+                        flush()
+                for dm in (page.get("DeleteMarkers", []) or []):
+                    if not dm.get("Key") or not dm.get("VersionId"):
+                        continue
+                    pending.append({"Key": dm["Key"], "VersionId": dm["VersionId"]})
+                    if len(pending) >= int(batch_size or 1000):
+                        flush()
+            flush()
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code not in ("NotImplemented", "NoSuchBucket"):
+                raise
+
         # If we're currently "in" that bucket, reset view state first
         if self.bucket == bucket_name:
             self.bucket = ""
@@ -970,6 +996,184 @@ class Model:
             _delete_one(key)
         return True
 
+    def get_bucket_versioning_status(self) -> str:
+        """Return 'Enabled', 'Suspended', or '' (never configured / unknown)."""
+        if not self.bucket:
+            return ""
+        try:
+            resp = self.client.get_bucket_versioning(Bucket=self.bucket)
+            return resp.get("Status", "") or ""
+        except Exception:
+            return ""
+
+    def set_bucket_versioning(self, status: str, log_fn=None):
+        """Enable or suspend versioning on the current bucket.
+
+        status must be 'Enabled' or 'Suspended'.
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        status = (status or "").strip().capitalize()
+        if status not in ("Enabled", "Suspended"):
+            raise ValueError("status must be 'Enabled' or 'Suspended'")
+
+        def _do():
+            self.client.put_bucket_versioning(
+                Bucket=self.bucket,
+                VersioningConfiguration={"Status": status},
+            )
+
+        try:
+            _do()
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error setting versioning on '{self.bucket}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            _do()
+
+    def list_object_versions(self, key: str) -> list:
+        """
+        Return every stored version and delete marker for a single object key,
+        newest first. Each entry is a dict:
+          {version_id, last_modified, size, is_latest, storage_class,
+           is_delete_marker, etag}
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        if not key or key.endswith("/"):
+            raise ValueError("Versions are only available for a single object")
+
+        def _fetch():
+            out = []
+            paginator = self.client.get_paginator("list_object_versions")
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=key):
+                for v in (page.get("Versions", []) or []):
+                    if v.get("Key") != key:
+                        continue
+                    out.append({
+                        "version_id": v.get("VersionId") or "null",
+                        "last_modified": v.get("LastModified"),
+                        "size": int(v.get("Size") or 0),
+                        "is_latest": bool(v.get("IsLatest")),
+                        "storage_class": v.get("StorageClass") or "STANDARD",
+                        "is_delete_marker": False,
+                        "etag": (v.get("ETag") or "").replace('"', ""),
+                    })
+                for dm in (page.get("DeleteMarkers", []) or []):
+                    if dm.get("Key") != key:
+                        continue
+                    out.append({
+                        "version_id": dm.get("VersionId") or "null",
+                        "last_modified": dm.get("LastModified"),
+                        "size": 0,
+                        "is_latest": bool(dm.get("IsLatest")),
+                        "storage_class": "",
+                        "is_delete_marker": True,
+                        "etag": "",
+                    })
+            # Newest first; entries without a timestamp sink to the bottom.
+            out.sort(
+                key=lambda e: (e["last_modified"] is not None, e["last_modified"]),
+                reverse=True,
+            )
+            return out
+
+        try:
+            return _fetch()
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            self.rebind_bucket()
+            return _fetch()
+
+    def download_object_version(self, key, version_id, local_path,
+                                progress_cb=None, cancel_event=None, log_fn=None):
+        """Download one specific version of an object to local_path."""
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        parent = os.path.dirname(local_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        size = None
+        try:
+            head = self.client.head_object(
+                Bucket=self.bucket, Key=key, VersionId=version_id
+            )
+            size = head.get("ContentLength")
+        except Exception:
+            pass  # non-fatal; proceed without a known size
+
+        def _do():
+            self.client.download_file(
+                self.bucket, key, local_path,
+                ExtraArgs={"VersionId": version_id},
+                Callback=_BotoProgressAdapter(
+                    size, key, progress_cb, cancel_event=cancel_event
+                ),
+                Config=self.transfer_cfg_download,
+            )
+
+        try:
+            _do()
+        except TransferCancelled:
+            raise
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error downloading version of '{key}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            _do()
+
+    def delete_object_version(self, key, version_id, log_fn=None):
+        """Permanently delete a single object version (or a delete marker)."""
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+
+        def _do():
+            self.client.delete_object(
+                Bucket=self.bucket, Key=key, VersionId=version_id
+            )
+
+        try:
+            _do()
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error deleting version of '{key}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            _do()
+
+    def make_version_current(self, key, version_id, log_fn=None):
+        """
+        Promote an older version to be the current one by copying that version
+        onto the same key server-side. This creates a new current version with
+        the older version's data (the standard S3 "restore a previous version"
+        technique); nothing is deleted.
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        copy_source = {"Bucket": self.bucket, "Key": key, "VersionId": version_id}
+
+        def _do():
+            self.client.copy_object(
+                CopySource=copy_source, Bucket=self.bucket, Key=key
+            )
+
+        try:
+            _do()
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error restoring version of '{key}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            _do()
+
     def bucket_total_size_bytes(self, cancel_event=None) -> int:
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
@@ -1071,11 +1275,25 @@ class Model:
         return bool(res_c) and res_d, reason
 
     def presigned_get_url(self, key: str, expires_sec: int = 3600) -> str:
-        """Return a temporary download URL for an object."""
+        """Return a temporary download (HTTP GET) URL for an object."""
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
         return self.client.generate_presigned_url(
             "get_object",
+            Params={"Bucket": self.bucket, "Key": key},
+            ExpiresIn=expires_sec,
+        )
+
+    def presigned_put_url(self, key: str, expires_sec: int = 3600) -> str:
+        """Return a temporary upload (HTTP PUT) URL for an object key.
+
+        Anyone with the link can upload to this exact key until it expires,
+        e.g. `curl --upload-file localfile "<url>"`.
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        return self.client.generate_presigned_url(
+            "put_object",
             Params={"Bucket": self.bucket, "Key": key},
             ExpiresIn=expires_sec,
         )
@@ -1240,6 +1458,262 @@ class Model:
             Key=key,
             Tagging={"TagSet": tags},
         )
+
+    # Storage classes selectable in the UI. The first is the default "hot"
+    # tier; the GLACIER/DEEP_ARCHIVE tiers require a restore before download.
+    STORAGE_CLASSES = (
+        "STANDARD",
+        "STANDARD_IA",
+        "ONEZONE_IA",
+        "INTELLIGENT_TIERING",
+        "GLACIER_IR",
+        "GLACIER",
+        "DEEP_ARCHIVE",
+        "REDUCED_REDUNDANCY",
+    )
+
+    # Storage classes whose objects must be restored before they can be read.
+    ARCHIVE_STORAGE_CLASSES = ("GLACIER", "DEEP_ARCHIVE")
+
+    @staticmethod
+    def parse_restore_status(restore_header: str) -> str:
+        """
+        Turn the raw x-amz-restore header into a short human status.
+          None / ""                                  -> ""  (not restored/archived)
+          'ongoing-request="true"'                   -> "in-progress"
+          'ongoing-request="false", expiry-date=...' -> "available until <date>"
+        """
+        if not restore_header:
+            return ""
+        if 'ongoing-request="true"' in restore_header:
+            return "in-progress"
+        if 'ongoing-request="false"' in restore_header:
+            marker = 'expiry-date="'
+            idx = restore_header.find(marker)
+            if idx != -1:
+                rest = restore_header[idx + len(marker):]
+                end = rest.find('"')
+                if end != -1:
+                    return f"available until {rest[:end]}"
+            return "available"
+        return restore_header
+
+    def restore_object(self, key: str, days: int = 7,
+                       tier: str = "Standard") -> tuple[bool, str | None]:
+        """
+        Initiate a restore of an archived (Glacier / Deep Archive) object.
+
+        Returns:
+          (True, None)      restore initiated
+          (False, reason)   could not initiate (already running, unsupported, …)
+        """
+        if not self.bucket:
+            return False, "Bucket is empty; select a bucket first"
+        req = {"Days": int(days)}
+        if tier:
+            req["GlacierJobParameters"] = {"Tier": tier}
+        try:
+            self.client.restore_object(
+                Bucket=self.bucket, Key=key, RestoreRequest=req
+            )
+            return True, None
+        except botocore.exceptions.ClientError as exc:
+            err = exc.response.get("Error", {})
+            code = err.get("Code") or ""
+            msg = err.get("Message") or str(exc)
+            if code == "RestoreAlreadyInProgress":
+                return False, "Restore is already in progress for this object."
+            if code == "NotImplemented":
+                return False, "Storage backend does not support restore (NotImplemented)."
+            return False, f"{code}: {msg}".strip(": ")
+        except Exception as exc:
+            return False, str(exc)
+
+    def change_storage_class(self, key: str, storage_class: str, log_fn=None):
+        """Change an object's storage class via a server-side copy onto itself."""
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        copy_source = {"Bucket": self.bucket, "Key": key}
+
+        def _do():
+            self.client.copy_object(
+                CopySource=copy_source,
+                Bucket=self.bucket,
+                Key=key,
+                StorageClass=storage_class,
+                MetadataDirective="COPY",
+            )
+
+        try:
+            _do()
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error changing storage class of '{key}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            _do()
+
+    def get_object_metadata(self, key: str) -> dict:
+        """
+        Return editable metadata for an object:
+          {content_type, cache_control, content_disposition, content_encoding,
+           storage_class, metadata (user x-amz-meta-* dict)}
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        resp = self.client.head_object(Bucket=self.bucket, Key=key)
+        return {
+            "content_type": resp.get("ContentType", "") or "",
+            "cache_control": resp.get("CacheControl", "") or "",
+            "content_disposition": resp.get("ContentDisposition", "") or "",
+            "content_encoding": resp.get("ContentEncoding", "") or "",
+            "storage_class": resp.get("StorageClass") or "STANDARD",
+            "metadata": dict(resp.get("Metadata", {}) or {}),
+        }
+
+    def set_object_metadata(self, key: str, *, content_type=None,
+                            cache_control=None, content_disposition=None,
+                            content_encoding=None, metadata=None,
+                            storage_class=None, log_fn=None):
+        """
+        Replace an object's system + user metadata via a server-side copy onto
+        itself with MetadataDirective=REPLACE. The current storage class is
+        preserved when passed in (a REPLACE copy would otherwise reset it to
+        STANDARD).
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+
+        params = {
+            "CopySource": {"Bucket": self.bucket, "Key": key},
+            "Bucket": self.bucket,
+            "Key": key,
+            "MetadataDirective": "REPLACE",
+        }
+        # ContentType must always be sent on a REPLACE copy or S3 defaults it
+        # to binary/octet-stream.
+        params["ContentType"] = content_type or ""
+        if cache_control:
+            params["CacheControl"] = cache_control
+        if content_disposition:
+            params["ContentDisposition"] = content_disposition
+        if content_encoding:
+            params["ContentEncoding"] = content_encoding
+        if metadata is not None:
+            params["Metadata"] = {str(k): str(v) for k, v in metadata.items()}
+        if storage_class and storage_class != "STANDARD":
+            params["StorageClass"] = storage_class
+
+        def _do():
+            self.client.copy_object(**params)
+
+        try:
+            _do()
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error setting metadata of '{key}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            _do()
+
+    def search_keys(self, prefix: str, query: str, cancel_event=None,
+                    max_results: int = 1000, log_fn=None) -> list:
+        """
+        Recursively list objects under 'prefix' and return [(key, size), ...]
+        whose key contains 'query' (case-insensitive). S3 only filters by
+        prefix, so the match itself is done client-side over the full listing.
+        Stops early at max_results (0/None means unlimited).
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        q = (query or "").strip().lower()
+
+        def _fetch():
+            res = []
+            paginator = self.client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix or ""):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                for obj in page.get("Contents", []) or []:
+                    key = obj.get("Key") or ""
+                    if not key or key.endswith("/"):
+                        continue
+                    if q and q not in key.lower():
+                        continue
+                    res.append((key, int(obj.get("Size") or 0)))
+                    if max_results and len(res) >= int(max_results):
+                        return res
+            return res
+
+        try:
+            return _fetch()
+        except TransferCancelled:
+            raise
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error searching '{prefix}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            return _fetch()
+
+    def get_object_preview(self, key: str, max_bytes: int = 1024 * 1024) -> dict:
+        """
+        Fetch up to max_bytes of an object for in-app preview.
+
+        Returns a dict:
+          {content_type, size (total, may be None), data (bytes),
+           truncated (bool)}
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+
+        def _do():
+            kwargs = {"Bucket": self.bucket, "Key": key}
+            if max_bytes and max_bytes > 0:
+                kwargs["Range"] = f"bytes=0-{int(max_bytes) - 1}"
+            try:
+                resp = self.client.get_object(**kwargs)
+            except botocore.exceptions.ClientError as exc:
+                # An empty object (size 0) cannot satisfy a byte range; retry
+                # unranged to preview it as empty rather than error out.
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in ("InvalidRange", "416") and "Range" in kwargs:
+                    kwargs.pop("Range")
+                    resp = self.client.get_object(**kwargs)
+                else:
+                    raise
+            body = resp["Body"].read()
+
+            # Prefer the total from Content-Range (present on a ranged reply);
+            # fall back to Content-Length (the length of *this* body).
+            total = None
+            cr = resp.get("ContentRange") or ""
+            if cr and "/" in cr:
+                tail = cr.rsplit("/", 1)[1]
+                if tail.isdigit():
+                    total = int(tail)
+            if total is None:
+                cl = resp.get("ContentLength")
+                total = int(cl) if cl is not None else None
+
+            truncated = total is not None and len(body) < total
+            return {
+                "content_type": resp.get("ContentType", "") or "",
+                "size": total,
+                "data": body,
+                "truncated": bool(truncated),
+            }
+
+        try:
+            return _do()
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            self.rebind_bucket()
+            return _do()
 
     def build_region_swapped_endpoint(self, base_endpoint: str,
                                       new_region: str) -> str:

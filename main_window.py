@@ -2,6 +2,7 @@ import os
 import sys
 import pathlib
 import time
+import tempfile
 from datetime import datetime
 import threading
 
@@ -15,17 +16,19 @@ from PyQt6 import QtWidgets
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
 from PyQt6.QtGui import QIcon, QStandardItemModel, QStandardItem, QAction
-from PyQt6.QtGui import QFontDatabase, QShortcut, QKeySequence, QPainter, QPen, QColor
-from PyQt6.QtCore import QRectF
+from PyQt6.QtGui import QFontDatabase, QShortcut, QKeySequence, QPainter, QPen, QColor, QFont
+from PyQt6.QtGui import QDesktopServices, QPixmap, QActionGroup
+from PyQt6.QtCore import QRectF, QUrl
 from model import Model as DataModel
 from model import FSObjectType
 from model import TransferCancelled
 from properties_window import PropertiesWindow
 from profile_switcher import ProfileSwitchWindow
+from theme import apply_theme, THEMES
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.9.4"
+__VERSION__ = "0.9.11"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -754,6 +757,71 @@ class Worker(QObject):
         finally:
             self.finished.emit(cancelled)
 
+    def _iter_object_keys(self, key, is_folder):
+        """Yield each concrete object key for a job target (recursing folders)."""
+        if is_folder:
+            for k, _ in self.data_model.get_keys(key, log_fn=self.progress.emit):
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                if k and not k.endswith("/"):
+                    yield k
+        else:
+            yield key
+
+    def set_storage_class(self):
+        # job = [(key, is_folder, storage_class)]
+        cancelled = False
+        try:
+            for key, is_folder, storage_class in self.job:
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                for k in self._iter_object_keys(key, is_folder):
+                    self.progress.emit(f"storage-class {storage_class}: {k}")
+                    self.data_model.change_storage_class(
+                        k, storage_class, log_fn=self.progress.emit
+                    )
+        except Exception as exc:
+            msg = str(exc) or exc.__class__.__name__
+            if "cancelled" in msg.lower():
+                cancelled = True
+            else:
+                self.progress.emit(f"storage-class change failed: {msg}")
+                self.error.emit(msg)
+        finally:
+            self.finished.emit(cancelled)
+
+    def restore(self):
+        # job = [(key, is_folder, days, tier)]
+        cancelled = False
+        initiated = 0
+        skipped = 0
+        try:
+            for key, is_folder, days, tier in self.job:
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                for k in self._iter_object_keys(key, is_folder):
+                    ok, reason = self.data_model.restore_object(
+                        k, days=days, tier=tier
+                    )
+                    if ok:
+                        initiated += 1
+                        self.progress.emit(f"restore initiated: {k}")
+                    else:
+                        skipped += 1
+                        self.progress.emit(f"restore skipped ({reason}): {k}")
+            self.progress.emit(
+                f"restore done: {initiated} initiated, {skipped} skipped"
+            )
+        except Exception as exc:
+            msg = str(exc) or exc.__class__.__name__
+            if "cancelled" in msg.lower():
+                cancelled = True
+            else:
+                self.progress.emit(f"restore failed: {msg}")
+                self.error.emit(msg)
+        finally:
+            self.finished.emit(cancelled)
+
 
 class UsageWorker(QObject):
     finished = pyqtSignal(str, str, object)  # bucket, prefix, result_or_exc
@@ -1061,6 +1129,790 @@ class TagsDialog(QDialog):
             QMessageBox.critical(self, "Tags", f"Could not save tags:\n{exc}")
 
 
+class _FuncWorker(QObject):
+    """Run one function on a QThread and report its result or exception.
+
+    The function receives this worker as its only argument so it can emit
+    byte progress via ``worker.progress`` while it runs.
+    """
+    done = pyqtSignal(object, object)   # (result, exception)
+    progress = pyqtSignal(int, int)     # (current_bytes, total_bytes)
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            res = self._fn(self)
+            self.done.emit(res, None)
+        except Exception as exc:
+            self.done.emit(None, exc)
+
+
+class PreviewDialog(QDialog):
+    """Inline preview for a single object: images and text render in-app;
+    anything else can be opened with the OS default application."""
+
+    IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico"}
+    TEXT_EXTS = {
+        ".txt", ".md", ".log", ".json", ".xml", ".yaml", ".yml", ".csv",
+        ".tsv", ".ini", ".cfg", ".conf", ".py", ".js", ".ts", ".html",
+        ".htm", ".css", ".sh", ".c", ".h", ".cpp", ".go", ".rs", ".java",
+        ".sql", ".toml", ".svg",
+    }
+    IMG_LIMIT = 25 * 1024 * 1024
+    TEXT_LIMIT = 1 * 1024 * 1024
+
+    def __init__(self, parent, model, key):
+        super().__init__(parent)
+        self._model = model
+        self._key = key
+        self._thread = None
+        self._worker = None
+        self._dl_thread = None
+        self._dl_worker = None
+
+        base = key.rstrip("/").split("/")[-1] or key
+        self.setWindowTitle(f"Preview — {base}")
+        self.resize(760, 620)
+
+        self._stack = QStackedWidget()
+
+        self._status = QLabel("Loading preview…")
+        self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status.setWordWrap(True)
+
+        self._img_label = QLabel()
+        self._img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._img_scroll = QScrollArea()
+        self._img_scroll.setWidget(self._img_label)
+        self._img_scroll.setWidgetResizable(True)
+
+        self._text = QPlainTextEdit()
+        self._text.setReadOnly(True)
+        self._text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        try:
+            self._text.setFont(
+                QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+            )
+        except Exception:
+            pass
+
+        self._stack.addWidget(self._status)      # index 0
+        self._stack.addWidget(self._img_scroll)  # index 1
+        self._stack.addWidget(self._text)        # index 2
+
+        self._open_btn = QPushButton("Open with default app")
+        self._open_btn.clicked.connect(self._open_external)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+
+        btns = QHBoxLayout()
+        btns.addWidget(self._open_btn)
+        btns.addStretch(1)
+        btns.addWidget(close_btn)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self._stack, 1)
+        lay.addLayout(btns)
+
+        self._start_load()
+
+    def _ext(self):
+        return os.path.splitext(self._key)[1].lower()
+
+    def _start_load(self):
+        is_image = self._ext() in self.IMAGE_EXTS
+        max_bytes = self.IMG_LIMIT if is_image else self.TEXT_LIMIT
+        key = self._key
+        clone = self._model.clone_for_worker()
+
+        def _fetch(_w):
+            return clone.get_object_preview(key, max_bytes)
+
+        self._thread = QThread(self)
+        self._worker = _FuncWorker(_fetch)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.done.connect(self._on_loaded)
+        self._worker.done.connect(self._thread.quit)
+        self._worker.done.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.start()
+
+    def _on_loaded(self, result, exc):
+        self._thread = None
+        self._worker = None
+        if exc is not None:
+            self._status.setText(f"Could not load preview:\n{exc}")
+            self._stack.setCurrentIndex(0)
+            return
+
+        data = result.get("data") or b""
+        ctype = (result.get("content_type") or "").lower()
+        truncated = result.get("truncated")
+        ext = self._ext()
+
+        # Raster images render as a pixmap (SVG is XML, shown as text below).
+        is_raster = (ext in self.IMAGE_EXTS) or (
+            ctype.startswith("image/") and "svg" not in ctype
+        )
+        if is_raster and ext != ".svg":
+            pix = QPixmap()
+            if pix.loadFromData(data):
+                self._img_label.setPixmap(pix)
+                self._stack.setCurrentIndex(1)
+                return
+            # not a decodable raster -> fall through to text/binary handling
+
+        if b"\x00" in data[:8192]:
+            self._status.setText(
+                "No inline preview for this binary file.\n\n"
+                'Use "Open with default app".'
+            )
+            self._stack.setCurrentIndex(0)
+            return
+
+        text = data.decode("utf-8", errors="replace")
+        if truncated:
+            text += "\n\n… (preview truncated)"
+        self._text.setPlainText(text)
+        self._stack.setCurrentIndex(2)
+
+    def _open_external(self):
+        if self._dl_thread is not None:
+            return
+        base = os.path.basename(self._key.rstrip("/")) or "object"
+        tmp_dir = tempfile.mkdtemp(prefix="s3duck_")
+        out_path = os.path.join(tmp_dir, base)
+        key = self._key
+        clone = self._model.clone_for_worker()
+        cancel = threading.Event()
+
+        prog = QProgressDialog("Downloading…", "Cancel", 0, 100, self)
+        prog.setWindowTitle("Open with default app")
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setAutoClose(False)
+        prog.setAutoReset(False)
+        prog.canceled.connect(cancel.set)
+
+        def _dl(w):
+            def _cb(total, cur, _k):
+                w.progress.emit(int(cur), int(total or 0))
+            clone.download_file(
+                key, out_path, tmp_dir, progress_cb=_cb, cancel_event=cancel
+            )
+            return out_path
+
+        self._dl_thread = QThread(self)
+        self._dl_worker = _FuncWorker(_dl)
+        self._dl_worker.moveToThread(self._dl_thread)
+        self._dl_thread.started.connect(self._dl_worker.run)
+
+        def _on_prog(cur, total):
+            if total > 0:
+                prog.setMaximum(100)
+                prog.setValue(min(100, int(cur * 100 / total)))
+            else:
+                prog.setMaximum(0)  # indeterminate
+
+        def _on_done(result, exc):
+            prog.close()
+            self._dl_thread.quit()
+            self._dl_worker.deleteLater()
+            self._dl_thread = None
+            self._dl_worker = None
+            self._open_btn.setEnabled(True)
+            if exc is not None:
+                if not cancel.is_set():
+                    QMessageBox.warning(
+                        self, "Open", f"Could not download file:\n{exc}"
+                    )
+                return
+            QDesktopServices.openUrl(QUrl.fromLocalFile(result))
+
+        self._dl_worker.progress.connect(_on_prog)
+        self._dl_worker.done.connect(_on_done)
+        self._dl_thread.finished.connect(self._dl_thread.deleteLater)
+        self._open_btn.setEnabled(False)
+        self._dl_thread.start()
+        prog.show()
+
+
+class VersionsDialog(QDialog):
+    """List, download, restore, and delete individual object versions."""
+
+    def __init__(self, parent, main_window, model, key):
+        super().__init__(parent)
+        self._mw = main_window
+        self._model = model
+        self._key = key
+        self._versions = []
+        self._dl_thread = None
+        self._dl_worker = None
+
+        base = key.rstrip("/").split("/")[-1] or key
+        self.setWindowTitle(f"Versions — {base}")
+        self.resize(720, 420)
+
+        self._info = QLabel("")
+        self._info.setWordWrap(True)
+
+        self._table = QTableWidget(0, 5)
+        self._table.setHorizontalHeaderLabels(
+            ["Modified", "Size", "Storage", "Version", "State"]
+        )
+        self._table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self._table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self._table.verticalHeader().setVisible(False)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.itemSelectionChanged.connect(self._update_buttons)
+
+        self._btn_download = QPushButton("Download…")
+        self._btn_current = QPushButton("Make current")
+        self._btn_delete = QPushButton("Delete version")
+        close_btn = QPushButton("Close")
+        self._btn_download.clicked.connect(self._download_selected)
+        self._btn_current.clicked.connect(self._make_current_selected)
+        self._btn_delete.clicked.connect(self._delete_selected)
+        close_btn.clicked.connect(self.reject)
+
+        row = QHBoxLayout()
+        row.addWidget(self._btn_download)
+        row.addWidget(self._btn_current)
+        row.addWidget(self._btn_delete)
+        row.addStretch(1)
+        row.addWidget(close_btn)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self._info)
+        lay.addWidget(self._table, 1)
+        lay.addLayout(row)
+
+        self._reload()
+
+    def _reload(self):
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            versions = self._model.list_object_versions(self._key)
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(
+                self, "Versions", f"Could not list versions:\n{exc}"
+            )
+            self._versions = []
+            self._render([])
+            return
+        QApplication.restoreOverrideCursor()
+        self._versions = versions
+        self._render(versions)
+
+    def _render(self, versions):
+        status = self._model.get_bucket_versioning_status()
+        if versions:
+            head = f"{len(versions)} version(s)"
+        else:
+            head = "No stored versions"
+        if status:
+            head += f" — bucket versioning: {status}"
+        elif not versions:
+            head += " — this bucket may not have versioning enabled"
+        self._info.setText(head)
+
+        self._table.setRowCount(0)
+        for v in versions:
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            when = "" if v["last_modified"] is None else str(v["last_modified"])
+            size = "—" if v["is_delete_marker"] else _human_bytes(v["size"])
+            storage = "" if v["is_delete_marker"] else v["storage_class"]
+            state = []
+            if v["is_latest"]:
+                state.append("latest")
+            if v["is_delete_marker"]:
+                state.append("delete-marker")
+            cells = [when, size, storage, v["version_id"], ", ".join(state)]
+            for c, txt in enumerate(cells):
+                self._table.setItem(r, c, QTableWidgetItem(txt))
+        self._table.resizeColumnsToContents()
+        self._update_buttons()
+
+    def _selected(self):
+        rows = self._table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        idx = rows[0].row()
+        if 0 <= idx < len(self._versions):
+            return self._versions[idx]
+        return None
+
+    def _update_buttons(self):
+        v = self._selected()
+        has = v is not None
+        is_dm = bool(v and v["is_delete_marker"])
+        self._btn_download.setEnabled(has and not is_dm)
+        self._btn_current.setEnabled(has and not is_dm and not v["is_latest"])
+        self._btn_delete.setEnabled(has)
+
+    def _make_current_selected(self):
+        v = self._selected()
+        if not v:
+            return
+        if QMessageBox.question(
+            self, "Make current",
+            "Promote this version to be the current object?\n\n"
+            "A new current version is created with this version's data; "
+            "nothing is deleted.",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._model.make_version_current(
+                self._key, v["version_id"], log_fn=self._mw.log
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Make current", f"Failed:\n{exc}")
+            return
+        self._mw.log(f"restored version {v['version_id']} of {self._key}")
+        self._reload()
+        self._mw.navigate()
+
+    def _delete_selected(self):
+        v = self._selected()
+        if not v:
+            return
+        what = "delete marker" if v["is_delete_marker"] else "version"
+        if QMessageBox.question(
+            self, "Delete version",
+            f"Permanently delete this {what}?\nThis cannot be undone.",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._model.delete_object_version(
+                self._key, v["version_id"], log_fn=self._mw.log
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Delete version", f"Failed:\n{exc}")
+            return
+        self._mw.log(f"deleted {what} {v['version_id']} of {self._key}")
+        self._reload()
+        self._mw.navigate()
+
+    def _download_selected(self):
+        if self._dl_thread is not None:
+            return
+        v = self._selected()
+        if not v or v["is_delete_marker"]:
+            return
+        base = os.path.basename(self._key.rstrip("/")) or "object"
+        path, _ = QFileDialog.getSaveFileName(self, "Save version as", base)
+        if not path:
+            return
+        key = self._key
+        vid = v["version_id"]
+        clone = self._model.clone_for_worker()
+        cancel = threading.Event()
+
+        prog = QProgressDialog("Downloading…", "Cancel", 0, 100, self)
+        prog.setWindowTitle("Download version")
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setAutoClose(False)
+        prog.setAutoReset(False)
+        prog.canceled.connect(cancel.set)
+
+        def _dl(w):
+            def _cb(total, cur, _k):
+                w.progress.emit(int(cur), int(total or 0))
+            clone.download_object_version(
+                key, vid, path, progress_cb=_cb, cancel_event=cancel
+            )
+            return path
+
+        self._dl_thread = QThread(self)
+        self._dl_worker = _FuncWorker(_dl)
+        self._dl_worker.moveToThread(self._dl_thread)
+        self._dl_thread.started.connect(self._dl_worker.run)
+
+        def _on_prog(cur, total):
+            if total > 0:
+                prog.setMaximum(100)
+                prog.setValue(min(100, int(cur * 100 / total)))
+            else:
+                prog.setMaximum(0)
+
+        def _on_done(result, exc):
+            prog.close()
+            self._dl_thread.quit()
+            self._dl_worker.deleteLater()
+            self._dl_thread = None
+            self._dl_worker = None
+            if exc is not None:
+                if not cancel.is_set():
+                    QMessageBox.warning(
+                        self, "Download version", f"Failed:\n{exc}"
+                    )
+                return
+            self._mw.statusBar().showMessage(f"Saved version to {result}", 4000)
+
+        self._dl_worker.progress.connect(_on_prog)
+        self._dl_worker.done.connect(_on_done)
+        self._dl_thread.finished.connect(self._dl_thread.deleteLater)
+        self._dl_thread.start()
+        prog.show()
+
+
+class MetadataDialog(QDialog):
+    """Edit an object's system headers (Content-Type, Cache-Control, …) and
+    custom x-amz-meta-* user metadata."""
+
+    def __init__(self, parent, model, key):
+        super().__init__(parent)
+        self._model = model
+        self._key = key
+        self._storage_class = "STANDARD"
+
+        base = key.rstrip("/").split("/")[-1] or key
+        self.setWindowTitle(f"Metadata — {base}")
+        self.resize(560, 480)
+
+        self._content_type = QLineEdit()
+        self._cache_control = QLineEdit()
+        self._content_disposition = QLineEdit()
+        self._content_encoding = QLineEdit()
+
+        form = QFormLayout()
+        form.addRow(QLabel("Content-Type"), self._content_type)
+        form.addRow(QLabel("Cache-Control"), self._cache_control)
+        form.addRow(QLabel("Content-Disposition"), self._content_disposition)
+        form.addRow(QLabel("Content-Encoding"), self._content_encoding)
+
+        self._table = QTableWidget(0, 2)
+        self._table.setHorizontalHeaderLabels(["Metadata key", "Value"])
+        self._table.horizontalHeader().setStretchLastSection(True)
+
+        add_btn = QPushButton("Add")
+        del_btn = QPushButton("Remove")
+        add_btn.clicked.connect(lambda: self._insert_row("", ""))
+        del_btn.clicked.connect(self._remove_row)
+        row_btns = QHBoxLayout()
+        row_btns.addWidget(add_btn)
+        row_btns.addWidget(del_btn)
+        row_btns.addStretch(1)
+
+        self.buttonBox = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttonBox.accepted.connect(self._save)
+        self.buttonBox.rejected.connect(self.reject)
+
+        lay = QVBoxLayout(self)
+        lay.addLayout(form)
+        lay.addWidget(QLabel("Custom metadata (x-amz-meta-*):"))
+        lay.addWidget(self._table, 1)
+        lay.addLayout(row_btns)
+        lay.addWidget(self.buttonBox)
+
+        self._load()
+
+    def _insert_row(self, k="", v=""):
+        r = self._table.rowCount()
+        self._table.insertRow(r)
+        self._table.setItem(r, 0, QTableWidgetItem(k))
+        self._table.setItem(r, 1, QTableWidgetItem(v))
+
+    def _remove_row(self):
+        r = self._table.currentRow()
+        if r >= 0:
+            self._table.removeRow(r)
+
+    def _load(self):
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            meta = self._model.get_object_metadata(self._key)
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "Metadata", f"Could not load metadata:\n{exc}")
+            return
+        QApplication.restoreOverrideCursor()
+        self._storage_class = meta.get("storage_class") or "STANDARD"
+        self._content_type.setText(meta.get("content_type", ""))
+        self._cache_control.setText(meta.get("cache_control", ""))
+        self._content_disposition.setText(meta.get("content_disposition", ""))
+        self._content_encoding.setText(meta.get("content_encoding", ""))
+        for k, v in (meta.get("metadata") or {}).items():
+            self._insert_row(str(k), str(v))
+
+    def _save(self):
+        metadata = {}
+        for r in range(self._table.rowCount()):
+            k_item = self._table.item(r, 0)
+            v_item = self._table.item(r, 1)
+            k = (k_item.text() if k_item else "").strip()
+            v = (v_item.text() if v_item else "").strip()
+            if k:
+                metadata[k] = v
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self._model.set_object_metadata(
+                self._key,
+                content_type=self._content_type.text().strip(),
+                cache_control=self._cache_control.text().strip(),
+                content_disposition=self._content_disposition.text().strip(),
+                content_encoding=self._content_encoding.text().strip(),
+                metadata=metadata,
+                storage_class=self._storage_class,
+            )
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Metadata", f"Could not save metadata:\n{exc}")
+            return
+        QApplication.restoreOverrideCursor()
+        self.accept()
+
+
+class SearchDialog(QDialog):
+    """Recursively search the current bucket/prefix by key substring."""
+
+    MAX_RESULTS = 1000
+
+    def __init__(self, parent, main_window, model, prefix):
+        super().__init__(parent)
+        self._mw = main_window
+        self._model = model
+        self._prefix = prefix or ""
+        self._thread = None
+        self._worker = None
+        self._cancel = None
+        self._results = []
+
+        scope = self._prefix if self._prefix else "(bucket root)"
+        self.setWindowTitle(f"Search — {model.bucket}/{self._prefix}")
+        self.resize(760, 480)
+
+        self._query = QLineEdit()
+        self._query.setPlaceholderText(f"Search under {scope} and below…")
+        self._query.returnPressed.connect(self._run_search)
+        self._btn_search = QPushButton("Search")
+        self._btn_search.clicked.connect(self._run_search)
+        top = QHBoxLayout()
+        top.addWidget(self._query, 1)
+        top.addWidget(self._btn_search)
+
+        self._info = QLabel("")
+        self._table = QTableWidget(0, 2)
+        self._table.setHorizontalHeaderLabels(["Key", "Size"])
+        self._table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.verticalHeader().setVisible(False)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.doubleClicked.connect(self._goto_selected)
+
+        self._btn_goto = QPushButton("Go to location")
+        self._btn_copy = QPushButton("Copy key")
+        close_btn = QPushButton("Close")
+        self._btn_goto.clicked.connect(self._goto_selected)
+        self._btn_copy.clicked.connect(self._copy_selected)
+        close_btn.clicked.connect(self.reject)
+        self._btn_goto.setEnabled(False)
+        self._btn_copy.setEnabled(False)
+        self._table.itemSelectionChanged.connect(self._update_buttons)
+        row = QHBoxLayout()
+        row.addWidget(self._btn_goto)
+        row.addWidget(self._btn_copy)
+        row.addStretch(1)
+        row.addWidget(close_btn)
+
+        lay = QVBoxLayout(self)
+        lay.addLayout(top)
+        lay.addWidget(self._info)
+        lay.addWidget(self._table, 1)
+        lay.addLayout(row)
+
+        self._query.setFocus()
+
+    def _update_buttons(self):
+        has = self._table.currentRow() >= 0 and bool(self._results)
+        self._btn_goto.setEnabled(has)
+        self._btn_copy.setEnabled(has)
+
+    def _run_search(self):
+        if self._thread is not None:
+            return
+        q = self._query.text().strip()
+        if not q:
+            return
+        self._info.setText("Searching…")
+        self._table.setRowCount(0)
+        self._results = []
+        self._btn_search.setEnabled(False)
+        prefix = self._prefix
+        limit = self.MAX_RESULTS
+        clone = self._model.clone_for_worker()
+        cancel = threading.Event()
+        self._cancel = cancel
+
+        def _search(_w):
+            return clone.search_keys(prefix, q, cancel_event=cancel,
+                                     max_results=limit)
+
+        self._thread = QThread(self)
+        self._worker = _FuncWorker(_search)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.done.connect(self._on_results)
+        self._worker.done.connect(self._thread.quit)
+        self._worker.done.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.start()
+
+    def _on_results(self, result, exc):
+        self._thread = None
+        self._worker = None
+        self._btn_search.setEnabled(True)
+        if exc is not None:
+            self._info.setText(f"Search failed: {exc}")
+            return
+        self._results = result or []
+        for key, size in self._results:
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            self._table.setItem(r, 0, QTableWidgetItem(key))
+            self._table.setItem(r, 1, QTableWidgetItem(_human_bytes(size)))
+        self._table.resizeColumnsToContents()
+        self._table.horizontalHeader().setStretchLastSection(True)
+        capped = len(self._results) >= self.MAX_RESULTS
+        self._info.setText(
+            f"{len(self._results)} match(es)"
+            + (f" — showing first {self.MAX_RESULTS}" if capped else "")
+        )
+        self._update_buttons()
+
+    def _selected_key(self):
+        r = self._table.currentRow()
+        if 0 <= r < len(self._results):
+            return self._results[r][0]
+        return None
+
+    def _copy_selected(self):
+        key = self._selected_key()
+        if key:
+            QtWidgets.QApplication.clipboard().setText(key)
+            self._mw.statusBar().showMessage("Key copied", 2000)
+
+    def _goto_selected(self):
+        key = self._selected_key()
+        if not key:
+            return
+        self.accept()
+        self._mw.goto_key(key)
+
+
+class PresignedLinkDialog(QDialog):
+    """Generate a temporary download (GET) or upload (PUT) link for an object,
+    with a configurable expiry."""
+
+    UNITS = (("Minutes", 60), ("Hours", 3600), ("Days", 86400))
+    MAX_EXPIRES = 7 * 24 * 3600  # SigV4 presigned-URL maximum (7 days)
+
+    def __init__(self, parent, model, key):
+        super().__init__(parent)
+        self._model = model
+        self._key = key
+
+        base = key.rstrip("/").split("/")[-1] or key
+        self.setWindowTitle(f"Share link — {base}")
+        self.resize(640, 220)
+
+        self._type = QComboBox()
+        self._type.addItems(["Download (GET)", "Upload (PUT)"])
+        self._amount = QSpinBox()
+        self._amount.setRange(1, 100000)
+        self._amount.setValue(1)
+        self._unit = QComboBox()
+        self._unit.addItems([u for u, _ in self.UNITS])
+        self._unit.setCurrentIndex(1)  # Hours
+
+        exp_row = QHBoxLayout()
+        exp_row.addWidget(self._amount)
+        exp_row.addWidget(self._unit)
+        exp_row.addStretch(1)
+        exp_w = QWidget()
+        exp_w.setLayout(exp_row)
+
+        form = QFormLayout()
+        form.addRow(QLabel("Link type"), self._type)
+        form.addRow(QLabel("Expires in"), exp_w)
+
+        self._url = QLineEdit()
+        self._url.setReadOnly(True)
+        self._note = QLabel("")
+        self._note.setWordWrap(True)
+
+        copy_btn = QPushButton("Copy")
+        close_btn = QPushButton("Close")
+        copy_btn.clicked.connect(self._copy)
+        close_btn.clicked.connect(self.reject)
+        btns = QHBoxLayout()
+        btns.addWidget(copy_btn)
+        btns.addStretch(1)
+        btns.addWidget(close_btn)
+
+        lay = QVBoxLayout(self)
+        lay.addLayout(form)
+        lay.addWidget(QLabel("URL:"))
+        lay.addWidget(self._url)
+        lay.addWidget(self._note)
+        lay.addLayout(btns)
+
+        self._type.currentIndexChanged.connect(self._regenerate)
+        self._amount.valueChanged.connect(self._regenerate)
+        self._unit.currentIndexChanged.connect(self._regenerate)
+        self._regenerate()
+
+    def _expires_sec(self):
+        return self._amount.value() * self.UNITS[self._unit.currentIndex()][1]
+
+    def _regenerate(self):
+        secs = self._expires_sec()
+        note = ""
+        if secs > self.MAX_EXPIRES:
+            secs = self.MAX_EXPIRES
+            note = "Clamped to the S3 maximum of 7 days. "
+        is_upload = self._type.currentIndex() == 1
+        try:
+            if is_upload:
+                url = self._model.presigned_put_url(self._key, secs)
+            else:
+                url = self._model.presigned_get_url(self._key, secs)
+        except Exception as exc:
+            self._url.setText("")
+            self._note.setText(f"Could not generate link: {exc}")
+            return
+        self._url.setText(url)
+        if is_upload:
+            note += 'Upload with:  curl --upload-file <file> "<URL>"'
+        self._note.setText(note)
+
+    def _copy(self):
+        if self._url.text():
+            QtWidgets.QApplication.clipboard().setText(self._url.text())
+            self._note.setText("Link copied to clipboard.")
+
+
 class _QEntry:
     def __init__(self, entry_id, method, job, need_refresh=True, label=""):
         self.entry_id = entry_id
@@ -1139,8 +1991,10 @@ class _QueueRow(QWidget):
     def _update_status_style(self, status: str):
         bg = self._STATUS_COLORS.get(status, "#e4e4e8")
         self._status.setText(status)
+        # Force dark text so the label stays readable on the pastel chip in
+        # both light and dark themes.
         self._status.setStyleSheet(
-            f"background: {bg}; border-radius: 3px; padding: 1px 4px;"
+            f"background: {bg}; color: #202020; border-radius: 3px; padding: 1px 4px;"
         )
 
     def set_status(self, status: str):
@@ -1164,7 +2018,9 @@ class TransferQueuePanel(QWidget):
         self._rows: dict = {}
 
         hdr = QLabel("  Transfer Queue")
-        hdr.setStyleSheet("background: #d8d8de; padding: 3px 6px; font-weight: bold;")
+        # Plain bold label (no hardcoded background) so it adapts to the theme;
+        # QLabel backgrounds are transparent by default.
+        hdr.setStyleSheet("padding: 3px 6px; font-weight: bold;")
 
         clear_btn = QPushButton("Clear done")
         clear_btn.setFlat(True)
@@ -1228,6 +2084,79 @@ class TransferQueuePanel(QWidget):
             self.hide()
 
 
+class Breadcrumb(QScrollArea):
+    """A clickable path bar. Each segment navigates to that prefix; the leading
+    'Buckets' segment returns to the bucket list."""
+
+    home = pyqtSignal()
+    go = pyqtSignal(str)   # target prefix ('' == bucket root)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setFixedHeight(28)
+        self._inner = QWidget()
+        self._lay = QHBoxLayout(self._inner)
+        self._lay.setContentsMargins(4, 0, 4, 0)
+        self._lay.setSpacing(1)
+        self._lay.addStretch(1)
+        self.setWidget(self._inner)
+        self._last_key = None
+
+    def _clear(self):
+        # Remove everything except the trailing stretch.
+        while self._lay.count() > 1:
+            item = self._lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+    def _add_segment(self, text, target, *, is_last):
+        btn = QToolButton()
+        btn.setText(text)
+        btn.setAutoRaise(True)
+        if is_last:
+            btn.setEnabled(False)
+        else:
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            if target is None:
+                btn.clicked.connect(lambda: self.home.emit())
+            else:
+                btn.clicked.connect(lambda _c=False, t=target: self.go.emit(t))
+        self._lay.insertWidget(self._lay.count() - 1, btn)
+
+    def _add_sep(self):
+        sep = QLabel("›")
+        sep.setEnabled(False)
+        self._lay.insertWidget(self._lay.count() - 1, sep)
+
+    def set_location(self, bucket, current_folder, in_bucket_list):
+        # Skip a rebuild when nothing changed (navigation + resize both call us).
+        state_key = (bool(in_bucket_list), bucket or "", current_folder or "")
+        if state_key == self._last_key:
+            return
+        self._last_key = state_key
+
+        self._clear()
+        self._add_segment("Buckets", None, is_last=in_bucket_list)
+        if not in_bucket_list and bucket:
+            folder = current_folder or ""
+            self._add_sep()
+            self._add_segment(bucket, "", is_last=(folder == ""))
+            parts = [p for p in folder.split("/") if p]
+            acc = ""
+            for i, p in enumerate(parts):
+                acc += p + "/"
+                self._add_sep()
+                self._add_segment(p, acc, is_last=(i == len(parts) - 1))
+        # Keep the newest (deepest) segment in view.
+        QTimer.singleShot(0, lambda: self.horizontalScrollBar().setValue(
+            self.horizontalScrollBar().maximum()))
+
+
 class MainWindow(QMainWindow):
     def __init__(self, *args, **kwargs):
         settings = kwargs.pop("settings")
@@ -1285,9 +2214,14 @@ class MainWindow(QMainWindow):
             if not stack:
                 stack = ["Sans-Serif"]
 
-            families = ",".join(f"'{f}'" for f in stack)
-            widget.setStyleSheet(
-                f"font-family: {families}; font-size: {pt}pt;")
+            # Apply the font via QFont, not a stylesheet: any stylesheet makes
+            # the widget stop following the palette background, which breaks
+            # theming (the log view stayed white in dark mode).
+            f = QFont(widget.font())
+            f.setFamilies(stack)
+            if pt > 0:
+                f.setPointSize(pt)
+            widget.setFont(f)
 
         _apply_emoji_safe_font(self.logview)
 
@@ -1375,6 +2309,7 @@ class MainWindow(QMainWindow):
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnQueuePanel)
         self.tBar.addAction(self.btnAbout)
+        self._build_theme_button()
         self.tBar.setIconSize(QSize(26, 26))
 
         self.model = QStandardItemModel()
@@ -1418,10 +2353,10 @@ class MainWindow(QMainWindow):
         self._tick_timer.timeout.connect(self._on_tick)
         self._status_prefix = "Transferring…"
 
-        self.s3PathEdit = QLineEdit()
-        self.s3PathEdit.setReadOnly(True)
-        self.s3PathEdit.setStyleSheet("font-family: monospace; background: #f0f0f0;")
-        self.statusBar().addPermanentWidget(self.s3PathEdit, 3)
+        self.breadcrumb = Breadcrumb()
+        self.breadcrumb.home.connect(self.goHome)
+        self.breadcrumb.go.connect(self._breadcrumb_go)
+        self.statusBar().addPermanentWidget(self.breadcrumb, 3)
 
         self._bucket_usage_token = 0
         self._bucket_usage_thread = None
@@ -1439,6 +2374,9 @@ class MainWindow(QMainWindow):
 
         self._search_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
         self._search_shortcut.activated.connect(self._toggle_search)
+
+        self._deep_search_shortcut = QShortcut(QKeySequence("Ctrl+Shift+F"), self)
+        self._deep_search_shortcut.activated.connect(self.open_search)
 
         self.menu = QMenu()
         self.menu.setAttribute(Qt.WidgetAttribute.WA_NoMouseReplay, True)
@@ -2019,6 +2957,14 @@ class MainWindow(QMainWindow):
                 properties_selected_action = None
                 share_tmp_action = None
                 share_public_action = None
+                open_action = None
+                versions_action = None
+                rename_action = None
+                restore_action = None
+                storage_action = None
+                metadata_action = None
+                search_action = None
+                versioning_action = None
 
                 if (
                     m
@@ -2073,6 +3019,18 @@ class MainWindow(QMainWindow):
                 )
                 self.menu.addAction(create_folder_action)
 
+                search_action = QAction(
+                    QIcon.fromTheme("edit-find"),
+                    "Search here…",
+                )
+                self.menu.addAction(search_action)
+
+                versioning_action = QAction(
+                    QIcon.fromTheme("document-open-recent"),
+                    "Bucket versioning…",
+                )
+                self.menu.addAction(versioning_action)
+
                 if ixs and not up_selected:
                     download_action = QAction(
                         QIcon.fromTheme(
@@ -2087,9 +3045,21 @@ class MainWindow(QMainWindow):
                     )
                     self.menu.addAction(download_action)
                     if m and getattr(m, 't', None) == FSObjectType.FILE:
+                        open_action = QAction(
+                            QIcon.fromTheme("document-open"),
+                            "Open / preview",
+                        )
+                        self.menu.addAction(open_action)
+
+                        versions_action = QAction(
+                            QIcon.fromTheme("document-open-recent"),
+                            "Versions…",
+                        )
+                        self.menu.addAction(versions_action)
+
                         share_tmp_action = QAction(
                             QIcon.fromTheme('insert-link'),
-                            'Copy share link…',
+                            'Share link…',
                         )
                         self.menu.addAction(share_tmp_action)
 
@@ -2126,12 +3096,36 @@ class MainWindow(QMainWindow):
                     )
                     self.menu.addAction(copy_move_action)
 
+                    rename_action = QAction(
+                        QIcon.fromTheme("edit-rename"),
+                        "Rename…",
+                    )
+                    self.menu.addAction(rename_action)
+
+                    storage_action = QAction(
+                        QIcon.fromTheme("drive-harddisk"),
+                        "Change storage class…",
+                    )
+                    self.menu.addAction(storage_action)
+
+                    restore_action = QAction(
+                        QIcon.fromTheme("emblem-downloads"),
+                        "Restore from Glacier…",
+                    )
+                    self.menu.addAction(restore_action)
+
                     if m and getattr(m, "t", None) == FSObjectType.FILE:
                         tags_action = QAction(
                             QIcon.fromTheme("document-properties"),
                             "Edit tags…",
                         )
                         self.menu.addAction(tags_action)
+
+                        metadata_action = QAction(
+                            QIcon.fromTheme("document-properties"),
+                            "Edit metadata…",
+                        )
+                        self.menu.addAction(metadata_action)
 
                 m2, name2, key = self.name_by_first_ix(ixs)
                 if not key:
@@ -2165,18 +3159,34 @@ class MainWindow(QMainWindow):
                     self.upload()
                 if clk == create_folder_action:
                     self.new_folder()
+                if search_action and clk == search_action:
+                    self.open_search()
+                if versioning_action and clk == versioning_action:
+                    self.bucket_versioning_ui()
                 if clk == download_action:
                     self.download()
                 if clk == share_tmp_action:
-                    self.copy_presigned_link(key)
+                    self.share_link(key)
                 if clk == share_public_action:
                     self.make_public_and_copy(key)
                 if clk == delete_action:
                     self.delete()
                 if copy_move_action and clk == copy_move_action:
                     self.copy_move()
+                if rename_action and clk == rename_action:
+                    self.rename_selected()
+                if open_action and clk == open_action:
+                    self.open_or_preview(key)
+                if versions_action and clk == versions_action:
+                    self.show_versions(key)
                 if tags_action and clk == tags_action:
                     self.edit_tags(key)
+                if metadata_action and clk == metadata_action:
+                    self.edit_metadata(key)
+                if storage_action and clk == storage_action:
+                    self.change_storage_class_ui()
+                if restore_action and clk == restore_action:
+                    self.restore_from_glacier()
                 if clk == properties_selected_action:
                     self.properties(self.data_model, key)
 
@@ -2204,6 +3214,10 @@ class MainWindow(QMainWindow):
                     return True
                 if key == Qt.Key.Key_Delete:
                     self.on_toolbar_delete()
+                    return True
+                if key == Qt.Key.Key_F2:
+                    if not self.in_bucket_list_mode():
+                        self.rename_selected()
                     return True
                 if key == Qt.Key.Key_Backspace:
                     self.goUp()
@@ -2533,6 +3547,12 @@ class MainWindow(QMainWindow):
             self.navigate(select_up_entry=True)
             return
 
+        # File -> open the in-app preview
+        if t == FSObjectType.FILE:
+            key = (self.data_model.current_folder or "") + name
+            self.open_or_preview(key)
+            return
+
     def navigate(self, restore_name: str = None,
                  select_up_entry: bool = False, show_loading: bool = False,
                  force: bool = False):
@@ -2748,6 +3768,7 @@ class MainWindow(QMainWindow):
         verb = {
             "upload": "Upload", "download": "Download", "delete": "Delete",
             "copy": "Copy", "move": "Move",
+            "restore": "Restore", "set_storage_class": "Set storage class",
         }.get(method, method.capitalize())
         return f"{verb} {n} item(s)"
 
@@ -3159,13 +4180,69 @@ class MainWindow(QMainWindow):
         return f"s3://{self.data_model.bucket}/{prefix}"
 
     def update_s3_path_label(self):
-        full = self.current_s3_path()
-        self.s3PathEdit.setText(full)
-        self.s3PathEdit.setToolTip(full)
+        self.breadcrumb.set_location(
+            self.data_model.bucket or "",
+            self.data_model.current_folder or "",
+            self.in_bucket_list_mode(),
+        )
+        self.breadcrumb.setToolTip(self.current_s3_path())
+
+    def _breadcrumb_go(self, prefix: str):
+        if self.in_bucket_list_mode():
+            return
+        if self.transfers_active():
+            self.statusBar().showMessage(
+                "Transfers active — navigation is disabled", 2000
+            )
+            return
+        self.change_current_folder(prefix or "")
+        self.navigate(select_up_entry=(not prefix))
 
     def copy_s3_path_to_clipboard(self):
         self.clip.setText(self.current_s3_path())
         self.statusBar().showMessage("S3 path copied", 2000)
+
+    def _build_theme_button(self):
+        self.themeButton = QToolButton()
+        self.themeButton.setIcon(
+            QIcon.fromTheme(
+                "preferences-desktop-theme",
+                QIcon(os.path.join(self.current_dir, "icons", "theme_24px.svg")),
+            )
+        )
+        self.themeButton.setIconSize(QSize(26, 26))
+        self.themeButton.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.themeButton.setToolTip("Appearance / theme")
+        self.themeButton.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
+        )
+        menu = QMenu(self.themeButton)
+        self._theme_group = QActionGroup(self)
+        self._theme_group.setExclusive(True)
+        labels = {"system": "System default", "light": "Light", "dark": "Dark"}
+        self.settings.beginGroup("common")
+        saved = self.settings.value("theme", "system") or "system"
+        self.settings.endGroup()
+        if saved not in THEMES:
+            saved = "system"
+        for name in THEMES:
+            act = QAction(labels[name], self, checkable=True)
+            act.setData(name)
+            act.setChecked(name == saved)
+            act.triggered.connect(lambda _c=False, n=name: self._set_theme(n))
+            self._theme_group.addAction(act)
+            menu.addAction(act)
+        self.themeButton.setMenu(menu)
+        self.tBar.addWidget(self.themeButton)
+
+    def _set_theme(self, name: str):
+        applied = apply_theme(QApplication.instance(), name)
+        self.settings.beginGroup("common")
+        self.settings.setValue("theme", applied)
+        self.settings.endGroup()
+        for act in self._theme_group.actions():
+            act.setChecked(act.data() == applied)
+        self.statusBar().showMessage(f"Theme: {applied}", 2000)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -3259,7 +4336,10 @@ class MainWindow(QMainWindow):
         self.actCopyS3Path.triggered.connect(self.copy_s3_path_to_clipboard)
 
         self.btnQueuePanel = QAction(
-            QIcon.fromTheme("format-justify-fill"),
+            QIcon.fromTheme(
+                "format-justify-fill",
+                QIcon(os.path.join(self.current_dir, "icons", "queue_24px.svg")),
+            ),
             "Transfer Queue (Ctrl+Q)",
             self,
         )
@@ -3336,16 +4416,12 @@ class MainWindow(QMainWindow):
         self.settings.setValue("size", self.size())
         self.settings.endGroup()
 
-    def copy_presigned_link(self, key: str):
-        """Copy a temporary presigned URL for the selected object."""
-        if not key or key.rstrip("/") == UP_ENTRY_LABEL:
+    def share_link(self, key: str):
+        """Open the presigned-link dialog (download/upload, configurable expiry)."""
+        if not key or key.endswith("/") or key.rstrip("/") == UP_ENTRY_LABEL:
+            self.statusBar().showMessage("Share links are for files only", 2000)
             return
-        try:
-            url = self.data_model.presigned_get_url(key, 3600)  # 1 hour
-            QtWidgets.QApplication.clipboard().setText(url)
-            self.statusBar().showMessage("Share link copied", 3000)
-        except Exception as exc:
-            QMessageBox.warning(self, "Share link", str(exc))
+        PresignedLinkDialog(self, self.data_model, key).exec()
 
     def make_public_and_copy(self, key: str):
         """Try to make object public-read and copy the direct URL anyway."""
@@ -3372,12 +4448,14 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Public URL", str(exc))
 
-    def copy_move(self):
-        if self.in_bucket_list_mode():
-            return
-
+    def _collect_selected_targets(self):
+        """Return [(name, key, is_folder)] for the current selection, skipping
+        the [..] up-entry. Folder keys carry a trailing '/'."""
         items = []
-        for ix in self.listview.selectionModel().selectedIndexes():
+        sm = self.listview.selectionModel()
+        if sm is None:
+            return items
+        for ix in sm.selectedIndexes():
             if ix.column() != 0:
                 continue
             primary_item, name, t = self.get_row_primary_item(ix)
@@ -3388,7 +4466,13 @@ class MainWindow(QMainWindow):
             if is_folder:
                 key += "/"
             items.append((name, key, is_folder))
+        return items
 
+    def copy_move(self):
+        if self.in_bucket_list_mode():
+            return
+
+        items = self._collect_selected_targets()
         if not items:
             return
 
@@ -3436,3 +4520,188 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Tags are only supported for files", 2000)
             return
         TagsDialog(self, self.data_model, key).exec()
+
+    def open_or_preview(self, key: str):
+        """Open the in-app preview for a single file object."""
+        if not key or key.endswith("/") or key == UP_ENTRY_LABEL:
+            return
+        PreviewDialog(self, self.data_model, key).exec()
+
+    def show_versions(self, key: str):
+        """Open the object-version manager for a single file object."""
+        if not key or key.endswith("/") or key == UP_ENTRY_LABEL:
+            self.statusBar().showMessage("Versions are only available for files", 2000)
+            return
+        VersionsDialog(self, self, self.data_model, key).exec()
+
+    def restore_from_glacier(self):
+        """Initiate a Glacier / Deep Archive restore for the selection
+        (files and/or whole folders), run through the transfer queue."""
+        if self.in_bucket_list_mode():
+            return
+        items = self._collect_selected_targets()
+        if not items:
+            self.statusBar().showMessage("Select object(s) to restore", 2000)
+            return
+        days, ok = QInputDialog.getInt(
+            self, "Restore from Glacier",
+            "Keep restored copy for (days):", 7, 1, 3650,
+        )
+        if not ok:
+            return
+        tiers = ["Standard", "Bulk", "Expedited"]
+        tier, ok = QInputDialog.getItem(
+            self, "Restore from Glacier", "Retrieval tier:", tiers, 0, False
+        )
+        if not ok:
+            return
+        job = [(key, is_folder, days, tier) for _n, key, is_folder in items]
+        self.assign_thread_operation("restore", job, need_refresh=False)
+        self.statusBar().showMessage(
+            f"Restoring {len(job)} target(s) ({tier}, {days}d)…", 4000
+        )
+
+    def change_storage_class_ui(self):
+        """Change the storage class of the selection (files and/or whole
+        folders), run through the transfer queue."""
+        if self.in_bucket_list_mode():
+            return
+        items = self._collect_selected_targets()
+        if not items:
+            self.statusBar().showMessage("Select object(s) to change", 2000)
+            return
+        classes = list(self.data_model.STORAGE_CLASSES)
+        # Preselect the current class of the first concrete file, if any.
+        current = "STANDARD"
+        first_file = next((k for _n, k, isf in items if not isf), None)
+        if first_file:
+            try:
+                resp = self.data_model.object_properties(first_file)
+                if isinstance(resp, dict):
+                    current = resp.get("StorageClass") or "STANDARD"
+            except Exception:
+                pass
+        try:
+            cur_idx = classes.index(current)
+        except ValueError:
+            cur_idx = 0
+        cls, ok = QInputDialog.getItem(
+            self, "Change storage class", "Storage class:", classes, cur_idx, False
+        )
+        if not ok:
+            return
+        job = [(key, is_folder, cls) for _n, key, is_folder in items]
+        self.assign_thread_operation("set_storage_class", job, need_refresh=False)
+        self.statusBar().showMessage(
+            f"Setting storage class to {cls} on {len(job)} target(s)…", 4000
+        )
+
+    def edit_metadata(self, key: str):
+        """Edit an object's Content-Type / headers / custom metadata."""
+        if not key or key.endswith("/") or key == UP_ENTRY_LABEL:
+            self.statusBar().showMessage("Metadata editing is for files only", 2000)
+            return
+        MetadataDialog(self, self.data_model, key).exec()
+
+    def open_search(self):
+        """Recursively search the current bucket/prefix by key substring."""
+        if self.in_bucket_list_mode():
+            self.statusBar().showMessage("Open a bucket to search", 2000)
+            return
+        SearchDialog(self, self, self.data_model,
+                     self.data_model.current_folder or "").exec()
+
+    def goto_key(self, key: str):
+        """Navigate to the folder containing 'key' and select it."""
+        if self.in_bucket_list_mode() or not key:
+            return
+        k = key.rstrip("/")
+        if "/" in k:
+            parent, name = k.rsplit("/", 1)
+            parent += "/"
+        else:
+            parent, name = "", k
+        self.change_current_folder(parent)
+        self.navigate(restore_name=name)
+
+    def bucket_versioning_ui(self):
+        """Enable or suspend versioning on the current bucket."""
+        if self.in_bucket_list_mode() or not self.data_model.bucket:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            status = self.data_model.get_bucket_versioning_status()
+        except Exception:
+            status = ""
+        QApplication.restoreOverrideCursor()
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Bucket versioning")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(
+            f"Versioning for '{self.data_model.bucket}' is currently: "
+            f"{status or 'not enabled'}."
+        )
+        enable_btn = box.addButton("Enable", QMessageBox.ButtonRole.AcceptRole)
+        suspend_btn = box.addButton("Suspend", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is enable_btn:
+            target = "Enabled"
+        elif clicked is suspend_btn:
+            target = "Suspended"
+        else:
+            return
+        try:
+            self.data_model.set_bucket_versioning(target, log_fn=self.log)
+        except Exception as exc:
+            QMessageBox.warning(self, "Bucket versioning", f"Failed:\n{exc}")
+            return
+        self.log(f"bucket versioning {target.lower()} for {self.data_model.bucket}")
+        self.statusBar().showMessage(f"Versioning {target.lower()}", 4000)
+
+    def rename_selected(self):
+        """Rename the first selected file or folder in place (copy + delete)."""
+        if self.in_bucket_list_mode():
+            return
+        sm = self.listview.selectionModel()
+        ixs = sm.selectedIndexes() if sm is not None else []
+
+        target = None
+        for ix in ixs:
+            if ix.column() != 0:
+                continue
+            primary_item, name, t = self.get_row_primary_item(ix)
+            if primary_item is None or name == UP_ENTRY_LABEL:
+                continue
+            target = (name, t)
+            break
+        if target is None:
+            self.statusBar().showMessage("Select a file or folder to rename", 2000)
+            return
+
+        old_name, t = target
+        is_folder = (t == FSObjectType.FOLDER)
+        new_name, ok = QInputDialog.getText(
+            self, "Rename", "New name:", text=old_name
+        )
+        if not ok:
+            return
+        new_name = (new_name or "").strip().strip("/")
+        if not new_name or new_name == old_name:
+            return
+        if "/" in new_name:
+            QMessageBox.warning(self, "Rename", "Name cannot contain '/'.")
+            return
+
+        cur = self.data_model.current_folder or ""
+        if is_folder:
+            src_key = cur + old_name + "/"
+            dst_key = cur + new_name + "/"
+        else:
+            src_key = cur + old_name
+            dst_key = cur + new_name
+
+        self.assign_thread_operation("move", [(src_key, dst_key, is_folder)])
+        self.statusBar().showMessage(f"Renaming to '{new_name}'…", 3000)

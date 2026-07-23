@@ -3,6 +3,8 @@ from PyQt6.QtCore import *
 from PyQt6.QtWidgets import *
 from PyQt6.QtGui import *
 
+from utils import center_on_screen
+
 
 class PropertiesWindow(QDialog):
     def __init__(self, *args, **kwargs):
@@ -10,11 +12,7 @@ class PropertiesWindow(QDialog):
         super().__init__(*args, **kwargs)
         model, key = settings
         self.setWindowTitle("Object properties")
-        self.setGeometry(140, 140, 600, 200)
-        qtRectangle = self.frameGeometry()
-        centerPoint = QApplication.primaryScreen().availableGeometry().center()
-        qtRectangle.moveCenter(centerPoint)
-        self.move(qtRectangle.topLeft())
+        self.resize(600, 200)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.key = key
         self.model = model
@@ -23,6 +21,8 @@ class PropertiesWindow(QDialog):
         self.keyName = QLabel()
         self.size = QLabel()
         self.eTag = QLabel()
+        self.storageClass = QLabel()
+        self.restoreStatus = QLabel()
         self.publicUrl = QLineEdit()
         self.publicUrl.setReadOnly(True)
 
@@ -39,6 +39,8 @@ class PropertiesWindow(QDialog):
         display_key = key if key else "<bucket root>"
         display_size = "N/A"
         display_etag = ""
+        display_storage_class = ""
+        display_restore = ""
         display_public_url = ""
 
         is_folder = bool(key) and key.endswith("/")
@@ -59,6 +61,17 @@ class PropertiesWindow(QDialog):
                 else:
                     try:
                         display_etag = resp.get("ETag", "").replace('"', "")
+                    except Exception:
+                        pass
+                    # StorageClass is omitted by S3 for the default STANDARD tier.
+                    try:
+                        display_storage_class = resp.get("StorageClass") or "STANDARD"
+                    except Exception:
+                        pass
+                    try:
+                        parser = getattr(self.model, "parse_restore_status", None)
+                        if parser is not None:
+                            display_restore = parser(resp.get("Restore"))
                     except Exception:
                         pass
             except botocore.exceptions.ClientError:
@@ -99,7 +112,13 @@ class PropertiesWindow(QDialog):
         self.keyName.setText(display_key)
         self.size.setText(display_size)
         self.eTag.setText(display_etag)
+        self.storageClass.setText(display_storage_class)
+        self.restoreStatus.setText(display_restore or "—")
         self.publicUrl.setText(display_public_url)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        center_on_screen(self)
 
     def exit(self):
         self.close()
@@ -112,5 +131,7 @@ class PropertiesWindow(QDialog):
         layout.addRow(QLabel("Key / Bucket"), self.keyName)
         layout.addRow(QLabel("Size"), self.size)
         layout.addRow(QLabel("ETag"), self.eTag)
+        layout.addRow(QLabel("Storage class"), self.storageClass)
+        layout.addRow(QLabel("Restore"), self.restoreStatus)
         layout.addRow(QLabel("Public URL"), self.publicUrl)
         self.formGroupBox.setLayout(layout)

@@ -3,7 +3,7 @@ from PyQt6.QtCore import *
 from PyQt6.QtWidgets import *
 from PyQt6.QtGui import *
 
-from utils import str_to_bool
+from utils import str_to_bool, center_on_screen
 
 
 class SettingsWindow(QDialog):
@@ -21,11 +21,7 @@ class SettingsWindow(QDialog):
             use_path,
         ) = settings
         self.setWindowTitle("Profile settings")
-        self.setGeometry(140, 140, 600, 250)
-        qtRectangle = self.frameGeometry()
-        centerPoint = QApplication.primaryScreen().availableGeometry().center()
-        qtRectangle.moveCenter(centerPoint)
-        self.move(qtRectangle.topLeft())
+        self.resize(600, 250)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
 
         self.formGroupBox = QGroupBox("Connection settings")
@@ -66,6 +62,10 @@ class SettingsWindow(QDialog):
         self.secretKeyEdit.setEchoMode(QLineEdit.EchoMode.Password)
         self.noSslCheck.setChecked(str_to_bool(no_ssl_check))
         self.usePath.setChecked(str_to_bool(use_path))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        center_on_screen(self)
 
     @QtCore.pyqtSlot()
     def on_text_changed(self):

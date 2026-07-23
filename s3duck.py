@@ -24,7 +24,8 @@ from PyQt6.QtWidgets import (
 from model import Model as DataModel
 from settings import SettingsWindow
 from main_window import MainWindow
-from utils import str_to_bool
+from utils import str_to_bool, center_on_screen
+from theme import apply_theme
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -116,7 +117,7 @@ class Profiles(QDialog):
         self.main_settings = None
         vbox.addLayout(hbox)
         self.setLayout(vbox)
-        self.setGeometry(800, 400, 350, 250)
+        self.resize(350, 250)
         self.setWindowTitle("Profiles")
         self.listWidget.currentItemChanged.connect(self.on_elements_changed)
         self.listWidget.itemSelectionChanged.connect(self.on_elements_changed)
@@ -128,6 +129,13 @@ class Profiles(QDialog):
             self.listWidget.setCurrentIndex(index)
         self.listWidget.doubleClicked.connect(self.onStart)
         self.show()
+
+    def showEvent(self, event):
+        # Center on the active screen once the frame geometry is known
+        # (multi-monitor aware). Done here rather than in __init__ so window
+        # decorations are accounted for.
+        super().showEvent(event)
+        center_on_screen(self)
 
     def select_last(self):
         index = self.listWidget.model().index(
@@ -509,6 +517,14 @@ def main():
     app.setFont(font)
     icon = QIcon(os.path.join(get_current_dir(), "resources", "ducky.ico"))
     app.setWindowIcon(icon)
+
+    # Apply the saved theme before any window is shown.
+    _settings = QSettings("s3duck", "s3duck")
+    _settings.beginGroup("common")
+    _saved_theme = _settings.value("theme", "system") or "system"
+    _settings.endGroup()
+    apply_theme(app, _saved_theme)
+
     profiles = Profiles()
     sys.exit(app.exec())
 

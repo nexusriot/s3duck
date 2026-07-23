@@ -14,11 +14,20 @@ Simple cross-platform GUI client for S3-compatible object storage (AWS S3, MinIO
 - **Object browser** — navigate prefixes as a virtual folder tree with sorting by name, size, and modified date
 - **Upload** — single/multiple files via dialog or drag-and-drop from the OS file manager
 - **Download** — single files or entire folder prefixes, recreating the directory tree locally
-- **Delete** — objects and folder prefixes (recursive)
+- **Delete** — objects and folder prefixes (recursive); recursive bucket delete also purges noncurrent versions and delete markers
+- **Rename** — in-place rename of a file or folder (server-side copy + delete), on the context menu or `F2`
 - **Create folder** — creates an S3 prefix placeholder
-- **Object properties** — key, size, ETag, and public URL
-- **Presigned URL** — copy a temporary share link (1 hour expiry)
+- **Preview / open** — double-click a file to preview images and text in-app, or open any object with the OS default application
+- **Recursive search** — search a whole bucket/prefix by key substring (`Ctrl+Shift+F` or "Search here…"), with jump-to-location on any result
+- **Object versioning** — enable/suspend bucket versioning from the UI; list every version and delete marker of an object, download a specific version, promote an older version to current, or delete individual versions
+- **Storage class** — view an object's storage class and change it (Standard, IA, Intelligent-Tiering, Glacier, Deep Archive, …); works on a multi-selection or whole folders and runs through the transfer queue
+- **Glacier restore** — initiate a restore of archived objects (single, multi-select, or whole prefixes) with a chosen retrieval tier and retention window, queued like other transfers; restore status shown in properties
+- **Edit metadata** — set `Content-Type`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, and custom `x-amz-meta-*` user metadata
+- **Object properties** — key, size, ETag, storage class, restore status, and public URL
+- **Presigned links** — generate a temporary download (GET) or **upload (PUT)** link with a configurable expiry (up to the 7-day S3 maximum)
 - **Make public** — set `public-read` ACL and copy direct URL
+- **Clickable breadcrumb** — jump straight to any parent prefix, the bucket root, or the bucket list from the path bar
+- **Theme** — Light, Dark, or system-default appearance, remembered across sessions
 - **Bucket usage stats** — total size, breakdown by file category (Documents / Media / Other) with a pie chart, and top folder groups
 - **Runtime profile switch** — switch S3 accounts without restarting the app
 - **Automatic region/endpoint detection** — when an operation fails due to a region or endpoint mismatch the app probes the server for the correct region, rebuilds the client, and retries transparently; applies to bucket open, listing, upload, download, and delete
@@ -98,7 +107,8 @@ s3duck/
 ├── settings.py          Profile create/edit dialog
 ├── properties_window.py Object properties dialog
 ├── profile_switcher.py  Runtime profile-switch dialog
-├── utils.py             Shared helpers (str_to_bool)
+├── theme.py             Light / Dark / system palette switching
+├── utils.py             Shared helpers (str_to_bool, center_on_screen)
 │
 ├── icons/               24 px SVG icons for toolbar and context menus
 ├── resources/           App icon (ico/icns/png), screenshots, .desktop file
@@ -151,8 +161,15 @@ s3duck/
 | `UsageWorker` | main_window.py | Off-thread bucket size aggregation by file category |
 | `PieWidget` | main_window.py | Custom `QPainter` pie chart for usage breakdown |
 | `Model` | model.py | All boto3 calls; `_try_bind_bucket` probes addressing styles; `rebind_bucket` auto-corrects region mid-session |
+| `PreviewDialog` | main_window.py | In-app image/text preview; "open with default app" via a temp download |
+| `VersionsDialog` | main_window.py | Per-object version manager (list / download / make-current / delete) |
+| `MetadataDialog` | main_window.py | Edit Content-Type / caching headers and custom user metadata |
+| `SearchDialog` | main_window.py | Recursive key search over a bucket/prefix with jump-to-location |
+| `PresignedLinkDialog` | main_window.py | Generate GET/PUT presigned links with a configurable expiry |
+| `Breadcrumb` | main_window.py | Clickable path bar for jumping to parent prefixes |
+| `apply_theme` | theme.py | Light / Dark / system palette switching |
 | `SettingsWindow` | settings.py | Profile form (name, URL, region, bucket, keys, flags) |
-| `PropertiesWindow` | properties_window.py | Object metadata: key, size, ETag, public URL |
+| `PropertiesWindow` | properties_window.py | Object metadata: key, size, ETag, storage class, restore status, public URL |
 | `ProfileSwitchWindow` | profile_switcher.py | Runtime profile switch without app restart |
 
 ### Data flow
