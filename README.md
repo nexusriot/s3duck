@@ -10,26 +10,40 @@ Simple cross-platform GUI client for S3-compatible object storage (AWS S3, MinIO
 ## Features
 
 - **Multi-profile management** — create, edit, copy, and delete named connection profiles; credentials are encrypted at rest using Fernet symmetric encryption
-- **Bucket browser** — list, create, and delete buckets; recursive delete with confirmation
+- **Temporary credentials** — session-token support for STS / SSO / assumed-role / MFA keys, with one-click import of any profile from `~/.aws/credentials`
+- **Bucket browser** — list, create, and delete buckets; recursive delete runs through the transfer queue (progress + cancel, UI stays responsive)
+- **Empty bucket** — delete every object, version, delete marker and in-flight upload while keeping the bucket, queued with progress and cancel
+- **Incomplete uploads** — find and abort in-flight multipart uploads that are invisible to normal listings but keep their parts billed; shows how much space they waste and can abort everything older than N days
 - **Object browser** — navigate prefixes as a virtual folder tree with sorting by name, size, and modified date
-- **Upload** — single/multiple files via dialog or drag-and-drop from the OS file manager
+- **Upload** — single/multiple files via dialog or drag-and-drop from the OS file manager; whole directory trees via "Upload folder" (`Ctrl+Shift+U`) or drag-and-drop
 - **Download** — single files or entire folder prefixes, recreating the directory tree locally
-- **Delete** — objects and folder prefixes (recursive); recursive bucket delete also purges noncurrent versions and delete markers
+- **Transfer settings** — multipart connections per transfer plus the storage class and server-side encryption (SSE-S3 / SSE-KMS) applied to uploads, persisted across sessions
+- **Overwrite protection** — downloads, copies, moves and renames detect existing destinations and offer Skip / Overwrite / Cancel
+- **Sync with a local folder** (`Ctrl+E`) — compare a directory against a prefix in either direction, review a dry-run plan (upload / download / delete / skip with a reason per file), then run it through the queue; optionally delete extras at the destination
+- **Transfer queue** — queued jobs with per-row progress, cancel, and retry for failed or cancelled entries
+- **Completion notifications** — a desktop notification when the queue drains while the window is in the background (toggle in Transfer settings)
+- **Delete** — objects and folder prefixes (recursive, batched 1000 keys per call); confirmation shows the scanned object count and total size; recursive bucket delete also purges noncurrent versions, delete markers and in-flight uploads
+- **Copy / Move** — server-side copy or move of a multi-selection, within a bucket or **across buckets** (same endpoint/region)
 - **Rename** — in-place rename of a file or folder (server-side copy + delete), on the context menu or `F2`
+- **Bulk rename** (`Shift+F2`) — rename a whole selection by find-and-replace (optionally regex, with backreferences) or a `{name}/{ext}/{n}` numbering template, with a live preview and duplicate/invalid-name checks
 - **Create folder** — creates an S3 prefix placeholder
 - **Preview / open** — double-click a file to preview images and text in-app, or open any object with the OS default application
-- **Recursive search** — search a whole bucket/prefix by key substring (`Ctrl+Shift+F` or "Search here…"), with jump-to-location on any result
+- **Recursive search** — search a whole bucket/prefix by key substring or regular expression (`Ctrl+Shift+F` or "Search here…"), filtered by size range, extension and modified date, with jump-to-location on any result
 - **Object versioning** — enable/suspend bucket versioning from the UI; list every version and delete marker of an object, download a specific version, promote an older version to current, or delete individual versions
 - **Storage class** — view an object's storage class and change it (Standard, IA, Intelligent-Tiering, Glacier, Deep Archive, …); works on a multi-selection or whole folders and runs through the transfer queue
 - **Glacier restore** — initiate a restore of archived objects (single, multi-select, or whole prefixes) with a chosen retrieval tier and retention window, queued like other transfers; restore status shown in properties
 - **Edit metadata** — set `Content-Type`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, and custom `x-amz-meta-*` user metadata
 - **Object properties** — key, size, ETag, storage class, restore status, and public URL
 - **Presigned links** — generate a temporary download (GET) or **upload (PUT)** link with a configurable expiry (up to the 7-day S3 maximum)
-- **Make public** — set `public-read` ACL and copy direct URL
+- **Make public** — set `public-read` ACL and copy direct URL; when the ACL is refused, Block Public Access and Object Ownership settings are reported as the reason
 - **Clickable breadcrumb** — jump straight to any parent prefix, the bucket root, or the bucket list from the path bar
+- **Go to location** (`Ctrl+L`) — paste an `s3://bucket/prefix` (or a bare prefix) and jump straight there, across buckets
+- **Remembered layout** — splitter position, column widths and sort order persist between sessions
+- **Listing summary** — folder/file counts and total size of the current listing in the status bar
 - **Theme** — Light, Dark, or system-default appearance, remembered across sessions
 - **Bucket usage stats** — total size, breakdown by file category (Documents / Media / Other) with a pie chart, and top folder groups
 - **Runtime profile switch** — switch S3 accounts without restarting the app
+- **Cached bucket bindings** — the proven endpoint/region/addressing combination per bucket is remembered, so reopening an off-region bucket skips the probe round trips
 - **Automatic region/endpoint detection** — when an operation fails due to a region or endpoint mismatch the app probes the server for the correct region, rebuilds the client, and retries transparently; applies to bucket open, listing, upload, download, and delete
 - **S3-compatible storage** — path-style addressing option for MinIO and similar backends
 - **Cross-platform** — Linux, macOS, Windows
@@ -108,7 +122,7 @@ s3duck/
 ├── properties_window.py Object properties dialog
 ├── profile_switcher.py  Runtime profile-switch dialog
 ├── theme.py             Light / Dark / system palette switching
-├── utils.py             Shared helpers (str_to_bool, center_on_screen)
+├── utils.py             Shared helpers (str_to_bool, center_on_screen, ~/.aws parsing, local tree scan)
 │
 ├── icons/               24 px SVG icons for toolbar and context menus
 ├── resources/           App icon (ico/icns/png), screenshots, .desktop file
@@ -162,7 +176,12 @@ s3duck/
 | `PieWidget` | main_window.py | Custom `QPainter` pie chart for usage breakdown |
 | `Model` | model.py | All boto3 calls; `_try_bind_bucket` probes addressing styles; `rebind_bucket` auto-corrects region mid-session |
 | `PreviewDialog` | main_window.py | In-app image/text preview; "open with default app" via a temp download |
-| `VersionsDialog` | main_window.py | Per-object version manager (list / download / make-current / delete) |
+| `VersionsDialog` | main_window.py | Per-object version manager (list / download / make-current / delete); lists off-thread |
+| `IncompleteUploadsDialog` | main_window.py | Find and abort orphaned multipart uploads still holding billed parts |
+| `TransferSettingsDialog` | main_window.py | Concurrency plus upload storage class / encryption |
+| `OverwriteDialog` | main_window.py | Skip / Overwrite prompt for existing destinations |
+| `BulkRenameDialog` | main_window.py | Find-replace / template rename with live preview |
+| `SyncDialog` | main_window.py | Local↔remote comparison, dry-run plan, queued execution |
 | `MetadataDialog` | main_window.py | Edit Content-Type / caching headers and custom user metadata |
 | `SearchDialog` | main_window.py | Recursive key search over a bucket/prefix with jump-to-location |
 | `PresignedLinkDialog` | main_window.py | Generate GET/PUT presigned links with a configurable expiry |

@@ -1,6 +1,11 @@
 #!/bin/env bash
 
-version=0.9.11
+# Single source of truth: __VERSION__ in main_window.py. Hardcoding it here
+# let the package version drift behind the app version.
+version=$(sed -n 's/^__VERSION__ = "\(.*\)"$/\1/p' main_window.py)
+if [ -z "$version" ]; then
+  echo "cannot read __VERSION__ from main_window.py"; exit 1
+fi
 
 # Detect or accept architecture
 if [ -n "$1" ]; then

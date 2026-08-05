@@ -15,7 +15,6 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QApplication,
     QVBoxLayout,
-    QSplitter,
     QMessageBox,
     QDialog,
     QMenu,
@@ -52,6 +51,16 @@ class Crypto:
         return self.fernet.decrypt(val).decode()
 
 
+def decrypt_optional(crypto, value) -> str:
+    """Decrypt a possibly absent/legacy field without failing the whole load."""
+    if not value:
+        return ""
+    try:
+        return crypto.decrypt_cred(value)
+    except Exception:
+        return ""
+
+
 class SettingsItem:
     def __init__(
         self,
@@ -63,6 +72,7 @@ class SettingsItem:
         enc_secret_key,
         no_ssl_check,
         use_path,
+        enc_session_token="",
     ):
         self.name = name
         self.url = url
@@ -72,6 +82,7 @@ class SettingsItem:
         self.enc_secret_key = enc_secret_key
         self.no_ssl_check = no_ssl_check
         self.use_path = use_path
+        self.enc_session_token = enc_session_token
 
 
 def get_current_dir():
@@ -94,7 +105,6 @@ class Profiles(QDialog):
 
         self.listWidget = QListWidget(self)
 
-        self.splitter = QSplitter()
         self.btnRun = QPushButton("Run", self)
         self.btnAdd = QPushButton("Add", self)
         self.btnEdit = QPushButton("Edit", self)
@@ -173,6 +183,7 @@ class Profiles(QDialog):
             item.bucket_name,
             str_to_bool(item.no_ssl_check),
             str_to_bool(item.use_path),
+            session_token=decrypt_optional(crypto, item.enc_session_token),
         )
         ok, reason = dm.check_profile()
         msgBox = QMessageBox()
@@ -191,9 +202,10 @@ class Profiles(QDialog):
             event.type() == QtCore.QEvent.Type.ContextMenu
             and source is self.listWidget
         ):
-            copy_profile_action = (
-                delete_action
-            ) = edit_profile_action = check_action = QObject()
+            copy_profile_action = None
+            delete_action = None
+            edit_profile_action = None
+            check_action = None
             menu = QMenu()
             ixs = self.listWidget.selectedIndexes()
             add_profile_action = QAction(
@@ -261,6 +273,8 @@ class Profiles(QDialog):
                 menu.addAction(delete_action)
 
             clk = menu.exec(event.globalPos())
+            if clk is None:
+                return super().eventFilter(source, event)
             if clk == copy_profile_action:
                 self.copy_profile()
             if clk == edit_profile_action:
@@ -275,8 +289,6 @@ class Profiles(QDialog):
         return super().eventFilter(source, event)
 
     def load(self):
-        self.settings.beginGroup("common")
-        self.settings.endGroup()
         self.settings.beginGroup("profiles")
         for index in range(self.settings.beginReadArray("profiles")):
             self.settings.setArrayIndex(index)
@@ -290,6 +302,7 @@ class Profiles(QDialog):
                     self.settings.value("secret_key"),
                     self.settings.value("no_ssl_check", "false"),
                     self.settings.value("use_path", "false"),
+                    self.settings.value("session_token", ""),
                 )
             )
         self.settings.endArray()
@@ -308,6 +321,7 @@ class Profiles(QDialog):
 
         acc_key = crypto.decrypt_cred(item.enc_access_key)
         secret_key = crypto.decrypt_cred(item.enc_secret_key)
+        session_token = decrypt_optional(crypto, item.enc_session_token)
         no_ssl_check = str_to_bool(item.no_ssl_check)
         use_path = str_to_bool(item.use_path)
 
@@ -320,6 +334,7 @@ class Profiles(QDialog):
             "",  # start with no active bucket -> we'll show bucket list
             no_ssl_check,
             use_path,
+            session_token=session_token,
         )
 
         # Sanity check creds: try to list buckets
@@ -344,6 +359,7 @@ class Profiles(QDialog):
                 secret_key,
                 no_ssl_check,
                 use_path,
+                session_token,
             )
             self.main_settings = settings
             self.main_window = MainWindow(settings=self.main_settings)
@@ -373,6 +389,7 @@ class Profiles(QDialog):
             self.settings.setValue("secret_key", item.enc_secret_key)
             self.settings.setValue("no_ssl_check", item.no_ssl_check)
             self.settings.setValue("use_path", item.use_path)
+            self.settings.setValue("session_token", item.enc_session_token)
         self.settings.endArray()
         self.settings.endGroup()
 
@@ -402,10 +419,12 @@ class Profiles(QDialog):
                 secret_key,
                 no_ssl_check,
                 use_path,
+                session_token,
             ) = value
             crypto = Crypto(key)
             enc_access_key = crypto.encrypt(access_key)
             enc_secret_key = crypto.encrypt(secret_key)
+            enc_session_token = crypto.encrypt(session_token or "")
             self.items.append(
                 SettingsItem(
                     name,
@@ -416,6 +435,7 @@ class Profiles(QDialog):
                     enc_secret_key,
                     no_ssl_check,
                     use_path,
+                    enc_session_token,
                 )
             )
             self.save_settings()
@@ -441,6 +461,7 @@ class Profiles(QDialog):
             crypto.decrypt_cred(item.enc_secret_key),
             item.no_ssl_check,
             item.use_path,
+            decrypt_optional(crypto, item.enc_session_token),
         )
         settings = SettingsWindow(self, settings=settings)
         value = settings.exec()
@@ -454,9 +475,11 @@ class Profiles(QDialog):
                 secret_key,
                 no_ssl_check,
                 use_path,
+                session_token,
             ) = value
             enc_access_key = crypto.encrypt(access_key)
             enc_secret_key = crypto.encrypt(secret_key)
+            enc_session_token = crypto.encrypt(session_token or "")
             self.items[elem] = SettingsItem(
                 name,
                 url,
@@ -466,6 +489,7 @@ class Profiles(QDialog):
                 enc_secret_key,
                 no_ssl_check,
                 use_path,
+                enc_session_token,
             )
             self.save_settings()
             self.populate_list()

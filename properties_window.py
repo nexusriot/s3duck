@@ -1,9 +1,26 @@
-import botocore.exceptions
 from PyQt6.QtCore import *
 from PyQt6.QtWidgets import *
 from PyQt6.QtGui import *
 
 from utils import center_on_screen
+
+
+class _SizeWorker(QObject):
+    """Sums a prefix's size off the main thread (a recursive listing)."""
+
+    done = pyqtSignal(object, object)  # (size_or_None, exception_or_None)
+
+    def __init__(self, model, key):
+        super().__init__()
+        self._model = model
+        self._key = key
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            self.done.emit(self._model.get_size(self._key), None)
+        except Exception as exc:
+            self.done.emit(None, exc)
 
 
 class PropertiesWindow(QDialog):
@@ -16,6 +33,8 @@ class PropertiesWindow(QDialog):
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.key = key
         self.model = model
+        self._size_thread = None
+        self._size_worker = None
 
         self.formGroupBox = QGroupBox("Properties")
         self.keyName = QLabel()
@@ -45,69 +64,38 @@ class PropertiesWindow(QDialog):
 
         is_folder = bool(key) and key.endswith("/")
 
-        # ETag + bucket-root detection come from head_object, which only
-        # exists for real objects. Folders (prefixes) and implicit folders
-        # have no object to HEAD, so don't let a 404 there abort the rest.
-        is_bucket_root = False
+        # ETag/StorageClass/Restore come from head_object, which only exists
+        # for real objects. Folders (prefixes) and implicit folders have no
+        # object to HEAD, so don't let a 404 there abort the rest.
         if not is_folder:
             try:
                 resp = self.model.object_properties(key)
-                # resp is either:
-                #   - dict from bucket_properties()
-                #   - real head_object() response (boto3 dict-like)
-                is_bucket_root = isinstance(resp, dict) and resp.get("IsBucketRoot")
-                if is_bucket_root:
-                    display_key = f"s3://{resp.get('Bucket','')}/"
-                else:
-                    try:
-                        display_etag = resp.get("ETag", "").replace('"', "")
-                    except Exception:
-                        pass
-                    # StorageClass is omitted by S3 for the default STANDARD tier.
-                    try:
-                        display_storage_class = resp.get("StorageClass") or "STANDARD"
-                    except Exception:
-                        pass
-                    try:
-                        parser = getattr(self.model, "parse_restore_status", None)
-                        if parser is not None:
-                            display_restore = parser(resp.get("Restore"))
-                    except Exception:
-                        pass
-            except botocore.exceptions.ClientError:
-                pass
+                display_etag = (resp.get("ETag") or "").replace('"', "")
+                # StorageClass is omitted by S3 for the default STANDARD tier.
+                display_storage_class = resp.get("StorageClass") or "STANDARD"
+                display_restore = self.model.parse_restore_status(
+                    resp.get("Restore"))
+                # head_object already carries the exact byte count, so a single
+                # object needs no extra listing call at all.
+                content_length = resp.get("ContentLength")
+                if content_length is not None:
+                    display_size = f"{int(content_length)} Bytes"
             except Exception:
                 pass
-
-        # Size: always computable from get_size (handles objects, folders and
-        # implicit prefixes), independent of whether head_object succeeded.
-        if not is_bucket_root:
-            try:
-                display_size = str(self.model.get_size(key)) + " Bytes"
-            except Exception:
-                display_size = "N/A"
 
         try:
-            if is_bucket_root or not key:
+            if not key:
                 # bucket root URL — respect virtual-host endpoints
                 ep = self.model.endpoint_url.rstrip("/")
                 b = (self.model.bucket or "").strip("/")
-                if b and hasattr(self.model, "_endpoint_has_bucket") \
-                        and self.model._endpoint_has_bucket(ep, b):
+                if b and self.model._endpoint_has_bucket(ep, b):
                     display_public_url = f"{ep}/"
                 else:
                     display_public_url = f"{ep}/{b}/" if b else ep
             else:
-                # object/folder URL (preferred: use helper if available)
-                if hasattr(self.model, "direct_object_url"):
-                    display_public_url = self.model.direct_object_url(key)
-                else:
-                    # fallback: path-style
-                    ep = self.model.endpoint_url.rstrip("/")
-                    display_public_url = f"{ep}/{self.model.bucket}/{key}"
+                display_public_url = self.model.direct_object_url(key)
         except Exception:
             pass
-
 
         self.keyName.setText(display_key)
         self.size.setText(display_size)
@@ -115,6 +103,50 @@ class PropertiesWindow(QDialog):
         self.storageClass.setText(display_storage_class)
         self.restoreStatus.setText(display_restore or "—")
         self.publicUrl.setText(display_public_url)
+
+        # A prefix has no single size to HEAD, so it needs a recursive listing.
+        # That can span many pages, so never run it on the main thread.
+        if display_size == "N/A":
+            self._start_size_calc()
+
+    def _start_size_calc(self):
+        self.size.setText("Calculating…")
+        try:
+            worker_model = self.model.clone_for_worker()
+        except Exception:
+            worker_model = self.model
+        self._size_thread = QThread(self)
+        self._size_worker = _SizeWorker(worker_model, self.key)
+        self._size_worker.moveToThread(self._size_thread)
+        self._size_thread.started.connect(self._size_worker.run)
+        self._size_worker.done.connect(self._on_size)
+        self._size_worker.done.connect(self._size_worker.deleteLater)
+        self._size_thread.finished.connect(self._size_thread.deleteLater)
+        self._size_thread.start()
+
+    def _on_size(self, size, exc):
+        self._stop_size_thread()
+        if exc is not None or size is None:
+            self.size.setText("N/A")
+            return
+        self.size.setText(f"{int(size)} Bytes")
+
+    def _stop_size_thread(self):
+        th, self._size_thread, self._size_worker = self._size_thread, None, None
+        if th is None:
+            return
+        try:
+            if th.isRunning():
+                th.quit()
+                th.wait(2000)
+        except RuntimeError:
+            pass
+
+    def closeEvent(self, event):
+        # The worker thread is parented to this dialog; closing while it runs
+        # would destroy a running QThread and abort the process.
+        self._stop_size_thread()
+        super().closeEvent(event)
 
     def showEvent(self, event):
         super().showEvent(event)

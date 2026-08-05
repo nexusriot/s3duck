@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import (

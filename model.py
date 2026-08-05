@@ -1,5 +1,7 @@
+from datetime import timezone
 from enum import Enum
 import platform
+import re
 import uuid
 import os
 import boto3
@@ -12,6 +14,23 @@ from boto3.s3.transfer import TransferConfig
 
 class TransferCancelled(Exception):
     pass
+
+
+def as_epoch(value) -> float:
+    """
+    Best-effort epoch seconds for an S3 LastModified / local mtime.
+    Naive datetimes are read as UTC; anything unusable becomes 0.0.
+    """
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return float(value.timestamp())
+    except Exception:
+        return 0.0
 
 
 class FSObjectType(Enum):
@@ -72,6 +91,11 @@ class _BotoProgressAdapter:
 
 
 class Model:
+    # Parallel multipart threads per transfer; user-tunable at runtime via
+    # set_transfer_concurrency ("Transfer settings…" in the UI).
+    DEFAULT_TRANSFER_CONCURRENCY = 4
+    MAX_TRANSFER_CONCURRENCY = 16
+
     def __init__(
         self,
         endpoint_url,
@@ -84,6 +108,8 @@ class Model:
         timeout=3,
         retries=3,
         read_timeout=60,
+        transfer_concurrency=None,
+        session_token=None,
     ):
         self.session = boto3.session.Session()
         self._client = None
@@ -106,6 +132,8 @@ class Model:
 
         self.access_key = access_key
         self.secret_key = secret_key
+        # Set for temporary credentials (STS / SSO / assumed role / MFA).
+        self.session_token = session_token or ""
         self.bucket = bucket or ""  # may be empty (bucket list mode)
         self.no_ssl_check = no_ssl_check
         self.use_path = use_path  # True -> path-style, False -> virtual-host style
@@ -113,22 +141,61 @@ class Model:
         self.retries = retries
         self.read_timeout = read_timeout
 
-        self.transfer_cfg_download = TransferConfig(
+        # bucket -> (endpoint_url, region, use_path) that was proven to work.
+        # Avoids re-probing every addressing-style/region combination on each
+        # bucket open; persisted by the UI across sessions.
+        self.binding_cache = {}
+
+        # Extra args applied to every upload (storage class, encryption).
+        self.upload_extra_args = {}
+
+        self.set_transfer_concurrency(
+            self.DEFAULT_TRANSFER_CONCURRENCY
+            if transfer_concurrency is None else transfer_concurrency
+        )
+
+    def set_transfer_concurrency(self, n) -> int:
+        """
+        Rebuild both TransferConfigs with 'n' parallel multipart threads
+        (clamped to 1..MAX_TRANSFER_CONCURRENCY). Returns the value applied.
+        Transfers already running keep the config object they started with;
+        new transfers pick this up.
+        """
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            n = self.DEFAULT_TRANSFER_CONCURRENCY
+        n = max(1, min(n, self.MAX_TRANSFER_CONCURRENCY))
+        self.transfer_concurrency = n
+        cfg = dict(
             multipart_threshold=16 * 1024 * 1024,  # 16MB
-            multipart_chunksize=8 * 1024 * 1024,  # 8MB
+            multipart_chunksize=8 * 1024 * 1024,   # 8MB
             io_chunksize=256 * 1024,
-            max_concurrency=1,
+            max_concurrency=n,
             use_threads=True,
         )
+        self.transfer_cfg_download = TransferConfig(**cfg)
+        self.transfer_cfg_upload = TransferConfig(**cfg)
+        return n
 
-        self.transfer_cfg_upload = TransferConfig(
-            multipart_threshold=16 * 1024 * 1024,
-            multipart_chunksize=8 * 1024 * 1024,
-            io_chunksize=256 * 1024,
-            max_concurrency=2,
-            use_threads=True,
-        )
+    # Server-side encryption modes offered in the UI.
+    SSE_MODES = ("", "AES256", "aws:kms")
 
+    def set_upload_options(self, storage_class=None, sse=None, kms_key_id=None):
+        """
+        Configure what every subsequent upload sends alongside the body:
+        a non-default storage class and/or server-side encryption.
+        Returns the resulting ExtraArgs dict.
+        """
+        args = {}
+        if storage_class and storage_class != "STANDARD":
+            args["StorageClass"] = storage_class
+        if sse:
+            args["ServerSideEncryption"] = sse
+            if sse == "aws:kms" and kms_key_id:
+                args["SSEKMSKeyId"] = kms_key_id
+        self.upload_extra_args = args
+        return args
 
     def clone_for_worker(self):
         """
@@ -152,12 +219,18 @@ class Model:
         m.region_name = self.region_name
         m.access_key = self.access_key
         m.secret_key = self.secret_key
+        m.session_token = self.session_token
         m.bucket = self.bucket
+        # Shared by reference on purpose: a binding a worker discovers is worth
+        # keeping for the whole app.
+        m.binding_cache = self.binding_cache
+        m.upload_extra_args = dict(self.upload_extra_args)
         m.no_ssl_check = self.no_ssl_check
         m.use_path = self.use_path
         m.timeout = self.timeout
         m.retries = self.retries
         m.read_timeout = self.read_timeout
+        m.transfer_concurrency = self.transfer_concurrency
         m.transfer_cfg_download = self.transfer_cfg_download
         m.transfer_cfg_upload = self.transfer_cfg_upload
         return m
@@ -185,6 +258,8 @@ class Model:
             "aws_access_key_id": self.access_key,
             "aws_secret_access_key": self.secret_key,
         }
+        if self.session_token:
+            params["aws_session_token"] = self.session_token
         if region:
             params.update({"region_name": region})
 
@@ -243,7 +318,66 @@ class Model:
             return ""
         return host.split(".")[0]
 
+    def _redirect_conflicts_with_bucket(self, endpoint_url: str,
+                                        bucket_name: str) -> bool:
+        """
+        True when endpoint_url's host is a virtual-host-style address for a
+        DIFFERENT bucket (e.g. 'other.s3.region.amazonaws.com' while binding
+        'mybucket'). Service-level hosts such as 's3.region.amazonaws.com' or
+        'minio.local' are not bucket-bound and must not be rejected.
+        """
+        try:
+            host = (urlparse(endpoint_url).hostname or "").strip().lower()
+        except Exception:
+            host = (endpoint_url or "").strip().lower()
+        parts = [p for p in host.split(".") if p]
+        if len(parts) < 3:
+            return False
+        if parts[0] == (bucket_name or "").strip().lower():
+            return False
+        second = parts[1]
+        return second == "s3" or second.startswith("s3-")
+
+    def _can_list_bucket(self, client_obj, bucket_name: str) -> bool:
+        """True if this client can list a single page of *bucket_name*."""
+        try:
+            paginator = client_obj.get_paginator("list_objects_v2")
+            iterator = paginator.paginate(
+                Bucket=bucket_name,
+                Prefix="",
+                Delimiter="/",
+                PaginationConfig={"MaxItems": 1},
+            )
+            for _ in iterator:
+                break
+            return True
+        except Exception:
+            return False
+
     def _try_bind_bucket(self, bucket_name: str):
+        """
+        Resolve a working (client, endpoint, region, use_path) for this bucket.
+
+        A previously proven combination is tried first — the full probe below
+        costs several round trips per bucket open, which is the single most
+        expensive thing this app does on an off-region bucket. A stale entry is
+        dropped and the probe re-runs.
+        """
+        cached = self.binding_cache.get(bucket_name)
+        if cached:
+            endpoint, region, use_path = cached
+            client = self._make_client(
+                endpoint_url=endpoint, region=region, use_path=use_path
+            )
+            if self._can_list_bucket(client, bucket_name):
+                return client, endpoint, region, use_path
+            self.binding_cache.pop(bucket_name, None)
+
+        result = self._probe_bucket_binding(bucket_name)
+        self.binding_cache[bucket_name] = (result[1], result[2], result[3])
+        return result
+
+    def _probe_bucket_binding(self, bucket_name: str):
         """
         Try different combinations (endpoint_url, path/virtual style) until
         ListObjectsV2 works on this bucket.
@@ -325,9 +459,11 @@ class Model:
             else:
                 endpoint_fixed = ep_raw
 
-            # If the hinted endpoint looks bucket-bound but to a DIFFERENT bucket, error out explicitly.
-            leftmost = self._extract_leftmost_label(endpoint_fixed)
-            if leftmost and leftmost != bucket_name.lower() and self._endpoint_has_bucket(endpoint_fixed, leftmost):
+            # If the hinted endpoint is virtual-host-bound to a DIFFERENT
+            # bucket, error out explicitly. (Service-level hosts like
+            # s3.<region>.amazonaws.com must still be tried below.)
+            if self._redirect_conflicts_with_bucket(endpoint_fixed, bucket_name):
+                leftmost = self._extract_leftmost_label(endpoint_fixed)
                 raise RuntimeError(
                     f"Endpoint redirect '{endpoint_fixed}' appears bound to bucket '{leftmost}', "
                     f"which does not match requested bucket '{bucket_name}'. "
@@ -539,15 +675,14 @@ class Model:
         root_client = self._make_client(region=region)
         root_client.create_bucket(**params)
 
-    def delete_bucket_recursive(self, bucket_name: str, *, batch_size: int = 1000):
+    def delete_bucket_recursive(self, bucket_name: str, *, batch_size: int = 1000,
+                                cancel_event=None, log_fn=None):
         """
         Delete bucket even if non-empty: first remove all objects (recursive),
         then delete the bucket itself.
 
-        Notes:
-          - This deletes *current* object versions only. If bucket has versioning enabled,
-            older versions / delete markers may remain and AWS will still refuse DeleteBucket.
-            (Supporting versioned buckets requires list_object_versions + delete by VersionId.)
+        Also aborts any in-flight multipart uploads: their orphaned parts are
+        invisible to ListObjectsV2 and keep DeleteBucket failing.
         """
         bucket_name = (bucket_name or "").strip()
         if not bucket_name:
@@ -556,22 +691,70 @@ class Model:
         # Use a client that can actually access this bucket (endpoint/style probing)
         bucket_client, _endpoint, _region, _use_path = self._try_bind_bucket(bucket_name)
 
+        self._purge_bucket_contents(
+            bucket_name, bucket_client, batch_size=batch_size,
+            cancel_event=cancel_event, log_fn=log_fn,
+        )
+
+        # If we're currently "in" that bucket, reset view state first
+        if self.bucket == bucket_name:
+            self.bucket = ""
+            self.current_folder = ""
+            self.prev_folder = ""
+
+        # Delete with the *bound* client: a profile/root client raises
+        # PermanentRedirect for buckets in another region, which would leave
+        # the bucket emptied but not deleted.
+        bucket_client.delete_bucket(Bucket=bucket_name)
+
+    def empty_bucket(self, bucket_name: str, *, batch_size: int = 1000,
+                     cancel_event=None, log_fn=None):
+        """Remove everything inside a bucket but keep the bucket itself."""
+        bucket_name = (bucket_name or "").strip()
+        if not bucket_name:
+            raise ValueError("bucket_name is empty")
+        bucket_client, _endpoint, _region, _use_path = self._try_bind_bucket(bucket_name)
+        self._purge_bucket_contents(
+            bucket_name, bucket_client, batch_size=batch_size,
+            cancel_event=cancel_event, log_fn=log_fn,
+        )
+        if self.bucket == bucket_name:
+            self.current_folder = ""
+            self.prev_folder = ""
+
+    def _purge_bucket_contents(self, bucket_name, bucket_client, *,
+                               batch_size=1000, cancel_event=None, log_fn=None):
+        """
+        Delete every object, noncurrent version, delete marker and in-flight
+        multipart upload in a bucket, leaving the bucket empty.
+        """
+        def _check_cancel():
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+
+        _check_cancel()
+
         paginator = bucket_client.get_paginator("list_objects_v2")
 
         pending = []
+        deleted = 0
 
         def flush():
-            nonlocal pending
+            nonlocal pending, deleted
             if not pending:
                 return
             bucket_client.delete_objects(
                 Bucket=bucket_name,
                 Delete={"Objects": pending, "Quiet": True},
             )
+            deleted += len(pending)
+            if log_fn:
+                log_fn(f"{bucket_name}: deleted {deleted} object(s)")
             pending = []
 
         # List everything
         for page in paginator.paginate(Bucket=bucket_name, Prefix=""):
+            _check_cancel()
             for obj in (page.get("Contents", []) or []):
                 k = obj.get("Key")
                 if not k:
@@ -590,6 +773,7 @@ class Model:
         try:
             vpaginator = bucket_client.get_paginator("list_object_versions")
             for page in vpaginator.paginate(Bucket=bucket_name):
+                _check_cancel()
                 for v in (page.get("Versions", []) or []):
                     if not v.get("Key") or not v.get("VersionId"):
                         continue
@@ -608,15 +792,22 @@ class Model:
             if code not in ("NotImplemented", "NoSuchBucket"):
                 raise
 
-        # If we're currently "in" that bucket, reset view state first
-        if self.bucket == bucket_name:
-            self.bucket = ""
-            self.current_folder = ""
-            self.prev_folder = ""
-
-        # Delete bucket using a root/profile client
-        root_client = self._make_client(region=self.profile_region or "us-east-1")
-        root_client.delete_bucket(Bucket=bucket_name)
+        # In-flight multipart uploads hold parts that ListObjectsV2 never
+        # reports, and S3 refuses DeleteBucket while they exist.
+        _check_cancel()
+        try:
+            for up in self.list_multipart_uploads(bucket_name=bucket_name,
+                                                  client_obj=bucket_client):
+                _check_cancel()
+                if log_fn:
+                    log_fn(f"{bucket_name}: aborting multipart upload {up['key']}")
+                bucket_client.abort_multipart_upload(
+                    Bucket=bucket_name, Key=up["key"], UploadId=up["upload_id"],
+                )
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code not in ("NotImplemented", "NoSuchBucket"):
+                raise
 
     def delete_bucket(self, bucket_name: str):
         """
@@ -827,6 +1018,13 @@ class Model:
 
                 out_path = os.path.join(base_dir, rel)
 
+                # Keys may contain ".." segments; never write outside base_dir.
+                if not os.path.abspath(out_path).startswith(
+                        os.path.abspath(base_dir) + os.sep):
+                    if log_fn:
+                        log_fn(f"skipped unsafe key (escapes target dir): {k}")
+                    continue
+
                 if k.endswith("/"):
                     os.makedirs(out_path, exist_ok=True)
                     continue
@@ -977,23 +1175,70 @@ class Model:
                 self.use_path = old_use_path
                 self._client = old_client
 
-    def delete(self, key, log_fn=None) -> bool:
-        def _delete_one(k):
-            try:
-                self.client.delete_object(Bucket=self.bucket, Key=k)
-            except Exception as exc:
-                if not self._is_region_error(exc):
-                    raise
-                if log_fn:
-                    log_fn(f"Region error deleting '{k}': {exc}")
-                self.rebind_bucket(log_fn=log_fn)
-                self.client.delete_object(Bucket=self.bucket, Key=k)
+    DELETE_BATCH_SIZE = 1000
 
+    def _delete_one(self, key, log_fn=None):
+        try:
+            self.client.delete_object(Bucket=self.bucket, Key=key)
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error deleting '{key}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            self.client.delete_object(Bucket=self.bucket, Key=key)
+
+    def _delete_batch(self, keys, log_fn=None):
+        """
+        Remove up to DELETE_BATCH_SIZE keys in one DeleteObjects call, falling
+        back to individual deletes on backends that don't implement it.
+        """
+        if not keys:
+            return
+        payload = {"Objects": [{"Key": k} for k in keys], "Quiet": True}
+
+        def _do():
+            self.client.delete_objects(Bucket=self.bucket, Delete=payload)
+
+        try:
+            _do()
+            return
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("NotImplemented", "MethodNotAllowed"):
+                if log_fn:
+                    log_fn("Batch delete unsupported here; deleting one by one")
+                for k in keys:
+                    self._delete_one(k, log_fn=log_fn)
+                return
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error batch-deleting: {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            _do()
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            self.rebind_bucket(log_fn=log_fn)
+            _do()
+
+    def delete(self, key, log_fn=None, cancel_event=None) -> bool:
+        """Delete one object, or every object under a prefix (batched)."""
         if key.endswith("/"):
+            batch = []
             for k, _ in self.get_keys(key, log_fn=log_fn):
-                _delete_one(k)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                if not k:
+                    continue
+                batch.append(k)
+                if len(batch) >= self.DELETE_BATCH_SIZE:
+                    self._delete_batch(batch, log_fn=log_fn)
+                    batch = []
+            self._delete_batch(batch, log_fn=log_fn)
         else:
-            _delete_one(key)
+            self._delete_one(key, log_fn=log_fn)
         return True
 
     def get_bucket_versioning_status(self) -> str:
@@ -1174,25 +1419,6 @@ class Model:
             self.rebind_bucket(log_fn=log_fn)
             _do()
 
-    def bucket_total_size_bytes(self, cancel_event=None) -> int:
-        if not self.bucket:
-            raise ValueError("Bucket is empty; select a bucket first")
-
-        paginator = self.client.get_paginator("list_objects_v2")
-        total = 0
-
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=""):
-            if cancel_event is not None and cancel_event.is_set():
-                raise TransferCancelled("cancelled")
-            for obj in page.get("Contents", []) or []:
-                key = obj.get("Key") or ""
-                # ignore folder placeholders
-                if key.endswith("/"):
-                    continue
-                total += int(obj.get("Size") or 0)
-
-        return int(total)
-
     def upload_file(self, local_file, key, progress_cb=None, cancel_event=None, log_fn=None):
         """
         Upload a file (with progress) or create a folder placeholder if local_file is None.
@@ -1210,11 +1436,14 @@ class Model:
         except Exception:
             total = None
 
+        extra_args = dict(self.upload_extra_args) or None
+
         def _do_upload():
             self.client.upload_file(
                 local_file,
                 self.bucket,
                 key,
+                ExtraArgs=extra_args,
                 Callback=_BotoProgressAdapter(total, key, progress_cb, cancel_event=cancel_event),
                 Config=self.transfer_cfg_upload,
             )
@@ -1230,22 +1459,6 @@ class Model:
                 log_fn(f"Region error uploading '{key}': {exc}")
             self.rebind_bucket(log_fn=log_fn)
             _do_upload()
-
-    def check_bucket(self):
-        """
-        Validate that self.bucket currently exists.
-        """
-        try:
-            res = self.client.list_buckets()
-            for b in res.get("Buckets", []):
-                if b["Name"] == self.bucket:
-                    return True, None
-            reason = "bucket not found"
-        except botocore.exceptions.ClientError as exc:
-            reason = exc.response["Error"]["Message"]
-        except Exception as exc:
-            reason = str(exc)
-        return False, reason
 
     def check_profile(self):
         """
@@ -1324,6 +1537,71 @@ class Model:
         except Exception as exc:
             return False, str(exc)
 
+    def public_access_summary(self) -> dict:
+        """
+        Explain why object ACLs may be refused: Block Public Access settings
+        and bucket ownership (ACLs are disabled under BucketOwnerEnforced).
+
+        Returns {"block": {...} | None, "ownership": str, "reasons": [str]}.
+        """
+        out = {"block": None, "ownership": "", "reasons": []}
+        if not self.bucket:
+            return out
+        try:
+            resp = self.client.get_public_access_block(Bucket=self.bucket)
+            cfg = resp.get("PublicAccessBlockConfiguration", {}) or {}
+            out["block"] = cfg
+            if cfg.get("BlockPublicAcls"):
+                out["reasons"].append(
+                    "Block Public Access: BlockPublicAcls is on, so public-read "
+                    "ACLs are rejected."
+                )
+            if cfg.get("IgnorePublicAcls"):
+                out["reasons"].append(
+                    "Block Public Access: IgnorePublicAcls is on, so public "
+                    "ACLs are ignored even once set."
+                )
+        except Exception:
+            pass  # unsupported or no configuration -> nothing to report
+        try:
+            resp = self.client.get_bucket_ownership_controls(Bucket=self.bucket)
+            rules = (resp.get("OwnershipControls", {}) or {}).get("Rules", []) or []
+            if rules:
+                ownership = rules[0].get("ObjectOwnership", "") or ""
+                out["ownership"] = ownership
+                if ownership == "BucketOwnerEnforced":
+                    out["reasons"].append(
+                        "Object Ownership is BucketOwnerEnforced, which disables "
+                        "ACLs entirely — use a bucket policy to grant public read."
+                    )
+        except Exception:
+            pass
+        return out
+
+    def existing_keys(self, keys) -> set:
+        """
+        Return the subset of *keys* that already exist, using one recursive
+        listing per distinct parent prefix rather than a HEAD per key.
+        """
+        wanted = {k for k in keys if k}
+        if not wanted or not self.bucket:
+            return set()
+        prefixes = set()
+        for key in wanted:
+            base = key.rstrip("/")
+            prefixes.add(base.rsplit("/", 1)[0] + "/" if "/" in base else "")
+        found = set()
+        for prefix in prefixes:
+            for k, _size in self.get_keys(prefix):
+                if k in wanted:
+                    found.add(k)
+                elif k and k.endswith("/") is False:
+                    # A folder target conflicts if anything lives under it.
+                    for w in wanted:
+                        if w.endswith("/") and k.startswith(w):
+                            found.add(w)
+        return found
+
     def direct_object_url(self, key: str) -> str:
         """
         Construct a direct (unsigned) URL for an object.
@@ -1343,24 +1621,18 @@ class Model:
         return f"{ep}/{self.bucket}/{key}"
 
     def get_size(self, key):
+        # A bare file key is also a *prefix* of sibling keys that merely share
+        # the name (e.g. "a.txt" vs "a.txt.bak"), so match it exactly.
+        if key and not str(key).endswith("/"):
+            for k, s in self.get_keys(key):
+                if k == key:
+                    return int(s or 0)
+            return 0
         total = 0
         for k, s in self.get_keys(key):
             if not k.endswith("/"):
                 total += int(s or 0)
         return total
-
-    def bucket_properties(self):
-        """
-        Return lightweight info about the current bucket for Properties
-        when no concrete key is selected.
-        """
-        return {
-            "Bucket": self.bucket,
-            "SizeBytes": None,
-            "ETag": None,
-            "Key": "",
-            "IsBucketRoot": True,
-        }
 
     def object_properties(self, key: str):
         """
@@ -1435,6 +1707,16 @@ class Model:
                     log_fn=None, cancel_event=None):
         """Server-side recursive copy of all objects under src_prefix to dst_prefix."""
         dst_bucket = dst_bucket or self.bucket
+        if dst_bucket == self.bucket:
+            sp = src_prefix if src_prefix.endswith("/") else src_prefix + "/"
+            dp = dst_prefix if dst_prefix.endswith("/") else dst_prefix + "/"
+            # A destination inside the source would nest the tree into itself;
+            # on a move the follow-up delete of src_prefix then wipes the copy.
+            if dp.startswith(sp):
+                raise ValueError(
+                    f"Destination '{dst_prefix}' is inside source "
+                    f"'{src_prefix}'; copying a folder into itself is not allowed"
+                )
         for key, _ in self.get_keys(src_prefix, log_fn=log_fn):
             if cancel_event is not None and cancel_event.is_set():
                 raise TransferCancelled("cancelled")
@@ -1445,6 +1727,105 @@ class Model:
             if log_fn:
                 log_fn(f"copying {key} -> {dst_key}")
             self.copy_object(key, dst_key, dst_bucket=dst_bucket, log_fn=log_fn)
+
+    def list_multipart_uploads(self, prefix: str = "", *, bucket_name: str = None,
+                               client_obj=None, with_sizes: bool = False,
+                               cancel_event=None, log_fn=None) -> list:
+        """
+        Return in-flight (incomplete) multipart uploads, newest first. Each
+        entry is a dict:
+          {key, upload_id, initiated, storage_class, size}
+
+        These are invisible to normal listings but keep billing for the parts
+        already uploaded, and they block DeleteBucket. 'size' is the summed
+        part size, only fetched when with_sizes (one ListParts call each).
+        """
+        bucket = bucket_name or self.bucket
+        if not bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+
+        def _fetch():
+            client = client_obj if client_obj is not None else self.client
+            out = []
+            paginator = client.get_paginator("list_multipart_uploads")
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix or ""):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                for up in (page.get("Uploads", []) or []):
+                    key = up.get("Key")
+                    upload_id = up.get("UploadId")
+                    if not key or not upload_id:
+                        continue
+                    out.append({
+                        "key": key,
+                        "upload_id": upload_id,
+                        "initiated": up.get("Initiated"),
+                        "storage_class": up.get("StorageClass") or "",
+                        "size": None,
+                    })
+
+            if with_sizes:
+                for entry in out:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise TransferCancelled("cancelled")
+                    try:
+                        entry["size"] = self._multipart_upload_size(
+                            client, bucket, entry["key"], entry["upload_id"]
+                        )
+                    except Exception as exc:
+                        if log_fn:
+                            log_fn(f"Could not size upload {entry['key']}: {exc}")
+
+            # Newest first; entries without a timestamp sink to the bottom.
+            out.sort(
+                key=lambda e: (e["initiated"] is not None, e["initiated"]),
+                reverse=True,
+            )
+            return out
+
+        try:
+            return _fetch()
+        except TransferCancelled:
+            raise
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error listing multipart uploads: {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            return _fetch()
+
+    @staticmethod
+    def _multipart_upload_size(client, bucket, key, upload_id) -> int:
+        """Sum the sizes of the parts already uploaded for one multipart upload."""
+        total = 0
+        paginator = client.get_paginator("list_parts")
+        for page in paginator.paginate(Bucket=bucket, Key=key, UploadId=upload_id):
+            for part in (page.get("Parts", []) or []):
+                total += int(part.get("Size") or 0)
+        return total
+
+    def abort_multipart_upload(self, key: str, upload_id: str,
+                               bucket_name: str = None, log_fn=None):
+        """Abort one in-flight multipart upload and free its stored parts."""
+        bucket = bucket_name or self.bucket
+        if not bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+
+        def _do():
+            self.client.abort_multipart_upload(
+                Bucket=bucket, Key=key, UploadId=upload_id
+            )
+
+        try:
+            _do()
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error aborting upload of '{key}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            _do()
 
     def get_object_tags(self, key: str) -> list:
         """Return the TagSet for an object as a list of {'Key': k, 'Value': v} dicts."""
@@ -1618,17 +1999,80 @@ class Model:
             self.rebind_bucket(log_fn=log_fn)
             _do()
 
-    def search_keys(self, prefix: str, query: str, cancel_event=None,
-                    max_results: int = 1000, log_fn=None) -> list:
+    @staticmethod
+    def build_search_matcher(query: str = "", *, regex: bool = False,
+                            case_sensitive: bool = False,
+                            min_size=None, max_size=None,
+                            modified_after=None, modified_before=None,
+                            extensions=None):
         """
-        Recursively list objects under 'prefix' and return [(key, size), ...]
-        whose key contains 'query' (case-insensitive). S3 only filters by
-        prefix, so the match itself is done client-side over the full listing.
-        Stops early at max_results (0/None means unlimited).
+        Compile the search filters once into ``match(key, size, modified)``.
+
+        Raises ValueError for an invalid regular expression so the UI can
+        report it instead of failing mid-listing.
+        """
+        needle = query or ""
+        compiled = None
+        if regex and needle:
+            try:
+                compiled = re.compile(
+                    needle, 0 if case_sensitive else re.IGNORECASE)
+            except re.error as exc:
+                raise ValueError(f"Invalid regular expression: {exc}") from exc
+        elif not case_sensitive:
+            needle = needle.lower()
+
+        wanted_exts = None
+        if extensions:
+            wanted_exts = set()
+            for raw in extensions:
+                ext = (raw or "").strip().lower()
+                if not ext:
+                    continue
+                wanted_exts.add(ext if ext.startswith(".") else "." + ext)
+            if not wanted_exts:
+                wanted_exts = None
+
+        after = as_epoch(modified_after) if modified_after is not None else None
+        before = as_epoch(modified_before) if modified_before is not None else None
+
+        def _match(key, size, modified):
+            if compiled is not None:
+                if not compiled.search(key):
+                    return False
+            elif needle:
+                haystack = key if case_sensitive else key.lower()
+                if needle not in haystack:
+                    return False
+            if min_size is not None and int(size or 0) < int(min_size):
+                return False
+            if max_size is not None and int(size or 0) > int(max_size):
+                return False
+            if wanted_exts is not None:
+                if os.path.splitext(key)[1].lower() not in wanted_exts:
+                    return False
+            if after is not None or before is not None:
+                stamp = as_epoch(modified)
+                if after is not None and stamp < after:
+                    return False
+                if before is not None and stamp > before:
+                    return False
+            return True
+
+        return _match
+
+    def search_keys(self, prefix: str, query: str, cancel_event=None,
+                    max_results: int = 1000, log_fn=None, **filters) -> list:
+        """
+        Recursively list objects under 'prefix' and return
+        [(key, size, last_modified), ...] matching 'query' and any extra
+        filters (see build_search_matcher). S3 only filters by prefix, so
+        matching happens client-side over the full listing. Stops early at
+        max_results (0/None means unlimited).
         """
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
-        q = (query or "").strip().lower()
+        matches = self.build_search_matcher(query, **filters)
 
         def _fetch():
             res = []
@@ -1640,9 +2084,11 @@ class Model:
                     key = obj.get("Key") or ""
                     if not key or key.endswith("/"):
                         continue
-                    if q and q not in key.lower():
+                    size = int(obj.get("Size") or 0)
+                    modified = obj.get("LastModified")
+                    if not matches(key, size, modified):
                         continue
-                    res.append((key, int(obj.get("Size") or 0)))
+                    res.append((key, size, modified))
                     if max_results and len(res) >= int(max_results):
                         return res
             return res
@@ -1656,6 +2102,47 @@ class Model:
                 raise
             if log_fn:
                 log_fn(f"Region error searching '{prefix}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            return _fetch()
+
+    def list_tree(self, prefix: str = "", cancel_event=None, log_fn=None) -> dict:
+        """
+        Map every object under 'prefix' to ``{relative_path: (size, mtime)}``
+        for sync comparison. Folder placeholders are skipped; mtime is epoch
+        seconds.
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        base = prefix or ""
+
+        def _fetch():
+            out = {}
+            paginator = self.client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=base):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                for obj in page.get("Contents", []) or []:
+                    key = obj.get("Key") or ""
+                    if not key or key.endswith("/"):
+                        continue
+                    rel = key[len(base):] if key.startswith(base) else key
+                    if not rel:
+                        continue
+                    out[rel] = (
+                        int(obj.get("Size") or 0),
+                        as_epoch(obj.get("LastModified")),
+                    )
+            return out
+
+        try:
+            return _fetch()
+        except TransferCancelled:
+            raise
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error listing tree '{base}': {exc}")
             self.rebind_bucket(log_fn=log_fn)
             return _fetch()
 
