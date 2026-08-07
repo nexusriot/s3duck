@@ -2713,6 +2713,11 @@ class _StubModel(Model):
     def list(self, fld):
         return []
 
+    def enter_bucket(self, bucket_name):
+        self.bucket = bucket_name
+        self.current_folder = ""
+        self.prev_folder = ""
+
 
 class _FakeRunningThread:
     """Stands in for a QThread that is still running."""
@@ -2752,6 +2757,44 @@ class MainWindowGuardTests(unittest.TestCase):
                and time.monotonic() < deadline):
             self._app.processEvents()
         self._app.processEvents()
+
+    def test_entering_a_bucket_actually_loads_its_listing(self):
+        """REGRESSION: the guard that blocks navigation during bucket entry
+        also blocked the navigation the success handler itself starts — the
+        worker emits success() before the thread stops running — so opening a
+        bucket left the view on the bucket list."""
+        self.assertTrue(self.win.in_bucket_list_mode())
+        seq_before = self.win._nav_seq
+
+        self.win.enter_bucket_async("bkt")
+        deadline = time.monotonic() + 5
+        while (self.win._nav_seq == seq_before
+               and time.monotonic() < deadline):
+            self._app.processEvents()
+        self._settle()
+
+        self.assertEqual(self.win.data_model.bucket, "bkt")
+        self.assertFalse(self.win.in_bucket_list_mode())
+        self.assertGreater(self.win._nav_seq, seq_before)
+        # the listing rendered: a bucket view always carries the [..] row
+        self.assertIsNotNone(self.win.ix_by_name(main_window.UP_ENTRY_LABEL))
+        self.assertTrue(self.win.listview.isEnabled())
+
+    def test_double_clicking_a_bucket_row_opens_it(self):
+        """The end-to-end path a user actually takes."""
+        row = self.win.proxy.index(0, 0)
+        self.assertEqual(row.data(), "bkt")
+        seq_before = self.win._nav_seq
+
+        self.win.list_doubleClicked(row)
+        deadline = time.monotonic() + 5
+        while (self.win._nav_seq == seq_before
+               and time.monotonic() < deadline):
+            self._app.processEvents()
+        self._settle()
+
+        self.assertEqual(self.win.data_model.bucket, "bkt")
+        self.assertFalse(self.win.in_bucket_list_mode())
 
     def test_navigation_is_blocked_while_entering_a_bucket(self):
         """BucketEnterWorker mutates the shared model, so cloning it mid-entry

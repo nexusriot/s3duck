@@ -5472,7 +5472,7 @@ class MainWindow(QMainWindow):
                 # enter_bucket resets navigation to the bucket root.
                 self.data_model.current_folder = target_prefix
                 self.data_model.prev_folder = ""
-            self.navigate(select_up_entry=True)
+            self.navigate(select_up_entry=True, force=True)
 
         def _on_enter_failure(bucket_name: str, err_msg: str):
             self.listview.setEnabled(True)
@@ -5484,7 +5484,7 @@ class MainWindow(QMainWindow):
             self._return_to_bucket_list_mode()
             # navigate() is async — the model is still empty here, so the
             # selection must be restored by the navigation-finished handler.
-            self.navigate(restore_name=bucket_name)
+            self.navigate(restore_name=bucket_name, force=True)
 
         def _clear_enter_refs():
             self._bucket_enter_thread = None
@@ -5514,7 +5514,12 @@ class MainWindow(QMainWindow):
         # rather than a clone, so starting a navigation mid-entry would clone
         # half-updated connection state. Refresh shortcuts stay live even while
         # the list view is disabled, which is how this gets hit.
-        if self.bucket_enter_active():
+        #
+        # force=True is the entry worker's own callbacks saying the model is
+        # settled: success() is emitted before the thread stops running, so
+        # without this exemption the guard would swallow the navigation that
+        # actually shows the opened bucket.
+        if (not force) and self.bucket_enter_active():
             self.statusBar().showMessage("Opening bucket — please wait…", 2000)
             return
 
