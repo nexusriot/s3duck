@@ -5,7 +5,7 @@ from PyQt6.QtGui import *
 
 from utils import str_to_bool, center_on_screen, load_aws_profiles
 
-EMPTY_SETTINGS = ("", "", "", "", "", "", "false", "true", "")
+EMPTY_SETTINGS = ("", "", "", "", "", "", "false", "true", "", "false")
 
 
 class SettingsWindow(QDialog):
@@ -24,6 +24,7 @@ class SettingsWindow(QDialog):
             no_ssl_check,
             use_path,
             session_token,
+            read_only,
         ) = settings
         self.setWindowTitle("Profile settings")
         self.resize(600, 250)
@@ -39,6 +40,7 @@ class SettingsWindow(QDialog):
         self.sessionTokenEdit = QLineEdit()
         self.noSslCheck = QCheckBox()
         self.usePath = QCheckBox()
+        self.readOnly = QCheckBox()
 
         self.createForm()
         self.importButton = QPushButton("Import from ~/.aws…")
@@ -78,6 +80,7 @@ class SettingsWindow(QDialog):
         self.sessionTokenEdit.setEchoMode(QLineEdit.EchoMode.Password)
         self.noSslCheck.setChecked(str_to_bool(no_ssl_check))
         self.usePath.setChecked(str_to_bool(use_path))
+        self.readOnly.setChecked(str_to_bool(read_only))
 
     def import_from_aws(self):
         profiles = load_aws_profiles()
@@ -134,6 +137,7 @@ class SettingsWindow(QDialog):
             self.noSslCheck.isChecked(),
             self.usePath.isChecked(),
             self.sessionTokenEdit.text(),
+            self.readOnly.isChecked(),
         )
         self.close()
 
@@ -156,4 +160,7 @@ class SettingsWindow(QDialog):
             QLabel("No SSL check (self-signed certificate support)"), self.noSslCheck
         )
         layout.addRow(QLabel("Use path in config (minio support)"), self.usePath)
+        layout.addRow(
+            QLabel("Read-only (block all writes and deletes)"), self.readOnly
+        )
         self.formGroupBox.setLayout(layout)

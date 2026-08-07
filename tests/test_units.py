@@ -8,7 +8,9 @@ Several tests are explicit regression guards for previously fixed bugs and
 are marked with "REGRESSION:" in their docstrings.
 """
 
+import hashlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -24,7 +26,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import botocore.exceptions
 from PyQt6.QtCore import QSettings
-from PyQt6.QtGui import QPalette
+from PyQt6.QtGui import QAction, QPalette
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QDialogButtonBox, QMessageBox, QToolButton,
 )
@@ -33,17 +35,25 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main_window
 import theme
-from utils import str_to_bool, load_aws_profiles, scan_local_tree
+from utils import (
+    str_to_bool, load_aws_profiles, scan_local_tree,
+    export_profile_bundle, import_profile_bundle, BundleError,
+)
 from main_window import (
     _to_epoch, categorize_key, _human_bytes, _scaled_bar_values,
     _dest_inside_source, _build_upload_job_for_path, _listing_summary,
-    bulk_rename_plan, build_sync_plan, summarize_sync_plan,
+    bulk_rename_plan, build_sync_plan, summarize_sync_plan, build_exclude_matcher,
+    collect_shortcuts, LIST_COLUMNS, LIST_OPTIONAL_COLUMNS,
     format_completion_notification, BULK_RENAME_FIND, BULK_RENAME_TEMPLATE,
     Breadcrumb, BulkRenameDialog, CopyMoveDialog, IncompleteUploadsDialog,
     MetadataDialog, OverwriteDialog, PresignedLinkDialog, SyncDialog,
     TagsDialog, TransferSettingsDialog, VersionsDialog, Worker,
 )
-from model import Model, Item, FSObjectType, TransferCancelled
+import model as model_module
+from model import (
+    Model, Item, FSObjectType, TransferCancelled, ReadOnlyError, run_parallel,
+    RateLimiter,
+)
 from properties_window import PropertiesWindow
 
 
@@ -122,6 +132,14 @@ class FakeS3Client:
         if self._get_object_resp is None:
             raise AssertionError("get_object was not configured for this test")
         return self._get_object_resp
+
+    def put_object(self, **kw):
+        self.calls.append(("put_object", kw))
+        return {}
+
+    def put_object_acl(self, **kw):
+        self.calls.append(("put_object_acl", kw))
+        return {}
 
     def get_bucket_versioning(self, **kw):
         self.calls.append(("get_bucket_versioning", kw))
@@ -980,6 +998,605 @@ class PublicAccessSummaryTests(unittest.TestCase):
         m._client = Client()
         out = m.public_access_summary()
         self.assertEqual(out["reasons"], [])
+
+
+class RunParallelTests(unittest.TestCase):
+    def test_sequential_when_single_worker(self):
+        seen = []
+        run_parallel([1, 2, 3], seen.append, 1)
+        self.assertEqual(seen, [1, 2, 3])   # order preserved
+
+    def test_all_items_processed_in_parallel(self):
+        seen = []
+        lock = threading.Lock()
+
+        def _fn(item):
+            with lock:
+                seen.append(item)
+
+        run_parallel(range(50), _fn, 8)
+        self.assertEqual(sorted(seen), list(range(50)))
+
+    def test_first_error_is_reraised_and_work_stops(self):
+        started = []
+        lock = threading.Lock()
+
+        def _fn(item):
+            with lock:
+                started.append(item)
+            raise RuntimeError(f"boom {item}")
+
+        with self.assertRaises(RuntimeError):
+            run_parallel(range(20), _fn, 4)
+        # the pool drains rather than leaving threads running
+        self.assertLessEqual(len(started), 20)
+
+    def test_cancel_event_stops_and_raises(self):
+        cancel = threading.Event()
+        cancel.set()
+        seen = []
+        with self.assertRaises(TransferCancelled):
+            run_parallel([1, 2, 3], seen.append, 4, cancel_event=cancel)
+        self.assertEqual(seen, [])
+
+    def test_cancel_checked_between_sequential_items(self):
+        cancel = threading.Event()
+        seen = []
+
+        def _fn(item):
+            seen.append(item)
+            cancel.set()
+
+        with self.assertRaises(TransferCancelled):
+            run_parallel([1, 2, 3], _fn, 1, cancel_event=cancel)
+        self.assertEqual(seen, [1])
+
+    def test_empty_input(self):
+        run_parallel([], lambda _i: None, 4)  # must not raise
+
+
+class ParallelFilesSettingTests(unittest.TestCase):
+    def test_default_and_clamping(self):
+        m = make_model()
+        self.assertEqual(m.parallel_files, Model.DEFAULT_PARALLEL_FILES)
+        self.assertEqual(m.set_parallel_files(0), 1)
+        self.assertEqual(m.set_parallel_files(999), Model.MAX_PARALLEL_FILES)
+        self.assertEqual(m.set_parallel_files("junk"),
+                         Model.DEFAULT_PARALLEL_FILES)
+
+    def test_clone_inherits(self):
+        m = make_model(parallel_files=7)
+        self.assertEqual(m.clone_for_worker().parallel_files, 7)
+
+    def test_prefix_download_runs_in_parallel(self):
+        """A whole-folder download is a single job entry, so the fan-out has
+        to happen inside download_file or the setting does nothing for it."""
+        m = make_model(bucket="b", parallel_files=4)
+        keys = [{"Key": f"dir/f{i}.txt", "Size": 1} for i in range(12)]
+        c = FakeS3Client(list_pages=[{"Contents": keys}])
+        m._client = c
+        with tempfile.TemporaryDirectory() as tmp:
+            m.download_file("dir/", None, tmp)
+        self.assertEqual(len(c.calls_of("download_file")), 12)
+
+    def test_prefix_copy_runs_in_parallel(self):
+        m = make_model(bucket="b", parallel_files=4)
+        keys = [{"Key": f"src/f{i}.txt", "Size": 1} for i in range(10)]
+        c = FakeS3Client(list_pages=[{"Contents": keys}])
+        m._client = c
+        m.copy_prefix("src/", "dst/")
+        copied = {kw["Key"] for kw in c.calls_of("copy_object")}
+        self.assertEqual(copied, {f"dst/f{i}.txt" for i in range(10)})
+
+
+class ReadOnlyProfileTests(unittest.TestCase):
+    """A read-only profile must refuse every write at the model layer, not
+    just hide buttons."""
+
+    def setUp(self):
+        self.m = make_model(bucket="b", read_only=True)
+        self.m._client = FakeS3Client(
+            list_pages=[{"Contents": [{"Key": "a.txt", "Size": 1}]}],
+            versions_pages=[{}], mpu_pages=[{}],
+        )
+
+    def test_writes_are_refused(self):
+        cases = {
+            "delete": lambda: self.m.delete("a.txt"),
+            "delete prefix": lambda: self.m.delete("dir/"),
+            "create_folder": lambda: self.m.create_folder("x/"),
+            "upload": lambda: self.m.upload_file(None, "x"),
+            "copy_object": lambda: self.m.copy_object("a", "b"),
+            "copy_prefix": lambda: self.m.copy_prefix("a/", "b/"),
+            "create_bucket": lambda: self.m.create_bucket("nb"),
+            "delete_bucket": lambda: self.m.delete_bucket("b"),
+            "delete_bucket_recursive": lambda: self.m.delete_bucket_recursive("b"),
+            "empty_bucket": lambda: self.m.empty_bucket("b"),
+            "versioning": lambda: self.m.set_bucket_versioning("Enabled"),
+            "storage class": lambda: self.m.change_storage_class("a", "GLACIER"),
+            "metadata": lambda: self.m.set_object_metadata("a"),
+            "tags": lambda: self.m.put_object_tags("a", []),
+            "make public": lambda: self.m.make_object_public("a"),
+            "delete version": lambda: self.m.delete_object_version("a", "v1"),
+            "make current": lambda: self.m.make_version_current("a", "v1"),
+            "abort upload": lambda: self.m.abort_multipart_upload("a", "u1"),
+            "presigned put": lambda: self.m.presigned_put_url("a"),
+            "undelete": lambda: self.m.undelete("a.txt"),
+            "restore": lambda: self.m.restore_object("a"),
+        }
+        for label, call in cases.items():
+            with self.subTest(operation=label):
+                with self.assertRaises(ReadOnlyError):
+                    call()
+
+    def test_reads_still_work(self):
+        self.assertEqual(
+            [k for k, _s in self.m.get_keys("")], ["a.txt"])
+        self.assertTrue(self.m.presigned_get_url("a.txt"))
+
+    def test_writable_profile_is_unaffected(self):
+        m = make_model(bucket="b")
+        m._client = FakeS3Client()
+        m.create_folder("x/")  # must not raise
+        self.assertEqual(len(m._client.calls_of("put_object")), 1)
+
+    def test_clone_keeps_the_flag(self):
+        self.assertTrue(self.m.clone_for_worker().read_only)
+
+
+class UndeleteTests(unittest.TestCase):
+    def setUp(self):
+        self.m = make_model(bucket="b")
+
+    def _client(self):
+        return FakeS3Client(versions_pages=[{
+            "DeleteMarkers": [
+                {"Key": "dir/a.txt", "VersionId": "dm-new", "IsLatest": True},
+                {"Key": "dir/a.txt", "VersionId": "dm-old", "IsLatest": False},
+                {"Key": "dir/b.txt", "VersionId": "dm-b", "IsLatest": True},
+            ],
+            "Versions": [{"Key": "dir/a.txt", "VersionId": "v1"}],
+        }])
+
+    def test_single_key_removes_only_its_latest_marker(self):
+        c = self._client()
+        self.m._client = c
+        restored = self.m.undelete("dir/a.txt")
+        self.assertEqual(restored, 1)
+        self.assertEqual(
+            c.calls_of("delete_object"),
+            [{"Bucket": "b", "Key": "dir/a.txt", "VersionId": "dm-new"}],
+        )
+
+    def test_prefix_restores_everything_underneath(self):
+        c = self._client()
+        self.m._client = c
+        restored = self.m.undelete("dir/")
+        self.assertEqual(restored, 2)
+        keys = {kw["Key"] for kw in c.calls_of("delete_object")}
+        self.assertEqual(keys, {"dir/a.txt", "dir/b.txt"})
+
+    def test_unversioned_bucket_restores_nothing(self):
+        self.m._client = FakeS3Client(versions_pages=[{}])
+        self.assertEqual(self.m.undelete("dir/a.txt"), 0)
+
+    def test_backend_without_versions_api(self):
+        class NoVersions(FakeS3Client):
+            def get_paginator(self, name):
+                if name == "list_object_versions":
+                    raise botocore.exceptions.ClientError(
+                        {"Error": {"Code": "NotImplemented", "Message": "no"}},
+                        "ListObjectVersions")
+                return super().get_paginator(name)
+
+        self.m._client = NoVersions()
+        self.assertEqual(self.m.undelete("a.txt"), 0)
+
+    def test_requires_a_bucket(self):
+        m = make_model(bucket="")
+        with self.assertRaises(ValueError):
+            m.undelete("a.txt")
+
+
+class CrossLocationCopyTests(unittest.TestCase):
+    """CopyObject is server-side and cannot reach a bucket in another region
+    or account; those copies must stream through instead of failing."""
+
+    def setUp(self):
+        self.m = make_model(bucket="src")
+
+    class Client(FakeS3Client):
+        def __init__(self, copy_error=None, **kw):
+            super().__init__(**kw)
+            self._copy_error = copy_error
+            self.uploaded = []
+
+        def copy_object(self, **kw):
+            self.calls.append(("copy_object", kw))
+            if self._copy_error is not None:
+                raise self._copy_error
+            return {}
+
+        def get_object(self, **kw):
+            self.calls.append(("get_object", kw))
+            return {"Body": io.BytesIO(b"payload"), "ContentType": "text/plain",
+                    "Metadata": {"owner": "vlad"}}
+
+        def upload_fileobj(self, body, bucket, key, **kw):
+            self.uploaded.append((bucket, key, body.read(), kw.get("ExtraArgs")))
+
+    @staticmethod
+    def _error(code):
+        return botocore.exceptions.ClientError(
+            {"Error": {"Code": code, "Message": "nope"}}, "CopyObject")
+
+    def test_same_bucket_copy_stays_server_side(self):
+        c = self.Client()
+        self.m._client = c
+        self.m.copy_object("a.txt", "b.txt")
+        self.assertEqual(len(c.calls_of("copy_object")), 1)
+        self.assertEqual(c.uploaded, [])
+
+    def test_cross_location_error_falls_back_to_streaming(self):
+        c = self.Client(copy_error=self._error("InvalidRequest"))
+        self.m._client = c
+        self.m._try_bind_bucket = lambda name: (c, "ep", "eu-north-1", True)
+        logs = []
+        self.m.copy_object("a.txt", "a.txt", dst_bucket="other",
+                           log_fn=logs.append)
+        self.assertEqual(len(c.uploaded), 1)
+        bucket, key, data, extra = c.uploaded[0]
+        self.assertEqual((bucket, key, data), ("other", "a.txt", b"payload"))
+        # content type and user metadata survive the streamed copy
+        self.assertEqual(extra["ContentType"], "text/plain")
+        self.assertEqual(extra["Metadata"], {"owner": "vlad"})
+        self.assertTrue(any("streaming" in line for line in logs))
+
+    def test_permanent_redirect_cross_bucket_streams(self):
+        c = self.Client(copy_error=self._error("PermanentRedirect"))
+        self.m._client = c
+        self.m._try_bind_bucket = lambda name: (c, "ep", "eu-north-1", True)
+        self.m.copy_object("a.txt", "a.txt", dst_bucket="other")
+        self.assertEqual(len(c.uploaded), 1)
+
+    def test_same_bucket_redirect_still_rebinds_instead_of_streaming(self):
+        c = self.Client(copy_error=self._error("PermanentRedirect"))
+        self.m._client = c
+        rebound = []
+        self.m.rebind_bucket = lambda log_fn=None: rebound.append(True)
+        with self.assertRaises(botocore.exceptions.ClientError):
+            self.m.copy_object("a.txt", "b.txt")  # same bucket
+        self.assertEqual(rebound, [True])
+        self.assertEqual(c.uploaded, [])
+
+    def test_unrelated_error_is_not_swallowed(self):
+        c = self.Client(copy_error=self._error("AccessDenied"))
+        self.m._client = c
+        with self.assertRaises(botocore.exceptions.ClientError):
+            self.m.copy_object("a.txt", "a.txt", dst_bucket="other")
+        self.assertEqual(c.uploaded, [])
+
+    def test_streaming_can_be_disabled(self):
+        c = self.Client(copy_error=self._error("InvalidRequest"))
+        self.m._client = c
+        with self.assertRaises(botocore.exceptions.ClientError):
+            self.m.copy_object("a.txt", "a.txt", dst_bucket="other",
+                               allow_stream=False)
+
+
+class ChecksumTests(unittest.TestCase):
+    def setUp(self):
+        self.m = make_model(bucket="b")
+
+    def test_etag_is_md5_detection(self):
+        self.assertTrue(Model.etag_is_md5('"' + "a" * 32 + '"'))
+        self.assertFalse(Model.etag_is_md5("a" * 32 + "-3"))  # multipart
+        self.assertFalse(Model.etag_is_md5(""))
+        self.assertFalse(Model.etag_is_md5("short"))
+
+    def test_matching_file_verifies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "f.bin")
+            with open(path, "wb") as handle:
+                handle.write(b"hello world")
+            digest = hashlib.md5(b"hello world").hexdigest()
+            self.assertTrue(self.m.verify_download(path, f'"{digest}"'))
+
+    def test_mismatch_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "f.bin")
+            with open(path, "wb") as handle:
+                handle.write(b"hello world")
+            logs = []
+            self.assertFalse(
+                self.m.verify_download(path, "b" * 32, log_fn=logs.append))
+            self.assertTrue(any("MISMATCH" in line for line in logs))
+
+    def test_multipart_etag_cannot_be_checked_and_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "f.bin")
+            with open(path, "wb") as handle:
+                handle.write(b"x")
+            logs = []
+            self.assertTrue(
+                self.m.verify_download(path, "a" * 32 + "-2", log_fn=logs.append))
+            self.assertTrue(any("skipped" in line for line in logs))
+
+
+class _RangedClient:
+    """Serves an in-memory object over ranged GETs, optionally failing once."""
+
+    def __init__(self, payload, fail_on_chunk=None):
+        self.payload = payload
+        self.fail_on_chunk = fail_on_chunk
+        self.ranges = []
+        self.lock = threading.Lock()
+
+    def head_object(self, **kw):
+        return {"ContentLength": len(self.payload),
+                "ETag": '"' + hashlib.md5(self.payload).hexdigest() + '"'}
+
+    def get_object(self, **kw):
+        rng = kw["Range"]
+        start, end = rng.replace("bytes=", "").split("-")
+        start, end = int(start), int(end)
+        with self.lock:
+            self.ranges.append((start, end))
+            if self.fail_on_chunk is not None and start == self.fail_on_chunk:
+                self.fail_on_chunk = None      # only fail once
+                raise RuntimeError("connection reset")
+        return {"Body": io.BytesIO(self.payload[start:end + 1])}
+
+
+class ResumableDownloadTests(unittest.TestCase):
+    """REGRESSION-proofing: a large download that dies part-way must resume
+    from the bytes already on disk instead of starting over."""
+
+    def _model(self, payload, fail_on_chunk=None):
+        m = make_model(bucket="b")
+        m.RESUME_CHUNK_SIZE = 1024
+        m.resume_threshold = 1
+        m.parallel_files = 1          # deterministic chunk order
+        m._client = _RangedClient(payload, fail_on_chunk)
+        return m
+
+    def test_full_download_assembles_the_object(self):
+        payload = os.urandom(4096)
+        m = self._model(payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "big.bin")
+            m.download_file("big.bin", out, tmp)
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(), payload)
+            # the sidecar and part file are cleaned up on success
+            self.assertEqual(os.listdir(tmp), ["big.bin"])
+
+    def test_interrupted_download_resumes_from_the_partial(self):
+        payload = os.urandom(4096)
+        m = self._model(payload, fail_on_chunk=2048)   # 3rd chunk explodes
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "big.bin")
+            with self.assertRaises(RuntimeError):
+                m.download_file("big.bin", out, tmp)
+            part = out + Model.PART_SUFFIX
+            self.assertTrue(os.path.exists(part))
+            self.assertTrue(os.path.exists(part + ".meta"))
+            first_pass = len(m._client.ranges)
+
+            m._client.ranges.clear()
+            m.download_file("big.bin", out, tmp)      # resume
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(), payload)
+            # only the chunks that were missing are re-fetched
+            self.assertLess(len(m._client.ranges), first_pass)
+            self.assertEqual(
+                {start for start, _e in m._client.ranges}, {2048, 3072})
+
+    def test_changed_object_discards_the_stale_partial(self):
+        payload = os.urandom(4096)
+        m = self._model(payload, fail_on_chunk=2048)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "big.bin")
+            with self.assertRaises(RuntimeError):
+                m.download_file("big.bin", out, tmp)
+            # the object is replaced remotely -> a different ETag
+            m._client = _RangedClient(os.urandom(4096))
+            m.download_file("big.bin", out, tmp)
+            starts = {start for start, _e in m._client.ranges}
+            self.assertEqual(starts, {0, 1024, 2048, 3072})  # all re-fetched
+
+    def test_small_files_skip_the_ranged_path(self):
+        m = make_model(bucket="b")
+        m.resume_threshold = 10 * 1024
+        c = FakeS3Client(head_object_resp={"ContentLength": 10, "ETag": '"x"'})
+        m._client = c
+        with tempfile.TemporaryDirectory() as tmp:
+            m.download_file("small.bin", os.path.join(tmp, "small.bin"), tmp)
+        self.assertEqual(len(c.calls_of("download_file")), 1)
+
+    def test_verification_failure_after_ranged_download(self):
+        payload = os.urandom(2048)
+        m = self._model(payload)
+        m.verify_downloads = True
+        # corrupt what the server hands back so the ETag will not match
+        m._client.payload = payload
+        original_head = m._client.head_object
+        m._client.head_object = lambda **kw: {
+            "ContentLength": len(payload), "ETag": '"' + "0" * 32 + '"'}
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "big.bin")
+            with self.assertRaises(Exception) as ctx:
+                m.download_file("big.bin", out, tmp)
+            self.assertIn("Checksum mismatch", str(ctx.exception))
+        m._client.head_object = original_head
+
+
+class RateLimiterTests(unittest.TestCase):
+    """Deterministic: the limiter takes injectable clock and sleep."""
+
+    def _limiter(self, rate, **kw):
+        self.now = 0.0
+        self.slept = []
+
+        def _time():
+            return self.now
+
+        def _sleep(seconds):
+            self.slept.append(seconds)
+            self.now += seconds
+
+        return RateLimiter(rate, time_fn=_time, sleep_fn=_sleep, **kw)
+
+    def test_zero_rate_never_blocks(self):
+        limiter = self._limiter(0)
+        self.assertEqual(limiter.consume(10 ** 9), 0.0)
+        self.assertEqual(self.slept, [])
+
+    def test_burst_within_capacity_is_free(self):
+        limiter = self._limiter(1000)          # 1 s of burst = 1000 bytes
+        self.assertEqual(limiter.consume(1000), 0.0)
+        self.assertEqual(self.slept, [])
+
+    def test_exceeding_the_bucket_sleeps_the_difference(self):
+        limiter = self._limiter(1000)
+        limiter.consume(1000)                  # drains the bucket
+        delay = limiter.consume(500)           # needs another half second
+        self.assertAlmostEqual(delay, 0.5, places=6)
+        self.assertEqual(len(self.slept), 1)
+
+    def test_tokens_refill_over_time(self):
+        limiter = self._limiter(1000)
+        limiter.consume(1000)
+        self.now += 2.0                        # plenty of time passes
+        self.assertEqual(limiter.consume(1000), 0.0)
+
+    def test_sustained_rate_is_respected(self):
+        limiter = self._limiter(1000, capacity=0)
+        for _ in range(4):
+            limiter.consume(500)
+        # 2000 bytes at 1000 B/s with no burst allowance ≈ 2 s of waiting
+        self.assertAlmostEqual(sum(self.slept), 2.0, places=6)
+
+    def test_negative_and_zero_amounts_ignored(self):
+        limiter = self._limiter(1000)
+        self.assertEqual(limiter.consume(0), 0.0)
+        self.assertEqual(limiter.consume(-5), 0.0)
+
+    def test_model_wires_the_limiter_and_shares_it_with_clones(self):
+        m = make_model()
+        self.assertIsNone(m.rate_limiter)
+        m.set_rate_limit(2048)
+        self.assertIsNotNone(m.rate_limiter)
+        self.assertIs(m.clone_for_worker().rate_limiter, m.rate_limiter)
+        m.set_rate_limit(0)
+        self.assertIsNone(m.rate_limiter)
+
+    def test_progress_adapter_charges_the_limiter(self):
+        limiter = self._limiter(1000)
+        seen = []
+        adapter = model_module._BotoProgressAdapter(
+            100, "k", lambda t, c, k: seen.append(c), limiter=limiter)
+        adapter(60)
+        adapter(40)
+        self.assertEqual(seen, [60, 100])
+        # everything transferred was charged against the bucket
+        self.assertAlmostEqual(limiter._tokens, 900.0, places=6)
+
+
+class ListingColumnDataTests(unittest.TestCase):
+    """Storage class and ETag come back with ListObjectsV2, so the optional
+    columns must cost no extra request."""
+
+    def test_listing_captures_storage_class_and_etag(self):
+        m = make_model(bucket="b")
+        m._client = FakeS3Client(list_pages=[{
+            "CommonPrefixes": [{"Prefix": "dir/sub/"}],
+            "Contents": [{
+                "Key": "dir/a.txt", "Size": 12, "LastModified": _dt(1),
+                "StorageClass": "GLACIER", "ETag": '"abc123"',
+            }],
+        }])
+        items = m.list("dir/")
+        by_name = {i.name: i for i in items}
+        self.assertEqual(by_name["a.txt"].storage_class, "GLACIER")
+        self.assertEqual(by_name["a.txt"].etag, "abc123")
+        # folders carry no object metadata
+        self.assertEqual(by_name["sub"].storage_class, "")
+
+    def test_storage_class_defaults_to_standard(self):
+        m = make_model(bucket="b")
+        m._client = FakeS3Client(list_pages=[{"Contents": [
+            {"Key": "a.txt", "Size": 1, "LastModified": _dt(1)}]}])
+        self.assertEqual(m.list("")[0].storage_class, "STANDARD")
+
+    def test_usage_listing_returns_storage_class(self):
+        m = make_model(bucket="b")
+        c = FakeS3Client(list_pages=[{"Contents": [
+            {"Key": "a.txt", "Size": 5, "StorageClass": "STANDARD_IA"}]}])
+        m._try_bind_bucket = lambda name: (c, "ep", "r", True)
+        self.assertEqual(
+            m.get_keys_for_bucket("b", ""), [("a.txt", 5, "STANDARD_IA")])
+
+
+class ProfileBundleTests(unittest.TestCase):
+    """Export must not write credentials in the clear, and import must reject
+    a wrong passphrase or a tampered file."""
+
+    PROFILES = [
+        {"name": "prod", "url": "https://s3.amazonaws.com",
+         "access_key": "AKPROD", "secret_key": "SUPERSECRET",
+         "session_token": "", "read_only": "true"},
+        {"name": "dev", "url": "https://minio.local", "access_key": "AKDEV",
+         "secret_key": "devsecret", "session_token": "tok"},
+    ]
+
+    def test_round_trip(self):
+        blob = export_profile_bundle(self.PROFILES, "correct horse")
+        restored = import_profile_bundle(blob, "correct horse")
+        self.assertEqual(restored, self.PROFILES)
+
+    def test_secrets_are_not_in_the_file(self):
+        blob = export_profile_bundle(self.PROFILES, "pw")
+        self.assertNotIn(b"SUPERSECRET", blob)
+        self.assertNotIn(b"AKPROD", blob)
+        # the envelope itself stays readable JSON
+        document = json.loads(blob.decode())
+        self.assertEqual(document["version"], 1)
+        self.assertIn("salt", document)
+
+    def test_wrong_passphrase_is_rejected(self):
+        blob = export_profile_bundle(self.PROFILES, "right")
+        with self.assertRaises(BundleError) as ctx:
+            import_profile_bundle(blob, "wrong")
+        self.assertIn("passphrase", str(ctx.exception).lower())
+
+    def test_tampered_payload_is_rejected(self):
+        blob = export_profile_bundle(self.PROFILES, "pw")
+        document = json.loads(blob.decode())
+        document["data"] = document["data"][:-6] + "AAAAA="
+        with self.assertRaises(BundleError):
+            import_profile_bundle(json.dumps(document).encode(), "pw")
+
+    def test_salt_differs_between_exports(self):
+        first = json.loads(export_profile_bundle(self.PROFILES, "pw").decode())
+        second = json.loads(export_profile_bundle(self.PROFILES, "pw").decode())
+        self.assertNotEqual(first["salt"], second["salt"])
+
+    def test_garbage_and_missing_fields(self):
+        with self.assertRaises(BundleError):
+            import_profile_bundle(b"not json at all", "pw")
+        with self.assertRaises(BundleError):
+            import_profile_bundle(b'{"hello": 1}', "pw")
+
+    def test_unsupported_version(self):
+        document = json.loads(export_profile_bundle(self.PROFILES, "pw").decode())
+        document["version"] = 99
+        with self.assertRaises(BundleError):
+            import_profile_bundle(json.dumps(document).encode(), "pw")
+
+    def test_export_requires_a_passphrase(self):
+        with self.assertRaises(BundleError):
+            export_profile_bundle(self.PROFILES, "")
 
 
 class SetBucketVersioningTests(unittest.TestCase):
@@ -2210,6 +2827,13 @@ class TransferSettingsDialogTests(unittest.TestCase):
         self.assertEqual(dlg.storage_class(), "")
         self.assertEqual(dlg.sse(), "")
 
+    def test_parallel_files_and_verify_round_trip(self):
+        dlg = self._dlg(parallel_files=9, verify_downloads=True)
+        self.assertEqual(dlg.parallel_files(), 9)
+        self.assertTrue(dlg.verify_downloads())
+        dlg._verify.setChecked(False)
+        self.assertFalse(dlg.verify_downloads())
+
 
 class OverwriteDialogTests(unittest.TestCase):
     @classmethod
@@ -2484,6 +3108,99 @@ class MainWindowBatchTests(unittest.TestCase):
         self.win._queue_start_next()
         self.assertEqual(shown, [])
 
+    def test_read_only_disables_write_actions_and_marks_the_title(self):
+        self.win.data_model.read_only = True
+        self.win.enable_action_buttons()
+        self.win.update_window_title()
+        self.assertFalse(self.win.btnRemove.isEnabled())
+        self.assertFalse(self.win.btnCreateFolder.isEnabled())
+        self.assertFalse(self.win.btnUpload.isEnabled())
+        self.assertFalse(self.win.btnUploadFolder.isEnabled())
+        self.assertIn("read-only", self.win.windowTitle())
+        # An armed undo is itself a write, so read-only must take it away
+        # again — check it is genuinely enabled first, or this proves nothing.
+        self.win.data_model.bucket = "bkt"
+        self.win._undo_delete = {"bucket": "bkt", "keys": ["a.txt"]}
+        self.win.data_model.read_only = False
+        self.win.enable_action_buttons()
+        self.assertTrue(self.win.btnUndoDelete.isEnabled())
+        self.win.data_model.read_only = True
+        self.win.enable_action_buttons()
+        self.assertFalse(self.win.btnUndoDelete.isEnabled())
+        # reading stays available
+        self.assertTrue(self.win.btnDownload.isEnabled())
+
+    def test_writable_profile_keeps_write_actions(self):
+        self.win.data_model.read_only = False
+        self.win.data_model.bucket = "bkt"
+        self.win.enable_action_buttons()
+        self.win.update_window_title()
+        self.assertTrue(self.win.btnRemove.isEnabled())
+        self.assertTrue(self.win.btnUpload.isEnabled())
+        self.assertNotIn("read-only", self.win.windowTitle())
+
+    def test_a_real_delete_arms_undo(self):
+        """The arming happens in the transfer-finished handler, so drive an
+        actual delete job rather than calling the recorder directly."""
+        class FakeDeleter:
+            def delete(self, key, log_fn=None, cancel_event=None):
+                return True
+
+        self.win.data_model.bucket = "bkt"
+        self.assertFalse(self.win.btnUndoDelete.isEnabled())
+        with patch.object(type(self.win.data_model), "clone_for_worker",
+                          lambda _s: FakeDeleter()):
+            self.win.assign_thread_operation(
+                "delete", ["a.txt", "dir/"], need_refresh=False)
+            deadline = time.monotonic() + 5
+            while (self.win._active_entry is not None
+                   and time.monotonic() < deadline):
+                self._app.processEvents()
+            self._app.processEvents()
+
+        self.assertIsNotNone(self.win._undo_delete)
+        self.assertEqual(self.win._undo_delete["keys"], ["a.txt", "dir/"])
+        self.assertTrue(self.win.btnUndoDelete.isEnabled())
+
+    def test_delete_arms_undo_and_undo_queues_a_job(self):
+        self.win.data_model.bucket = "bkt"
+        self.assertFalse(self.win.btnUndoDelete.isEnabled())
+        self.win._record_undoable_delete(["a.txt", "dir/"])
+        self.assertTrue(self.win.btnUndoDelete.isEnabled())
+
+        started = []
+        with patch.object(main_window.QMessageBox, "question",
+                          return_value=QMessageBox.StandardButton.Yes), \
+             patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append((m, j))):
+            self.win.undo_delete()
+        self.assertEqual(started, [("undelete", [("a.txt",), ("dir/",)])])
+        # a one-shot action: it disarms once used
+        self.assertFalse(self.win.btnUndoDelete.isEnabled())
+
+    def test_undo_is_dropped_when_the_bucket_changes(self):
+        self.win.data_model.bucket = "bkt"
+        self.win._record_undoable_delete(["a.txt"])
+        self.win._return_to_bucket_list_mode()
+        self.assertIsNone(self.win._undo_delete)
+        self.assertFalse(self.win.btnUndoDelete.isEnabled())
+
+    def test_undo_refuses_when_the_bucket_no_longer_matches(self):
+        self.win.data_model.bucket = "bkt"
+        self.win._record_undoable_delete(["a.txt"])
+        self.win.data_model.bucket = "other"
+        started = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append((m, j))):
+            self.win.undo_delete()
+        self.assertEqual(started, [])
+
+    def test_undo_stays_disabled_on_a_read_only_profile(self):
+        self.win.data_model.bucket = "bkt"
+        self.win.data_model.read_only = True
+        self.win._record_undoable_delete(["a.txt"])
+        self.assertFalse(self.win.btnUndoDelete.isEnabled())
+
     def test_no_conflicts_runs_untouched(self):
         job = [("a", "/tmp/fresh", 1, "/tmp")]
         self.assertEqual(
@@ -2640,6 +3357,69 @@ class BuildSyncPlanTests(unittest.TestCase):
         summary = summarize_sync_plan(actions)
         self.assertEqual(summary["upload"], 2)
         self.assertEqual(summary["bytes"], 30)
+
+
+class ExcludeMatcherTests(unittest.TestCase):
+    def test_no_patterns_excludes_nothing(self):
+        match = build_exclude_matcher([])
+        self.assertFalse(match("anything/at/all.txt"))
+        self.assertFalse(build_exclude_matcher(None)("x"))
+
+    def test_glob_matches_at_any_depth(self):
+        match = build_exclude_matcher(["*.tmp"])
+        self.assertTrue(match("a.tmp"))
+        self.assertTrue(match("deep/nested/b.tmp"))
+        self.assertFalse(match("a.txt"))
+
+    def test_directory_pattern_excludes_contents(self):
+        match = build_exclude_matcher(["node_modules/"])
+        self.assertTrue(match("node_modules/pkg/index.js"))
+        self.assertTrue(match("app/node_modules/pkg/index.js"))
+        self.assertFalse(match("src/app.js"))
+        # a file merely starting with the same characters is kept
+        self.assertFalse(match("node_modules_notes.txt"))
+
+    def test_bare_directory_name_also_excludes_contents(self):
+        match = build_exclude_matcher([".git"])
+        self.assertTrue(match(".git/config"))
+        self.assertTrue(match("sub/.git/HEAD"))
+
+    def test_path_glob(self):
+        match = build_exclude_matcher(["build/*.o"])
+        self.assertTrue(match("build/main.o"))
+        self.assertFalse(match("build/main.c"))
+
+    def test_blank_patterns_ignored(self):
+        match = build_exclude_matcher(["", "  ", "*.log"])
+        self.assertTrue(match("x.log"))
+        self.assertFalse(match("x.txt"))
+
+
+class SyncPlanExcludeTests(unittest.TestCase):
+    def test_excluded_paths_never_appear_in_the_plan(self):
+        local = {"keep.txt": (1, 1.0), "skip.tmp": (1, 1.0),
+                 "node_modules/a.js": (1, 1.0)}
+        actions = build_sync_plan(
+            local, {}, direction="upload",
+            exclude=["*.tmp", "node_modules/"])
+        self.assertEqual([a["rel"] for a in actions], ["keep.txt"])
+
+    def test_excluded_extras_are_not_deleted(self):
+        """The dangerous case: with delete_extra on, an excluded remote file
+        must not be swept away just because it is absent locally."""
+        actions = build_sync_plan(
+            {}, {"secrets.env": (1, 1.0), "junk.txt": (1, 1.0)},
+            direction="upload", delete_extra=True, exclude=["*.env"])
+        self.assertEqual(
+            [(a["action"], a["rel"]) for a in actions],
+            [("delete_remote", "junk.txt")],
+        )
+
+    def test_callable_exclude_is_accepted(self):
+        actions = build_sync_plan(
+            {"a.txt": (1, 1.0), "b.txt": (1, 1.0)}, {},
+            direction="upload", exclude=lambda rel: rel == "a.txt")
+        self.assertEqual([a["rel"] for a in actions], ["b.txt"])
 
 
 class ScanLocalTreeTests(unittest.TestCase):
@@ -2896,6 +3676,19 @@ class SyncDialogTests(unittest.TestCase):
         dlg._down.setChecked(True)
         self.assertEqual(dlg.direction(), "download")
 
+    def test_exclude_patterns_are_parsed_and_applied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("keep.txt", "drop.tmp"):
+                with open(os.path.join(tmp, name), "w") as handle:
+                    handle.write("x")
+            dlg, _mw = self._dlg()
+            dlg._local.setText(tmp)
+            dlg._exclude.setText("*.tmp, *.bak")
+            self.assertEqual(dlg.exclude_patterns(), ["*.tmp", "*.bak"])
+            dlg._preview()
+            self._settle(dlg)
+            self.assertEqual([a["rel"] for a in dlg._actions], ["keep.txt"])
+
     def test_run_hands_the_plan_to_the_window(self):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "f.txt"), "w") as handle:
@@ -2997,6 +3790,191 @@ class SyncWorkerTests(unittest.TestCase):
         worker.error.connect(errors.append)
         worker.sync()
         self.assertEqual(errors, ["nope"])
+
+
+class CollectShortcutsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _action(self, text, keys=""):
+        from PyQt6.QtGui import QAction, QKeySequence
+        act = QAction(text)
+        if keys:
+            act.setShortcut(QKeySequence(keys))
+        self.addCleanup(act.deleteLater)
+        return act
+
+    def test_only_actions_with_shortcuts_are_listed(self):
+        rows = collect_shortcuts([
+            self._action("Download (Ctrl+D)", "Ctrl+D"),
+            self._action("No shortcut here"),
+        ])
+        self.assertEqual(rows, [("Ctrl+D", "Download")])
+
+    def test_parenthetical_hint_is_stripped(self):
+        rows = collect_shortcuts([self._action("Refresh (F5, Ctrl+R)", "F5")])
+        self.assertEqual(rows[0][1], "Refresh")
+
+    def test_duplicates_removed_and_sorted_by_label(self):
+        rows = collect_shortcuts([
+            self._action("Zebra", "Ctrl+Z"),
+            self._action("Alpha", "Ctrl+A"),
+            self._action("Alpha", "Ctrl+A"),
+        ])
+        self.assertEqual([label for _k, label in rows], ["Alpha", "Zebra"])
+
+    def test_extra_rows_are_appended_verbatim(self):
+        rows = collect_shortcuts([], [("Enter", "Open")])
+        self.assertEqual(rows, [("Enter", "Open")])
+
+
+class UsageDialogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def test_result_renders_counts_classes_and_largest(self):
+        dlg = main_window.BucketUsageDialog("bkt", "pre/")
+        self.addCleanup(dlg.close)
+        dlg.set_result(
+            "bkt", "pre/", 3072, {"Documents": 1024, "Media": 2048, "Other": 0},
+            {"docs": 1024}, count=7,
+            by_class={"STANDARD": 1024, "GLACIER": 2048},
+            largest=[(2048, "big.mp4"), (1024, "doc.pdf")],
+        )
+        self.assertIn("7", dlg.total_lbl.text())
+        self.assertIn("GLACIER", dlg.by_class.text())
+        self.assertIn("big.mp4", dlg.largest.text())
+
+    def test_empty_result_says_so(self):
+        dlg = main_window.BucketUsageDialog("bkt")
+        self.addCleanup(dlg.close)
+        dlg.set_result("bkt", "", 0, {}, {}, count=0, by_class={}, largest=[])
+        self.assertIn("(empty)", dlg.by_class.text())
+        self.assertIn("(empty)", dlg.largest.text())
+
+
+class TransferHistoryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def setUp(self):
+        self.settings = QSettings("s3duck-tests", "s3duck-tests")
+        self.settings.clear()
+        self.addCleanup(self.settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            self.win = main_window.MainWindow(settings=(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                self.settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False, "", False,
+            ))
+        self.addCleanup(self.win.close)
+        deadline = time.monotonic() + 5
+        while not self.win.listview.isEnabled() and time.monotonic() < deadline:
+            self._app.processEvents()
+        self._app.processEvents()
+
+    def _entry(self, method="upload", job=None, status="done"):
+        entry = main_window._QEntry(1, method, job or [("k", "/tmp/f")],
+                                    label="Upload 1 item(s)")
+        entry.status = status
+        return entry
+
+    def test_completed_job_is_recorded_newest_first(self):
+        self.win._record_history(self._entry(), done_bytes=2048)
+        self.win._record_history(
+            self._entry(method="download", status="error"), done_bytes=10)
+        history = self.win.load_transfer_history()
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["method"], "download")
+        self.assertEqual(history[0]["status"], "error")
+        self.assertEqual(history[1]["bytes"], 2048)
+
+    def test_small_jobs_are_rerunnable(self):
+        self.win._record_history(self._entry())
+        self.assertIn("job", self.win.load_transfer_history()[0])
+
+    def test_huge_jobs_are_not_stored_for_rerun(self):
+        big = [("k%d" % i, "/tmp/f%d" % i)
+               for i in range(main_window.MainWindow.HISTORY_JOB_LIMIT + 1)]
+        self.win._record_history(self._entry(job=big))
+        record = self.win.load_transfer_history()[0]
+        self.assertNotIn("job", record)
+        self.assertEqual(record["items"], len(big))
+
+    def test_history_is_capped(self):
+        limit = main_window.MainWindow.HISTORY_LIMIT
+        entries = [{"when": str(i), "method": "upload", "label": "x",
+                    "items": 1, "bytes": 0, "status": "done"}
+                   for i in range(limit + 25)]
+        self.win._save_transfer_history(entries)
+        self.assertEqual(len(self.win.load_transfer_history()), limit)
+
+    def test_rerun_requeues_the_stored_job(self):
+        started = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append((m, j))):
+            self.win.rerun_history_entry(
+                {"method": "upload", "job": [["k", "/tmp/f"]]})
+        # JSON turned the tuples into lists; they come back as tuples
+        self.assertEqual(started, [("upload", [("k", "/tmp/f")])])
+
+    def test_rerun_ignores_entries_without_a_job(self):
+        started = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append((m, j))):
+            self.win.rerun_history_entry({"method": "upload"})
+        self.assertEqual(started, [])
+
+    def test_clear_empties_the_log(self):
+        self.win._record_history(self._entry())
+        self.win.clear_transfer_history()
+        self.assertEqual(self.win.load_transfer_history(), [])
+
+    def test_corrupt_history_is_ignored(self):
+        self.settings.beginGroup("common")
+        self.settings.setValue("transfer_history", "{not json")
+        self.settings.endGroup()
+        self.assertEqual(self.win.load_transfer_history(), [])
+
+    def test_optional_columns_hidden_by_default_and_toggleable(self):
+        for index in LIST_OPTIONAL_COLUMNS:
+            self.assertTrue(self.win.listview.isColumnHidden(index))
+        self.assertEqual(self.win.model.columnCount(), len(LIST_COLUMNS))
+        self.win.listview.setColumnHidden(3, False)
+        self.win.close()
+
+        again_settings = self.settings
+        with patch.object(main_window, "DataModel", _StubModel):
+            again = main_window.MainWindow(settings=(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                again_settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False, "", False,
+            ))
+        self.addCleanup(again.close)
+        # visibility survives a restart
+        self.assertFalse(again.listview.isColumnHidden(3))
+        self.assertTrue(again.listview.isColumnHidden(4))
+
+    def test_shortcut_help_includes_actions_and_listview_keys(self):
+        """REGRESSION: most QActions are parentless, so collecting only
+        findChildren(QAction) left the toolbar out of the cheat sheet."""
+        actions = list(self.win.tBar.actions()) + self.win.findChildren(QAction)
+        rows = collect_shortcuts(actions, main_window.LISTVIEW_KEY_HELP)
+        labels = [label for _k, label in rows]
+        all_keys = " | ".join(k for k, _l in rows)
+        for expected in ("Ctrl+D", "Ctrl+U", "Ctrl+Z", "Ctrl+L"):
+            self.assertIn(expected, all_keys)  # real toolbar actions
+        # Refresh binds two keys; both must be listed, not just the first
+        self.assertIn("F5", all_keys)
+        self.assertIn("Ctrl+R", all_keys)
+        self.assertIn("Backspace", all_keys)   # an event-filter key
+        self.assertIn("Ctrl+E", all_keys)      # a bare QShortcut
+        self.assertTrue(any("Download" in l for l in labels))
+        # labels lose their "(Ctrl+D)" hint
+        self.assertNotIn("Download (Ctrl+D)", labels)
 
 
 class ThemeTests(unittest.TestCase):

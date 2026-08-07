@@ -1,7 +1,11 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timezone
 from enum import Enum
+import hashlib
+import json
 import platform
 import re
+import time
 import uuid
 import os
 import boto3
@@ -14,6 +18,54 @@ from boto3.s3.transfer import TransferConfig
 
 class TransferCancelled(Exception):
     pass
+
+
+class ReadOnlyError(Exception):
+    """Raised when a write is attempted on a profile marked read-only."""
+
+
+def run_parallel(items, fn, workers, cancel_event=None):
+    """
+    Apply fn to every item, up to *workers* at a time.
+
+    Sequential when workers <= 1 (which keeps ordering deterministic). The
+    first exception stops further work and is re-raised once the in-flight
+    calls have drained, so a failure never leaves threads running.
+    """
+    items = list(items)
+    if not items:
+        return
+    if workers is None or int(workers) <= 1:
+        for item in items:
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+            fn(item)
+        return
+
+    first_exc = None
+    lock = threading.Lock()
+
+    def _wrapped(item):
+        nonlocal first_exc
+        if first_exc is not None:
+            return
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        try:
+            fn(item)
+        except Exception as exc:  # recorded, re-raised by the caller below
+            with lock:
+                if first_exc is None:
+                    first_exc = exc
+
+    with ThreadPoolExecutor(max_workers=int(workers)) as pool:
+        for future in [pool.submit(_wrapped, item) for item in items]:
+            future.result()
+
+    if first_exc is not None:
+        raise first_exc
+    if cancel_event is not None and cancel_event.is_set():
+        raise TransferCancelled("cancelled")
 
 
 def as_epoch(value) -> float:
@@ -40,11 +92,15 @@ class FSObjectType(Enum):
 
 
 class Item:
-    def __init__(self, name, type_, modified, size):
+    def __init__(self, name, type_, modified, size, storage_class="", etag=""):
         self.name = name
         self.type_ = type_
         self.modified = modified
         self.size = size
+        # Both come free with ListObjectsV2, so the optional listing columns
+        # cost no extra request.
+        self.storage_class = storage_class
+        self.etag = etag
 
     def __repr__(self):
         return "name: %s; type_: %d(%s), modified: %s size: %d" % (
@@ -58,16 +114,58 @@ class Item:
         )
 
 
+class RateLimiter:
+    """
+    Token bucket shared by every transfer so the ceiling is a *total*, not
+    per-file. consume() blocks until the requested bytes are affordable.
+
+    time_fn/sleep_fn are injectable so the behaviour can be tested without
+    actually waiting.
+    """
+
+    def __init__(self, rate_bps, *, time_fn=time.monotonic, sleep_fn=time.sleep,
+                 capacity=None):
+        self.rate_bps = float(rate_bps or 0)
+        self._time = time_fn
+        self._sleep = sleep_fn
+        # One second of burst by default, so small chunks are not serialised.
+        self.capacity = float(capacity if capacity is not None else self.rate_bps)
+        self._tokens = self.capacity
+        self._last = self._time()
+        self._lock = threading.Lock()
+
+    def consume(self, amount) -> float:
+        """Charge *amount* bytes, sleeping as needed. Returns seconds slept."""
+        amount = int(amount or 0)
+        if self.rate_bps <= 0 or amount <= 0:
+            return 0.0
+        with self._lock:
+            now = self._time()
+            self._tokens = min(
+                self.capacity, self._tokens + (now - self._last) * self.rate_bps)
+            self._last = now
+            if self._tokens >= amount:
+                self._tokens -= amount
+                return 0.0
+            deficit = amount - self._tokens
+            delay = deficit / self.rate_bps
+            self._tokens = 0.0
+            self._last = now + delay
+        self._sleep(delay)
+        return delay
+
+
 class _BotoProgressAdapter:
     """
     Adapt boto3 Callback(bytes_amount) -> progress_cb(total, current, key).
     Also supports cooperative cancellation.
     """
-    def __init__(self, total, key, cb, cancel_event=None):
+    def __init__(self, total, key, cb, cancel_event=None, limiter=None):
         self.total = max(1, int(total or 0))
         self.key = key
         self.cb = cb
         self.cancel_event = cancel_event
+        self.limiter = limiter
         self._sofar = 0
         self._lock = threading.Lock()
 
@@ -76,10 +174,12 @@ class _BotoProgressAdapter:
         if self.cancel_event is not None and self.cancel_event.is_set():
             raise TransferCancelled("cancelled")
 
+        inc = int(bytes_amount or 0)
+        if self.limiter is not None:
+            self.limiter.consume(inc)
+
         if self.cb is None:
             return
-
-        inc = int(bytes_amount or 0)
         with self._lock:
             self._sofar += inc
             cur = self._sofar
@@ -95,6 +195,13 @@ class Model:
     # set_transfer_concurrency ("Transfer settings…" in the UI).
     DEFAULT_TRANSFER_CONCURRENCY = 4
     MAX_TRANSFER_CONCURRENCY = 16
+    # Files in flight at once. Total connections ≈ parallel_files × concurrency.
+    DEFAULT_PARALLEL_FILES = 4
+    MAX_PARALLEL_FILES = 32
+    # Downloads this size or larger go through the resumable ranged path.
+    RESUME_THRESHOLD = 16 * 1024 * 1024
+    RESUME_CHUNK_SIZE = 8 * 1024 * 1024
+    PART_SUFFIX = ".s3duckpart"
 
     def __init__(
         self,
@@ -110,9 +217,14 @@ class Model:
         read_timeout=60,
         transfer_concurrency=None,
         session_token=None,
+        parallel_files=None,
+        read_only=False,
     ):
         self.session = boto3.session.Session()
         self._client = None
+        # Serialises rebind_bucket: parallel transfers can hit a region error
+        # at the same moment and would otherwise race on _client/endpoint.
+        self._rebind_lock = threading.RLock()
 
         # navigation state
         self.current_folder = ""
@@ -149,6 +261,23 @@ class Model:
         # Extra args applied to every upload (storage class, encryption).
         self.upload_extra_args = {}
 
+        # Writes are refused entirely when the profile is read-only.
+        self.read_only = bool(read_only)
+
+        # Shared across all transfers so the cap is a total, not per file.
+        self.rate_limiter = None
+
+        # Compare the downloaded bytes against the object's ETag afterwards.
+        self.verify_downloads = False
+        # Downloads at or above this size use the resumable ranged path.
+        self.resume_threshold = self.RESUME_THRESHOLD
+
+        # How many *files* move at once (transfer_concurrency parallelises the
+        # chunks within one file).
+        self.set_parallel_files(
+            self.DEFAULT_PARALLEL_FILES if parallel_files is None else parallel_files
+        )
+
         self.set_transfer_concurrency(
             self.DEFAULT_TRANSFER_CONCURRENCY
             if transfer_concurrency is None else transfer_concurrency
@@ -177,6 +306,30 @@ class Model:
         self.transfer_cfg_download = TransferConfig(**cfg)
         self.transfer_cfg_upload = TransferConfig(**cfg)
         return n
+
+    def set_parallel_files(self, n) -> int:
+        """How many files transfer simultaneously (1 = strictly sequential)."""
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            n = self.DEFAULT_PARALLEL_FILES
+        self.parallel_files = max(1, min(n, self.MAX_PARALLEL_FILES))
+        return self.parallel_files
+
+    def set_rate_limit(self, bytes_per_sec):
+        """Cap total transfer throughput; 0/None removes the limit."""
+        try:
+            rate = float(bytes_per_sec or 0)
+        except (TypeError, ValueError):
+            rate = 0.0
+        self.rate_limiter = RateLimiter(rate) if rate > 0 else None
+        return self.rate_limiter
+
+    def _guard_write(self):
+        if self.read_only:
+            raise ReadOnlyError(
+                "This profile is read-only; the operation was blocked."
+            )
 
     # Server-side encryption modes offered in the UI.
     SSE_MODES = ("", "AES256", "aws:kms")
@@ -220,6 +373,12 @@ class Model:
         m.access_key = self.access_key
         m.secret_key = self.secret_key
         m.session_token = self.session_token
+        m.read_only = self.read_only
+        m.parallel_files = self.parallel_files
+        m.rate_limiter = self.rate_limiter
+        m.verify_downloads = self.verify_downloads
+        m.resume_threshold = self.resume_threshold
+        m._rebind_lock = threading.RLock()
         m.bucket = self.bucket
         # Shared by reference on purpose: a binding a worker discovers is worth
         # keeping for the whole app.
@@ -520,7 +679,10 @@ class Model:
         bucket = self.bucket
         if not bucket:
             return
+        with self._rebind_lock:
+            self._rebind_bucket_locked(bucket, log_fn)
 
+    def _rebind_bucket_locked(self, bucket, log_fn=None):
         region_hint = endpoint_hint = None
         try:
             region_hint, endpoint_hint = self.get_bucket_hints(bucket)
@@ -664,6 +826,7 @@ class Model:
         For AWS S3:
           - us-east-1 is special: you cannot/should not pass LocationConstraint.
         """
+        self._guard_write()
         params = {"Bucket": bucket_name}
 
         region = self.profile_region or "us-east-1"
@@ -684,6 +847,7 @@ class Model:
         Also aborts any in-flight multipart uploads: their orphaned parts are
         invisible to ListObjectsV2 and keep DeleteBucket failing.
         """
+        self._guard_write()
         bucket_name = (bucket_name or "").strip()
         if not bucket_name:
             raise ValueError("bucket_name is empty")
@@ -710,6 +874,7 @@ class Model:
     def empty_bucket(self, bucket_name: str, *, batch_size: int = 1000,
                      cancel_event=None, log_fn=None):
         """Remove everything inside a bucket but keep the bucket itself."""
+        self._guard_write()
         bucket_name = (bucket_name or "").strip()
         if not bucket_name:
             raise ValueError("bucket_name is empty")
@@ -818,6 +983,7 @@ class Model:
         the DeleteBucket call. Using the profile-default client here failed for
         buckets that live in a non-default region (PermanentRedirect).
         """
+        self._guard_write()
         # Bind to a client that can actually reach this bucket.
         bucket_client, _endpoint, _region, _use_path = self._try_bind_bucket(bucket_name)
 
@@ -913,6 +1079,8 @@ class Model:
                             FSObjectType.FILE,
                             obj["LastModified"],
                             obj["Size"],
+                            storage_class=obj.get("StorageClass") or "STANDARD",
+                            etag=(obj.get("ETag") or "").replace('"', ""),
                         )
                     )
         except botocore.exceptions.ClientError as exc:
@@ -984,7 +1152,9 @@ class Model:
                     bucket,
                     k,
                     out_path,
-                    Callback=_BotoProgressAdapter(size, k, progress_cb, cancel_event=cancel_event),
+                    Callback=_BotoProgressAdapter(
+                        size, k, progress_cb, cancel_event=cancel_event,
+                        limiter=self.rate_limiter),
                     Config=self.transfer_cfg_download,
                 )
             try:
@@ -1005,6 +1175,7 @@ class Model:
             base_dir = os.path.join(folder_path, base_name)
             os.makedirs(base_dir, exist_ok=True)
 
+            pending = []
             for k, size in self.get_keys(prefix, log_fn=log_fn):
                 if not k:
                     continue
@@ -1030,15 +1201,26 @@ class Model:
                     continue
 
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                _download_one(self.bucket, k, out_path, size)
+                pending.append((k, out_path, size))
+
+            # Whole-prefix downloads are one job entry, so without this the
+            # parallel-files setting would do nothing for "download a folder".
+            run_parallel(
+                pending,
+                lambda item: _download_one(self.bucket, item[0], item[1], item[2]),
+                self.parallel_files,
+                cancel_event=cancel_event,
+            )
             return
 
         size = None
+        etag = ""
         try:
             if cancel_event is not None and cancel_event.is_set():
                 raise TransferCancelled("cancelled")
             head = self.client.head_object(Bucket=self.bucket, Key=key)
             size = head.get("ContentLength")
+            etag = self.normalize_etag(head.get("ETag"))
         except TransferCancelled:
             raise
         except Exception as exc:
@@ -1049,6 +1231,7 @@ class Model:
                 try:
                     head = self.client.head_object(Bucket=self.bucket, Key=key)
                     size = head.get("ContentLength")
+                    etag = self.normalize_etag(head.get("ETag"))
                 except Exception:
                     pass  # non-fatal; proceed without size
 
@@ -1063,9 +1246,164 @@ class Model:
         except Exception:
             pass
 
+        # Large downloads take the ranged path so an interruption can resume
+        # instead of starting over; small ones stay on the managed transfer.
+        if size is not None and int(size) >= int(self.resume_threshold):
+            self._download_ranged(
+                key, local_name, size, etag, progress_cb=progress_cb,
+                cancel_event=cancel_event, log_fn=log_fn,
+            )
+            return
+
         _download_one(self.bucket, key, local_name, size)
 
+        if self.verify_downloads and etag:
+            if not self.verify_download(local_name, etag, log_fn=log_fn):
+                raise Exception(
+                    f"Checksum mismatch after downloading '{key}'; the local "
+                    "file does not match the object's ETag"
+                )
+
+    @staticmethod
+    def normalize_etag(etag) -> str:
+        return (etag or "").replace('"', "").strip()
+
+    @classmethod
+    def etag_is_md5(cls, etag) -> bool:
+        """
+        True when the ETag is a plain MD5 we can reproduce locally. Multipart
+        uploads use a '<md5-of-md5s>-<parts>' form that cannot be checked
+        without knowing the original part boundaries.
+        """
+        tag = cls.normalize_etag(etag)
+        return bool(tag) and "-" not in tag and len(tag) == 32
+
+    @staticmethod
+    def file_md5(path, chunk_size: int = 1024 * 1024) -> str:
+        digest = hashlib.md5()
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(chunk_size), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def verify_download(self, path, etag, log_fn=None) -> bool:
+        """
+        Compare a downloaded file with the object's ETag.
+
+        Returns True when they match, False on mismatch, and True (with a log
+        line) when the ETag is multipart and therefore not comparable.
+        """
+        if not self.etag_is_md5(etag):
+            if log_fn:
+                log_fn(f"checksum skipped (multipart ETag): {path}")
+            return True
+        actual = self.file_md5(path)
+        expected = self.normalize_etag(etag)
+        if actual != expected:
+            if log_fn:
+                log_fn(f"CHECKSUM MISMATCH for {path}: {actual} != {expected}")
+            return False
+        if log_fn:
+            log_fn(f"checksum ok: {path}")
+        return True
+
+    def _resume_paths(self, out_path):
+        part = out_path + self.PART_SUFFIX
+        return part, part + ".meta"
+
+    def _download_ranged(self, key, out_path, size, etag, progress_cb=None,
+                         cancel_event=None, log_fn=None):
+        """
+        Download in fixed-size ranges into a '.s3duckpart' file, recording which
+        chunks landed. An interrupted transfer resumes from the sidecar instead
+        of restarting, and the chunks still download in parallel.
+        """
+        size = int(size)
+        chunk_size = int(self.RESUME_CHUNK_SIZE)
+        total_chunks = max(1, (size + chunk_size - 1) // chunk_size)
+        part_path, meta_path = self._resume_paths(out_path)
+        etag = self.normalize_etag(etag)
+
+        done = set()
+        if os.path.exists(part_path) and os.path.exists(meta_path):
+            try:
+                with open(meta_path) as handle:
+                    saved = json.load(handle)
+                if (saved.get("etag") == etag
+                        and int(saved.get("size", -1)) == size
+                        and int(saved.get("chunk_size", -1)) == chunk_size):
+                    done = {int(i) for i in saved.get("chunks", [])}
+                    if log_fn and done:
+                        log_fn(
+                            f"resuming {key}: {len(done)}/{total_chunks} chunks "
+                            "already local"
+                        )
+                else:
+                    # The object changed under us; the partial file is useless.
+                    os.remove(part_path)
+                    os.remove(meta_path)
+            except Exception:
+                done = set()
+
+        if not os.path.exists(part_path):
+            with open(part_path, "wb") as handle:
+                handle.truncate(size)
+            done = set()
+
+        state_lock = threading.Lock()
+        transferred = len(done) * chunk_size
+
+        def _save_meta():
+            tmp = meta_path + ".tmp"
+            with open(tmp, "w") as handle:
+                json.dump({"etag": etag, "size": size,
+                           "chunk_size": chunk_size,
+                           "chunks": sorted(done)}, handle)
+            os.replace(tmp, meta_path)
+
+        handle = open(part_path, "r+b")
+        try:
+            def _fetch(index):
+                nonlocal transferred
+                if cancel_event is not None and cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                start = index * chunk_size
+                end = min(size, start + chunk_size) - 1
+                resp = self.client.get_object(
+                    Bucket=self.bucket, Key=key, Range=f"bytes={start}-{end}")
+                data = resp["Body"].read()
+                if self.rate_limiter is not None:
+                    self.rate_limiter.consume(len(data))
+                with state_lock:
+                    handle.seek(start)
+                    handle.write(data)
+                    handle.flush()
+                    done.add(index)
+                    _save_meta()
+                    transferred += len(data)
+                    current = transferred
+                if progress_cb is not None:
+                    progress_cb(size, min(current, size), key)
+
+            pending = [i for i in range(total_chunks) if i not in done]
+            run_parallel(pending, _fetch, self.parallel_files,
+                         cancel_event=cancel_event)
+        finally:
+            handle.close()
+
+        os.replace(part_path, out_path)
+        if os.path.exists(meta_path):
+            os.remove(meta_path)
+
+        if self.verify_downloads and not self.verify_download(
+                out_path, etag, log_fn=log_fn):
+            raise Exception(
+                f"Checksum mismatch after downloading '{key}'; the local file "
+                "does not match the object's ETag"
+            )
+
     def create_folder(self, key, log_fn=None):
+        self._guard_write()
         try:
             return self.client.put_object(Bucket=self.bucket, Key=key)
         except Exception as exc:
@@ -1103,7 +1441,8 @@ class Model:
 
     def get_keys_for_bucket(self, bucket_name: str, prefix: str = ""):
         """
-        Return [(Key, Size), ...] for objects under 'prefix' in *bucket_name*.
+        Return [(Key, Size, StorageClass), ...] for objects under 'prefix' in
+        *bucket_name*.
 
         Unlike get_keys(), this does NOT require (and does not modify) the
         current navigation state (self.bucket / current_folder).
@@ -1124,7 +1463,8 @@ class Model:
                     if not key:
                         continue
                     size = int(obj.get("Size") or 0)
-                    result.append((key, size))
+                    result.append(
+                        (key, size, obj.get("StorageClass") or "STANDARD"))
             return result
 
         # First attempt: existing logic
@@ -1225,6 +1565,7 @@ class Model:
 
     def delete(self, key, log_fn=None, cancel_event=None) -> bool:
         """Delete one object, or every object under a prefix (batched)."""
+        self._guard_write()
         if key.endswith("/"):
             batch = []
             for k, _ in self.get_keys(key, log_fn=log_fn):
@@ -1256,6 +1597,7 @@ class Model:
 
         status must be 'Enabled' or 'Suspended'.
         """
+        self._guard_write()
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
         status = (status or "").strip().capitalize()
@@ -1356,7 +1698,8 @@ class Model:
                 self.bucket, key, local_path,
                 ExtraArgs={"VersionId": version_id},
                 Callback=_BotoProgressAdapter(
-                    size, key, progress_cb, cancel_event=cancel_event
+                    size, key, progress_cb, cancel_event=cancel_event,
+                    limiter=self.rate_limiter,
                 ),
                 Config=self.transfer_cfg_download,
             )
@@ -1375,6 +1718,7 @@ class Model:
 
     def delete_object_version(self, key, version_id, log_fn=None):
         """Permanently delete a single object version (or a delete marker)."""
+        self._guard_write()
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
 
@@ -1393,6 +1737,61 @@ class Model:
             self.rebind_bucket(log_fn=log_fn)
             _do()
 
+    def undelete(self, key: str, log_fn=None) -> int:
+        """
+        Undo a delete on a versioning-enabled bucket by removing the delete
+        markers it left behind. For a prefix ('foo/') every marker underneath
+        is removed. Returns how many objects came back.
+
+        On a bucket without versioning there are no markers and the delete was
+        permanent, so this reports 0 rather than pretending to succeed.
+        """
+        self._guard_write()
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+
+        exact = not key.endswith("/")
+
+        def _fetch_markers():
+            markers = []
+            paginator = self.client.get_paginator("list_object_versions")
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=key):
+                for dm in (page.get("DeleteMarkers", []) or []):
+                    marker_key = dm.get("Key")
+                    version_id = dm.get("VersionId")
+                    if not marker_key or not version_id:
+                        continue
+                    # Only the newest marker resurrects the object; older ones
+                    # belong to earlier delete/restore cycles.
+                    if not dm.get("IsLatest"):
+                        continue
+                    if exact and marker_key != key:
+                        continue
+                    markers.append((marker_key, version_id))
+            return markers
+
+        try:
+            markers = _fetch_markers()
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code == "NotImplemented":
+                if log_fn:
+                    log_fn("Backend does not support versions; nothing to undo")
+                return 0
+            if not self._is_region_error(exc):
+                raise
+            self.rebind_bucket(log_fn=log_fn)
+            markers = _fetch_markers()
+
+        restored = 0
+        for marker_key, version_id in markers:
+            self.client.delete_object(
+                Bucket=self.bucket, Key=marker_key, VersionId=version_id)
+            restored += 1
+            if log_fn:
+                log_fn(f"restored {marker_key}")
+        return restored
+
     def make_version_current(self, key, version_id, log_fn=None):
         """
         Promote an older version to be the current one by copying that version
@@ -1400,6 +1799,7 @@ class Model:
         the older version's data (the standard S3 "restore a previous version"
         technique); nothing is deleted.
         """
+        self._guard_write()
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
         copy_source = {"Bucket": self.bucket, "Key": key, "VersionId": version_id}
@@ -1424,6 +1824,7 @@ class Model:
         Upload a file (with progress) or create a folder placeholder if local_file is None.
         Automatically retries once on region/endpoint errors.
         """
+        self._guard_write()
         if local_file is None:
             self.create_folder("%s/" % key, log_fn=log_fn)
             return
@@ -1444,7 +1845,9 @@ class Model:
                 self.bucket,
                 key,
                 ExtraArgs=extra_args,
-                Callback=_BotoProgressAdapter(total, key, progress_cb, cancel_event=cancel_event),
+                Callback=_BotoProgressAdapter(
+                    total, key, progress_cb, cancel_event=cancel_event,
+                    limiter=self.rate_limiter),
                 Config=self.transfer_cfg_upload,
             )
 
@@ -1503,6 +1906,7 @@ class Model:
         Anyone with the link can upload to this exact key until it expires,
         e.g. `curl --upload-file localfile "<url>"`.
         """
+        self._guard_write()
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
         return self.client.generate_presigned_url(
@@ -1519,6 +1923,7 @@ class Model:
           (True, None) if ACL applied
           (False, reason) if ACL could not be applied (e.g., MinIO NotImplemented)
         """
+        self._guard_write()
         if not self.bucket:
             return False, "Bucket is empty; select a bucket first"
 
@@ -1685,15 +2090,87 @@ class Model:
 
         return region_hint, endpoint_hint
 
-    def copy_object(self, src_key: str, dst_key: str, dst_bucket: str = None, log_fn=None):
-        """Copy a single S3 object server-side (no data transfer)."""
+    # A server-side copy fails with these when the destination is not reachable
+    # from the source's client (another region, endpoint or account).
+    CROSS_LOCATION_CODES = (
+        "PermanentRedirect", "AuthorizationHeaderMalformed",
+        "InvalidLocationConstraint", "CrossLocationLoggingProhibitted",
+        "InvalidRequest", "NoSuchBucket",
+    )
+
+    def _stream_copy(self, src_key: str, dst_key: str, dst_bucket: str,
+                     log_fn=None):
+        """
+        Copy by streaming the object through this process.
+
+        CopyObject is server-side and requires one endpoint to reach both
+        buckets, which is not true across regions or accounts. Reading from the
+        source client and writing with a client bound to the destination works
+        anywhere, at the cost of moving the bytes.
+        """
+        dst_client, _endpoint, _region, _use_path = self._try_bind_bucket(dst_bucket)
+        resp = self.client.get_object(Bucket=self.bucket, Key=src_key)
+        body = resp["Body"]
+
+        extra = {}
+        for field, header in (
+            ("ContentType", "ContentType"),
+            ("CacheControl", "CacheControl"),
+            ("ContentDisposition", "ContentDisposition"),
+            ("ContentEncoding", "ContentEncoding"),
+        ):
+            value = resp.get(header)
+            if value:
+                extra[field] = value
+        metadata = resp.get("Metadata") or {}
+        if metadata:
+            extra["Metadata"] = dict(metadata)
+        extra.update(self.upload_extra_args)
+
+        dst_client.upload_fileobj(
+            body, dst_bucket, dst_key,
+            ExtraArgs=extra or None,
+            Config=self.transfer_cfg_upload,
+        )
+        if log_fn:
+            log_fn(f"streamed {src_key} -> {dst_bucket}/{dst_key}")
+
+    def copy_object(self, src_key: str, dst_key: str, dst_bucket: str = None,
+                    log_fn=None, allow_stream=True):
+        """
+        Copy one object, server-side when possible.
+
+        A cross-region or cross-account destination cannot be reached by the
+        source's client, so on those errors the bytes are streamed through this
+        process instead of failing.
+        """
+        self._guard_write()
         dst_bucket = dst_bucket or self.bucket
+        cross_bucket = dst_bucket != self.bucket
         copy_source = {"Bucket": self.bucket, "Key": src_key}
 
         def _do():
             self.client.copy_object(CopySource=copy_source, Bucket=dst_bucket, Key=dst_key)
 
         try:
+            _do()
+            return
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if (allow_stream and cross_bucket
+                    and code in self.CROSS_LOCATION_CODES):
+                if log_fn:
+                    log_fn(
+                        f"Server-side copy refused ({code}); streaming "
+                        f"'{src_key}' to bucket '{dst_bucket}' instead"
+                    )
+                self._stream_copy(src_key, dst_key, dst_bucket, log_fn=log_fn)
+                return
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error copying '{src_key}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
             _do()
         except Exception as exc:
             if not self._is_region_error(exc):
@@ -1706,6 +2183,7 @@ class Model:
     def copy_prefix(self, src_prefix: str, dst_prefix: str, dst_bucket: str = None,
                     log_fn=None, cancel_event=None):
         """Server-side recursive copy of all objects under src_prefix to dst_prefix."""
+        self._guard_write()
         dst_bucket = dst_bucket or self.bucket
         if dst_bucket == self.bucket:
             sp = src_prefix if src_prefix.endswith("/") else src_prefix + "/"
@@ -1717,16 +2195,16 @@ class Model:
                     f"Destination '{dst_prefix}' is inside source "
                     f"'{src_prefix}'; copying a folder into itself is not allowed"
                 )
-        for key, _ in self.get_keys(src_prefix, log_fn=log_fn):
-            if cancel_event is not None and cancel_event.is_set():
-                raise TransferCancelled("cancelled")
-            if not key:
-                continue
+        def _copy_one(key):
             rel = key[len(src_prefix):]
             dst_key = dst_prefix + rel
             if log_fn:
                 log_fn(f"copying {key} -> {dst_key}")
             self.copy_object(key, dst_key, dst_bucket=dst_bucket, log_fn=log_fn)
+
+        keys = [k for k, _ in self.get_keys(src_prefix, log_fn=log_fn) if k]
+        run_parallel(keys, _copy_one, self.parallel_files,
+                     cancel_event=cancel_event)
 
     def list_multipart_uploads(self, prefix: str = "", *, bucket_name: str = None,
                                client_obj=None, with_sizes: bool = False,
@@ -1808,6 +2286,7 @@ class Model:
     def abort_multipart_upload(self, key: str, upload_id: str,
                                bucket_name: str = None, log_fn=None):
         """Abort one in-flight multipart upload and free its stored parts."""
+        self._guard_write()
         bucket = bucket_name or self.bucket
         if not bucket:
             raise ValueError("Bucket is empty; select a bucket first")
@@ -1834,6 +2313,7 @@ class Model:
 
     def put_object_tags(self, key: str, tags: list):
         """Replace the full TagSet for an object."""
+        self._guard_write()
         self.client.put_object_tagging(
             Bucket=self.bucket,
             Key=key,
@@ -1888,6 +2368,7 @@ class Model:
           (True, None)      restore initiated
           (False, reason)   could not initiate (already running, unsupported, …)
         """
+        self._guard_write()
         if not self.bucket:
             return False, "Bucket is empty; select a bucket first"
         req = {"Days": int(days)}
@@ -1912,6 +2393,7 @@ class Model:
 
     def change_storage_class(self, key: str, storage_class: str, log_fn=None):
         """Change an object's storage class via a server-side copy onto itself."""
+        self._guard_write()
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
         copy_source = {"Bucket": self.bucket, "Key": key}
@@ -1963,6 +2445,7 @@ class Model:
         preserved when passed in (a REPLACE copy would otherwise reset it to
         STANDARD).
         """
+        self._guard_write()
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
 

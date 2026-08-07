@@ -1,3 +1,5 @@
+import fnmatch
+import json
 import os
 import re
 import sys
@@ -24,6 +26,7 @@ from PyQt6.QtCore import QRectF, QUrl
 from model import Model as DataModel
 from model import FSObjectType
 from model import TransferCancelled
+from model import run_parallel
 from utils import scan_local_tree
 from properties_window import PropertiesWindow
 from profile_switcher import ProfileSwitchWindow
@@ -34,6 +37,12 @@ OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
 __VERSION__ = "0.11.0"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
+
+# Listing columns. Storage class and ETag come free with ListObjectsV2 but are
+# hidden by default; the header context menu toggles them.
+LIST_COLUMNS = ("Name", "Size", "Modified", "Storage class", "ETag")
+LIST_COLUMN_DEFAULT_WIDTHS = (320, 80, 140, 110, 240)
+LIST_OPTIONAL_COLUMNS = (3, 4)
 
 PROGRESS_EMIT_INTERVAL_SEC = 0.6   # ~1.6 updates/sec
 PROGRESS_MIN_BYTE_DELTA = 1 * 1024 * 1024  # also emit if at least 1MB progressed
@@ -360,8 +369,52 @@ def bulk_rename_plan(items, *, mode=BULK_RENAME_FIND, find="", replace="",
     return plan, problems
 
 
+def build_exclude_matcher(patterns):
+    """
+    Compile sync exclude patterns into ``match(rel_path) -> bool``.
+
+    A pattern matches if it globs the whole relative path or just the file
+    name, so `*.tmp` works at any depth. A pattern ending in `/` (or naming a
+    directory) excludes everything beneath it, which is what `node_modules/`
+    is expected to do.
+    """
+    cleaned = [p.strip() for p in (patterns or []) if p and p.strip()]
+    if not cleaned:
+        return lambda _rel: False
+
+    dir_prefixes = []
+    globs = []
+    for pattern in cleaned:
+        if pattern.endswith("/"):
+            dir_prefixes.append(pattern.rstrip("/"))
+        else:
+            globs.append(pattern)
+
+    def _match(rel):
+        rel = (rel or "").strip("/")
+        if not rel:
+            return False
+        parts = rel.split("/")
+        for prefix in dir_prefixes:
+            if rel == prefix or rel.startswith(prefix + "/"):
+                return True
+            if prefix in parts[:-1]:
+                return True
+        name = parts[-1]
+        for pattern in globs:
+            if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(name, pattern):
+                return True
+            # a bare directory name also excludes its contents
+            if pattern in parts[:-1]:
+                return True
+        return False
+
+    return _match
+
+
 def build_sync_plan(local_entries, remote_entries, *, direction,
-                    delete_extra=False, tolerance=SYNC_MTIME_TOLERANCE_SEC):
+                    delete_extra=False, tolerance=SYNC_MTIME_TOLERANCE_SEC,
+                    exclude=None):
     """
     Compare two ``{rel_path: (size, mtime_epoch)}`` maps and return the list of
     actions needed to make the destination match the source.
@@ -373,6 +426,8 @@ def build_sync_plan(local_entries, remote_entries, *, direction,
     if direction not in ("upload", "download"):
         raise ValueError("direction must be 'upload' or 'download'")
 
+    is_excluded = exclude if callable(exclude) else build_exclude_matcher(exclude)
+
     if direction == "upload":
         source, dest = local_entries, remote_entries
         transfer, delete_action = "upload", "delete_remote"
@@ -382,6 +437,8 @@ def build_sync_plan(local_entries, remote_entries, *, direction,
 
     actions = []
     for rel in sorted(source):
+        if is_excluded(rel):
+            continue
         src_size, src_mtime = source[rel]
         if rel not in dest:
             actions.append({"action": transfer, "rel": rel,
@@ -399,7 +456,7 @@ def build_sync_plan(local_entries, remote_entries, *, direction,
                             "size": src_size, "reason": "up to date"})
 
     for rel in sorted(dest):
-        if rel in source:
+        if rel in source or is_excluded(rel):
             continue
         size = dest[rel][0]
         if delete_extra:
@@ -422,6 +479,55 @@ def summarize_sync_plan(actions) -> dict:
             total_bytes += int(entry.get("size") or 0)
     counts["bytes"] = total_bytes
     return counts
+
+
+# Keys with no QAction behind them — handled either in the list view's event
+# filter or by a bare QShortcut — so scanning actions cannot find them.
+LISTVIEW_KEY_HELP = (
+    ("Ctrl+F", "Quick filter the current listing"),
+    ("Ctrl+Shift+F", "Recursive search under this prefix"),
+    ("Ctrl+E", "Sync with a local folder"),
+    ("Shift+F2", "Rename multiple items"),
+    ("Ctrl+/", "Show this shortcut list"),
+    ("Enter", "Open the selected bucket / folder / file"),
+    ("Backspace", "Go up one level"),
+    ("Del", "Delete selection"),
+    ("Insert", "Create bucket or folder"),
+    ("F2", "Rename selected item"),
+    ("Home", "Back to the bucket list"),
+    ("Esc", "Clear the quick filter, else cancel transfers"),
+    ("Any letter", "Start the quick filter (type-to-search)"),
+)
+
+
+def collect_shortcuts(actions, extra=()) -> list:
+    """
+    Build the (keys, description) rows for the shortcut help.
+
+    Derived from the real QActions so the list cannot drift from the app, with
+    the event-filter keys supplied separately.
+    """
+    rows = []
+    seen = set()
+    for action in actions or []:
+        try:
+            # shortcuts() (plural) — an action can carry several, and
+            # shortcut() would only ever report the first (F5 but not Ctrl+R).
+            bindings = [k.toString() for k in action.shortcuts()]
+            label = action.text()
+        except Exception:
+            continue
+        keys = ", ".join(k for k in bindings if k)
+        if not keys or not label:
+            continue
+        # Strip the "(Ctrl+D)" hint baked into several action labels.
+        label = re.sub(r"\s*\([^)]*\)\s*$", "", label).strip(" …")
+        if (keys, label) in seen:
+            continue
+        seen.add((keys, label))
+        rows.append((keys, label))
+    rows.sort(key=lambda row: row[1].lower())
+    return rows + list(extra)
 
 
 def format_completion_notification(stats) -> tuple:
@@ -706,6 +812,11 @@ class Worker(QObject):
         self.job = job
         self._cancel_event = threading.Event()
 
+    @property
+    def _file_workers(self) -> int:
+        """How many files to move at once (1 keeps ordering deterministic)."""
+        return int(getattr(self.data_model, "parallel_files", 1) or 1)
+
     @pyqtSlot()
     def cancel(self):
         self._cancel_event.set()
@@ -771,23 +882,22 @@ class Worker(QObject):
 
                 return _cb
 
-            for key, local_name, size, folder_path in self.job:
-                if self._cancel_event.is_set():
-                    raise TransferCancelled("cancelled")
-
+            def _download_one(item):
+                key, local_name, size, folder_path = item
                 if local_name:
                     msg = "downloading %s -> %s (%s)" % (key, local_name, size)
                 else:
                     msg = "downloading directory: %s -> %s" % (key, folder_path)
                 self.progress.emit(msg)
-
-                cb = make_cb()
                 self.data_model.download_file(
                     key, local_name, folder_path,
-                    progress_cb=cb,
+                    progress_cb=make_cb(),
                     cancel_event=self._cancel_event,
                     log_fn=self.progress.emit,
                 )
+
+            run_parallel(self.job, _download_one, self._file_workers,
+                         cancel_event=self._cancel_event)
 
             self.batch_progress.emit(int(done_all), int(total_bytes_all))
 
@@ -876,23 +986,22 @@ class Worker(QObject):
 
                 return _cb
 
-            for key, local_name in self.job:
-                if self._cancel_event.is_set():
-                    raise TransferCancelled("cancelled")
-
+            def _upload_one(item):
+                key, local_name = item
                 if local_name is not None:
                     msg = "uploading %s -> %s" % (local_name, key)
                 else:
                     msg = "creating folder %s" % key
                 self.progress.emit(msg)
-
-                cb = make_cb() if local_name else None
                 self.data_model.upload_file(
                     local_name, key,
-                    progress_cb=cb,
+                    progress_cb=make_cb() if local_name else None,
                     cancel_event=self._cancel_event,
                     log_fn=self.progress.emit,
                 )
+
+            run_parallel(self.job, _upload_one, self._file_workers,
+                         cancel_event=self._cancel_event)
 
             self.batch_progress.emit(int(done_all), int(total_bytes_all))
 
@@ -1059,9 +1168,8 @@ class Worker(QObject):
 
                 return _cb
 
-            for action, rel, local_path, key, _size in self.job:
-                if self._cancel_event.is_set():
-                    raise TransferCancelled("cancelled")
+            def _sync_one(item):
+                action, rel, local_path, key, _size = item
                 if action == "upload":
                     self.progress.emit(f"sync upload {rel}")
                     self.data_model.upload_file(
@@ -1089,6 +1197,9 @@ class Worker(QObject):
                     except OSError as exc:
                         self.progress.emit(f"could not delete {local_path}: {exc}")
 
+            run_parallel(self.job, _sync_one, self._file_workers,
+                         cancel_event=self._cancel_event)
+
             self.batch_progress.emit(int(done_all), int(total_bytes_all))
         except Exception as exc:
             msg = str(exc) or exc.__class__.__name__
@@ -1096,6 +1207,33 @@ class Worker(QObject):
                 cancelled = True
             else:
                 self.progress.emit(f"sync failed: {msg}")
+                self.error.emit(msg)
+        finally:
+            self.finished.emit(cancelled)
+
+    def undelete(self):
+        # job = [(key,)]
+        cancelled = False
+        restored = 0
+        try:
+            for (key,) in self.job:
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                self.progress.emit(f"restoring {key}")
+                restored += self.data_model.undelete(key, log_fn=self.progress.emit)
+            if restored:
+                self.progress.emit(f"restored {restored} object(s)")
+            else:
+                self.progress.emit(
+                    "nothing to restore — the bucket has no delete markers "
+                    "(versioning was not enabled, so the delete was permanent)"
+                )
+        except Exception as exc:
+            msg = str(exc) or exc.__class__.__name__
+            if "cancelled" in msg.lower():
+                cancelled = True
+            else:
+                self.progress.emit(f"undo failed: {msg}")
                 self.error.emit(msg)
         finally:
             self.finished.emit(cancelled)
@@ -1214,29 +1352,47 @@ class UsageWorker(QObject):
     def run(self):
         try:
             total = 0
+            count = 0
             by_cat = {"Documents": 0, "Media": 0, "Other": 0}
             by_top = {}
+            by_class = {}
+            largest = []
 
             pref = self.prefix or ""
             pref_len = len(pref)
 
-            for k, s in self.data_model.get_keys_for_bucket(self.bucket_name, pref):
+            for k, s, storage in self.data_model.get_keys_for_bucket(
+                    self.bucket_name, pref):
                 if not k or str(k).endswith("/"):
                     continue
                 key = str(k)
                 sz = int(s or 0)
                 total += sz
+                count += 1
 
                 cat = categorize_key(key)
                 by_cat[cat] = by_cat.get(cat, 0) + sz
+
+                cls = storage or "STANDARD"
+                by_class[cls] = by_class.get(cls, 0) + sz
 
                 rel = key[pref_len:] if key.startswith(pref) else key
                 top = rel.split("/", 1)[0] if "/" in rel else "(files)"
                 by_top[top] = by_top.get(top, 0) + sz
 
-            by_top = dict(sorted(by_top.items(), key=lambda kv: kv[1], reverse=True)[:12])
+                largest.append((sz, rel))
+                if len(largest) > 200:      # keep the scan memory-bounded
+                    largest.sort(reverse=True)
+                    del largest[50:]
 
-            self.finished.emit(self.bucket_name, self.prefix, {"total": total, "by_cat": by_cat, "by_top": by_top})
+            by_top = dict(sorted(by_top.items(), key=lambda kv: kv[1], reverse=True)[:12])
+            largest.sort(reverse=True)
+
+            self.finished.emit(self.bucket_name, self.prefix, {
+                "total": total, "count": count, "by_cat": by_cat,
+                "by_top": by_top, "by_class": by_class,
+                "largest": largest[:10],
+            })
         except Exception as exc:
             self.finished.emit(self.bucket_name, self.prefix, exc)
 
@@ -1305,6 +1461,11 @@ class BucketUsageDialog(QDialog):
         self.top_groups = QLabel("<b>Top groups</b><br><pre>Calculating…</pre>")
         self.top_groups.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
+        self.by_class = QLabel("<b>Storage classes</b><br><pre>Calculating…</pre>")
+        self.by_class.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.largest = QLabel("<b>Largest objects</b><br><pre>Calculating…</pre>")
+        self.largest.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
         top = QHBoxLayout()
         top.addWidget(self.pie, 0)
         top.addLayout(legend, 1)
@@ -1317,6 +1478,8 @@ class BucketUsageDialog(QDialog):
         layout.addWidget(self.total_lbl)
         layout.addLayout(top)
         layout.addWidget(self.top_groups)
+        layout.addWidget(self.by_class)
+        layout.addWidget(self.largest)
         layout.addWidget(btn)
         self.setLayout(layout)
 
@@ -1335,6 +1498,8 @@ class BucketUsageDialog(QDialog):
         for k in ["Documents", "Media", "Other"]:
             self.legend_labels[k].setText(f"{k}: Calculating…")
         self.top_groups.setText("<b>Top groups</b><br><pre>Calculating…</pre>")
+        self.by_class.setText("<b>Storage classes</b><br><pre>Calculating…</pre>")
+        self.largest.setText("<b>Largest objects</b><br><pre>Calculating…</pre>")
 
     def set_error(self, bucket_name: str, prefix: str, err: Exception):
         self._bucket = bucket_name
@@ -1345,13 +1510,19 @@ class BucketUsageDialog(QDialog):
         for k in ["Documents", "Media", "Other"]:
             self.legend_labels[k].setText(f"{k}: n/a")
         self.top_groups.setText(f"<b>Top groups</b><br><pre>n/a\n{err}</pre>")
+        self.by_class.setText("<b>Storage classes</b><br><pre>n/a</pre>")
+        self.largest.setText("<b>Largest objects</b><br><pre>n/a</pre>")
 
-    def set_result(self, bucket_name: str, prefix: str, total: int, by_cat: dict, by_top: dict):
+    def set_result(self, bucket_name: str, prefix: str, total: int, by_cat: dict,
+                   by_top: dict, count: int = 0, by_class: dict = None,
+                   largest=None):
         self._bucket = bucket_name
         title = f"<b>{bucket_name}</b>" + (f"<br><span style='color:#666'>/{prefix}</span>" if prefix else "")
         self.title.setText(title)
 
-        self.total_lbl.setText(f"Total: <b>{_human_bytes(int(total))}</b>")
+        self.total_lbl.setText(
+            f"Total: <b>{_human_bytes(int(total))}</b>"
+            + (f" in <b>{int(count)}</b> object(s)" if count else ""))
 
         norm_cat = {"Documents": 0, "Media": 0, "Other": 0}
         for k, v in (by_cat or {}).items():
@@ -1369,6 +1540,21 @@ class BucketUsageDialog(QDialog):
             lines = ["(empty)"]
 
         self.top_groups.setText("<b>Top groups</b><br><pre>" + "\n".join(lines) + "</pre>")
+
+        class_lines = [
+            f"{name:22s}  {_human_bytes(int(size or 0))}"
+            for name, size in sorted((by_class or {}).items(),
+                                     key=lambda kv: kv[1], reverse=True)
+        ] or ["(empty)"]
+        self.by_class.setText(
+            "<b>Storage classes</b><br><pre>" + "\n".join(class_lines) + "</pre>")
+
+        big_lines = [
+            f"{_human_bytes(int(size or 0)):>10s}  {name}"
+            for size, name in (largest or [])
+        ] or ["(empty)"]
+        self.largest.setText(
+            "<b>Largest objects</b><br><pre>" + "\n".join(big_lines) + "</pre>")
 
 
 class CopyMoveDialog(QDialog):
@@ -1496,7 +1682,8 @@ class TransferSettingsDialog(QDialog):
 
     def __init__(self, parent, *, concurrency, max_concurrency, storage_classes,
                  sse_modes, storage_class="", sse="", kms_key_id="",
-                 notify=True):
+                 notify=True, parallel_files=4, max_parallel_files=32,
+                 verify_downloads=False, rate_limit_kbps=0):
         super().__init__(parent)
         self.setWindowTitle("Transfer settings")
         self.setMinimumWidth(460)
@@ -1504,6 +1691,10 @@ class TransferSettingsDialog(QDialog):
         self._concurrency = QSpinBox()
         self._concurrency.setRange(1, max_concurrency)
         self._concurrency.setValue(int(concurrency))
+
+        self._parallel_files = QSpinBox()
+        self._parallel_files.setRange(1, max_parallel_files)
+        self._parallel_files.setValue(int(parallel_files))
 
         self._storage = QComboBox()
         for name in storage_classes:
@@ -1523,16 +1714,30 @@ class TransferSettingsDialog(QDialog):
             "Notify when transfers finish while the window is in the background")
         self._notify.setChecked(bool(notify))
 
+        self._rate_limit = QSpinBox()
+        self._rate_limit.setRange(0, 10 * 1024 * 1024)
+        self._rate_limit.setSuffix(" KB/s")
+        self._rate_limit.setSpecialValueText("unlimited")
+        self._rate_limit.setValue(int(rate_limit_kbps or 0))
+
+        self._verify = QCheckBox(
+            "Verify downloads against the object's ETag (re-reads each file)")
+        self._verify.setChecked(bool(verify_downloads))
+
         form = QFormLayout()
-        form.addRow(QLabel("Parallel connections per transfer"), self._concurrency)
+        form.addRow(QLabel("Files transferred at once"), self._parallel_files)
+        form.addRow(QLabel("Connections per file (multipart)"), self._concurrency)
+        form.addRow(QLabel("Bandwidth limit (all transfers)"), self._rate_limit)
         form.addRow(QLabel("Upload storage class"), self._storage)
         form.addRow(QLabel("Upload encryption"), self._sse)
         form.addRow(QLabel("KMS key"), self._kms)
+        form.addRow(self._verify)
         form.addRow(self._notify)
 
         note = QLabel(
-            "Storage class and encryption apply to new uploads. Existing "
-            "objects are unaffected; use \"Change storage class…\" for those."
+            "Total connections is roughly files × connections-per-file. "
+            "Storage class and encryption apply to new uploads; existing "
+            "objects are unaffected, use \"Change storage class…\" for those."
         )
         note.setWordWrap(True)
 
@@ -1560,6 +1765,9 @@ class TransferSettingsDialog(QDialog):
     def concurrency(self) -> int:
         return self._concurrency.value()
 
+    def parallel_files(self) -> int:
+        return self._parallel_files.value()
+
     def storage_class(self) -> str:
         return self._storage.currentData() or ""
 
@@ -1571,6 +1779,12 @@ class TransferSettingsDialog(QDialog):
 
     def notify(self) -> bool:
         return self._notify.isChecked()
+
+    def verify_downloads(self) -> bool:
+        return self._verify.isChecked()
+
+    def rate_limit_kbps(self) -> int:
+        return self._rate_limit.value()
 
 
 class BulkRenameDialog(QDialog):
@@ -1738,6 +1952,17 @@ class SyncDialog(QDialog):
         self._delete_extra = QCheckBox(
             "Delete files at the destination that are missing at the source")
 
+        self._exclude = QLineEdit()
+        self._exclude.setPlaceholderText(
+            "Exclude, e.g.  *.tmp  node_modules/  .git/")
+        self._exclude.setToolTip(
+            "Space or comma separated globs. A trailing '/' excludes a whole "
+            "directory."
+        )
+        exclude_row = QHBoxLayout()
+        exclude_row.addWidget(QLabel("Exclude"))
+        exclude_row.addWidget(self._exclude, 1)
+
         dir_row = QHBoxLayout()
         dir_row.addWidget(self._up)
         dir_row.addWidget(self._down)
@@ -1771,6 +1996,7 @@ class SyncDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.addLayout(local_row)
         lay.addLayout(dir_row)
+        lay.addLayout(exclude_row)
         lay.addWidget(self._delete_extra)
         lay.addWidget(self._info)
         lay.addWidget(self._table, 1)
@@ -1792,6 +2018,9 @@ class SyncDialog(QDialog):
     def direction(self) -> str:
         return "upload" if self._up.isChecked() else "download"
 
+    def exclude_patterns(self) -> list:
+        return [p for p in re.split(r"[,\s]+", self._exclude.text() or "") if p]
+
     def _preview(self):
         if self._thread is not None:
             return
@@ -1808,6 +2037,7 @@ class SyncDialog(QDialog):
         prefix = self._prefix
         direction = self.direction()
         delete_extra = self._delete_extra.isChecked()
+        exclude = self.exclude_patterns()
         clone = self._model.clone_for_worker()
         cancel = threading.Event()
         self._cancel = cancel
@@ -1816,7 +2046,7 @@ class SyncDialog(QDialog):
             remote = clone.list_tree(prefix, cancel_event=cancel)
             local = scan_local_tree(local_dir)
             return build_sync_plan(local, remote, direction=direction,
-                                   delete_extra=delete_extra)
+                                   delete_extra=delete_extra, exclude=exclude)
 
         self._thread = QThread(self)
         self._worker = _FuncWorker(_scan)
@@ -1879,6 +2109,121 @@ class SyncDialog(QDialog):
         self.accept()
         self._mw.start_sync(
             todo, self._local.text().strip(), self._prefix, self.direction())
+
+
+class ShortcutsDialog(QDialog):
+    """Keyboard reference — plain letters are reserved for type-to-search, so
+    every real shortcut carries a modifier and none of them are obvious."""
+
+    def __init__(self, parent, rows):
+        super().__init__(parent)
+        self.setWindowTitle("Keyboard shortcuts")
+        self.resize(560, 560)
+
+        self._table = QTableWidget(0, 2)
+        self._table.setHorizontalHeaderLabels(["Shortcut", "Action"])
+        self._table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        for keys, label in rows:
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            self._table.setItem(r, 0, QTableWidgetItem(keys))
+            self._table.setItem(r, 1, QTableWidgetItem(label))
+        self._table.resizeColumnToContents(0)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(close_btn)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self._table, 1)
+        lay.addLayout(row)
+
+
+class TransferHistoryDialog(QDialog):
+    """Past transfers, with the option to run one again."""
+
+    def __init__(self, parent, main_window, entries):
+        super().__init__(parent)
+        self._mw = main_window
+        self._entries = list(entries or [])
+        self.setWindowTitle("Transfer history")
+        self.resize(820, 460)
+
+        self._table = QTableWidget(0, 5)
+        self._table.setHorizontalHeaderLabels(
+            ["When", "Operation", "Items", "Bytes", "Result"])
+        self._table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self._table.itemSelectionChanged.connect(self._update_buttons)
+        self._render()
+
+        self._btn_rerun = QPushButton("Run again")
+        self._btn_rerun.clicked.connect(self._rerun)
+        self._btn_rerun.setEnabled(False)
+        clear_btn = QPushButton("Clear history")
+        clear_btn.clicked.connect(self._clear)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+
+        row = QHBoxLayout()
+        row.addWidget(self._btn_rerun)
+        row.addWidget(clear_btn)
+        row.addStretch(1)
+        row.addWidget(close_btn)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self._table, 1)
+        lay.addLayout(row)
+
+    def _render(self):
+        self._table.setRowCount(0)
+        for entry in self._entries:
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            cells = [
+                entry.get("when", ""),
+                entry.get("label", entry.get("method", "")),
+                str(entry.get("items", "")),
+                _human_bytes(entry.get("bytes") or 0),
+                entry.get("status", ""),
+            ]
+            for c, text in enumerate(cells):
+                self._table.setItem(r, c, QTableWidgetItem(text))
+        self._table.resizeColumnToContents(0)
+
+    def _selected(self):
+        r = self._table.currentRow()
+        if 0 <= r < len(self._entries):
+            return self._entries[r]
+        return None
+
+    def _update_buttons(self):
+        entry = self._selected()
+        self._btn_rerun.setEnabled(bool(entry and entry.get("job")))
+
+    def _rerun(self):
+        entry = self._selected()
+        if not entry or not entry.get("job"):
+            return
+        self.accept()
+        self._mw.rerun_history_entry(entry)
+
+    def _clear(self):
+        self._entries = []
+        self._mw.clear_transfer_history()
+        self._render()
+        self._update_buttons()
 
 
 class OverwriteDialog(QDialog):
@@ -3262,7 +3607,7 @@ class _QueueRow(QWidget):
     _OP_ICONS = {
         "upload": "⬆", "download": "⬇", "delete": "✕",
         "copy": "⇆", "move": "➜", "delete_buckets": "✕",
-        "empty_buckets": "∅", "sync": "⇅",
+        "empty_buckets": "∅", "sync": "⇅", "undelete": "↺",
     }
     _STATUS_COLORS = {
         "queued": "#e4e4e8", "running": "#bbdefb",
@@ -3338,6 +3683,7 @@ class _QueueRow(QWidget):
 class TransferQueuePanel(QWidget):
     cancel_requested = pyqtSignal(int)
     retry_requested = pyqtSignal(int)
+    history_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3352,10 +3698,15 @@ class TransferQueuePanel(QWidget):
         clear_btn.setFlat(True)
         clear_btn.clicked.connect(self._clear_done)
 
+        history_btn = QPushButton("History")
+        history_btn.setFlat(True)
+        history_btn.clicked.connect(self.history_requested)
+
         hdr_row = QHBoxLayout()
         hdr_row.setContentsMargins(0, 0, 0, 0)
         hdr_row.setSpacing(0)
         hdr_row.addWidget(hdr, 1)
+        hdr_row.addWidget(history_btn)
         hdr_row.addWidget(clear_btn)
 
         self._content = QWidget()
@@ -3491,8 +3842,9 @@ class MainWindow(QMainWindow):
         self.title = "S3 Duck 🦆 %s" % __VERSION__
         self.setWindowIcon(QIcon.fromTheme("applications-internet"))
 
-        # Profiles created before session-token support pass 10 fields.
-        settings = tuple(settings) + ("",) * (11 - len(tuple(settings)))
+        # Profiles created before session-token / read-only support pass fewer
+        # fields; pad so old callers keep working.
+        settings = tuple(settings) + ("",) * (12 - len(tuple(settings)))
         (
             current_dir,
             settings,
@@ -3505,6 +3857,7 @@ class MainWindow(QMainWindow):
             no_ssl_check,
             use_path,
             session_token,
+            read_only,
         ) = settings
         self.settings = settings
         self.current_dir = current_dir
@@ -3516,11 +3869,18 @@ class MainWindow(QMainWindow):
                 "transfer_concurrency", DataModel.DEFAULT_TRANSFER_CONCURRENCY))
         except (TypeError, ValueError):
             transfer_concurrency = DataModel.DEFAULT_TRANSFER_CONCURRENCY
+        try:
+            parallel_files = int(settings.value(
+                "parallel_files", DataModel.DEFAULT_PARALLEL_FILES))
+        except (TypeError, ValueError):
+            parallel_files = DataModel.DEFAULT_PARALLEL_FILES
         settings.endGroup()
         self.data_model = DataModel(
             url, region, access_key, secret_key, bucket, no_ssl_check, use_path,
             transfer_concurrency=transfer_concurrency,
             session_token=session_token,
+            parallel_files=parallel_files,
+            read_only=bool(read_only),
         )
         self._load_binding_cache()
         self._load_upload_options()
@@ -3604,6 +3964,7 @@ class MainWindow(QMainWindow):
         self._queue_panel = TransferQueuePanel(self)
         self._queue_panel.cancel_requested.connect(self._on_queue_cancel_requested)
         self._queue_panel.retry_requested.connect(self._on_queue_retry_requested)
+        self._queue_panel.history_requested.connect(self.show_transfer_history)
         vlay = QVBoxLayout()
         vlay.setContentsMargins(0, 0, 0, 0)
         vlay.setSpacing(0)
@@ -3646,6 +4007,7 @@ class MainWindow(QMainWindow):
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnCreateFolder)
         self.tBar.addAction(self.btnRemove)
+        self.tBar.addAction(self.btnUndoDelete)
         self.tBar.addAction(self.btnCancel)
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnSwitchProfile)
@@ -3657,7 +4019,7 @@ class MainWindow(QMainWindow):
         self.tBar.setIconSize(QSize(26, 26))
 
         self.model = QStandardItemModel()
-        self.model.setHorizontalHeaderLabels(["Name", "Size", "Modified"])
+        self.model.setHorizontalHeaderLabels(list(LIST_COLUMNS))
 
         self.proxy = UpTopProxyModel(UP_ENTRY_LABEL, self)
         self.proxy.setSourceModel(self.model)
@@ -3714,6 +4076,7 @@ class MainWindow(QMainWindow):
         self._queue_entries: dict = {}
         self._batch_stats = {"done": 0, "cancelled": 0, "error": 0}
         self._tray_icon = None
+        self._undo_delete = None
 
         self.thread = None
         self.worker = None
@@ -3725,6 +4088,9 @@ class MainWindow(QMainWindow):
 
         self._deep_search_shortcut = QShortcut(QKeySequence("Ctrl+Shift+F"), self)
         self._deep_search_shortcut.activated.connect(self.open_search)
+
+        self._shortcuts_shortcut = QShortcut(QKeySequence("Ctrl+/"), self)
+        self._shortcuts_shortcut.activated.connect(self.show_shortcuts)
 
         self._sync_shortcut = QShortcut(QKeySequence("Ctrl+E"), self)
         self._sync_shortcut.activated.connect(self.open_sync)
@@ -3744,9 +4110,13 @@ class MainWindow(QMainWindow):
 
         self.listview.header().setSortIndicatorShown(True)
         self.listview.setSortingEnabled(True)
-        self.listview.header().resizeSection(0, 320)
-        self.listview.header().resizeSection(1, 80)
-        self.listview.header().resizeSection(2, 80)
+        header = self.listview.header()
+        for index, width in enumerate(LIST_COLUMN_DEFAULT_WIDTHS):
+            header.resizeSection(index, width)
+        for index in LIST_OPTIONAL_COLUMNS:
+            self.listview.setColumnHidden(index, True)
+        header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        header.customContextMenuRequested.connect(self._column_context_menu)
 
         self.listview.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.listview.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -3944,6 +4314,13 @@ class MainWindow(QMainWindow):
 
     def _load_upload_options(self):
         self.settings.beginGroup("common")
+        self.data_model.verify_downloads = str(
+            self.settings.value("verify_downloads", "false")).lower() in ("true", "1")
+        try:
+            self.data_model.set_rate_limit(
+                int(self.settings.value("rate_limit_kbps", 0) or 0) * 1024)
+        except (TypeError, ValueError):
+            pass
         storage_class = self.settings.value("upload_storage_class", "") or ""
         sse = self.settings.value("upload_sse", "") or ""
         kms = self.settings.value("upload_kms_key", "") or ""
@@ -3970,12 +4347,16 @@ class MainWindow(QMainWindow):
             self._bucket_enter_worker = None
             return False
 
+    def is_read_only(self) -> bool:
+        return bool(getattr(self.data_model, "read_only", False))
+
     def update_window_title(self):
         profile = getattr(self, "profile_name", "")
+        suffix = "  [read-only]" if self.is_read_only() else ""
         if profile:
-            self.setWindowTitle(f"{self.title} — {profile}")
+            self.setWindowTitle(f"{self.title} — {profile}{suffix}")
         else:
-            self.setWindowTitle(self.title)
+            self.setWindowTitle(f"{self.title}{suffix}")
 
     def in_bucket_list_mode(self) -> bool:
         return not bool(self.data_model.bucket)
@@ -3988,6 +4369,9 @@ class MainWindow(QMainWindow):
         - restore *root* endpoint & addressing style
         - drop cached client so future self.data_model.client is rebuilt
         """
+        # The pending undo belongs to the bucket we are leaving.
+        self._clear_undo_delete()
+
         self.data_model.bucket = ""
         self.data_model.current_folder = ""
         self.data_model.prev_folder = ""
@@ -4273,7 +4657,12 @@ class MainWindow(QMainWindow):
 
             self.statusBar().showMessage("Usage calculated", 2000)
             if self._bucket_usage_dialog is not None:
-                self._bucket_usage_dialog.set_result(bname, pref, total, by_cat, by_top)
+                self._bucket_usage_dialog.set_result(
+                    bname, pref, total, by_cat, by_top,
+                    count=int(result.get("count", 0) or 0),
+                    by_class=dict(result.get("by_class", {}) or {}),
+                    largest=list(result.get("largest", []) or []),
+                )
 
         w.finished.connect(apply_result)
         w.finished.connect(t.quit)
@@ -4314,6 +4703,9 @@ class MainWindow(QMainWindow):
                     m is not None and raw_name and raw_name.rstrip("/") == UP_ENTRY_LABEL
                 )
                 bucket_list_mode = self.in_bucket_list_mode()
+                # A read-only profile shows only the non-mutating entries; the
+                # model refuses writes too, this just avoids dead menu items.
+                writable = not self.is_read_only()
 
                 if upload_path is None or up_selected:
                     upload_path = self.data_model.current_folder
@@ -4322,6 +4714,16 @@ class MainWindow(QMainWindow):
 
                 # bucket list mode menu
                 if bucket_list_mode:
+                    act_new_bucket = None
+                    act_empty_bucket = None
+                    act_del_bucket = None
+                    if not writable:
+                        self._menu_click_guard.arm()
+                        self.menu.addAction(
+                            QAction("(read-only profile)", self)
+                        ).setEnabled(False)
+                        self.menu.exec(event.globalPos())
+                        return True
                     act_new_bucket = QAction(
                         QIcon.fromTheme(
                             "folder-new",
@@ -4614,6 +5016,23 @@ class MainWindow(QMainWindow):
                     )
                     self.menu.addAction(properties_selected_action)
 
+                if not writable:
+                    # Strip every mutating entry in one pass rather than
+                    # guarding each addAction above.
+                    for act in (
+                        upload_selected_action, upload_current_action,
+                        upload_folder_action, create_folder_action,
+                        versioning_action, incomplete_action, sync_action,
+                        share_public_action, delete_action, copy_move_action,
+                        rename_action, bulk_rename_action, storage_action,
+                        restore_action, tags_action, metadata_action,
+                    ):
+                        if act is not None:
+                            self.menu.removeAction(act)
+                    hint = QAction("(read-only profile)", self)
+                    hint.setEnabled(False)
+                    self.menu.addAction(hint)
+
                 self._menu_click_guard.arm()
                 clk = self.menu.exec(event.globalPos())
                 if not clk:
@@ -4775,6 +5194,10 @@ class MainWindow(QMainWindow):
         self.data_model.access_key = prof.access_key
         self.data_model.secret_key = prof.secret_key
         self.data_model.no_ssl_check = prof.no_ssl_check
+        self.data_model.session_token = getattr(prof, "session_token", "") or ""
+        self.data_model.read_only = bool(getattr(prof, "read_only", False))
+        self.data_model.binding_cache.clear()
+        self._clear_undo_delete()
 
         self.data_model._client = None
 
@@ -4791,6 +5214,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        self._load_binding_cache()
         self.navigate(show_loading=True)
         self.update_window_title()
 
@@ -4811,6 +5235,7 @@ class MainWindow(QMainWindow):
             <a title='Vladislav Ananev' href='https://github.com/nexusriot' target='_blank'>
             <br><span style='color: #8743e2; font-size: 10pt;'>©2022-2026 Vladislav Ananev</a><br><br></strong></span></p>
             """
+            + "Press Ctrl+/ for the keyboard shortcut list<br><br>"
             + "version %s" % __VERSION__
             + "<br>Qt %s" % qt_version
             + "<br><br>"
@@ -4836,6 +5261,8 @@ class MainWindow(QMainWindow):
                     [
                         ListItem(0, FSObjectType.BUCKET, bucket_icon, b.name),
                         ListItem(0, FSObjectType.BUCKET, "<BUCKET>"),
+                        ListItem(0, FSObjectType.BUCKET, ""),
+                        ListItem(0, FSObjectType.BUCKET, ""),
                         ListItem(0, FSObjectType.BUCKET, ""),
                     ]
                 )
@@ -4863,6 +5290,8 @@ class MainWindow(QMainWindow):
                                  UP_ENTRY_LABEL),
                         ListItem(0, FSObjectType.FOLDER, ""),
                         ListItem(0, FSObjectType.FOLDER, ""),
+                        ListItem(0, FSObjectType.FOLDER, ""),
+                        ListItem(0, FSObjectType.FOLDER, ""),
                     ]
                 )
 
@@ -4877,6 +5306,8 @@ class MainWindow(QMainWindow):
                         size_val = int(i.size or 0)
                         size = _human_bytes(size_val)
                         modified = str(i.modified)
+                        storage = getattr(i, "storage_class", "") or ""
+                        etag = getattr(i, "etag", "") or ""
                     else:
                         icon = QIcon().fromTheme(
                             "network-server",
@@ -4886,12 +5317,16 @@ class MainWindow(QMainWindow):
                         size_val = 0
                         size = "<DIR>"
                         modified = ""
+                        storage = ""
+                        etag = ""
 
                     self.model.appendRow(
                         [
                             ListItem(size_val, i.type_, icon, i.name),
                             ListItem(size_val, i.type_, size),
                             ListItem(size_val, i.type_, modified),
+                            ListItem(size_val, i.type_, storage),
+                            ListItem(size_val, i.type_, etag),
                         ]
                     )
 
@@ -5031,6 +5466,7 @@ class MainWindow(QMainWindow):
 
         def _on_enter_success(bucket_name: str):
             self._last_selected_bucket = bucket_name
+            self._clear_undo_delete()
             self.listview.setEnabled(True)
             if target_prefix:
                 # enter_bucket resets navigation to the bucket root.
@@ -5366,6 +5802,7 @@ class MainWindow(QMainWindow):
             "delete_buckets": "Delete bucket",
             "empty_buckets": "Empty bucket",
             "sync": "Sync",
+            "undelete": "Undo delete of",
         }.get(method, method.capitalize())
         return f"{verb} {n} item(s)"
 
@@ -5478,6 +5915,11 @@ class MainWindow(QMainWindow):
                 self._batch_stats.get(entry.status, 0) + 1)
             self._queue_panel.update_status(entry)
 
+            self._record_history(entry, done_bytes=self._smooth_done)
+
+            if method == "delete" and entry.status == "done":
+                self._record_undoable_delete(entry.job)
+
             if need_refresh:
                 QTimer.singleShot(0, lambda: self.navigate(force=True))
 
@@ -5563,6 +6005,119 @@ class MainWindow(QMainWindow):
                 self._transfer_queue.pop(i)
                 self._queue_panel.update_status(e)
                 return
+
+    HISTORY_LIMIT = 200
+    HISTORY_JOB_LIMIT = 100   # only small jobs are worth storing for re-run
+
+    def load_transfer_history(self) -> list:
+        self.settings.beginGroup("common")
+        raw = self.settings.value("transfer_history", "") or ""
+        self.settings.endGroup()
+        try:
+            entries = json.loads(raw) if raw else []
+        except Exception:
+            entries = []
+        return entries if isinstance(entries, list) else []
+
+    def _save_transfer_history(self, entries):
+        self.settings.beginGroup("common")
+        self.settings.setValue(
+            "transfer_history", json.dumps(entries[:self.HISTORY_LIMIT]))
+        self.settings.endGroup()
+
+    def _record_history(self, entry, done_bytes=0):
+        """Append a finished job to the persisted history, newest first."""
+        job = entry.job or []
+        record = {
+            "when": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "method": entry.method,
+            "label": entry.label,
+            "items": len(job),
+            "bytes": int(done_bytes or 0),
+            "status": entry.status,
+        }
+        # Big jobs would bloat the settings file; those simply are not re-runnable.
+        if len(job) <= self.HISTORY_JOB_LIMIT:
+            try:
+                record["job"] = json.loads(json.dumps(job))
+            except (TypeError, ValueError):
+                pass
+        entries = self.load_transfer_history()
+        entries.insert(0, record)
+        self._save_transfer_history(entries)
+
+    def clear_transfer_history(self):
+        self._save_transfer_history([])
+        self.log("transfer history cleared")
+
+    def show_transfer_history(self):
+        TransferHistoryDialog(self, self, self.load_transfer_history()).exec()
+
+    def rerun_history_entry(self, entry):
+        job = entry.get("job") or []
+        method = entry.get("method")
+        if not job or not method:
+            return
+        # JSON turned the tuples into lists; the workers unpack either.
+        self.log(f"re-running {method} from history ({len(job)} item(s))")
+        self.assign_thread_operation(method, [tuple(i) if isinstance(i, list) else i
+                                              for i in job])
+
+    def show_shortcuts(self):
+        # Most QActions are created without a parent, so findChildren alone
+        # would miss the whole toolbar.
+        actions = list(self.tBar.actions()) + self.findChildren(QAction)
+        ShortcutsDialog(
+            self, collect_shortcuts(actions, LISTVIEW_KEY_HELP)).exec()
+
+    def _record_undoable_delete(self, keys):
+        """
+        Remember what a delete removed so it can be undone.
+
+        On a versioning-enabled bucket the objects are not gone — S3 left a
+        delete marker on top of them, and dropping that marker brings them
+        back. Whether markers exist is only discovered when undo runs, so no
+        extra request is made here.
+        """
+        keys = [k for k in (keys or []) if k]
+        if not keys or not self.data_model.bucket:
+            return
+        self._undo_delete = {"bucket": self.data_model.bucket, "keys": keys}
+        self.btnUndoDelete.setEnabled(not self.is_read_only())
+        self.statusBar().showMessage(
+            f"Deleted {len(keys)} item(s) — Ctrl+Z undoes this on a "
+            "versioned bucket", 8000
+        )
+
+    def _clear_undo_delete(self):
+        self._undo_delete = None
+        try:
+            self.btnUndoDelete.setEnabled(False)
+        except Exception:
+            pass
+
+    def undo_delete(self):
+        """Remove the delete markers left by the last delete in this bucket."""
+        undo = self._undo_delete
+        if not undo:
+            self.statusBar().showMessage("Nothing to undo", 2000)
+            return
+        if undo["bucket"] != self.data_model.bucket:
+            self._clear_undo_delete()
+            self.statusBar().showMessage(
+                "The undo applies to a different bucket", 3000)
+            return
+        keys = undo["keys"]
+        if QMessageBox.question(
+            self, "Undo delete",
+            f"Attempt to restore {len(keys)} deleted item(s)?\n\n"
+            "This works only if the bucket had versioning enabled when they "
+            "were deleted; otherwise nothing can be recovered.",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._clear_undo_delete()
+        self.assign_thread_operation("undelete", [(k,) for k in keys])
+        self.statusBar().showMessage(f"Restoring {len(keys)} item(s)…", 4000)
 
     def _on_queue_retry_requested(self, entry_id: int):
         """Re-queue a failed or cancelled job as a fresh entry."""
@@ -5812,6 +6367,12 @@ class MainWindow(QMainWindow):
         cur_notify = str(
             self.settings.value("notify_on_complete", "true")).lower() in ("true", "1")
         self.settings.endGroup()
+        cur_files = getattr(self.data_model, "parallel_files",
+                            DataModel.DEFAULT_PARALLEL_FILES)
+        cur_verify = bool(getattr(self.data_model, "verify_downloads", False))
+        self.settings.beginGroup("common")
+        cur_rate = int(self.settings.value("rate_limit_kbps", 0) or 0)
+        self.settings.endGroup()
 
         dlg = TransferSettingsDialog(
             self,
@@ -5824,11 +6385,18 @@ class MainWindow(QMainWindow):
             sse=cur_sse,
             kms_key_id=cur_kms,
             notify=cur_notify,
+            parallel_files=cur_files,
+            max_parallel_files=DataModel.MAX_PARALLEL_FILES,
+            verify_downloads=cur_verify,
+            rate_limit_kbps=cur_rate,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
         applied = self.data_model.set_transfer_concurrency(dlg.concurrency())
+        files = self.data_model.set_parallel_files(dlg.parallel_files())
+        self.data_model.verify_downloads = dlg.verify_downloads()
+        self.data_model.set_rate_limit(dlg.rate_limit_kbps() * 1024)
         extra = self.data_model.set_upload_options(
             storage_class=dlg.storage_class(),
             sse=dlg.sse(),
@@ -5836,6 +6404,10 @@ class MainWindow(QMainWindow):
         )
         self.settings.beginGroup("common")
         self.settings.setValue("transfer_concurrency", applied)
+        self.settings.setValue("parallel_files", files)
+        self.settings.setValue(
+            "verify_downloads", "true" if dlg.verify_downloads() else "false")
+        self.settings.setValue("rate_limit_kbps", dlg.rate_limit_kbps())
         self.settings.setValue("upload_storage_class", dlg.storage_class())
         self.settings.setValue("upload_sse", dlg.sse())
         self.settings.setValue("upload_kms_key", dlg.kms_key_id())
@@ -5843,7 +6415,7 @@ class MainWindow(QMainWindow):
             "notify_on_complete", "true" if dlg.notify() else "false")
         self.settings.endGroup()
         self.log(
-            f"Transfer settings: concurrency {applied}, upload extras "
+            f"Transfer settings: {files} file(s) at once, concurrency {applied}, upload extras "
             f"{extra or '(none)'} (applies to new transfers)"
         )
         self.statusBar().showMessage(f"Transfer concurrency: {applied}", 3000)
@@ -5890,14 +6462,16 @@ class MainWindow(QMainWindow):
     def enable_action_buttons(self):
         at_root = self.in_bucket_list_mode()
         active = self.transfers_active()
+        writable = not self.is_read_only()
 
         self.btnSwitchProfile.setEnabled(not active)
-        self.btnCreateFolder.setEnabled(not active)
-        self.btnRemove.setEnabled(True)
-        self.btnUpload.setEnabled(not at_root)
-        self.btnUploadFolder.setEnabled(not at_root)
+        self.btnCreateFolder.setEnabled(not active and writable)
+        self.btnRemove.setEnabled(writable)
+        self.btnUpload.setEnabled(not at_root and writable)
+        self.btnUploadFolder.setEnabled(not at_root and writable)
         self.btnDownload.setEnabled(not at_root)
         self.btnCancel.setEnabled(active)
+        self.btnUndoDelete.setEnabled(bool(self._undo_delete) and writable)
 
         try:
             b, _p = self._usage_target_from_selection()
@@ -6120,6 +6694,13 @@ class MainWindow(QMainWindow):
             "Cancel (Esc)",
             triggered=self.cancel_transfers,
         )
+        self.btnUndoDelete = QAction(
+            QIcon.fromTheme("edit-undo", QIcon(os.path.join(self.current_dir, "icons", "arrow_back_24px.svg"))),
+            "Undo delete (Ctrl+Z) — versioned buckets only",
+            triggered=lambda: self.undo_delete(),
+        )
+        self.btnUndoDelete.setShortcut(QKeySequence("Ctrl+Z"))
+        self.btnUndoDelete.setEnabled(False)
         self.btnBucketUsage = QAction(
             QIcon.fromTheme("view-statistics", QIcon(os.path.join(self.current_dir, "icons", "pie_24px.svg"))),
             "Bucket usage Σ (Ctrl+S)",
@@ -6173,6 +6754,7 @@ class MainWindow(QMainWindow):
         self.settings.beginGroup("view")
         state = self.settings.value("splitter")
         widths = self.settings.value("columns")
+        hidden = self.settings.value("visible_columns")
         sort_col = self.settings.value("sort_column")
         sort_order = self.settings.value("sort_order")
         self.settings.endGroup()
@@ -6184,13 +6766,17 @@ class MainWindow(QMainWindow):
                 pass
         if widths:
             header = self.listview.header()
-            for i, raw in enumerate(list(widths)[:3]):
+            for i, raw in enumerate(list(widths)[:len(LIST_COLUMNS)]):
                 try:
                     width = int(raw)
                 except (TypeError, ValueError):
                     continue
                 if width > 0:
                     header.resizeSection(i, width)
+        if hidden is not None:
+            shown = {str(v) for v in (hidden or [])}
+            for index in LIST_OPTIONAL_COLUMNS:
+                self.listview.setColumnHidden(index, str(index) not in shown)
         try:
             if sort_col is not None:
                 order = (Qt.SortOrder.DescendingOrder
@@ -6205,7 +6791,13 @@ class MainWindow(QMainWindow):
         self.settings.beginGroup("view")
         self.settings.setValue("splitter", self.splitter.saveState())
         self.settings.setValue(
-            "columns", [str(header.sectionSize(i)) for i in range(3)])
+            "columns",
+            [str(header.sectionSize(i)) for i in range(len(LIST_COLUMNS))])
+        self.settings.setValue(
+            "visible_columns",
+            [str(i) for i in LIST_OPTIONAL_COLUMNS
+             if not self.listview.isColumnHidden(i)],
+        )
         self.settings.setValue("sort_column", header.sortIndicatorSection())
         self.settings.setValue(
             "sort_order",
@@ -6540,6 +7132,20 @@ class MainWindow(QMainWindow):
             return
         SearchDialog(self, self, self.data_model,
                      self.data_model.current_folder or "").exec()
+
+    def _column_context_menu(self, pos):
+        """Toggle the optional listing columns from the header."""
+        menu = QMenu(self)
+        for index in LIST_OPTIONAL_COLUMNS:
+            act = menu.addAction(LIST_COLUMNS[index])
+            act.setCheckable(True)
+            act.setChecked(not self.listview.isColumnHidden(index))
+            act.setData(index)
+        chosen = menu.exec(self.listview.header().mapToGlobal(pos))
+        if chosen is None:
+            return
+        index = chosen.data()
+        self.listview.setColumnHidden(index, not chosen.isChecked())
 
     def _log_context_menu(self, pos):
         """Standard log actions plus Clear / Save — the view is capped at 3000

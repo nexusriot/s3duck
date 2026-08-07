@@ -1,8 +1,83 @@
+import base64
 import configparser
+import json
 import os
+import secrets
 
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import QApplication
+
+PROFILE_BUNDLE_VERSION = 1
+PROFILE_BUNDLE_ITERATIONS = 480000
+
+
+class BundleError(Exception):
+    """Raised when a profile bundle cannot be read or decrypted."""
+
+
+def _bundle_key(passphrase: str, salt: bytes) -> bytes:
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=PROFILE_BUNDLE_ITERATIONS,
+    )
+    return base64.urlsafe_b64encode(kdf.derive((passphrase or "").encode()))
+
+
+def export_profile_bundle(profiles, passphrase: str) -> bytes:
+    """
+    Serialise profiles (with plaintext credentials) into an encrypted bundle.
+
+    The credentials are protected with a passphrase-derived key rather than
+    written in the clear, so the file can be moved between machines without
+    also carrying this installation's Fernet key.
+    """
+    if not passphrase:
+        raise BundleError("A passphrase is required to export profiles")
+    salt = secrets.token_bytes(16)
+    payload = json.dumps(list(profiles)).encode()
+    token = Fernet(_bundle_key(passphrase, salt)).encrypt(payload)
+    document = {
+        "version": PROFILE_BUNDLE_VERSION,
+        "salt": base64.b64encode(salt).decode(),
+        "data": token.decode(),
+    }
+    return json.dumps(document, indent=2).encode()
+
+
+def import_profile_bundle(blob, passphrase: str) -> list:
+    """Reverse export_profile_bundle. Raises BundleError on any problem."""
+    try:
+        document = json.loads(blob.decode() if isinstance(blob, bytes) else blob)
+    except Exception as exc:
+        raise BundleError(f"Not a valid profile bundle: {exc}") from exc
+    if not isinstance(document, dict) or "data" not in document or "salt" not in document:
+        raise BundleError("Not a valid profile bundle")
+    version = document.get("version")
+    if version != PROFILE_BUNDLE_VERSION:
+        raise BundleError(f"Unsupported bundle version: {version}")
+    try:
+        salt = base64.b64decode(document["salt"])
+    except Exception as exc:
+        raise BundleError("Bundle salt is corrupt") from exc
+    try:
+        payload = Fernet(_bundle_key(passphrase, salt)).decrypt(
+            document["data"].encode())
+    except InvalidToken as exc:
+        raise BundleError("Wrong passphrase, or the bundle was modified") from exc
+    except Exception as exc:
+        raise BundleError(f"Could not decrypt bundle: {exc}") from exc
+    try:
+        profiles = json.loads(payload.decode())
+    except Exception as exc:
+        raise BundleError(f"Bundle contents are corrupt: {exc}") from exc
+    if not isinstance(profiles, list):
+        raise BundleError("Bundle does not contain a list of profiles")
+    return profiles
 
 
 def str_to_bool(s):

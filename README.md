@@ -10,20 +10,28 @@ Simple cross-platform GUI client for S3-compatible object storage (AWS S3, MinIO
 ## Features
 
 - **Multi-profile management** — create, edit, copy, and delete named connection profiles; credentials are encrypted at rest using Fernet symmetric encryption
+- **Profile export / import** — move profiles between machines as a bundle whose credentials are encrypted with a passphrase you choose (never written in the clear)
+- **Read-only profiles** — mark a profile read-only to block every write and delete; the toolbar and context menus hide mutating actions, the title bar shows `[read-only]`, and the data layer refuses writes as a backstop
 - **Temporary credentials** — session-token support for STS / SSO / assumed-role / MFA keys, with one-click import of any profile from `~/.aws/credentials`
 - **Bucket browser** — list, create, and delete buckets; recursive delete runs through the transfer queue (progress + cancel, UI stays responsive)
 - **Empty bucket** — delete every object, version, delete marker and in-flight upload while keeping the bucket, queued with progress and cancel
 - **Incomplete uploads** — find and abort in-flight multipart uploads that are invisible to normal listings but keep their parts billed; shows how much space they waste and can abort everything older than N days
-- **Object browser** — navigate prefixes as a virtual folder tree with sorting by name, size, and modified date
+- **Object browser** — navigate prefixes as a virtual folder tree with sorting by name, size, and modified date; optional Storage-class and ETag columns via the header context menu (both come free with the listing)
 - **Upload** — single/multiple files via dialog or drag-and-drop from the OS file manager; whole directory trees via "Upload folder" (`Ctrl+Shift+U`) or drag-and-drop
 - **Download** — single files or entire folder prefixes, recreating the directory tree locally
-- **Transfer settings** — multipart connections per transfer plus the storage class and server-side encryption (SSE-S3 / SSE-KMS) applied to uploads, persisted across sessions
+- **Resumable downloads** — large files download as parallel ranges into a `.s3duckpart` file with a progress sidecar, so an interrupted transfer picks up where it stopped instead of restarting (a changed ETag discards the stale partial)
+- **Checksum verification** — optionally compare each downloaded file against the object's ETag and fail the transfer on a mismatch (multipart ETags are reported as not comparable)
+- **Parallel transfers** — configurable number of files moving at once *and* multipart connections within each file; applies to uploads, downloads (including whole prefixes) and sync
+- **Transfer settings** — files in flight, connections per file, plus the storage class and server-side encryption (SSE-S3 / SSE-KMS) applied to uploads, persisted across sessions
 - **Overwrite protection** — downloads, copies, moves and renames detect existing destinations and offer Skip / Overwrite / Cancel
-- **Sync with a local folder** (`Ctrl+E`) — compare a directory against a prefix in either direction, review a dry-run plan (upload / download / delete / skip with a reason per file), then run it through the queue; optionally delete extras at the destination
+- **Sync with a local folder** (`Ctrl+E`) — compare a directory against a prefix in either direction, review a dry-run plan (upload / download / delete / skip with a reason per file), then run it through the queue; supports exclude globs (`*.tmp`, `node_modules/`) and optionally deleting extras at the destination
 - **Transfer queue** — queued jobs with per-row progress, cancel, and retry for failed or cancelled entries
+- **Transfer history** — a persisted log of past jobs (when, what, bytes, outcome) with one-click re-run for small jobs, from the queue panel
+- **Bandwidth limit** — optional ceiling on total transfer throughput, shared across every parallel file and chunk
 - **Completion notifications** — a desktop notification when the queue drains while the window is in the background (toggle in Transfer settings)
 - **Delete** — objects and folder prefixes (recursive, batched 1000 keys per call); confirmation shows the scanned object count and total size; recursive bucket delete also purges noncurrent versions, delete markers and in-flight uploads
-- **Copy / Move** — server-side copy or move of a multi-selection, within a bucket or **across buckets** (same endpoint/region)
+- **Undo delete** (`Ctrl+Z`) — on a versioning-enabled bucket a delete only writes a delete marker, so the last delete can be rolled back by removing those markers
+- **Copy / Move** — server-side copy or move of a multi-selection, within a bucket or **across buckets**; when the destination lives in another region or account (where a server-side copy is impossible) the object is streamed through instead of failing
 - **Rename** — in-place rename of a file or folder (server-side copy + delete), on the context menu or `F2`
 - **Bulk rename** (`Shift+F2`) — rename a whole selection by find-and-replace (optionally regex, with backreferences) or a `{name}/{ext}/{n}` numbering template, with a live preview and duplicate/invalid-name checks
 - **Create folder** — creates an S3 prefix placeholder
@@ -40,8 +48,9 @@ Simple cross-platform GUI client for S3-compatible object storage (AWS S3, MinIO
 - **Go to location** (`Ctrl+L`) — paste an `s3://bucket/prefix` (or a bare prefix) and jump straight there, across buckets
 - **Remembered layout** — splitter position, column widths and sort order persist between sessions
 - **Listing summary** — folder/file counts and total size of the current listing in the status bar
+- **Keyboard shortcuts** (`Ctrl+/`) — a searchable reference generated from the app's own actions, since plain letters are reserved for type-to-search
 - **Theme** — Light, Dark, or system-default appearance, remembered across sessions
-- **Bucket usage stats** — total size, breakdown by file category (Documents / Media / Other) with a pie chart, and top folder groups
+- **Bucket usage stats** — total size and object count, breakdown by file category with a pie chart, top folder groups, a storage-class breakdown and the largest objects
 - **Runtime profile switch** — switch S3 accounts without restarting the app
 - **Cached bucket bindings** — the proven endpoint/region/addressing combination per bucket is remembered, so reopening an off-region bucket skips the probe round trips
 - **Automatic region/endpoint detection** — when an operation fails due to a region or endpoint mismatch the app probes the server for the correct region, rebuilds the client, and retries transparently; applies to bucket open, listing, upload, download, and delete
@@ -180,6 +189,9 @@ s3duck/
 | `IncompleteUploadsDialog` | main_window.py | Find and abort orphaned multipart uploads still holding billed parts |
 | `TransferSettingsDialog` | main_window.py | Concurrency plus upload storage class / encryption |
 | `OverwriteDialog` | main_window.py | Skip / Overwrite prompt for existing destinations |
+| `ShortcutsDialog` | main_window.py | Keyboard reference derived from the live QActions |
+| `TransferHistoryDialog` | main_window.py | Past transfers with re-run |
+| `RateLimiter` | model.py | Shared token bucket capping total throughput |
 | `BulkRenameDialog` | main_window.py | Find-replace / template rename with live preview |
 | `SyncDialog` | main_window.py | Local↔remote comparison, dry-run plan, queued execution |
 | `MetadataDialog` | main_window.py | Edit Content-Type / caching headers and custom user metadata |

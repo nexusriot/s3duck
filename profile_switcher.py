@@ -21,6 +21,8 @@ class Profile:
     secret_key: str
     no_ssl_check: bool
     use_path: bool
+    session_token: str = ""
+    read_only: bool = False
 
 
 class Crypto:
@@ -38,6 +40,16 @@ class Crypto:
         return self.fernet.decrypt(enc).decode()
 
 
+def _decrypt_optional(crypto: "Crypto", value) -> str:
+    """Decrypt an optional/legacy field without failing the whole profile."""
+    if not value:
+        return ""
+    try:
+        return crypto.decrypt(value)
+    except Exception:
+        return ""
+
+
 def load_profiles(settings: QSettings) -> List[dict]:
     items = []
     settings.beginGroup("profiles")
@@ -53,6 +65,8 @@ def load_profiles(settings: QSettings) -> List[dict]:
             "secret_key": settings.value("secret_key", ""),
             "no_ssl_check": settings.value("no_ssl_check", "false"),
             "use_path": settings.value("use_path", "false"),
+            "session_token": settings.value("session_token", ""),
+            "read_only": settings.value("read_only", "false"),
         })
     settings.endArray()
     settings.endGroup()
@@ -77,6 +91,8 @@ def decrypt_profile(settings: QSettings, raw: dict) -> Profile:
         secret_key=crypto.decrypt(raw.get("secret_key")),
         no_ssl_check=str_to_bool(raw.get("no_ssl_check", "false")),
         use_path=str_to_bool(raw.get("use_path", "false")),
+        session_token=_decrypt_optional(crypto, raw.get("session_token")),
+        read_only=str_to_bool(raw.get("read_only", "false")),
     )
 
 

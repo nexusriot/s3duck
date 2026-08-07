@@ -17,13 +17,19 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QMessageBox,
     QDialog,
+    QFileDialog,
+    QInputDialog,
+    QLineEdit,
     QMenu,
 )
 
 from model import Model as DataModel
 from settings import SettingsWindow
 from main_window import MainWindow
-from utils import str_to_bool, center_on_screen
+from utils import (
+    str_to_bool, center_on_screen, export_profile_bundle,
+    import_profile_bundle, BundleError,
+)
 from theme import apply_theme
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -73,6 +79,7 @@ class SettingsItem:
         no_ssl_check,
         use_path,
         enc_session_token="",
+        read_only="false",
     ):
         self.name = name
         self.url = url
@@ -83,6 +90,7 @@ class SettingsItem:
         self.no_ssl_check = no_ssl_check
         self.use_path = use_path
         self.enc_session_token = enc_session_token
+        self.read_only = read_only
 
 
 def get_current_dir():
@@ -184,6 +192,7 @@ class Profiles(QDialog):
             str_to_bool(item.no_ssl_check),
             str_to_bool(item.use_path),
             session_token=decrypt_optional(crypto, item.enc_session_token),
+            read_only=str_to_bool(item.read_only),
         )
         ok, reason = dm.check_profile()
         msgBox = QMessageBox()
@@ -220,6 +229,13 @@ class Profiles(QDialog):
                 "Add profile",
             )
             menu.addAction(add_profile_action)
+            import_action = QAction(
+                QIcon.fromTheme("document-open"), "Import profiles…")
+            export_action = QAction(
+                QIcon.fromTheme("document-save"), "Export profiles…")
+            menu.addAction(import_action)
+            if self.items:
+                menu.addAction(export_action)
             if ixs:
                 copy_profile_action = QAction(
                     QIcon.fromTheme(
@@ -286,6 +302,12 @@ class Profiles(QDialog):
             if clk == add_profile_action:
                 self.onAdd()
                 return True
+            if clk == import_action:
+                self.onImport()
+                return True
+            if clk == export_action:
+                self.onExport()
+                return True
         return super().eventFilter(source, event)
 
     def load(self):
@@ -303,6 +325,7 @@ class Profiles(QDialog):
                     self.settings.value("no_ssl_check", "false"),
                     self.settings.value("use_path", "false"),
                     self.settings.value("session_token", ""),
+                    self.settings.value("read_only", "false"),
                 )
             )
         self.settings.endArray()
@@ -324,6 +347,7 @@ class Profiles(QDialog):
         session_token = decrypt_optional(crypto, item.enc_session_token)
         no_ssl_check = str_to_bool(item.no_ssl_check)
         use_path = str_to_bool(item.use_path)
+        read_only = str_to_bool(item.read_only)
 
         # Build DataModel with NO bucket initially.
         dm = DataModel(
@@ -335,6 +359,7 @@ class Profiles(QDialog):
             no_ssl_check,
             use_path,
             session_token=session_token,
+            read_only=read_only,
         )
 
         # Sanity check creds: try to list buckets
@@ -360,6 +385,7 @@ class Profiles(QDialog):
                 no_ssl_check,
                 use_path,
                 session_token,
+                read_only,
             )
             self.main_settings = settings
             self.main_window = MainWindow(settings=self.main_settings)
@@ -376,6 +402,118 @@ class Profiles(QDialog):
                 msgBox.setText("Cannot list buckets")
             msgBox.exec()
 
+    def _crypto(self):
+        self.settings.beginGroup("common")
+        key = self.settings.value("key")
+        self.settings.endGroup()
+        if not key:
+            key = Crypto.generate_key()
+            self.settings.beginGroup("common")
+            self.settings.setValue("key", key)
+            self.settings.endGroup()
+        return Crypto(key)
+
+    def _ask_passphrase(self, title, prompt):
+        text, ok = QInputDialog.getText(
+            self, title, prompt, QLineEdit.EchoMode.Password)
+        if not ok or not text:
+            return None
+        return text
+
+    def onExport(self):
+        """Write all profiles to a passphrase-encrypted bundle."""
+        if not self.items:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export profiles", "s3duck-profiles.json",
+            "Profile bundles (*.json);;All files (*)")
+        if not path:
+            return
+        passphrase = self._ask_passphrase(
+            "Export profiles",
+            "Passphrase to protect the exported credentials:")
+        if passphrase is None:
+            return
+        crypto = self._crypto()
+        payload = []
+        for item in self.items:
+            payload.append({
+                "name": item.name,
+                "url": item.url,
+                "region": item.region,
+                "bucket_name": item.bucket_name,
+                "access_key": crypto.decrypt_cred(item.enc_access_key),
+                "secret_key": crypto.decrypt_cred(item.enc_secret_key),
+                "session_token": decrypt_optional(crypto, item.enc_session_token),
+                "no_ssl_check": str(item.no_ssl_check),
+                "use_path": str(item.use_path),
+                "read_only": str(item.read_only),
+            })
+        try:
+            blob = export_profile_bundle(payload, passphrase)
+            with open(path, "wb") as handle:
+                handle.write(blob)
+        except (BundleError, OSError) as exc:
+            QMessageBox.critical(self, "Export profiles", str(exc))
+            return
+        QMessageBox.information(
+            self, "Export profiles",
+            f"Exported {len(payload)} profile(s) to:\n{path}")
+
+    def onImport(self):
+        """Add profiles from a bundle produced by Export."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import profiles", "",
+            "Profile bundles (*.json);;All files (*)")
+        if not path:
+            return
+        passphrase = self._ask_passphrase(
+            "Import profiles", "Passphrase used when the bundle was exported:")
+        if passphrase is None:
+            return
+        try:
+            with open(path, "rb") as handle:
+                profiles = import_profile_bundle(handle.read(), passphrase)
+        except (BundleError, OSError) as exc:
+            QMessageBox.critical(self, "Import profiles", str(exc))
+            return
+
+        crypto = self._crypto()
+        existing = {item.name for item in self.items}
+        added = 0
+        for entry in profiles:
+            name = str(entry.get("name") or "").strip()
+            if not name:
+                continue
+            # Never clobber a profile that is already configured here.
+            while name in existing:
+                name = f"{name}-imported"
+            existing.add(name)
+            self.items.append(
+                SettingsItem(
+                    name,
+                    str(entry.get("url") or ""),
+                    str(entry.get("region") or ""),
+                    str(entry.get("bucket_name") or ""),
+                    crypto.encrypt(str(entry.get("access_key") or "")),
+                    crypto.encrypt(str(entry.get("secret_key") or "")),
+                    str(entry.get("no_ssl_check", "false")).lower(),
+                    str(entry.get("use_path", "false")).lower(),
+                    crypto.encrypt(str(entry.get("session_token") or "")),
+                    str(entry.get("read_only", "false")).lower(),
+                )
+            )
+            added += 1
+        if not added:
+            QMessageBox.warning(
+                self, "Import profiles", "The bundle contained no profiles.")
+            return
+        self.save_settings()
+        self.populate_list()
+        self.select_last()
+        QMessageBox.information(
+            self, "Import profiles", f"Imported {added} profile(s).")
+
     def save_settings(self):
         self.settings.beginGroup("profiles")
         self.settings.beginWriteArray("profiles")
@@ -390,6 +528,7 @@ class Profiles(QDialog):
             self.settings.setValue("no_ssl_check", item.no_ssl_check)
             self.settings.setValue("use_path", item.use_path)
             self.settings.setValue("session_token", item.enc_session_token)
+            self.settings.setValue("read_only", item.read_only)
         self.settings.endArray()
         self.settings.endGroup()
 
@@ -420,6 +559,7 @@ class Profiles(QDialog):
                 no_ssl_check,
                 use_path,
                 session_token,
+                read_only,
             ) = value
             crypto = Crypto(key)
             enc_access_key = crypto.encrypt(access_key)
@@ -436,6 +576,7 @@ class Profiles(QDialog):
                     no_ssl_check,
                     use_path,
                     enc_session_token,
+                    str(bool(read_only)).lower(),
                 )
             )
             self.save_settings()
@@ -462,6 +603,7 @@ class Profiles(QDialog):
             item.no_ssl_check,
             item.use_path,
             decrypt_optional(crypto, item.enc_session_token),
+            item.read_only,
         )
         settings = SettingsWindow(self, settings=settings)
         value = settings.exec()
@@ -476,6 +618,7 @@ class Profiles(QDialog):
                 no_ssl_check,
                 use_path,
                 session_token,
+                read_only,
             ) = value
             enc_access_key = crypto.encrypt(access_key)
             enc_secret_key = crypto.encrypt(secret_key)
@@ -490,6 +633,7 @@ class Profiles(QDialog):
                 no_ssl_check,
                 use_path,
                 enc_session_token,
+                str(bool(read_only)).lower(),
             )
             self.save_settings()
             self.populate_list()
