@@ -6,6 +6,7 @@ import sys
 import pathlib
 import time
 import tempfile
+import zipfile
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
 import threading
@@ -15,6 +16,14 @@ try:
 except ImportError:
     sip = None
 
+# Optional: shipped with PyQt6 but absent from stripped-down builds.
+try:
+    from PyQt6.QtPdf import QPdfDocument
+    from PyQt6.QtPdfWidgets import QPdfView
+except ImportError:
+    QPdfDocument = None
+    QPdfView = None
+
 from PyQt6 import QtCore
 from PyQt6 import QtWidgets
 from PyQt6.QtWidgets import *
@@ -22,7 +31,8 @@ from PyQt6.QtCore import *
 from PyQt6.QtGui import QIcon, QStandardItemModel, QStandardItem, QAction
 from PyQt6.QtGui import QFontDatabase, QShortcut, QKeySequence, QPainter, QPen, QColor, QFont
 from PyQt6.QtGui import QDesktopServices, QPixmap, QActionGroup
-from PyQt6.QtCore import QRectF, QUrl
+from PyQt6.QtGui import QDrag, QSyntaxHighlighter, QTextCharFormat
+from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QMimeData, QRectF, QUrl
 from model import Model as DataModel
 from model import FSObjectType
 from model import TransferCancelled
@@ -34,7 +44,7 @@ from theme import apply_theme, THEMES
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.11.0"
+__VERSION__ = "0.12.0"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -369,6 +379,98 @@ def bulk_rename_plan(items, *, mode=BULK_RENAME_FIND, find="", replace="",
     return plan, problems
 
 
+def bookmark_label(bucket, prefix) -> str:
+    """Default display name for a saved location."""
+    bucket = bucket or ""
+    prefix = prefix or ""
+    return f"{bucket}/{prefix}" if prefix else (bucket or "/")
+
+
+def parse_bookmarks(raw) -> list:
+    """
+    Read the stored bookmark list.
+
+    One tab-separated `name<TAB>bucket<TAB>prefix` record per line; malformed
+    lines are dropped rather than losing the whole list.
+    """
+    out = []
+    for line in str(raw or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        name, bucket, prefix = (p.strip() for p in parts)
+        if not bucket:
+            continue
+        out.append({
+            "name": name or bookmark_label(bucket, prefix),
+            "bucket": bucket,
+            "prefix": prefix,
+        })
+    return out
+
+
+def serialize_bookmarks(bookmarks) -> str:
+    """Inverse of parse_bookmarks. Tabs and newlines in a name are stripped so
+    a record can never span lines."""
+    lines = []
+    for entry in bookmarks or []:
+        bucket = (entry.get("bucket") or "").strip()
+        if not bucket:
+            continue
+        name = re.sub(r"[\t\r\n]+", " ", entry.get("name") or "").strip()
+        prefix = (entry.get("prefix") or "").strip()
+        lines.append("\t".join(
+            [name or bookmark_label(bucket, prefix), bucket, prefix]))
+    return "\n".join(lines)
+
+
+def add_bookmark_to(bookmarks, name, bucket, prefix) -> tuple:
+    """
+    Append a bookmark unless that exact location is already saved.
+
+    Returns ``(new_list, added)`` so the caller can report a duplicate rather
+    than silently growing the menu.
+    """
+    entries = list(bookmarks or [])
+    for entry in entries:
+        if entry.get("bucket") == bucket and (entry.get("prefix") or "") == (prefix or ""):
+            return entries, False
+    entries.append({
+        "name": name or bookmark_label(bucket, prefix),
+        "bucket": bucket,
+        "prefix": prefix or "",
+    })
+    return entries, True
+
+
+def build_paste_job(clip, dst_bucket, dst_prefix):
+    """
+    Turn a clipboard payload into copy/move job entries.
+
+    clip is {"mode", "bucket", "items": [(name, key, is_folder)]}. Returns
+    ``(job, skipped)`` where job rows are
+    ``(src_key, dst_key, is_folder, dst_bucket_or_None)`` — dst_bucket is None
+    when the paste stays inside the source bucket, matching what the copy/move
+    workers expect.
+    """
+    job = []
+    skipped = []
+    if not clip:
+        return job, skipped
+    src_bucket = clip.get("bucket") or ""
+    cross_bucket = bool(dst_bucket) and dst_bucket != src_bucket
+    prefix = dst_prefix or ""
+
+    for name, src_key, is_folder in clip.get("items") or []:
+        dst_key = prefix + name + ("/" if is_folder else "")
+        if not cross_bucket and _dest_inside_source(src_key, dst_key, is_folder):
+            skipped.append(name)
+            continue
+        job.append((src_key, dst_key, is_folder,
+                    dst_bucket if cross_bucket else None))
+    return job, skipped
+
+
 def build_exclude_matcher(patterns):
     """
     Compile sync exclude patterns into ``match(rel_path) -> bool``.
@@ -489,6 +591,10 @@ LISTVIEW_KEY_HELP = (
     ("Ctrl+E", "Sync with a local folder"),
     ("Shift+F2", "Rename multiple items"),
     ("Ctrl+/", "Show this shortcut list"),
+    ("Ctrl+C", "Copy selection to the clipboard"),
+    ("Ctrl+X", "Cut selection to the clipboard"),
+    ("Ctrl+V", "Paste clipboard into this folder"),
+    ("Ctrl+B", "Bookmark the current location"),
     ("Enter", "Open the selected bucket / folder / file"),
     ("Backspace", "Go up one level"),
     ("Del", "Delete selection"),
@@ -549,6 +655,75 @@ def format_completion_notification(stats) -> tuple:
     if cancelled:
         parts.append(f"{cancelled} cancelled")
     return title, ", ".join(parts) or "nothing to do"
+
+
+def hex_dump(data, width: int = 16, max_bytes: int = 64 * 1024) -> str:
+    """Classic offset / hex / ASCII rendering for binary previews."""
+    data = data or b""
+    truncated = len(data) > max_bytes
+    view = data[:max_bytes]
+    lines = []
+    for offset in range(0, len(view), width):
+        block = view[offset:offset + width]
+        hex_part = " ".join(f"{b:02x}" for b in block)
+        hex_part = hex_part.ljust(width * 3 - 1)
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in block)
+        lines.append(f"{offset:08x}  {hex_part}  |{text}|")
+    if truncated:
+        lines.append(f"… {len(data) - max_bytes} more byte(s) not shown")
+    return "\n".join(lines)
+
+
+class CodeHighlighter(QSyntaxHighlighter):
+    """
+    Deliberately language-agnostic: strings, comments, numbers and a common
+    keyword set. Enough to make code readable without shipping a grammar per
+    language.
+    """
+
+    KEYWORDS = (
+        "and as assert async await break case class const continue def default"
+        " del elif else except export extends finally for from func function"
+        " global if impl import in interface is lambda let match mod new nil"
+        " none not null or pass private protected public raise return select"
+        " self static struct switch this throw try type var void while with"
+        " yield true false"
+    ).split()
+
+    def __init__(self, document):
+        super().__init__(document)
+        self._rules = []
+
+        keyword_fmt = QTextCharFormat()
+        keyword_fmt.setForeground(QColor(86, 156, 214))
+        keyword_fmt.setFontWeight(QFont.Weight.Bold)
+        self._rules.append((
+            re.compile(r"\b(" + "|".join(self.KEYWORDS) + r")\b"), keyword_fmt))
+
+        number_fmt = QTextCharFormat()
+        number_fmt.setForeground(QColor(181, 206, 168))
+        self._rules.append((re.compile(r"\b\d[\d_.xXa-fA-F]*\b"), number_fmt))
+
+        string_fmt = QTextCharFormat()
+        string_fmt.setForeground(QColor(206, 145, 120))
+        self._rules.append((
+            re.compile(r"'[^'\\]*(?:\\.[^'\\]*)*'"
+                       r'|"[^"\\]*(?:\\.[^"\\]*)*"'), string_fmt))
+
+        comment_fmt = QTextCharFormat()
+        comment_fmt.setForeground(QColor(106, 153, 85))
+        comment_fmt.setFontItalic(True)
+        # Applied last so a trailing comment wins over anything inside it.
+        self._comment_rule = (re.compile(r"(#|//).*$"), comment_fmt)
+
+    def highlightBlock(self, text):
+        for pattern, fmt in self._rules:
+            for match in pattern.finditer(text):
+                self.setFormat(match.start(), match.end() - match.start(), fmt)
+        pattern, fmt = self._comment_rule
+        match = pattern.search(text)
+        if match:
+            self.setFormat(match.start(), len(text) - match.start(), fmt)
 
 
 def _join_qthread(th, timeout_ms: int = 2000):
@@ -638,6 +813,27 @@ class Tree(QTreeView):
         self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
+
+    def startDrag(self, supported_actions):
+        """
+        Drag objects out to a file manager.
+
+        Qt hands the drop target real file URLs, so the selection has to be on
+        disk before the drag begins; the parent downloads it to a temp folder
+        behind a cancellable progress dialog.
+        """
+        if self.parent.in_bucket_list_mode():
+            return
+        paths = self.parent.prepare_drag_files()
+        if not paths:
+            return
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(p) for p in paths if os.path.exists(p)])
+        if not mime.urls():
+            return
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.CopyAction)
 
     def dragEnterEvent(self, event):
         widget = event.source()
@@ -1209,6 +1405,110 @@ class Worker(QObject):
                 self.progress.emit(f"sync failed: {msg}")
                 self.error.emit(msg)
         finally:
+            self.finished.emit(cancelled)
+
+    def set_tags(self):
+        # job = [(key, is_folder, add_dict, remove_list, replace_bool)]
+        cancelled = False
+        changed = 0
+        try:
+            for key, is_folder, add, remove, replace in self.job:
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                for k in self._iter_object_keys(key, is_folder):
+                    self.data_model.update_object_tags(
+                        k, add=add, remove=remove, replace=replace)
+                    changed += 1
+                    self.progress.emit(f"tagged {k}")
+            self.progress.emit(f"tagging done: {changed} object(s)")
+        except Exception as exc:
+            msg = str(exc) or exc.__class__.__name__
+            if "cancelled" in msg.lower():
+                cancelled = True
+            else:
+                self.progress.emit(f"tagging failed: {msg}")
+                self.error.emit(msg)
+        finally:
+            self.finished.emit(cancelled)
+
+    def zip_download(self):
+        """
+        job = [(zip_path, base_prefix, key, is_folder)] — every row carries the
+        same archive path and base prefix. Objects stream straight into the zip
+        so nothing is staged on disk twice.
+        """
+        cancelled = False
+        archive = None
+        try:
+            zip_path = self.job[0][0]
+            base_prefix = self.job[0][1]
+
+            # Expand folders and total the bytes before opening the archive.
+            entries = []
+            total_bytes_all = 0
+            for _zp, _bp, key, is_folder in self.job:
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                if is_folder:
+                    for k, size in self.data_model.get_keys(
+                            key, log_fn=self.progress.emit):
+                        if not k or k.endswith("/"):
+                            continue
+                        entries.append((k, int(size or 0)))
+                        total_bytes_all += int(size or 0)
+                else:
+                    size = self.data_model.get_size(key)
+                    entries.append((key, int(size or 0)))
+                    total_bytes_all += int(size or 0)
+            total_bytes_all = max(1, total_bytes_all)
+
+            done = 0
+            throttle = {"t": 0.0, "b": 0}
+
+            def _emit(current):
+                now = time.time()
+                if ((now - throttle["t"]) >= PROGRESS_EMIT_INTERVAL_SEC
+                        or (current - throttle["b"]) >= PROGRESS_MIN_BYTE_DELTA
+                        or current >= total_bytes_all):
+                    throttle["t"] = now
+                    throttle["b"] = current
+                    self.batch_progress.emit(int(current), int(total_bytes_all))
+
+            archive = zipfile.ZipFile(
+                zip_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True)
+            for key, _size in entries:
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                arcname = key[len(base_prefix):] if key.startswith(base_prefix) else key
+                arcname = arcname.lstrip("/") or os.path.basename(key)
+                self.progress.emit(f"archiving {key}")
+                with archive.open(arcname, "w") as target:
+                    for block in self.data_model.stream_object(
+                            key, cancel_event=self._cancel_event):
+                        target.write(block)
+                        done += len(block)
+                        _emit(done)
+            self.batch_progress.emit(int(done), int(total_bytes_all))
+            self.progress.emit(f"wrote {len(entries)} object(s) to {zip_path}")
+        except Exception as exc:
+            msg = str(exc) or exc.__class__.__name__
+            if "cancelled" in msg.lower():
+                cancelled = True
+            else:
+                self.progress.emit(f"zip download failed: {msg}")
+                self.error.emit(msg)
+        finally:
+            if archive is not None:
+                try:
+                    archive.close()
+                except Exception:
+                    pass
+            # A cancelled or failed archive is unusable; do not leave it behind.
+            if cancelled:
+                try:
+                    os.remove(self.job[0][0])
+                except OSError:
+                    pass
             self.finished.emit(cancelled)
 
     def undelete(self):
@@ -2111,6 +2411,171 @@ class SyncDialog(QDialog):
             todo, self._local.text().strip(), self._prefix, self.direction())
 
 
+class BulkTagsDialog(QDialog):
+    """Add, overwrite or strip tags across a whole selection."""
+
+    def __init__(self, parent, target_count):
+        super().__init__(parent)
+        self.setWindowTitle("Edit tags on selection")
+        self.setMinimumWidth(520)
+
+        head = QLabel(
+            f"Applying to <b>{target_count} selected item(s)</b>. Folders are "
+            "expanded to every object beneath them."
+        )
+        head.setWordWrap(True)
+
+        self._table = QTableWidget(0, 2)
+        self._table.setHorizontalHeaderLabels(["Tag key", "Tag value"])
+        hdr = self._table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._table.verticalHeader().hide()
+
+        add_btn = QPushButton("Add row")
+        del_btn = QPushButton("Remove row")
+        add_btn.clicked.connect(lambda: self._insert_row())
+        del_btn.clicked.connect(self._remove_row)
+        row_btns = QHBoxLayout()
+        row_btns.addWidget(add_btn)
+        row_btns.addWidget(del_btn)
+        row_btns.addStretch(1)
+
+        self._remove_keys = QLineEdit()
+        self._remove_keys.setPlaceholderText(
+            "Tag keys to delete, comma separated")
+
+        self._replace = QCheckBox(
+            "Replace all existing tags (anything not listed above is removed)")
+
+        self.buttonBox = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttonBox.accepted.connect(self.accept)
+        self.buttonBox.rejected.connect(self.reject)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(head)
+        lay.addWidget(QLabel("Tags to set:"))
+        lay.addWidget(self._table, 1)
+        lay.addLayout(row_btns)
+        lay.addWidget(QLabel("Tags to remove:"))
+        lay.addWidget(self._remove_keys)
+        lay.addWidget(self._replace)
+        lay.addWidget(self.buttonBox)
+
+        self._insert_row()
+
+    def _insert_row(self, key="", value=""):
+        r = self._table.rowCount()
+        self._table.insertRow(r)
+        self._table.setItem(r, 0, QTableWidgetItem(key))
+        self._table.setItem(r, 1, QTableWidgetItem(value))
+
+    def _remove_row(self):
+        r = self._table.currentRow()
+        if r >= 0:
+            self._table.removeRow(r)
+
+    def tags_to_add(self) -> dict:
+        out = {}
+        for r in range(self._table.rowCount()):
+            k_item = self._table.item(r, 0)
+            v_item = self._table.item(r, 1)
+            key = (k_item.text() if k_item else "").strip()
+            if key:
+                out[key] = (v_item.text() if v_item else "").strip()
+        return out
+
+    def tags_to_remove(self) -> list:
+        return [k for k in re.split(r"[,\s]+", self._remove_keys.text() or "")
+                if k]
+
+    def replace_all(self) -> bool:
+        return self._replace.isChecked()
+
+    def is_noop(self) -> bool:
+        return not self.tags_to_add() and not self.tags_to_remove() \
+            and not self.replace_all()
+
+
+class BookmarksDialog(QDialog):
+    """Rename or delete saved locations."""
+
+    def __init__(self, parent, bookmarks):
+        super().__init__(parent)
+        self.setWindowTitle("Bookmarks")
+        self.resize(620, 420)
+        self._bookmarks = [dict(b) for b in bookmarks or []]
+
+        self._table = QTableWidget(0, 2)
+        self._table.setHorizontalHeaderLabels(["Name", "Location"])
+        self._table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self._render()
+
+        remove_btn = QPushButton("Remove")
+        remove_btn.clicked.connect(self._remove)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+
+        row = QHBoxLayout()
+        row.addWidget(remove_btn)
+        row.addStretch(1)
+        row.addWidget(close_btn)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Edit a name in place, or remove a bookmark."))
+        lay.addWidget(self._table, 1)
+        lay.addLayout(row)
+
+    def _render(self):
+        self._table.setRowCount(0)
+        for entry in self._bookmarks:
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+            self._table.setItem(r, 0, QTableWidgetItem(entry.get("name", "")))
+            location = QTableWidgetItem(
+                f"s3://{entry.get('bucket', '')}/{entry.get('prefix', '')}")
+            location.setFlags(location.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self._table.setItem(r, 1, location)
+
+    def _sync_names(self):
+        """Pull in-place edits back into the backing list.
+
+        _render rebuilds the table from that list, so without this a rename
+        followed by a removal would silently lose the rename."""
+        for index, entry in enumerate(self._bookmarks):
+            item = self._table.item(index, 0)
+            if item is not None and item.text():
+                entry["name"] = item.text()
+
+    def _remove(self):
+        self._sync_names()
+        r = self._table.currentRow()
+        if 0 <= r < len(self._bookmarks):
+            del self._bookmarks[r]
+            self._render()
+
+    def bookmarks(self) -> list:
+        """The edited list — names are read back out of the table."""
+        self._sync_names()
+        return [
+            {
+                "name": entry.get("name", ""),
+                "bucket": entry.get("bucket", ""),
+                "prefix": entry.get("prefix", ""),
+            }
+            for entry in self._bookmarks
+        ]
+
+
 class ShortcutsDialog(QDialog):
     """Keyboard reference — plain letters are reserved for type-to-search, so
     every real shortcut carries a modifier and none of them are obvious."""
@@ -2408,8 +2873,15 @@ class PreviewDialog(QDialog):
         ".htm", ".css", ".sh", ".c", ".h", ".cpp", ".go", ".rs", ".java",
         ".sql", ".toml", ".svg",
     }
+    CODE_EXTS = {
+        ".py", ".js", ".ts", ".c", ".h", ".cpp", ".go", ".rs", ".java",
+        ".sh", ".sql", ".css", ".html", ".htm", ".xml", ".json", ".yaml",
+        ".yml", ".toml", ".ini", ".cfg", ".conf",
+    }
+    PDF_EXTS = {".pdf"}
     IMG_LIMIT = 25 * 1024 * 1024
     TEXT_LIMIT = 1 * 1024 * 1024
+    PDF_LIMIT = 50 * 1024 * 1024
 
     def __init__(self, parent, model, key):
         super().__init__(parent)
@@ -2446,9 +2918,29 @@ class PreviewDialog(QDialog):
         except Exception:
             pass
 
+        self._hex = QPlainTextEdit()
+        self._hex.setReadOnly(True)
+        self._hex.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        try:
+            self._hex.setFont(
+                QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        except Exception:
+            pass
+
+        self._highlighter = None
+        self._pdf_doc = None
+        self._pdf_view = None
+
         self._stack.addWidget(self._status)      # index 0
         self._stack.addWidget(self._img_scroll)  # index 1
         self._stack.addWidget(self._text)        # index 2
+        self._stack.addWidget(self._hex)         # index 3
+        if QPdfView is not None:
+            self._pdf_doc = QPdfDocument(self)
+            self._pdf_view = QPdfView(self)
+            self._pdf_view.setDocument(self._pdf_doc)
+            self._pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
+            self._stack.addWidget(self._pdf_view)   # index 4
 
         self._open_btn = QPushButton("Open with default app")
         self._open_btn.clicked.connect(self._open_external)
@@ -2470,8 +2962,14 @@ class PreviewDialog(QDialog):
         return os.path.splitext(self._key)[1].lower()
 
     def _start_load(self):
-        is_image = self._ext() in self.IMAGE_EXTS
-        max_bytes = self.IMG_LIMIT if is_image else self.TEXT_LIMIT
+        ext = self._ext()
+        if ext in self.IMAGE_EXTS:
+            max_bytes = self.IMG_LIMIT
+        elif ext in self.PDF_EXTS and QPdfView is not None:
+            # A PDF cannot be rendered from a partial file.
+            max_bytes = self.PDF_LIMIT
+        else:
+            max_bytes = self.TEXT_LIMIT
         key = self._key
         clone = self._model.clone_for_worker()
 
@@ -2520,18 +3018,36 @@ class PreviewDialog(QDialog):
                 return
             # not a decodable raster -> fall through to text/binary handling
 
-        if b"\x00" in data[:8192]:
+        if ext in self.PDF_EXTS or ctype == "application/pdf":
+            if self._pdf_view is not None and not truncated:
+                self._pdf_bytes = QByteArray(data)
+                self._pdf_buffer = QBuffer(self._pdf_bytes, self)
+                self._pdf_buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+                self._pdf_doc.load(self._pdf_buffer)
+                if self._pdf_doc.status() == QPdfDocument.Status.Ready:
+                    self._stack.setCurrentIndex(4)
+                    return
             self._status.setText(
-                "No inline preview for this binary file.\n\n"
-                'Use "Open with default app".'
+                "Could not render this PDF inline"
+                + (" (file is larger than the preview limit)." if truncated
+                   else ".")
+                + '\n\nUse "Open with default app".'
             )
             self._stack.setCurrentIndex(0)
+            return
+
+        if b"\x00" in data[:8192]:
+            # Binary: show a hex dump rather than refusing outright.
+            self._hex.setPlainText(hex_dump(data))
+            self._stack.setCurrentIndex(3)
             return
 
         text = data.decode("utf-8", errors="replace")
         if truncated:
             text += "\n\n… (preview truncated)"
         self._text.setPlainText(text)
+        if ext in self.CODE_EXTS and self._highlighter is None:
+            self._highlighter = CodeHighlighter(self._text.document())
         self._stack.setCurrentIndex(2)
 
     def _open_external(self):
@@ -3572,12 +4088,17 @@ class PresignedLinkDialog(QDialog):
 
 
 class _QEntry:
-    def __init__(self, entry_id, method, job, need_refresh=True, label=""):
+    def __init__(self, entry_id, method, job, need_refresh=True, label="",
+                 source_bucket=""):
         self.entry_id = entry_id
         self.method = method
         self.job = job
         self.need_refresh = need_refresh
         self.label = label
+        # Set when the job's SOURCE keys live in a different bucket than the
+        # one being viewed (cross-bucket paste); the worker's model is bound
+        # to it before the transfer starts.
+        self.source_bucket = source_bucket or ""
         self.status = "queued"
         self.thread = None
         self.worker = None
@@ -3608,6 +4129,7 @@ class _QueueRow(QWidget):
         "upload": "⬆", "download": "⬇", "delete": "✕",
         "copy": "⇆", "move": "➜", "delete_buckets": "✕",
         "empty_buckets": "∅", "sync": "⇅", "undelete": "↺",
+        "set_tags": "🏷", "zip_download": "🗜",
     }
     _STATUS_COLORS = {
         "queued": "#e4e4e8", "running": "#bbdefb",
@@ -3884,6 +4406,8 @@ class MainWindow(QMainWindow):
         )
         self._load_binding_cache()
         self._load_upload_options()
+        self._bookmarks = []
+        self._load_bookmarks()
         self.logview = QPlainTextEdit(self)
         self.logview.setMaximumBlockCount(3000)  # prevents UI freeze on huge logs
 
@@ -4000,6 +4524,7 @@ class MainWindow(QMainWindow):
         self.tBar.addAction(self.btnBucketUsage)
         self.tBar.addAction(self.actCopyS3Path)
         self.tBar.addAction(self.actGoToLocation)
+        self._build_bookmark_button()
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnDownload)
         self.tBar.addAction(self.btnUpload)
@@ -4077,6 +4602,7 @@ class MainWindow(QMainWindow):
         self._batch_stats = {"done": 0, "cancelled": 0, "error": 0}
         self._tray_icon = None
         self._undo_delete = None
+        self._clipboard = None
 
         self.thread = None
         self.worker = None
@@ -4088,6 +4614,17 @@ class MainWindow(QMainWindow):
 
         self._deep_search_shortcut = QShortcut(QKeySequence("Ctrl+Shift+F"), self)
         self._deep_search_shortcut.activated.connect(self.open_search)
+
+        self._bookmark_shortcut = QShortcut(QKeySequence("Ctrl+B"), self)
+        self._bookmark_shortcut.activated.connect(self.add_bookmark)
+
+        self._copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self)
+        self._copy_shortcut.activated.connect(lambda: self.copy_to_clipboard())
+        self._cut_shortcut = QShortcut(QKeySequence.StandardKey.Cut, self)
+        self._cut_shortcut.activated.connect(
+            lambda: self.copy_to_clipboard(cut=True))
+        self._paste_shortcut = QShortcut(QKeySequence.StandardKey.Paste, self)
+        self._paste_shortcut.activated.connect(self.paste_from_clipboard)
 
         self._shortcuts_shortcut = QShortcut(QKeySequence("Ctrl+/"), self)
         self._shortcuts_shortcut.activated.connect(self.show_shortcuts)
@@ -4311,6 +4848,99 @@ class MainWindow(QMainWindow):
         self.settings.setValue(
             self._binding_cache_settings_key(), "\n".join(lines))
         self.settings.endGroup()
+
+    def _bookmarks_settings_key(self) -> str:
+        return f"bookmarks/{self.profile_name or 'default'}"
+
+    def _load_bookmarks(self):
+        self.settings.beginGroup("common")
+        raw = self.settings.value(self._bookmarks_settings_key(), "") or ""
+        self.settings.endGroup()
+        self._bookmarks = parse_bookmarks(raw)
+
+    def _save_bookmarks(self):
+        self.settings.beginGroup("common")
+        self.settings.setValue(
+            self._bookmarks_settings_key(), serialize_bookmarks(self._bookmarks))
+        self.settings.endGroup()
+
+    def add_bookmark(self):
+        """Save the current bucket/prefix for one-click return."""
+        if self.in_bucket_list_mode() or not self.data_model.bucket:
+            self.statusBar().showMessage("Open a bucket to bookmark it", 2000)
+            return
+        bucket = self.data_model.bucket
+        prefix = self.data_model.current_folder or ""
+        suggested = bookmark_label(bucket, prefix)
+        name, ok = QInputDialog.getText(
+            self, "Add bookmark", "Name:", text=suggested)
+        if not ok:
+            return
+        self._bookmarks, added = add_bookmark_to(
+            self._bookmarks, (name or "").strip(), bucket, prefix)
+        if not added:
+            self.statusBar().showMessage("This location is already bookmarked", 3000)
+            return
+        self._save_bookmarks()
+        self._rebuild_bookmark_menu()
+        self.log(f"bookmarked s3://{bucket}/{prefix}")
+        self.statusBar().showMessage("Bookmark added", 3000)
+
+    def manage_bookmarks(self):
+        dlg = BookmarksDialog(self, self._bookmarks)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._bookmarks = dlg.bookmarks()
+        self._save_bookmarks()
+        self._rebuild_bookmark_menu()
+
+    def go_to_bookmark(self, entry):
+        """Jump to a saved location, crossing buckets when needed."""
+        bucket = entry.get("bucket") or ""
+        prefix = entry.get("prefix") or ""
+        if not bucket:
+            return
+        if bucket == self.data_model.bucket:
+            self.change_current_folder(prefix)
+            self.navigate(select_up_entry=True)
+            return
+        self.enter_bucket_async(bucket, target_prefix=prefix)
+
+    def _rebuild_bookmark_menu(self):
+        menu = self.bookmarkButton.menu()
+        menu.clear()
+        add_act = menu.addAction("Bookmark this location (Ctrl+B)")
+        add_act.triggered.connect(lambda: self.add_bookmark())
+        manage_act = menu.addAction("Manage bookmarks…")
+        manage_act.triggered.connect(lambda: self.manage_bookmarks())
+        manage_act.setEnabled(bool(self._bookmarks))
+        if self._bookmarks:
+            menu.addSeparator()
+            for entry in self._bookmarks:
+                act = menu.addAction(entry.get("name") or bookmark_label(
+                    entry.get("bucket"), entry.get("prefix")))
+                act.setToolTip(
+                    f"s3://{entry.get('bucket', '')}/{entry.get('prefix', '')}")
+                act.triggered.connect(
+                    lambda _checked=False, e=dict(entry): self.go_to_bookmark(e))
+
+    def _build_bookmark_button(self):
+        self.bookmarkButton = QToolButton()
+        self.bookmarkButton.setIcon(
+            QIcon.fromTheme(
+                "bookmarks",
+                QIcon(os.path.join(self.current_dir, "icons", "ok_24px.svg")),
+            )
+        )
+        self.bookmarkButton.setIconSize(QSize(26, 26))
+        self.bookmarkButton.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.bookmarkButton.setToolTip("Bookmarks")
+        self.bookmarkButton.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.bookmarkButton.setMenu(QMenu(self.bookmarkButton))
+        self.tBar.addWidget(self.bookmarkButton)
+        self._rebuild_bookmark_menu()
 
     def _load_upload_options(self):
         self.settings.beginGroup("common")
@@ -4797,6 +5427,11 @@ class MainWindow(QMainWindow):
                 incomplete_action = None
                 bulk_rename_action = None
                 sync_action = None
+                copy_clip_action = None
+                cut_clip_action = None
+                paste_clip_action = None
+                bulk_tags_action = None
+                zip_action = None
 
                 if (
                     m
@@ -4875,6 +5510,14 @@ class MainWindow(QMainWindow):
                 )
                 self.menu.addAction(search_action)
 
+                if self._clipboard and self._clipboard.get("items"):
+                    paste_clip_action = QAction(
+                        QIcon.fromTheme("edit-paste"),
+                        "Paste %d item(s) here (Ctrl+V)"
+                        % len(self._clipboard["items"]),
+                    )
+                    self.menu.addAction(paste_clip_action)
+
                 versioning_action = QAction(
                     QIcon.fromTheme("document-open-recent"),
                     "Bucket versioning…",
@@ -4945,6 +5588,23 @@ class MainWindow(QMainWindow):
                     self.menu.addAction(delete_action)
 
                     self.menu.addSeparator()
+                    copy_clip_action = QAction(
+                        QIcon.fromTheme("edit-copy"), "Copy (Ctrl+C)")
+                    self.menu.addAction(copy_clip_action)
+                    cut_clip_action = QAction(
+                        QIcon.fromTheme("edit-cut"), "Cut (Ctrl+X)")
+                    self.menu.addAction(cut_clip_action)
+
+                    zip_action = QAction(
+                        QIcon.fromTheme("package-x-generic"),
+                        "Download as ZIP…")
+                    self.menu.addAction(zip_action)
+
+                    bulk_tags_action = QAction(
+                        QIcon.fromTheme("document-properties"),
+                        "Edit tags on selection…")
+                    self.menu.addAction(bulk_tags_action)
+
                     copy_move_action = QAction(
                         QIcon.fromTheme(
                             "edit-copy",
@@ -5026,6 +5686,7 @@ class MainWindow(QMainWindow):
                         share_public_action, delete_action, copy_move_action,
                         rename_action, bulk_rename_action, storage_action,
                         restore_action, tags_action, metadata_action,
+                        cut_clip_action, paste_clip_action, bulk_tags_action,
                     ):
                         if act is not None:
                             self.menu.removeAction(act)
@@ -5066,6 +5727,16 @@ class MainWindow(QMainWindow):
                     self.rename_selected()
                 if bulk_rename_action and clk == bulk_rename_action:
                     self.bulk_rename()
+                if copy_clip_action and clk == copy_clip_action:
+                    self.copy_to_clipboard()
+                if cut_clip_action and clk == cut_clip_action:
+                    self.copy_to_clipboard(cut=True)
+                if paste_clip_action and clk == paste_clip_action:
+                    self.paste_from_clipboard()
+                if bulk_tags_action and clk == bulk_tags_action:
+                    self.bulk_tags()
+                if zip_action and clk == zip_action:
+                    self.download_as_zip()
                 if sync_action and clk == sync_action:
                     self.open_sync()
                 if open_action and clk == open_action:
@@ -5198,6 +5869,7 @@ class MainWindow(QMainWindow):
         self.data_model.read_only = bool(getattr(prof, "read_only", False))
         self.data_model.binding_cache.clear()
         self._clear_undo_delete()
+        self._clipboard = None
 
         self.data_model._client = None
 
@@ -5215,6 +5887,8 @@ class MainWindow(QMainWindow):
             pass
 
         self._load_binding_cache()
+        self._load_bookmarks()
+        self._rebuild_bookmark_menu()
         self.navigate(show_loading=True)
         self.update_window_title()
 
@@ -5773,7 +6447,8 @@ class MainWindow(QMainWindow):
             return
         self.assign_thread_operation("download", job, need_refresh=False)
 
-    def assign_thread_operation(self, method, job, need_refresh=True):
+    def assign_thread_operation(self, method, job, need_refresh=True,
+                                source_bucket=""):
         if not job:
             return
 
@@ -5784,6 +6459,7 @@ class MainWindow(QMainWindow):
             job=job,
             need_refresh=need_refresh,
             label=label,
+            source_bucket=source_bucket,
         )
         self._queue_next_id += 1
         # Kept so a failed/cancelled row can be re-run from the queue panel.
@@ -5808,6 +6484,8 @@ class MainWindow(QMainWindow):
             "empty_buckets": "Empty bucket",
             "sync": "Sync",
             "undelete": "Undo delete of",
+            "set_tags": "Tag",
+            "zip_download": "Zip",
         }.get(method, method.capitalize())
         return f"{verb} {n} item(s)"
 
@@ -5825,7 +6503,7 @@ class MainWindow(QMainWindow):
         # Its own boto3 client, so a region rebind inside the transfer cannot
         # race whatever the main thread reads from the shared model. The
         # binding cache is still shared, so discoveries are not lost.
-        self.worker = Worker(self.data_model.clone_for_worker(), job)
+        self.worker = Worker(self._worker_model_for(entry), job)
         self.worker.moveToThread(self.thread)
 
         entry.thread = self.thread
@@ -5882,7 +6560,11 @@ class MainWindow(QMainWindow):
             _transfer_ui_start("Syncing…")
             self.thread.finished.connect(_transfer_ui_stop)
 
-        if method in ("upload", "download", "sync"):
+        if method == "zip_download":
+            _transfer_ui_start("Archiving…")
+            self.thread.finished.connect(_transfer_ui_stop)
+
+        if method in ("upload", "download", "sync", "zip_download"):
             eid = entry.entry_id
 
             def _on_queue_bytes(done, total, _eid=eid):
@@ -5920,7 +6602,12 @@ class MainWindow(QMainWindow):
                 self._batch_stats.get(entry.status, 0) + 1)
             self._queue_panel.update_status(entry)
 
-            self._record_history(entry, done_bytes=self._smooth_done)
+            # _smooth_done only tracks byte-progress methods; for the rest it
+            # still holds the previous transfer's total.
+            if method in ("upload", "download", "sync", "zip_download"):
+                self._record_history(entry, done_bytes=self._smooth_done)
+            else:
+                self._record_history(entry)
 
             if method == "delete" and entry.status == "done":
                 self._record_undoable_delete(entry.job)
@@ -5937,6 +6624,28 @@ class MainWindow(QMainWindow):
 
         self.thread.start()
         self.disable_action_buttons()
+
+    def _worker_model_for(self, entry: '_QEntry'):
+        """
+        The model clone a transfer runs against.
+
+        Copy/move workers resolve CopySource — and move's delete pass —
+        against their model's bucket, so a cross-bucket paste must run on a
+        model bound to the SOURCE bucket. The clone inherits the destination
+        bucket's endpoint binding (possibly a virtual-host of the wrong
+        bucket), so navigation and connection state are reset to the profile
+        root and the usual probing rebinds the source on first use.
+        """
+        model = self.data_model.clone_for_worker()
+        if entry.source_bucket:
+            model.bucket = entry.source_bucket
+            model.current_folder = ""
+            model.prev_folder = ""
+            model.endpoint_url = model.profile_endpoint_url
+            model.use_path = model.profile_use_path
+            model.region_name = model.profile_region
+            model._client = None
+        return model
 
     def _queue_start_next(self):
         if self.transfers_active():
@@ -6011,6 +6720,9 @@ class MainWindow(QMainWindow):
                 self._queue_panel.update_status(e)
                 return
 
+    # Dropping onto a file manager downloads first; warn past this much.
+    DRAG_WARN_BYTES = 256 * 1024 * 1024
+
     HISTORY_LIMIT = 200
     HISTORY_JOB_LIMIT = 100   # only small jobs are worth storing for re-run
 
@@ -6047,6 +6759,9 @@ class MainWindow(QMainWindow):
                 record["job"] = json.loads(json.dumps(job))
             except (TypeError, ValueError):
                 pass
+            else:
+                if entry.source_bucket:
+                    record["source_bucket"] = entry.source_bucket
         entries = self.load_transfer_history()
         entries.insert(0, record)
         self._save_transfer_history(entries)
@@ -6065,8 +6780,11 @@ class MainWindow(QMainWindow):
             return
         # JSON turned the tuples into lists; the workers unpack either.
         self.log(f"re-running {method} from history ({len(job)} item(s))")
-        self.assign_thread_operation(method, [tuple(i) if isinstance(i, list) else i
-                                              for i in job])
+        self.assign_thread_operation(
+            method,
+            [tuple(i) if isinstance(i, list) else i for i in job],
+            source_bucket=entry.get("source_bucket") or "",
+        )
 
     def show_shortcuts(self):
         # Most QActions are created without a parent, so findChildren alone
@@ -6131,7 +6849,8 @@ class MainWindow(QMainWindow):
             return
         self.log(f"retrying {entry.method}: {entry.label}")
         self.assign_thread_operation(
-            entry.method, entry.job, need_refresh=entry.need_refresh)
+            entry.method, entry.job, need_refresh=entry.need_refresh,
+            source_bucket=entry.source_bucket)
 
     def _toggle_queue_panel(self):
         if self._queue_panel.isVisible():
@@ -7276,6 +7995,178 @@ class MainWindow(QMainWindow):
             return
         self.log(f"bucket versioning {target.lower()} for {self.data_model.bucket}")
         self.statusBar().showMessage(f"Versioning {target.lower()}", 4000)
+
+    def copy_to_clipboard(self, cut=False):
+        """Remember the selection for a later paste, and put the s3:// URIs on
+        the system clipboard so they are useful outside the app too."""
+        if self.in_bucket_list_mode():
+            return
+        items = self._collect_selected_targets()
+        if not items:
+            self.statusBar().showMessage("Nothing selected", 2000)
+            return
+        if cut and self.is_read_only():
+            self.statusBar().showMessage("Profile is read-only", 2000)
+            return
+        self._clipboard = {
+            "mode": "cut" if cut else "copy",
+            "bucket": self.data_model.bucket,
+            "items": items,
+        }
+        bucket = self.data_model.bucket
+        self.clip.setText(
+            "\n".join(f"s3://{bucket}/{key}" for _n, key, _f in items))
+        verb = "Cut" if cut else "Copied"
+        self.statusBar().showMessage(
+            f"{verb} {len(items)} item(s) — Ctrl+V to paste", 4000)
+        self.log(f"{verb.lower()} {len(items)} item(s) from s3://{bucket}/")
+
+    def paste_from_clipboard(self):
+        """Copy or move the clipboard contents into the current folder."""
+        if self.in_bucket_list_mode() or not self.data_model.bucket:
+            self.statusBar().showMessage("Open a bucket to paste into", 2000)
+            return
+        if self.is_read_only():
+            self.statusBar().showMessage("Profile is read-only", 2000)
+            return
+        clip = self._clipboard
+        if not clip or not clip.get("items"):
+            self.statusBar().showMessage("Clipboard is empty", 2000)
+            return
+
+        job, skipped = build_paste_job(
+            clip, self.data_model.bucket, self.data_model.current_folder or "")
+        if skipped:
+            self.log(
+                "Skipped (destination equals or nests inside source): "
+                + ", ".join(skipped))
+        if not job:
+            self.statusBar().showMessage("Nothing to paste here", 2000)
+            return
+
+        conflicts = self._destination_conflicts([entry[1] for entry in job])
+        if conflicts is None:
+            return
+        job = self._resolve_overwrites(
+            job, conflicts, what="destination", index_of=lambda e: e[1])
+        if not job:
+            return
+
+        is_cut = clip.get("mode") == "cut"
+        src_bucket = clip.get("bucket") or ""
+        source_bucket = (
+            src_bucket if src_bucket != self.data_model.bucket else "")
+        # A cut across buckets still copies then deletes the source.
+        self.assign_thread_operation(
+            "move" if is_cut else "copy", job, source_bucket=source_bucket)
+        if is_cut:
+            self._clipboard = None
+        self.statusBar().showMessage(
+            f"{'Moving' if is_cut else 'Copying'} {len(job)} item(s) here…",
+            3000)
+
+    def bulk_tags(self):
+        """Add / replace / remove tags across the whole selection."""
+        if self.in_bucket_list_mode():
+            return
+        if self.is_read_only():
+            self.statusBar().showMessage("Profile is read-only", 2000)
+            return
+        items = self._collect_selected_targets()
+        if not items:
+            self.statusBar().showMessage("Select object(s) to tag", 2000)
+            return
+        dlg = BulkTagsDialog(self, len(items))
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dlg.is_noop():
+            self.statusBar().showMessage("No tag changes requested", 2000)
+            return
+        add = dlg.tags_to_add()
+        remove = dlg.tags_to_remove()
+        replace = dlg.replace_all()
+        job = [(key, is_folder, add, remove, replace)
+               for _n, key, is_folder in items]
+        self.assign_thread_operation("set_tags", job, need_refresh=False)
+        self.statusBar().showMessage(f"Tagging {len(job)} target(s)…", 3000)
+
+    def download_as_zip(self):
+        """Stream the selection into a single zip archive."""
+        if self.in_bucket_list_mode():
+            return
+        items = self._collect_selected_targets()
+        if not items:
+            self.statusBar().showMessage("Select object(s) to archive", 2000)
+            return
+        base = (self.data_model.current_folder or "").rstrip("/").split("/")[-1]
+        default = os.path.join(
+            os.path.expanduser("~"),
+            f"{base or self.data_model.bucket or 'objects'}.zip")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Download as ZIP", default, "Zip archives (*.zip)")
+        if not path:
+            return
+        if not path.lower().endswith(".zip"):
+            path += ".zip"
+        prefix = self.data_model.current_folder or ""
+        job = [(path, prefix, key, is_folder) for _n, key, is_folder in items]
+        self.assign_thread_operation("zip_download", job, need_refresh=False)
+        self.statusBar().showMessage(f"Archiving {len(job)} item(s)…", 3000)
+
+    def prepare_drag_files(self):
+        """
+        Download the selection to a temp folder so it can be dropped on a file
+        manager. Qt drags are synchronous, so the bytes must exist before the
+        drag starts — the wait is shown and cancellable.
+        """
+        items = [(name, key, is_folder)
+                 for name, key, is_folder in self._collect_selected_targets()]
+        if not items:
+            return []
+
+        clone = self.data_model.clone_for_worker()
+        keys = [(name, key, is_folder) for name, key, is_folder in items]
+
+        def _measure(_w):
+            total = 0
+            for _name, key, is_folder in keys:
+                if is_folder:
+                    for _k, size in clone.get_keys(key):
+                        total += int(size or 0)
+                else:
+                    total += int(clone.get_size(key) or 0)
+            return total
+
+        total, exc = self._run_with_progress("Measuring selection…", _measure)
+        if exc is not None or total is None:
+            return []
+        if total > self.DRAG_WARN_BYTES:
+            if QMessageBox.question(
+                self, "Drag out",
+                f"Dropping this selection downloads {_human_bytes(total)} "
+                "first. Continue?",
+            ) != QMessageBox.StandardButton.Yes:
+                return []
+
+        tmp_dir = tempfile.mkdtemp(prefix="s3duck_drag_")
+
+        def _fetch(_w):
+            paths = []
+            for name, key, is_folder in keys:
+                if is_folder:
+                    clone.download_file(key, None, tmp_dir)
+                    paths.append(os.path.join(tmp_dir, name))
+                else:
+                    out = os.path.join(tmp_dir, name)
+                    clone.download_file(key, out, tmp_dir)
+                    paths.append(out)
+            return paths
+
+        paths, exc = self._run_with_progress("Preparing files…", _fetch)
+        if exc is not None:
+            QMessageBox.warning(self, "Drag out", f"Could not prepare files:\n{exc}")
+            return []
+        return paths or []
 
     def bulk_rename(self):
         """Rename every selected item via find/replace or a numbering template."""

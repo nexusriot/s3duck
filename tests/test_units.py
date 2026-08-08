@@ -16,7 +16,9 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
+import zipfile
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -35,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main_window
 import theme
+from s3duck import selected_row_index
 from utils import (
     str_to_bool, load_aws_profiles, scan_local_tree,
     export_profile_bundle, import_profile_bundle, BundleError,
@@ -44,6 +47,8 @@ from main_window import (
     _dest_inside_source, _build_upload_job_for_path, _listing_summary,
     bulk_rename_plan, build_sync_plan, summarize_sync_plan, build_exclude_matcher,
     collect_shortcuts, LIST_COLUMNS, LIST_OPTIONAL_COLUMNS,
+    build_paste_job, hex_dump, bookmark_label, parse_bookmarks,
+    serialize_bookmarks, add_bookmark_to,
     format_completion_notification, BULK_RENAME_FIND, BULK_RENAME_TEMPLATE,
     Breadcrumb, BulkRenameDialog, CopyMoveDialog, IncompleteUploadsDialog,
     MetadataDialog, OverwriteDialog, PresignedLinkDialog, SyncDialog,
@@ -3465,6 +3470,249 @@ class SyncPlanExcludeTests(unittest.TestCase):
         self.assertEqual([a["rel"] for a in actions], ["b.txt"])
 
 
+class SelectedRowIndexTests(unittest.TestCase):
+    """REGRESSION: Qt returns row -1 with no selection, and `items[-1]` would
+    silently act on the LAST profile — copy/check operated on the wrong one."""
+
+    def test_no_selection_returns_minus_one(self):
+        self.assertEqual(selected_row_index(-1, 3), -1)
+        self.assertEqual(selected_row_index(None, 3), -1)
+
+    def test_stale_row_past_the_end_is_rejected(self):
+        self.assertEqual(selected_row_index(5, 3), -1)
+        self.assertEqual(selected_row_index(0, 0), -1)
+
+    def test_valid_rows_pass_through(self):
+        self.assertEqual(selected_row_index(0, 3), 0)
+        self.assertEqual(selected_row_index(2, 3), 2)
+
+    def test_empty_list_is_never_indexable(self):
+        for row in (-1, 0, 1):
+            self.assertEqual(selected_row_index(row, 0), -1)
+
+
+class BookmarkStorageTests(unittest.TestCase):
+    def test_round_trip(self):
+        entries = [
+            {"name": "prod logs", "bucket": "bkt", "prefix": "logs/2026/"},
+            {"name": "root", "bucket": "other", "prefix": ""},
+        ]
+        self.assertEqual(parse_bookmarks(serialize_bookmarks(entries)), entries)
+
+    def test_malformed_lines_are_dropped_not_fatal(self):
+        raw = "good\tbkt\tp/\nbroken line\n\t\t\nalso\tb2\t"
+        parsed = parse_bookmarks(raw)
+        self.assertEqual([b["bucket"] for b in parsed], ["bkt", "b2"])
+
+    def test_tabs_and_newlines_in_a_name_cannot_split_a_record(self):
+        raw = serialize_bookmarks(
+            [{"name": "a\tb\nc", "bucket": "bkt", "prefix": "p/"}])
+        self.assertEqual(len(raw.splitlines()), 1)
+        self.assertEqual(len(parse_bookmarks(raw)), 1)
+
+    def test_missing_name_falls_back_to_the_location(self):
+        parsed = parse_bookmarks("\tbkt\tlogs/")
+        self.assertEqual(parsed[0]["name"], "bkt/logs/")
+
+    def test_label_formatting(self):
+        self.assertEqual(bookmark_label("bkt", "a/b/"), "bkt/a/b/")
+        self.assertEqual(bookmark_label("bkt", ""), "bkt")
+        self.assertEqual(bookmark_label("", ""), "/")
+
+    def test_empty_input(self):
+        self.assertEqual(parse_bookmarks(""), [])
+        self.assertEqual(parse_bookmarks(None), [])
+        self.assertEqual(serialize_bookmarks([]), "")
+
+    def test_add_rejects_a_duplicate_location(self):
+        entries, added = add_bookmark_to([], "one", "bkt", "p/")
+        self.assertTrue(added)
+        entries, added = add_bookmark_to(entries, "other name", "bkt", "p/")
+        self.assertFalse(added)
+        self.assertEqual(len(entries), 1)
+
+    def test_add_allows_the_same_bucket_at_another_prefix(self):
+        entries, _ = add_bookmark_to([], "root", "bkt", "")
+        entries, added = add_bookmark_to(entries, "deep", "bkt", "a/")
+        self.assertTrue(added)
+        self.assertEqual(len(entries), 2)
+
+    def test_add_defaults_the_name(self):
+        entries, _ = add_bookmark_to([], "", "bkt", "a/")
+        self.assertEqual(entries[0]["name"], "bkt/a/")
+
+
+class BuildPasteJobTests(unittest.TestCase):
+    def _clip(self, mode="copy", bucket="src", items=None):
+        return {"mode": mode, "bucket": bucket,
+                "items": items or [("a.txt", "from/a.txt", False),
+                                   ("dir", "from/dir/", True)]}
+
+    def test_same_bucket_paste_targets_the_current_prefix(self):
+        job, skipped = build_paste_job(self._clip(), "src", "to/")
+        self.assertEqual(job, [
+            ("from/a.txt", "to/a.txt", False, None),
+            ("from/dir/", "to/dir/", True, None),
+        ])
+        self.assertEqual(skipped, [])
+
+    def test_cross_bucket_paste_carries_the_destination(self):
+        job, _skipped = build_paste_job(self._clip(), "other", "to/")
+        self.assertEqual({entry[3] for entry in job}, {"other"})
+
+    def test_paste_into_the_same_place_is_skipped(self):
+        job, skipped = build_paste_job(
+            self._clip(items=[("a.txt", "to/a.txt", False)]), "src", "to/")
+        self.assertEqual(job, [])
+        self.assertEqual(skipped, ["a.txt"])
+
+    def test_folder_cannot_be_pasted_into_itself(self):
+        job, skipped = build_paste_job(
+            self._clip(items=[("dir", "dir/", True)]), "src", "dir/sub/")
+        self.assertEqual(job, [])
+        self.assertEqual(skipped, ["dir"])
+
+    def test_same_prefix_in_another_bucket_is_allowed(self):
+        job, skipped = build_paste_job(
+            self._clip(items=[("a.txt", "to/a.txt", False)]), "other", "to/")
+        self.assertEqual(len(job), 1)
+        self.assertEqual(skipped, [])
+
+    def test_paste_at_bucket_root(self):
+        job, _s = build_paste_job(
+            self._clip(items=[("a.txt", "from/a.txt", False)]), "src", "")
+        self.assertEqual(job[0][1], "a.txt")
+
+    def test_empty_clipboard(self):
+        self.assertEqual(build_paste_job(None, "b", "p/"), ([], []))
+        self.assertEqual(build_paste_job({}, "b", "p/"), ([], []))
+
+
+class MergeTagsTests(unittest.TestCase):
+    CURRENT = [{"Key": "env", "Value": "prod"}, {"Key": "team", "Value": "ops"}]
+
+    def test_add_merges_over_existing(self):
+        out = Model.merge_tags(self.CURRENT, add={"owner": "vlad"})
+        self.assertEqual(
+            {t["Key"]: t["Value"] for t in out},
+            {"env": "prod", "team": "ops", "owner": "vlad"})
+
+    def test_add_overwrites_the_same_key(self):
+        out = Model.merge_tags(self.CURRENT, add={"env": "staging"})
+        self.assertEqual(
+            {t["Key"]: t["Value"] for t in out}["env"], "staging")
+
+    def test_remove_drops_keys(self):
+        out = Model.merge_tags(self.CURRENT, remove=["team", "absent"])
+        self.assertEqual([t["Key"] for t in out], ["env"])
+
+    def test_replace_discards_everything_else(self):
+        out = Model.merge_tags(self.CURRENT, add={"only": "1"}, replace=True)
+        self.assertEqual(out, [{"Key": "only", "Value": "1"}])
+
+    def test_existing_order_is_preserved(self):
+        out = Model.merge_tags(self.CURRENT, add={"z": "1"})
+        self.assertEqual([t["Key"] for t in out], ["env", "team", "z"])
+
+    def test_values_are_stringified(self):
+        out = Model.merge_tags([], add={"n": 5})
+        self.assertEqual(out, [{"Key": "n", "Value": "5"}])
+
+    def test_update_reads_merges_and_writes(self):
+        m = make_model(bucket="b")
+
+        class TagClient(FakeS3Client):
+            def get_object_tagging(self, **kw):
+                self.calls.append(("get_object_tagging", kw))
+                return {"TagSet": [{"Key": "env", "Value": "prod"}]}
+
+            def put_object_tagging(self, **kw):
+                self.calls.append(("put_object_tagging", kw))
+                return {}
+
+        c = TagClient()
+        m._client = c
+        m.update_object_tags("a.txt", add={"owner": "vlad"}, remove=["env"])
+        put = c.calls_of("put_object_tagging")[0]
+        self.assertEqual(put["Tagging"]["TagSet"],
+                         [{"Key": "owner", "Value": "vlad"}])
+
+    def test_replace_skips_the_read(self):
+        m = make_model(bucket="b")
+
+        class TagClient(FakeS3Client):
+            def get_object_tagging(self, **kw):
+                raise AssertionError("must not read when replacing")
+
+            def put_object_tagging(self, **kw):
+                self.calls.append(("put_object_tagging", kw))
+                return {}
+
+        m._client = TagClient()
+        m.update_object_tags("a.txt", add={"a": "b"}, replace=True)
+
+    def test_read_only_refuses(self):
+        m = make_model(bucket="b", read_only=True)
+        m._client = FakeS3Client()
+        with self.assertRaises(ReadOnlyError):
+            m.update_object_tags("a.txt", add={"a": "b"})
+
+
+class StreamObjectTests(unittest.TestCase):
+    def test_yields_chunks_and_charges_the_limiter(self):
+        m = make_model(bucket="b")
+        payload = b"x" * 4096
+
+        class Client:
+            def get_object(self, **kw):
+                return {"Body": io.BytesIO(payload)}
+
+        m._client = Client()
+        m.set_rate_limit(10 ** 9)
+        chunks = list(m.stream_object("k", chunk_size=1024))
+        self.assertEqual(b"".join(chunks), payload)
+        self.assertEqual(len(chunks), 4)
+
+    def test_cancellation_stops_the_stream(self):
+        m = make_model(bucket="b")
+
+        class Client:
+            def get_object(self, **kw):
+                return {"Body": io.BytesIO(b"y" * 4096)}
+
+        m._client = Client()
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(TransferCancelled):
+            list(m.stream_object("k", chunk_size=1024, cancel_event=cancel))
+
+    def test_requires_a_bucket(self):
+        with self.assertRaises(ValueError):
+            list(make_model(bucket="").stream_object("k"))
+
+
+class HexDumpTests(unittest.TestCase):
+    def test_layout(self):
+        out = hex_dump(b"AB\x00\xff")
+        self.assertTrue(out.startswith("00000000  41 42 00 ff"))
+        self.assertIn("|AB..|", out)
+
+    def test_multiple_rows_and_offsets(self):
+        out = hex_dump(bytes(range(48)), width=16)
+        lines = out.splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(lines[1].startswith("00000010"))
+        self.assertTrue(lines[2].startswith("00000020"))
+
+    def test_truncation_is_announced(self):
+        out = hex_dump(b"z" * 100, max_bytes=32)
+        self.assertIn("68 more byte(s) not shown", out)
+
+    def test_empty(self):
+        self.assertEqual(hex_dump(b""), "")
+        self.assertEqual(hex_dump(None), "")
+
+
 class ScanLocalTreeTests(unittest.TestCase):
     def test_relative_paths_sizes_and_mtimes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3935,6 +4183,27 @@ class TransferHistoryTests(unittest.TestCase):
         self.assertEqual(history[0]["status"], "error")
         self.assertEqual(history[1]["bytes"], 2048)
 
+    def test_non_transfer_ops_do_not_inherit_stale_byte_counts(self):
+        """REGRESSION: a delete recorded right after a big download showed the
+        download's byte total, because _smooth_done was read unconditionally."""
+        class NoopDeleter:
+            def delete(self, key, log_fn=None, cancel_event=None):
+                return True
+
+        self.win._smooth_done = 12345          # residue of an earlier transfer
+        with patch.object(type(self.win.data_model), "clone_for_worker",
+                          lambda _s: NoopDeleter()):
+            self.win.assign_thread_operation(
+                "delete", ["a.txt"], need_refresh=False)
+            deadline = time.monotonic() + 5
+            while (self.win._active_entry is not None
+                   and time.monotonic() < deadline):
+                self._app.processEvents()
+            self._app.processEvents()
+        record = self.win.load_transfer_history()[0]
+        self.assertEqual(record["method"], "delete")
+        self.assertEqual(record["bytes"], 0)
+
     def test_small_jobs_are_rerunnable(self):
         self.win._record_history(self._entry())
         self.assertIn("job", self.win.load_transfer_history()[0])
@@ -4018,6 +4287,501 @@ class TransferHistoryTests(unittest.TestCase):
         self.assertTrue(any("Download" in l for l in labels))
         # labels lose their "(Ctrl+D)" hint
         self.assertNotIn("Download (Ctrl+D)", labels)
+
+
+class ZipDownloadWorkerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    class FakeModel:
+        def __init__(self):
+            self.blobs = {"pre/a.txt": b"alpha", "pre/dir/b.txt": b"bravo"}
+
+        def get_keys(self, prefix, log_fn=None):
+            return [(k, len(v)) for k, v in self.blobs.items()
+                    if k.startswith(prefix)]
+
+        def get_size(self, key):
+            return len(self.blobs.get(key, b""))
+
+        def stream_object(self, key, chunk_size=1024 * 1024, cancel_event=None):
+            yield self.blobs[key]
+
+    def test_files_and_folders_land_in_one_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            zip_path = os.path.join(tmp, "out.zip")
+            job = [
+                (zip_path, "pre/", "pre/a.txt", False),
+                (zip_path, "pre/", "pre/dir/", True),
+            ]
+            worker = Worker(self.FakeModel(), job)
+            finished = []
+            worker.finished.connect(finished.append)
+            worker.zip_download()
+            self.assertEqual(finished, [False])
+            with zipfile.ZipFile(zip_path) as zf:
+                # arcnames are relative to the browsed prefix
+                self.assertEqual(sorted(zf.namelist()), ["a.txt", "dir/b.txt"])
+                self.assertEqual(zf.read("dir/b.txt"), b"bravo")
+
+    def test_cancelling_before_it_starts_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            zip_path = os.path.join(tmp, "out.zip")
+            worker = Worker(self.FakeModel(),
+                            [(zip_path, "pre/", "pre/a.txt", False)])
+            worker.cancel()
+            finished = []
+            worker.finished.connect(finished.append)
+            worker.zip_download()
+            self.assertEqual(finished, [True])
+            self.assertFalse(os.path.exists(zip_path))
+
+    def test_cancelling_midway_deletes_the_partial_archive(self):
+        """The archive is already open by then, so the cleanup path has to
+        actually remove it — a truncated zip cannot be opened."""
+        outer = self
+
+        class CancelMidway(outer.FakeModel):
+            def __init__(self):
+                super().__init__()
+                self.cancel_event = None
+
+            def stream_object(self, key, chunk_size=1024 * 1024,
+                              cancel_event=None):
+                yield b"partial"
+                self.cancel_event.set()
+                raise TransferCancelled("cancelled")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zip_path = os.path.join(tmp, "out.zip")
+            model = CancelMidway()
+            worker = Worker(model, [(zip_path, "pre/", "pre/a.txt", False)])
+            model.cancel_event = worker._cancel_event
+            finished = []
+            worker.finished.connect(finished.append)
+            worker.zip_download()
+            self.assertEqual(finished, [True])
+            self.assertFalse(os.path.exists(zip_path))
+
+    def test_failure_is_reported(self):
+        class Failing(self.FakeModel):
+            def stream_object(self, key, chunk_size=1024 * 1024,
+                              cancel_event=None):
+                raise RuntimeError("read error")
+                yield b""      # pragma: no cover
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zip_path = os.path.join(tmp, "out.zip")
+            worker = Worker(Failing(), [(zip_path, "pre/", "pre/a.txt", False)])
+            errors = []
+            worker.error.connect(errors.append)
+            worker.zip_download()
+            self.assertEqual(errors, ["read error"])
+
+
+class SetTagsWorkerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    class FakeModel:
+        def __init__(self):
+            self.calls = []
+
+        def get_keys(self, prefix, log_fn=None):
+            return [(prefix + "a.txt", 1), (prefix + "b.txt", 2), (prefix, 0)]
+
+        def update_object_tags(self, key, add=None, remove=None, replace=False):
+            self.calls.append((key, dict(add or {}), list(remove or []), replace))
+
+    def test_folders_fan_out_to_every_object(self):
+        model = self.FakeModel()
+        job = [("f.txt", False, {"env": "prod"}, [], False),
+               ("dir/", True, {"env": "prod"}, [], False)]
+        worker = Worker(model, job)
+        worker.set_tags()
+        keys = [c[0] for c in model.calls]
+        self.assertIn("f.txt", keys)
+        self.assertIn("dir/a.txt", keys)
+        self.assertIn("dir/b.txt", keys)
+        self.assertNotIn("dir/", keys)       # placeholder skipped
+        self.assertTrue(all(c[1] == {"env": "prod"} for c in model.calls))
+
+    def test_remove_and_replace_are_forwarded(self):
+        model = self.FakeModel()
+        Worker(model, [("f.txt", False, {}, ["old"], True)]).set_tags()
+        self.assertEqual(model.calls, [("f.txt", {}, ["old"], True)])
+
+    def test_cancel_stops_early(self):
+        model = self.FakeModel()
+        worker = Worker(model, [("f.txt", False, {"a": "b"}, [], False)])
+        worker.cancel()
+        finished = []
+        worker.finished.connect(finished.append)
+        worker.set_tags()
+        self.assertEqual(model.calls, [])
+        self.assertEqual(finished, [True])
+
+
+class BulkTagsDialogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _dlg(self):
+        dlg = main_window.BulkTagsDialog(None, 3)
+        self.addCleanup(dlg.close)
+        return dlg
+
+    def test_empty_dialog_is_a_noop(self):
+        self.assertTrue(self._dlg().is_noop())
+
+    def test_collects_tags_and_removals(self):
+        dlg = self._dlg()
+        dlg._table.item(0, 0).setText("env")
+        dlg._table.item(0, 1).setText("prod")
+        dlg._remove_keys.setText("old, stale")
+        self.assertEqual(dlg.tags_to_add(), {"env": "prod"})
+        self.assertEqual(dlg.tags_to_remove(), ["old", "stale"])
+        self.assertFalse(dlg.is_noop())
+
+    def test_blank_keys_are_dropped(self):
+        dlg = self._dlg()
+        dlg._table.item(0, 1).setText("value with no key")
+        self.assertEqual(dlg.tags_to_add(), {})
+
+    def test_replace_alone_is_meaningful(self):
+        dlg = self._dlg()
+        dlg._replace.setChecked(True)
+        self.assertTrue(dlg.replace_all())
+        self.assertFalse(dlg.is_noop())   # replace with no tags clears them
+
+
+class PreviewRenderTests(unittest.TestCase):
+    """PreviewDialog picks a page from the fetched bytes; drive _on_loaded
+    directly so no network or worker thread is involved."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    class FakeModel:
+        bucket = "b"
+
+        def clone_for_worker(self):
+            return self
+
+        def get_object_preview(self, key, max_bytes):
+            return {"data": b"", "content_type": "", "size": 0,
+                    "truncated": False}
+
+    def _dlg(self, key):
+        dlg = main_window.PreviewDialog(None, self.FakeModel(), key)
+        self.addCleanup(dlg.close)
+        deadline = time.monotonic() + 5
+        while dlg._thread is not None and time.monotonic() < deadline:
+            self._app.processEvents()
+        return dlg
+
+    def test_binary_falls_back_to_a_hex_dump(self):
+        dlg = self._dlg("a.bin")
+        dlg._on_loaded({"data": b"\x00\x01ABC", "content_type": "",
+                        "size": 5, "truncated": False}, None)
+        self.assertEqual(dlg._stack.currentIndex(), 3)   # hex page
+        self.assertIn("|..ABC|", dlg._hex.toPlainText())
+
+    def test_code_gets_a_highlighter(self):
+        dlg = self._dlg("script.py")
+        dlg._on_loaded({"data": b"def f():\n    return 1\n",
+                        "content_type": "text/plain", "size": 20,
+                        "truncated": False}, None)
+        self.assertEqual(dlg._stack.currentIndex(), 2)   # text page
+        self.assertIsNotNone(dlg._highlighter)
+
+    def test_plain_text_has_no_highlighter(self):
+        dlg = self._dlg("notes.txt")
+        dlg._on_loaded({"data": b"hello", "content_type": "text/plain",
+                        "size": 5, "truncated": False}, None)
+        self.assertEqual(dlg._stack.currentIndex(), 2)
+        self.assertIsNone(dlg._highlighter)
+
+    def test_truncated_pdf_explains_itself(self):
+        dlg = self._dlg("doc.pdf")
+        dlg._on_loaded({"data": b"%PDF-1.4 truncated", "content_type":
+                        "application/pdf", "size": 10 ** 9, "truncated": True},
+                       None)
+        self.assertEqual(dlg._stack.currentIndex(), 0)   # status page
+        self.assertIn("larger than the preview limit", dlg._status.text())
+
+    def test_real_pdf_renders_when_qtpdf_is_available(self):
+        if main_window.QPdfView is None:
+            self.skipTest("QtPdf not available in this build")
+        pdf = (b"%PDF-1.1\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+               b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+               b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 99 99]>>endobj\n"
+               b"trailer<</Root 1 0 R>>\n")
+        dlg = self._dlg("doc.pdf")
+        dlg._on_loaded({"data": pdf, "content_type": "application/pdf",
+                        "size": len(pdf), "truncated": False}, None)
+        # either it rendered (page 4) or it reported why (page 0)
+        self.assertIn(dlg._stack.currentIndex(), (0, 4))
+
+
+class ClipboardTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def setUp(self):
+        self.settings = QSettings("s3duck-tests", "s3duck-tests")
+        self.settings.clear()
+        self.addCleanup(self.settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            self.win = main_window.MainWindow(settings=(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                self.settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False, "", False,
+            ))
+        self.addCleanup(self.win.close)
+        deadline = time.monotonic() + 5
+        while not self.win.listview.isEnabled() and time.monotonic() < deadline:
+            self._app.processEvents()
+        self._app.processEvents()
+        self.win.data_model.bucket = "bkt"
+        self.win.data_model.current_folder = "from/"
+
+    def _select(self, items):
+        return patch.object(main_window.MainWindow, "_collect_selected_targets",
+                            lambda _s: items)
+
+    def test_copy_stores_the_selection_and_the_uris(self):
+        items = [("a.txt", "from/a.txt", False)]
+        with self._select(items):
+            self.win.copy_to_clipboard()
+        self.assertEqual(self.win._clipboard["mode"], "copy")
+        self.assertEqual(self.win._clipboard["bucket"], "bkt")
+        self.assertEqual(
+            QApplication.clipboard().text(), "s3://bkt/from/a.txt")
+
+    def test_cut_is_blocked_on_a_read_only_profile(self):
+        self.win.data_model.read_only = True
+        with self._select([("a.txt", "from/a.txt", False)]):
+            self.win.copy_to_clipboard(cut=True)
+        self.assertIsNone(self.win._clipboard)
+
+    def test_paste_copies_into_the_current_folder(self):
+        started = []
+        self.win._clipboard = {"mode": "copy", "bucket": "bkt",
+                               "items": [("a.txt", "from/a.txt", False)]}
+        self.win.data_model.current_folder = "to/"
+        with patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: set()), \
+             patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append((m, j))):
+            self.win.paste_from_clipboard()
+        self.assertEqual(started[0][0], "copy")
+        self.assertEqual(started[0][1], [("from/a.txt", "to/a.txt", False, None)])
+        # a copy stays on the clipboard for another paste
+        self.assertIsNotNone(self.win._clipboard)
+
+    def test_paste_after_cut_moves_and_clears_the_clipboard(self):
+        started = []
+        self.win._clipboard = {"mode": "cut", "bucket": "bkt",
+                               "items": [("a.txt", "from/a.txt", False)]}
+        self.win.data_model.current_folder = "to/"
+        with patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: set()), \
+             patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append((m, j))):
+            self.win.paste_from_clipboard()
+        self.assertEqual(started[0][0], "move")
+        self.assertIsNone(self.win._clipboard)
+
+    def test_paste_across_buckets_sets_the_destination_bucket(self):
+        """REGRESSION (critical): the copy/move workers resolve CopySource —
+        and move's delete pass — against their model's bucket. A cross-bucket
+        paste must therefore hand the SOURCE bucket to the transfer, or the
+        copy reads from the destination bucket and a cut deletes an unrelated
+        destination object that happens to share the key."""
+        started = []
+        self.win._clipboard = {"mode": "copy", "bucket": "other",
+                               "items": [("a.txt", "from/a.txt", False)]}
+        self.win.data_model.current_folder = ""
+        with patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: set()), \
+             patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append((m, j, kw))):
+            self.win.paste_from_clipboard()
+        method, job, kwargs = started[0]
+        self.assertEqual(job[0][3], "bkt")                     # destination
+        self.assertEqual(kwargs.get("source_bucket"), "other")  # source
+
+    def test_same_bucket_paste_has_no_source_override(self):
+        started = []
+        self.win._clipboard = {"mode": "copy", "bucket": "bkt",
+                               "items": [("a.txt", "from/a.txt", False)]}
+        self.win.data_model.current_folder = "to/"
+        with patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: set()), \
+             patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append((m, j, kw))):
+            self.win.paste_from_clipboard()
+        self.assertEqual(started[0][2].get("source_bucket", ""), "")
+
+    def test_worker_model_is_bound_to_the_source_bucket(self):
+        """The entry's source_bucket must rebind the worker's model clone —
+        bucket, navigation AND endpoint, since the clone inherits the
+        destination bucket's (possibly virtual-host) endpoint binding."""
+        self.win.data_model.current_folder = "deep/"
+        entry = main_window._QEntry(
+            1, "copy", [("from/a.txt", "a.txt", False, "bkt")],
+            label="Copy", source_bucket="other")
+        model = self.win._worker_model_for(entry)
+        self.assertEqual(model.bucket, "other")
+        self.assertEqual(model.current_folder, "")
+        self.assertEqual(model.endpoint_url, model.profile_endpoint_url)
+        self.assertIsNone(model._client)
+
+        plain = main_window._QEntry(2, "copy", [("a", "b", False, None)],
+                                    label="Copy")
+        self.assertEqual(self.win._worker_model_for(plain).bucket, "bkt")
+
+    def test_retry_keeps_the_source_bucket(self):
+        started = []
+        with patch.object(main_window.MainWindow, "_start_transfer",
+                          lambda _s, entry: started.append(entry)):
+            self.win.assign_thread_operation(
+                "copy", [("from/a.txt", "a.txt", False, "bkt")],
+                source_bucket="other")
+            started[0].status = "error"
+            self.win._on_queue_retry_requested(started[0].entry_id)
+        self.assertEqual(len(started), 2)
+        self.assertEqual(started[1].source_bucket, "other")
+
+    def test_profile_switch_clears_the_clipboard(self):
+        """A clipboard from another profile points at another account's
+        objects; pasting it through new credentials must be impossible."""
+        self.win._clipboard = {"mode": "copy", "bucket": "bkt",
+                               "items": [("a.txt", "from/a.txt", False)]}
+        prof = types.SimpleNamespace(
+            name="p2", url="https://s3.amazonaws.com", region="us-east-1",
+            access_key="AK2", secret_key="SK2", no_ssl_check=False,
+            use_path=False, session_token="", read_only=False)
+        self.win.apply_profile(prof)
+        deadline = time.monotonic() + 5
+        while not self.win.listview.isEnabled() and time.monotonic() < deadline:
+            self._app.processEvents()
+        self._app.processEvents()
+        self.assertIsNone(self.win._clipboard)
+
+    def test_paste_is_blocked_when_read_only(self):
+        started = []
+        self.win.data_model.read_only = True
+        self.win._clipboard = {"mode": "copy", "bucket": "bkt",
+                               "items": [("a.txt", "from/a.txt", False)]}
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append((m, j))):
+            self.win.paste_from_clipboard()
+        self.assertEqual(started, [])
+
+    def test_bookmark_is_added_and_survives_a_restart(self):
+        self.win.data_model.current_folder = "logs/2026/"
+        with patch.object(main_window.QInputDialog, "getText",
+                          return_value=("prod logs", True)):
+            self.win.add_bookmark()
+        self.assertEqual(len(self.win._bookmarks), 1)
+        self.assertEqual(self.win._bookmarks[0]["prefix"], "logs/2026/")
+        self.win.close()
+
+        with patch.object(main_window, "DataModel", _StubModel):
+            again = main_window.MainWindow(settings=(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                self.settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False, "", False,
+            ))
+        self.addCleanup(again.close)
+        self.assertEqual(
+            [b["name"] for b in again._bookmarks], ["prod logs"])
+
+    def test_duplicate_location_is_not_bookmarked_twice(self):
+        self.win.data_model.current_folder = "logs/"
+        with patch.object(main_window.QInputDialog, "getText",
+                          return_value=("one", True)):
+            self.win.add_bookmark()
+        with patch.object(main_window.QInputDialog, "getText",
+                          return_value=("two", True)):
+            self.win.add_bookmark()
+        self.assertEqual(len(self.win._bookmarks), 1)
+
+    def test_cancelling_the_name_prompt_adds_nothing(self):
+        with patch.object(main_window.QInputDialog, "getText",
+                          return_value=("", False)):
+            self.win.add_bookmark()
+        self.assertEqual(self.win._bookmarks, [])
+
+    def test_bookmarks_need_an_open_bucket(self):
+        self.win.data_model.bucket = ""
+        with patch.object(main_window.QInputDialog, "getText",
+                          return_value=("x", True)):
+            self.win.add_bookmark()
+        self.assertEqual(self.win._bookmarks, [])
+
+    def test_same_bucket_bookmark_navigates_without_reopening(self):
+        entered = []
+        navigated = []
+        with patch.object(main_window.MainWindow, "enter_bucket_async",
+                          lambda _s, name, target_prefix=None:
+                              entered.append((name, target_prefix))), \
+             patch.object(main_window.MainWindow, "navigate",
+                          lambda _s, **kw: navigated.append(kw)):
+            self.win.go_to_bookmark(
+                {"bucket": "bkt", "prefix": "logs/"})
+        self.assertEqual(entered, [])
+        self.assertEqual(self.win.data_model.current_folder, "logs/")
+        self.assertEqual(len(navigated), 1)
+
+    def test_other_bucket_bookmark_reopens_that_bucket(self):
+        entered = []
+        with patch.object(main_window.MainWindow, "enter_bucket_async",
+                          lambda _s, name, target_prefix=None:
+                              entered.append((name, target_prefix))):
+            self.win.go_to_bookmark({"bucket": "other", "prefix": "deep/"})
+        self.assertEqual(entered, [("other", "deep/")])
+
+    def test_bookmark_menu_lists_saved_locations(self):
+        self.win._bookmarks = [
+            {"name": "one", "bucket": "bkt", "prefix": "a/"},
+            {"name": "two", "bucket": "bkt2", "prefix": ""},
+        ]
+        self.win._rebuild_bookmark_menu()
+        labels = [a.text() for a in self.win.bookmarkButton.menu().actions()
+                  if not a.isSeparator()]
+        self.assertIn("one", labels)
+        self.assertIn("two", labels)
+        self.assertTrue(any("Bookmark this location" in l for l in labels))
+
+    def test_manage_dialog_edits_are_kept(self):
+        self.win._bookmarks = [
+            {"name": "one", "bucket": "bkt", "prefix": "a/"},
+            {"name": "two", "bucket": "bkt2", "prefix": ""},
+        ]
+        dlg = main_window.BookmarksDialog(None, self.win._bookmarks)
+        self.addCleanup(dlg.close)
+        dlg._table.item(0, 0).setText("renamed")
+        dlg._table.setCurrentCell(1, 0)
+        dlg._remove()
+        result = dlg.bookmarks()
+        self.assertEqual([b["name"] for b in result], ["renamed"])
+        self.assertEqual(result[0]["bucket"], "bkt")
+
+    def test_paste_with_empty_clipboard_does_nothing(self):
+        started = []
+        self.win._clipboard = None
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append((m, j))):
+            self.win.paste_from_clipboard()
+        self.assertEqual(started, [])
 
 
 class ThemeTests(unittest.TestCase):

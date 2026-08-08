@@ -19,6 +19,8 @@ Simple cross-platform GUI client for S3-compatible object storage (AWS S3, MinIO
 - **Object browser** — navigate prefixes as a virtual folder tree with sorting by name, size, and modified date; optional Storage-class and ETag columns via the header context menu (both come free with the listing)
 - **Upload** — single/multiple files via dialog or drag-and-drop from the OS file manager; whole directory trees via "Upload folder" (`Ctrl+Shift+U`) or drag-and-drop
 - **Download** — single files or entire folder prefixes, recreating the directory tree locally
+- **Download as ZIP** — stream a selection (files and whole folders) straight into one archive, without staging it on disk twice
+- **Drag out** — drag objects from the list onto a file manager; the selection is downloaded to a temp folder first, with progress and a size warning
 - **Resumable downloads** — large files download as parallel ranges into a `.s3duckpart` file with a progress sidecar, so an interrupted transfer picks up where it stopped instead of restarting (a changed ETag discards the stale partial)
 - **Checksum verification** — optionally compare each downloaded file against the object's ETag and fail the transfer on a mismatch (multipart ETags are reported as not comparable)
 - **Parallel transfers** — configurable number of files moving at once *and* multipart connections within each file; applies to uploads, downloads (including whole prefixes) and sync
@@ -31,21 +33,24 @@ Simple cross-platform GUI client for S3-compatible object storage (AWS S3, MinIO
 - **Completion notifications** — a desktop notification when the queue drains while the window is in the background (toggle in Transfer settings)
 - **Delete** — objects and folder prefixes (recursive, batched 1000 keys per call); confirmation shows the scanned object count and total size; recursive bucket delete also purges noncurrent versions, delete markers and in-flight uploads
 - **Undo delete** (`Ctrl+Z`) — on a versioning-enabled bucket a delete only writes a delete marker, so the last delete can be rolled back by removing those markers
+- **Clipboard** (`Ctrl+C` / `Ctrl+X` / `Ctrl+V`) — copy or cut a selection and paste it into any folder or bucket; copying also puts the `s3://` URIs on the system clipboard for use elsewhere
 - **Copy / Move** — server-side copy or move of a multi-selection, within a bucket or **across buckets**; when the destination lives in another region or account (where a server-side copy is impossible) the object is streamed through instead of failing
 - **Rename** — in-place rename of a file or folder (server-side copy + delete), on the context menu or `F2`
 - **Bulk rename** (`Shift+F2`) — rename a whole selection by find-and-replace (optionally regex, with backreferences) or a `{name}/{ext}/{n}` numbering template, with a live preview and duplicate/invalid-name checks
 - **Create folder** — creates an S3 prefix placeholder
-- **Preview / open** — double-click a file to preview images and text in-app, or open any object with the OS default application
+- **Preview / open** — double-click a file to preview images, text, **PDFs** and syntax-highlighted code in-app, with a **hex dump** for binaries; anything can still be opened with the OS default application
 - **Recursive search** — search a whole bucket/prefix by key substring or regular expression (`Ctrl+Shift+F` or "Search here…"), filtered by size range, extension and modified date, with jump-to-location on any result
 - **Object versioning** — enable/suspend bucket versioning from the UI; list every version and delete marker of an object, download a specific version, promote an older version to current, or delete individual versions
 - **Storage class** — view an object's storage class and change it (Standard, IA, Intelligent-Tiering, Glacier, Deep Archive, …); works on a multi-selection or whole folders and runs through the transfer queue
 - **Glacier restore** — initiate a restore of archived objects (single, multi-select, or whole prefixes) with a chosen retrieval tier and retention window, queued like other transfers; restore status shown in properties
+- **Bulk tagging** — add, overwrite or strip tags across a whole selection, expanding folders to every object beneath them
 - **Edit metadata** — set `Content-Type`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, and custom `x-amz-meta-*` user metadata
 - **Object properties** — key, size, ETag, storage class, restore status, and public URL
 - **Presigned links** — generate a temporary download (GET) or **upload (PUT)** link with a configurable expiry (up to the 7-day S3 maximum)
 - **Make public** — set `public-read` ACL and copy direct URL; when the ACL is refused, Block Public Access and Object Ownership settings are reported as the reason
 - **Clickable breadcrumb** — jump straight to any parent prefix, the bucket root, or the bucket list from the path bar
 - **Go to location** (`Ctrl+L`) — paste an `s3://bucket/prefix` (or a bare prefix) and jump straight there, across buckets
+- **Bookmarks** (`Ctrl+B`) — save any bucket/prefix and return to it from the toolbar menu, with rename/remove management; stored per profile
 - **Remembered layout** — splitter position, column widths and sort order persist between sessions
 - **Listing summary** — folder/file counts and total size of the current listing in the status bar
 - **Keyboard shortcuts** (`Ctrl+/`) — a searchable reference generated from the app's own actions, since plain letters are reserved for type-to-search
@@ -56,6 +61,8 @@ Simple cross-platform GUI client for S3-compatible object storage (AWS S3, MinIO
 - **Automatic region/endpoint detection** — when an operation fails due to a region or endpoint mismatch the app probes the server for the correct region, rebuilds the client, and retries transparently; applies to bucket open, listing, upload, download, and delete
 - **S3-compatible storage** — path-style addressing option for MinIO and similar backends
 - **Cross-platform** — Linux, macOS, Windows
+
+Planned work and known limitations are tracked in [ROADMAP.md](ROADMAP.md).
 
 ---
 
@@ -192,6 +199,9 @@ s3duck/
 | `ShortcutsDialog` | main_window.py | Keyboard reference derived from the live QActions |
 | `TransferHistoryDialog` | main_window.py | Past transfers with re-run |
 | `RateLimiter` | model.py | Shared token bucket capping total throughput |
+| `BulkTagsDialog` | main_window.py | Add / replace / remove tags across a selection |
+| `BookmarksDialog` | main_window.py | Rename / remove saved locations |
+| `CodeHighlighter` | main_window.py | Language-agnostic syntax highlighting in previews |
 | `BulkRenameDialog` | main_window.py | Find-replace / template rename with live preview |
 | `SyncDialog` | main_window.py | Local↔remote comparison, dry-run plan, queued execution |
 | `MetadataDialog` | main_window.py | Edit Content-Type / caching headers and custom user metadata |

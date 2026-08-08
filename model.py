@@ -2306,6 +2306,67 @@ class Model:
             self.rebind_bucket(log_fn=log_fn)
             _do()
 
+    def stream_object(self, key: str, chunk_size: int = 1024 * 1024,
+                      cancel_event=None):
+        """
+        Yield an object's bytes in chunks without buffering it whole — used to
+        feed a zip archive directly. Honours the shared bandwidth limit.
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        resp = self.client.get_object(Bucket=self.bucket, Key=key)
+        body = resp["Body"]
+        try:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                block = body.read(chunk_size)
+                if not block:
+                    return
+                if self.rate_limiter is not None:
+                    self.rate_limiter.consume(len(block))
+                yield block
+        finally:
+            try:
+                body.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def merge_tags(current, add=None, remove=None, replace=False) -> list:
+        """
+        Work out the new TagSet for an object.
+
+        current/result are boto3's [{'Key':k,'Value':v}] form. With replace the
+        result is exactly *add*; otherwise *add* is merged over the existing
+        tags and any key in *remove* is dropped. Insertion order is kept so a
+        rewrite does not shuffle unrelated tags.
+        """
+        add = dict(add or {})
+        remove = {str(k) for k in (remove or [])}
+        if replace:
+            merged = dict(add)
+        else:
+            merged = {}
+            for tag in current or []:
+                key = tag.get("Key")
+                if key is None:
+                    continue
+                merged[str(key)] = str(tag.get("Value") or "")
+            merged.update({str(k): str(v) for k, v in add.items()})
+            for key in remove:
+                merged.pop(key, None)
+        return [{"Key": k, "Value": v} for k, v in merged.items()]
+
+    def update_object_tags(self, key: str, add=None, remove=None,
+                           replace=False) -> list:
+        """Read-modify-write one object's tags. Returns the stored TagSet."""
+        self._guard_write()
+        current = [] if replace else self.get_object_tags(key)
+        tags = self.merge_tags(current, add=add, remove=remove, replace=replace)
+        self.put_object_tags(key, tags)
+        return tags
+
     def get_object_tags(self, key: str) -> list:
         """Return the TagSet for an object as a list of {'Key': k, 'Value': v} dicts."""
         resp = self.client.get_object_tagging(Bucket=self.bucket, Key=key)

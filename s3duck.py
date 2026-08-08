@@ -57,6 +57,19 @@ class Crypto:
         return self.fernet.decrypt(val).decode()
 
 
+def selected_row_index(row, item_count) -> int:
+    """
+    Validate a Qt row against the backing list.
+
+    QModelIndex.row() is -1 when nothing is selected, and a bare items[row]
+    would then silently act on the LAST profile. Returns -1 when there is no
+    usable selection.
+    """
+    if row is None or row < 0 or row >= int(item_count or 0):
+        return -1
+    return int(row)
+
+
 def decrypt_optional(crypto, value) -> str:
     """Decrypt a possibly absent/legacy field without failing the whole load."""
     if not value:
@@ -155,6 +168,11 @@ class Profiles(QDialog):
         super().showEvent(event)
         center_on_screen(self)
 
+    def _current_item_index(self) -> int:
+        model = self.listWidget.selectionModel()
+        row = model.currentIndex().row() if model is not None else -1
+        return selected_row_index(row, len(self.items))
+
     def select_last(self):
         index = self.listWidget.model().index(
             self.listWidget.count() - 1, 0
@@ -162,8 +180,9 @@ class Profiles(QDialog):
         self.listWidget.setCurrentIndex(index)
 
     def copy_profile(self):
-        index = self.listWidget.selectionModel().currentIndex()
-        elem = index.row()
+        elem = self._current_item_index()
+        if elem < 0:
+            return
         item = deepcopy(self.items[elem])
         item.name = "%s-copy" % item.name
         self.items.append(item)
@@ -176,8 +195,9 @@ class Profiles(QDialog):
         Keep old behavior:
         still checks a specific bucket configured on this profile.
         """
-        index = self.listWidget.selectionModel().currentIndex()
-        elem = index.row()
+        elem = self._current_item_index()
+        if elem < 0:
+            return
         item = self.items[elem]
         self.settings.beginGroup("common")
         key = self.settings.value("key")
@@ -332,8 +352,7 @@ class Profiles(QDialog):
         self.settings.endGroup()
 
     def onStart(self):
-        index = self.listWidget.selectionModel().currentIndex()
-        elem = index.row()
+        elem = self._current_item_index()
         if elem < 0:
             return
         item = self.items[elem]
@@ -585,7 +604,7 @@ class Profiles(QDialog):
 
     def onEdit(self):
         index = self.listWidget.selectionModel().currentIndex()
-        elem = index.row()
+        elem = self._current_item_index()
         if elem < 0:
             return
         item = self.items[elem]
@@ -640,8 +659,7 @@ class Profiles(QDialog):
             self.listWidget.setCurrentIndex(index)
 
     def onDelete(self):
-        index = self.listWidget.selectionModel().currentIndex()
-        elem = index.row()
+        elem = self._current_item_index()
         if elem < 0:
             return
         qm = QMessageBox
