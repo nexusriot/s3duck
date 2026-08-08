@@ -45,6 +45,10 @@ limitations worth fixing. Items move up or down based on review findings.
 - **Trash convention** — optional "move to `.trash/` prefix" instead of
   delete, with an empty-trash action (complements undo-delete, which needs
   versioning).
+- **Content-hash duplicate confirmation** — the duplicate finder groups by
+  size + ETag; confirming the "same size, ETags cannot compare" candidates
+  would mean downloading and hashing them, which is worth offering explicitly
+  for small files.
 - **S3 Select preview** — run simple SQL over CSV/JSON objects in the preview
   dialog instead of downloading them.
 - **QR code for presigned links** — hand a download link to a phone.
@@ -65,5 +69,8 @@ limitations worth fixing. Items move up or down based on review findings.
   the configured file parallelism.
 - Multipart ETags cannot be checksum-verified without the original part
   boundaries; verification reports them as "not comparable" and passes.
-- Cancelling a background scan (destination check, drag-out measure) abandons
-  the worker thread; it finishes quietly in the background.
+- Cancelling a background scan (destination check, drag-out measure, duplicate
+  scan) abandons the worker thread; it finishes quietly in the background.
+- The duplicate finder compares ETags, so identical content uploaded with
+  different multipart part sizes is reported as an unconfirmed candidate
+  rather than a match.

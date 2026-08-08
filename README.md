@@ -55,6 +55,7 @@ Simple cross-platform GUI client for S3-compatible object storage (AWS S3, MinIO
 - **Listing summary** — folder/file counts and total size of the current listing in the status bar
 - **Keyboard shortcuts** (`Ctrl+/`) — a searchable reference generated from the app's own actions, since plain letters are reserved for type-to-search
 - **Theme** — Light, Dark, or system-default appearance, remembered across sessions
+- **Duplicate finder** (Tools → Find duplicates, `Ctrl+Shift+D`) — group objects holding identical content by size + ETag at the cost of a listing, showing reclaimable space; select all-but-newest/oldest and delete the redundant copies. Objects whose ETags cannot settle the question (multipart vs single-part) are listed separately and never auto-selected
 - **Bucket usage stats** — total size and object count, breakdown by file category with a pie chart, top folder groups, a storage-class breakdown and the largest objects
 - **Runtime profile switch** — switch S3 accounts without restarting the app
 - **Cached bucket bindings** — the proven endpoint/region/addressing combination per bucket is remembered, so reopening an off-region bucket skips the probe round trips
@@ -201,6 +202,7 @@ s3duck/
 | `RateLimiter` | model.py | Shared token bucket capping total throughput |
 | `BulkTagsDialog` | main_window.py | Add / replace / remove tags across a selection |
 | `BookmarksDialog` | main_window.py | Rename / remove saved locations |
+| `DuplicateFinderDialog` | main_window.py | Size+ETag duplicate scan with guarded deletion |
 | `CodeHighlighter` | main_window.py | Language-agnostic syntax highlighting in previews |
 | `BulkRenameDialog` | main_window.py | Find-replace / template rename with live preview |
 | `SyncDialog` | main_window.py | Local↔remote comparison, dry-run plan, queued execution |

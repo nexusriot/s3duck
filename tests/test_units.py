@@ -27,8 +27,8 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import botocore.exceptions
-from PyQt6.QtCore import QSettings
-from PyQt6.QtGui import QAction, QPalette
+from PyQt6.QtCore import QSettings, Qt
+from PyQt6.QtGui import QAction, QKeySequence, QPalette
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QDialogButtonBox, QMessageBox, QToolButton,
 )
@@ -48,6 +48,7 @@ from main_window import (
     bulk_rename_plan, build_sync_plan, summarize_sync_plan, build_exclude_matcher,
     collect_shortcuts, LIST_COLUMNS, LIST_OPTIONAL_COLUMNS,
     build_paste_job, hex_dump, bookmark_label, parse_bookmarks,
+    find_duplicate_groups, summarize_duplicate_groups, select_redundant_keys,
     serialize_bookmarks, add_bookmark_to,
     format_completion_notification, BULK_RENAME_FIND, BULK_RENAME_TEMPLATE,
     Breadcrumb, BulkRenameDialog, CopyMoveDialog, IncompleteUploadsDialog,
@@ -3249,6 +3250,32 @@ class MainWindowBatchTests(unittest.TestCase):
         self.win._record_undoable_delete(["a.txt"])
         self.assertFalse(self.win.btnUndoDelete.isEnabled())
 
+    def test_progress_helper_returns_when_the_work_finishes_instantly(self):
+        """REGRESSION (hang): the helper used QProgressDialog.exec(), but a
+        worker that finished before exec() was entered had already called
+        reset() — leaving the app frozen behind a dialog nothing would close.
+        A small bucket made destination checks fast enough to hit it."""
+        result, exc = self.win._run_with_progress("t", lambda _w: 42)
+        self.assertEqual(result, 42)
+        self.assertIsNone(exc)
+
+    def test_progress_helper_surfaces_worker_errors(self):
+        def _boom(_w):
+            raise RuntimeError("nope")
+
+        result, exc = self.win._run_with_progress("t", _boom)
+        self.assertIsNone(result)
+        self.assertIsInstance(exc, RuntimeError)
+
+    def test_progress_helper_handles_slow_work(self):
+        def _slow(_w):
+            time.sleep(0.2)
+            return "done"
+
+        result, exc = self.win._run_with_progress("t", _slow)
+        self.assertEqual(result, "done")
+        self.assertIsNone(exc)
+
     def test_no_conflicts_runs_untouched(self):
         job = [("a", "/tmp/fresh", 1, "/tmp")]
         self.assertEqual(
@@ -3489,6 +3516,213 @@ class SelectedRowIndexTests(unittest.TestCase):
     def test_empty_list_is_never_indexable(self):
         for row in (-1, 0, 1):
             self.assertEqual(selected_row_index(row, 0), -1)
+
+
+class FindDuplicateGroupsTests(unittest.TestCase):
+    MD5_A = "a" * 32
+    MD5_B = "b" * 32
+
+    def test_same_size_and_etag_is_a_confirmed_group(self):
+        groups = find_duplicate_groups([
+            ("one.txt", 100, self.MD5_A, _dt(1)),
+            ("two.txt", 100, self.MD5_A, _dt(2)),
+            ("other.txt", 100, self.MD5_B, _dt(3)),
+        ])
+        self.assertEqual(len(groups), 1)
+        group = groups[0]
+        self.assertTrue(group["confirmed"])
+        self.assertEqual([k for k, _m in group["members"]],
+                         ["one.txt", "two.txt"])
+        self.assertEqual(group["wasted"], 100)
+
+    def test_distinct_plain_etags_are_never_grouped(self):
+        """Two different MD5s prove the contents differ — grouping them would
+        invite deleting a file that is not a duplicate."""
+        groups = find_duplicate_groups([
+            ("one.txt", 100, self.MD5_A, _dt(1)),
+            ("two.txt", 100, self.MD5_B, _dt(2)),
+        ])
+        self.assertEqual(groups, [])
+
+    def test_multipart_etags_that_match_are_confirmed(self):
+        etag = self.MD5_A + "-4"
+        groups = find_duplicate_groups([
+            ("one.bin", 10 ** 8, etag, _dt(1)),
+            ("two.bin", 10 ** 8, etag, _dt(2)),
+        ])
+        self.assertEqual(len(groups), 1)
+        self.assertTrue(groups[0]["confirmed"])
+
+    def test_multipart_vs_single_part_is_unconfirmed(self):
+        """Identical bytes uploaded with different part sizes yield different
+        ETags, so same-size-different-ETag is a candidate, not a finding."""
+        groups = find_duplicate_groups([
+            ("one.bin", 500, self.MD5_A, _dt(1)),
+            ("two.bin", 500, self.MD5_B + "-2", _dt(2)),
+        ])
+        self.assertEqual(len(groups), 1)
+        self.assertFalse(groups[0]["confirmed"])
+        self.assertEqual(groups[0]["etag"], "")
+
+    def test_two_blank_etags_are_never_confirmed(self):
+        """A backend that returns no ETag tells us nothing about the content;
+        grouping such objects as confirmed would make them auto-selectable for
+        deletion on nothing more than a matching size."""
+        groups = find_duplicate_groups([
+            ("a.bin", 500, "", _dt(1)),
+            ("b.bin", 500, "", _dt(2)),
+        ])
+        self.assertEqual(len(groups), 1)
+        self.assertFalse(groups[0]["confirmed"])
+        self.assertEqual(groups[0]["etag"], "")
+        self.assertEqual(select_redundant_keys(groups), set())
+
+    def test_missing_etag_makes_a_size_match_unconfirmed(self):
+        groups = find_duplicate_groups([
+            ("one.bin", 500, "", _dt(1)),
+            ("two.bin", 500, self.MD5_A, _dt(2)),
+        ])
+        self.assertEqual(len(groups), 1)
+        self.assertFalse(groups[0]["confirmed"])
+
+    def test_confirmed_and_unconfirmed_coexist_at_one_size(self):
+        groups = find_duplicate_groups([
+            ("a1.bin", 500, self.MD5_A, _dt(1)),
+            ("a2.bin", 500, self.MD5_A, _dt(2)),
+            ("b.bin", 500, self.MD5_B + "-3", _dt(3)),
+            ("c.bin", 500, "", _dt(4)),
+        ])
+        kinds = sorted(g["confirmed"] for g in groups)
+        self.assertEqual(kinds, [False, True])
+        unconfirmed = next(g for g in groups if not g["confirmed"])
+        self.assertEqual([k for k, _m in unconfirmed["members"]],
+                         ["b.bin", "c.bin"])
+
+    def test_zero_byte_objects_are_excluded_by_default(self):
+        self.assertEqual(find_duplicate_groups([
+            ("a", 0, self.MD5_A, _dt(1)),
+            ("b", 0, self.MD5_A, _dt(2)),
+        ]), [])
+
+    def test_min_size_filter(self):
+        entries = [("a", 10, self.MD5_A, _dt(1)), ("b", 10, self.MD5_A, _dt(2))]
+        self.assertEqual(len(find_duplicate_groups(entries, min_size=10)), 1)
+        self.assertEqual(find_duplicate_groups(entries, min_size=11), [])
+
+    def test_folder_placeholders_are_ignored(self):
+        self.assertEqual(find_duplicate_groups([
+            ("dir/", 100, self.MD5_A, _dt(1)),
+            ("dir2/", 100, self.MD5_A, _dt(2)),
+        ]), [])
+
+    def test_groups_sorted_by_reclaimable_bytes(self):
+        groups = find_duplicate_groups([
+            ("s1", 10, self.MD5_A, _dt(1)),
+            ("s2", 10, self.MD5_A, _dt(2)),
+            ("big1", 900, self.MD5_B, _dt(1)),
+            ("big2", 900, self.MD5_B, _dt(2)),
+        ])
+        self.assertEqual([g["size"] for g in groups], [900, 10])
+
+    def test_three_copies_report_two_wasted(self):
+        groups = find_duplicate_groups([
+            ("a", 50, self.MD5_A, _dt(1)),
+            ("b", 50, self.MD5_A, _dt(2)),
+            ("c", 50, self.MD5_A, _dt(3)),
+        ])
+        self.assertEqual(groups[0]["count"], 3)
+        self.assertEqual(groups[0]["wasted"], 100)
+
+    def test_quoted_etags_are_normalized(self):
+        groups = find_duplicate_groups([
+            ("a", 10, f'"{self.MD5_A}"', _dt(1)),
+            ("b", 10, self.MD5_A, _dt(2)),
+        ])
+        self.assertEqual(len(groups), 1)
+
+    def test_empty_input(self):
+        self.assertEqual(find_duplicate_groups([]), [])
+        self.assertEqual(find_duplicate_groups(None), [])
+
+    def test_summary_counts_only_confirmed_bytes(self):
+        groups = find_duplicate_groups([
+            ("a1", 100, self.MD5_A, _dt(1)),
+            ("a2", 100, self.MD5_A, _dt(2)),
+            ("u1", 700, "", _dt(1)),
+            ("u2", 700, self.MD5_B, _dt(2)),
+        ])
+        summary = summarize_duplicate_groups(groups)
+        self.assertEqual(summary["groups"], 2)
+        self.assertEqual(summary["confirmed_groups"], 1)
+        self.assertEqual(summary["redundant"], 2)
+        # unconfirmed bytes are not promised as reclaimable
+        self.assertEqual(summary["wasted"], 100)
+
+
+class SelectRedundantKeysTests(unittest.TestCase):
+    MD5 = "c" * 32
+
+    def _groups(self):
+        return find_duplicate_groups([
+            ("old.txt", 10, self.MD5, _dt(1)),
+            ("mid.txt", 10, self.MD5, _dt(2)),
+            ("new.txt", 10, self.MD5, _dt(3)),
+        ])
+
+    def test_keep_newest_selects_the_rest(self):
+        self.assertEqual(
+            select_redundant_keys(self._groups(), keep="newest"),
+            {"old.txt", "mid.txt"})
+
+    def test_keep_oldest_selects_the_rest(self):
+        self.assertEqual(
+            select_redundant_keys(self._groups(), keep="oldest"),
+            {"mid.txt", "new.txt"})
+
+    def test_unconfirmed_groups_are_never_auto_selected(self):
+        groups = find_duplicate_groups([
+            ("a", 500, "", _dt(1)),
+            ("b", 500, "d" * 32, _dt(2)),
+        ])
+        self.assertFalse(groups[0]["confirmed"])
+        self.assertEqual(select_redundant_keys(groups), set())
+
+    def test_undated_members_are_treated_as_oldest(self):
+        groups = find_duplicate_groups([
+            ("dated.txt", 10, self.MD5, _dt(5)),
+            ("undated.txt", 10, self.MD5, None),
+        ])
+        self.assertEqual(
+            select_redundant_keys(groups, keep="newest"), {"undated.txt"})
+
+    def test_every_group_keeps_one_survivor(self):
+        groups = find_duplicate_groups([
+            ("g1a", 10, self.MD5, _dt(1)), ("g1b", 10, self.MD5, _dt(2)),
+            ("g2a", 20, "e" * 32, _dt(1)), ("g2b", 20, "e" * 32, _dt(2)),
+        ])
+        selected = select_redundant_keys(groups)
+        for group in groups:
+            survivors = [k for k, _m in group["members"] if k not in selected]
+            self.assertEqual(len(survivors), 1)
+
+    def test_bad_keep_value_rejected(self):
+        with self.assertRaises(ValueError):
+            select_redundant_keys([], keep="sideways")
+
+
+class ListObjectDigestsTests(unittest.TestCase):
+    def test_returns_key_size_etag_and_modified(self):
+        m = make_model(bucket="b")
+        m._client = FakeS3Client(list_pages=[{"Contents": [
+            {"Key": "a.txt", "Size": 5, "ETag": '"abc"', "LastModified": _dt(1)},
+            {"Key": "dir/", "Size": 0, "ETag": '""', "LastModified": _dt(1)},
+        ]}])
+        rows = m.list_object_digests("")
+        self.assertEqual(rows, [("a.txt", 5, "abc", _dt(1))])
+
+    def test_requires_a_bucket(self):
+        with self.assertRaises(ValueError):
+            make_model(bucket="").list_object_digests("")
 
 
 class BookmarkStorageTests(unittest.TestCase):
@@ -4089,7 +4323,6 @@ class CollectShortcutsTests(unittest.TestCase):
         cls._app = _ensure_qapp()
 
     def _action(self, text, keys=""):
-        from PyQt6.QtGui import QAction, QKeySequence
         act = QAction(text)
         if keys:
             act.setShortcut(QKeySequence(keys))
@@ -4782,6 +5015,195 @@ class ClipboardTests(unittest.TestCase):
                           lambda _s, m, j, **kw: started.append((m, j))):
             self.win.paste_from_clipboard()
         self.assertEqual(started, [])
+
+
+class _FakeDuplicateModel:
+    bucket = "bkt"
+
+    def __init__(self, rows=None, fail=False):
+        self._rows = rows or []
+        self._fail = fail
+        self.prefixes = []
+        self.cancel_events = []
+
+    def clone_for_worker(self):
+        return self
+
+    def list_object_digests(self, prefix="", cancel_event=None, log_fn=None):
+        self.prefixes.append(prefix)
+        self.cancel_events.append(cancel_event)
+        if self._fail:
+            raise RuntimeError("denied")
+        return list(self._rows)
+
+
+class DuplicateFinderDialogTests(unittest.TestCase):
+    MD5_A = "a" * 32
+    MD5_B = "b" * 32
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _settle(self, dlg, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while dlg._thread is not None and time.monotonic() < deadline:
+            self._app.processEvents()
+        self._app.processEvents()
+
+    def _dlg(self, rows=None, prefix="pre/", fail=False, read_only=False):
+        mw = _FakeMainWindow()
+        mw.is_read_only = lambda: read_only
+        mw.deleted = []
+        mw.delete_duplicate_keys = lambda keys: mw.deleted.append(list(keys))
+        model = _FakeDuplicateModel(rows, fail=fail)
+        dlg = main_window.DuplicateFinderDialog(None, mw, model, prefix)
+        self.addCleanup(dlg.close)
+        return dlg, mw, model
+
+    def _rows(self):
+        return [
+            ("pre/old.bin", 2 * 1024 * 1024, self.MD5_A, _dt(1)),
+            ("pre/new.bin", 2 * 1024 * 1024, self.MD5_A, _dt(3)),
+            ("pre/unique.bin", 5 * 1024 * 1024, self.MD5_B, _dt(2)),
+        ]
+
+    def test_scan_groups_duplicates_and_reports_reclaimable_space(self):
+        dlg, _mw, _model = self._dlg(self._rows())
+        dlg._min_size.setText("1")
+        dlg._min_unit.setCurrentIndex(0)      # bytes
+        dlg._scan()
+        self._settle(dlg)
+        self.assertEqual(len(dlg._groups), 1)
+        self.assertEqual(dlg._tree.topLevelItemCount(), 1)
+        self.assertEqual(dlg._tree.topLevelItem(0).childCount(), 2)
+        self.assertIn("2.0 MB", dlg._info.text())
+
+    def test_nothing_is_preselected(self):
+        """Deletion is irreversible; the user must choose explicitly."""
+        dlg, _mw, _model = self._dlg(self._rows())
+        dlg._min_unit.setCurrentIndex(0)
+        dlg._scan()
+        self._settle(dlg)
+        self.assertEqual(dlg.selected_keys(), [])
+        self.assertFalse(dlg._btn_delete.isEnabled())
+
+    def test_keep_newest_and_oldest_pick_opposite_survivors(self):
+        dlg, _mw, _model = self._dlg(self._rows())
+        dlg._min_unit.setCurrentIndex(0)
+        dlg._scan()
+        self._settle(dlg)
+        dlg._auto_select("newest")
+        self.assertEqual(dlg.selected_keys(), ["pre/old.bin"])
+        dlg._auto_select("oldest")
+        self.assertEqual(dlg.selected_keys(), ["pre/new.bin"])
+        dlg._clear_selection()
+        self.assertEqual(dlg.selected_keys(), [])
+
+    def test_min_size_filter_is_applied(self):
+        dlg, _mw, _model = self._dlg(self._rows())
+        dlg._min_size.setText("3")
+        dlg._min_unit.setCurrentIndex(2)      # MB — above the duplicate pair
+        dlg._scan()
+        self._settle(dlg)
+        self.assertEqual(dlg._groups, [])
+        self.assertIn("No duplicates", dlg._info.text())
+
+    def test_scope_checkbox_widens_the_scan_to_the_bucket(self):
+        dlg, _mw, model = self._dlg(self._rows(), prefix="pre/")
+        dlg._min_unit.setCurrentIndex(0)
+        dlg._scan()
+        self._settle(dlg)
+        self.assertEqual(model.prefixes[-1], "pre/")
+        dlg._scope.setChecked(True)
+        dlg._scan()
+        self._settle(dlg)
+        self.assertEqual(model.prefixes[-1], "")
+
+    def test_scan_passes_a_cancel_event(self):
+        dlg, _mw, model = self._dlg(self._rows())
+        dlg._scan()
+        self._settle(dlg)
+        self.assertIsNotNone(model.cancel_events[0])
+
+    def test_scan_failure_is_reported(self):
+        dlg, _mw, _model = self._dlg(fail=True)
+        dlg._scan()
+        self._settle(dlg)
+        self.assertIn("Scan failed", dlg._info.text())
+        self.assertTrue(dlg._btn_scan.isEnabled())
+
+    def test_delete_hands_the_selection_to_the_window(self):
+        dlg, mw, _model = self._dlg(self._rows())
+        dlg._min_unit.setCurrentIndex(0)
+        dlg._scan()
+        self._settle(dlg)
+        dlg._auto_select("newest")
+        with patch.object(main_window.QMessageBox, "question",
+                          return_value=QMessageBox.StandardButton.Yes):
+            dlg._delete_selected()
+        self.assertEqual(mw.deleted, [["pre/old.bin"]])
+
+    def test_declining_the_confirmation_deletes_nothing(self):
+        dlg, mw, _model = self._dlg(self._rows())
+        dlg._min_unit.setCurrentIndex(0)
+        dlg._scan()
+        self._settle(dlg)
+        dlg._auto_select("newest")
+        with patch.object(main_window.QMessageBox, "question",
+                          return_value=QMessageBox.StandardButton.No):
+            dlg._delete_selected()
+        self.assertEqual(mw.deleted, [])
+
+    def test_warns_when_a_whole_group_is_selected(self):
+        """Checking every copy destroys the content instead of de-duplicating."""
+        dlg, mw, _model = self._dlg(self._rows())
+        dlg._min_unit.setCurrentIndex(0)
+        dlg._scan()
+        self._settle(dlg)
+        for item in dlg._iter_key_items():
+            item.setCheckState(0, Qt.CheckState.Checked)
+        self.assertTrue(dlg._selection_would_empty_a_group())
+        seen = {}
+        with patch.object(main_window.QMessageBox, "question",
+                          side_effect=lambda *a, **k: seen.update(text=a[2])
+                          or QMessageBox.StandardButton.No):
+            dlg._delete_selected()
+        self.assertIn("WARNING", seen["text"])
+
+    def test_read_only_profile_cannot_delete(self):
+        dlg, _mw, _model = self._dlg(self._rows(), read_only=True)
+        dlg._min_unit.setCurrentIndex(0)
+        dlg._scan()
+        self._settle(dlg)
+        dlg._auto_select("newest")
+        self.assertFalse(dlg._btn_delete.isEnabled())
+
+    def test_unconfirmed_group_is_labelled_and_not_auto_selected(self):
+        rows = [
+            ("pre/a.bin", 4096, self.MD5_A, _dt(1)),
+            ("pre/b.bin", 4096, self.MD5_B + "-2", _dt(2)),
+        ]
+        dlg, _mw, _model = self._dlg(rows)
+        dlg._min_unit.setCurrentIndex(0)
+        dlg._scan()
+        self._settle(dlg)
+        self.assertEqual(len(dlg._groups), 1)
+        self.assertFalse(dlg._groups[0]["confirmed"])
+        self.assertIn("cannot confirm", dlg._tree.topLevelItem(0).text(0))
+        dlg._auto_select("newest")
+        self.assertEqual(dlg.selected_keys(), [])
+
+    def test_min_size_parsing_is_forgiving(self):
+        dlg, _mw, _model = self._dlg()
+        dlg._min_unit.setCurrentIndex(0)
+        dlg._min_size.setText("not a number")
+        self.assertEqual(dlg.min_size_bytes(), 1)
+        dlg._min_size.setText("0")
+        self.assertEqual(dlg.min_size_bytes(), 1)   # zero-byte objects excluded
+        dlg._min_size.setText("2")
+        dlg._min_unit.setCurrentIndex(1)            # KB
+        self.assertEqual(dlg.min_size_bytes(), 2048)
 
 
 class ThemeTests(unittest.TestCase):

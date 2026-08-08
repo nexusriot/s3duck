@@ -2649,6 +2649,46 @@ class Model:
             self.rebind_bucket(log_fn=log_fn)
             return _fetch()
 
+    def list_object_digests(self, prefix: str = "", cancel_event=None,
+                            log_fn=None) -> list:
+        """
+        Return ``[(key, size, etag, last_modified), ...]`` for every object
+        under 'prefix'. ETag and size both come back with ListObjectsV2, so
+        content comparison costs no extra request.
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+
+        def _fetch():
+            out = []
+            paginator = self.client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix or ""):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                for obj in page.get("Contents", []) or []:
+                    key = obj.get("Key") or ""
+                    if not key or key.endswith("/"):
+                        continue
+                    out.append((
+                        key,
+                        int(obj.get("Size") or 0),
+                        self.normalize_etag(obj.get("ETag")),
+                        obj.get("LastModified"),
+                    ))
+            return out
+
+        try:
+            return _fetch()
+        except TransferCancelled:
+            raise
+        except Exception as exc:
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error scanning '{prefix}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            return _fetch()
+
     def list_tree(self, prefix: str = "", cancel_event=None, log_fn=None) -> dict:
         """
         Map every object under 'prefix' to ``{relative_path: (size, mtime)}``

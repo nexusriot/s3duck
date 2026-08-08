@@ -379,6 +379,125 @@ def bulk_rename_plan(items, *, mode=BULK_RENAME_FIND, find="", replace="",
     return plan, problems
 
 
+def _etag_is_comparable(etag) -> bool:
+    """
+    True when an ETag pins the content on its own.
+
+    A single-part upload's ETag is the MD5 of the body. A multipart ETag is
+    '<md5-of-part-md5s>-<n>': still deterministic, so two objects sharing one
+    are identical — but two objects with *different* multipart ETags may still
+    hold the same bytes if they were uploaded with different part sizes.
+    """
+    return bool(etag) and "-" not in etag
+
+
+def find_duplicate_groups(entries, *, min_size=1) -> list:
+    """
+    Group objects that hold the same content.
+
+    ``entries`` is an iterable of ``(key, size, etag, last_modified)``.
+    Returns groups sorted by reclaimable bytes, each a dict of
+    ``{size, etag, members, count, wasted, confirmed}`` where members are
+    ``(key, last_modified)`` sorted by key.
+
+    Objects sharing a size *and* an ETag are confirmed duplicates. Objects
+    sharing only a size are reported as unconfirmed **only** when their ETags
+    cannot settle it (a multipart or missing ETag is involved); two distinct
+    plain-MD5 ETags prove the contents differ, so those are never grouped.
+    Zero-byte objects are excluded by default — every empty file matches every
+    other, which is noise rather than a finding.
+    """
+    by_size = {}
+    for entry in entries or []:
+        key, size, etag, modified = (list(entry) + [None] * 4)[:4]
+        if not key or str(key).endswith("/"):
+            continue
+        size = int(size or 0)
+        if size < int(min_size):
+            continue
+        by_size.setdefault(size, []).append(
+            (str(key), (etag or "").replace('"', "").strip(), modified))
+
+    groups = []
+    for size, rows in by_size.items():
+        by_etag = {}
+        for key, etag, modified in rows:
+            by_etag.setdefault(etag, []).append((key, modified))
+
+        leftovers = []
+        for etag, members in by_etag.items():
+            if etag and len(members) >= 2:
+                groups.append({
+                    "size": size,
+                    "etag": etag,
+                    "members": sorted(members, key=lambda m: m[0]),
+                    "count": len(members),
+                    "wasted": size * (len(members) - 1),
+                    "confirmed": True,
+                })
+            else:
+                leftovers.extend((key, etag, modified)
+                                 for key, modified in members)
+
+        # Same size, unresolved ETags: only a real candidate when at least one
+        # side cannot be compared by ETag at all.
+        if len(leftovers) >= 2 and any(
+                not _etag_is_comparable(etag) for _k, etag, _m in leftovers):
+            members = sorted(((key, modified) for key, _e, modified in leftovers),
+                             key=lambda m: m[0])
+            groups.append({
+                "size": size,
+                "etag": "",
+                "members": members,
+                "count": len(members),
+                "wasted": size * (len(members) - 1),
+                "confirmed": False,
+            })
+
+    groups.sort(key=lambda g: (-g["wasted"], -g["size"], g["members"][0][0]))
+    return groups
+
+
+def summarize_duplicate_groups(groups) -> dict:
+    """Totals for the duplicate report header."""
+    groups = list(groups or [])
+    confirmed = [g for g in groups if g.get("confirmed")]
+    return {
+        "groups": len(groups),
+        "confirmed_groups": len(confirmed),
+        "redundant": sum(g["count"] - 1 for g in groups),
+        "wasted": sum(g["wasted"] for g in confirmed),
+    }
+
+
+def select_redundant_keys(groups, keep="newest") -> set:
+    """
+    Which keys to delete so one copy of each group survives.
+
+    keep is "newest" or "oldest" by last-modified; entries without a timestamp
+    sort oldest so a dated copy is preferred as the survivor. Unconfirmed
+    groups are never auto-selected — their members are not proven identical.
+    """
+    if keep not in ("newest", "oldest"):
+        raise ValueError("keep must be 'newest' or 'oldest'")
+    chosen = set()
+    for group in groups or []:
+        if not group.get("confirmed"):
+            continue
+        members = list(group.get("members") or [])
+        if len(members) < 2:
+            continue
+        ordered = sorted(
+            members,
+            key=lambda m: (m[1] is not None, _to_epoch(m[1]), m[0]),
+        )
+        survivor = ordered[-1] if keep == "newest" else ordered[0]
+        for key, _modified in members:
+            if key != survivor[0]:
+                chosen.add(key)
+    return chosen
+
+
 def bookmark_label(bucket, prefix) -> str:
     """Default display name for a saved location."""
     bucket = bucket or ""
@@ -595,6 +714,7 @@ LISTVIEW_KEY_HELP = (
     ("Ctrl+X", "Cut selection to the clipboard"),
     ("Ctrl+V", "Paste clipboard into this folder"),
     ("Ctrl+B", "Bookmark the current location"),
+    ("Ctrl+Shift+D", "Find duplicate objects"),
     ("Enter", "Open the selected bucket / folder / file"),
     ("Backspace", "Go up one level"),
     ("Del", "Delete selection"),
@@ -2498,6 +2618,271 @@ class BulkTagsDialog(QDialog):
     def is_noop(self) -> bool:
         return not self.tags_to_add() and not self.tags_to_remove() \
             and not self.replace_all()
+
+
+class DuplicateFinderDialog(QDialog):
+    """
+    Find objects holding the same content and delete the redundant copies.
+
+    Grouping uses size + ETag, which ListObjectsV2 already returns, so a scan
+    costs no more than a listing. Groups whose ETags cannot settle the question
+    are shown separately and are never auto-selected.
+    """
+
+    SIZE_UNITS = (("B", 1), ("KB", 1024), ("MB", 1024 ** 2), ("GB", 1024 ** 3))
+
+    def __init__(self, parent, main_window, model, prefix):
+        super().__init__(parent)
+        self._mw = main_window
+        self._model = model
+        self._prefix = prefix or ""
+        self._groups = []
+        self._thread = None
+        self._worker = None
+        self._cancel = None
+
+        self.setWindowTitle(f"Find duplicates — {model.bucket}/{self._prefix}")
+        self.resize(900, 600)
+
+        self._scope = QCheckBox(
+            f"Search the whole bucket (not just {self._prefix or '/'})")
+        self._scope.setEnabled(bool(self._prefix))
+
+        self._min_size = QLineEdit("1")
+        self._min_size.setMaximumWidth(90)
+        self._min_unit = QComboBox()
+        for label, factor in self.SIZE_UNITS:
+            self._min_unit.addItem(label, factor)
+        self._min_unit.setCurrentIndex(2)  # MB — tiny files are mostly noise
+
+        self._btn_scan = QPushButton("Scan")
+        self._btn_scan.clicked.connect(self._scan)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Ignore files smaller than"))
+        top.addWidget(self._min_size)
+        top.addWidget(self._min_unit)
+        top.addStretch(1)
+        top.addWidget(self._btn_scan)
+
+        self._info = QLabel("Scan to look for duplicate objects.")
+        self._info.setWordWrap(True)
+
+        self._tree = QTreeWidget()
+        self._tree.setHeaderLabels(["Object", "Size", "Modified", "ETag"])
+        self._tree.setColumnWidth(0, 420)
+        self._tree.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._tree.itemChanged.connect(self._on_item_changed)
+
+        self._btn_keep_newest = QPushButton("Select all but newest")
+        self._btn_keep_oldest = QPushButton("Select all but oldest")
+        self._btn_clear = QPushButton("Clear selection")
+        self._btn_delete = QPushButton("Delete selected…")
+        close_btn = QPushButton("Close")
+        self._btn_keep_newest.clicked.connect(
+            lambda: self._auto_select("newest"))
+        self._btn_keep_oldest.clicked.connect(
+            lambda: self._auto_select("oldest"))
+        self._btn_clear.clicked.connect(self._clear_selection)
+        self._btn_delete.clicked.connect(self._delete_selected)
+        close_btn.clicked.connect(self.reject)
+
+        row = QHBoxLayout()
+        row.addWidget(self._btn_keep_newest)
+        row.addWidget(self._btn_keep_oldest)
+        row.addWidget(self._btn_clear)
+        row.addStretch(1)
+        row.addWidget(self._btn_delete)
+        row.addWidget(close_btn)
+
+        lay = QVBoxLayout(self)
+        lay.addLayout(top)
+        lay.addWidget(self._scope)
+        lay.addWidget(self._info)
+        lay.addWidget(self._tree, 1)
+        lay.addLayout(row)
+
+        self._update_buttons()
+
+    def closeEvent(self, event):
+        if self._cancel is not None:
+            self._cancel.set()
+        th, self._thread, self._worker = self._thread, None, None
+        self._cancel = None
+        _join_qthread(th)
+        super().closeEvent(event)
+
+    def min_size_bytes(self) -> int:
+        raw = (self._min_size.text() or "").strip()
+        factor = self._min_unit.currentData() or 1
+        try:
+            value = int(float(raw) * factor)
+        except ValueError:
+            value = 1
+        return max(1, value)
+
+    def _scan(self):
+        if self._thread is not None:
+            return
+        prefix = "" if self._scope.isChecked() else self._prefix
+        min_size = self.min_size_bytes()
+        clone = self._model.clone_for_worker()
+        cancel = threading.Event()
+        self._cancel = cancel
+        self._groups = []
+        self._tree.clear()
+        self._info.setText("Scanning…")
+        self._btn_scan.setEnabled(False)
+        self._update_buttons()
+
+        def _run(_w):
+            rows = clone.list_object_digests(prefix, cancel_event=cancel)
+            return find_duplicate_groups(rows, min_size=min_size)
+
+        self._thread = QThread(self)
+        self._worker = _FuncWorker(_run)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.done.connect(self._on_scanned)
+        self._worker.done.connect(self._thread.quit)
+        self._worker.done.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.start()
+
+    def _on_scanned(self, result, exc):
+        th, self._thread, self._worker = self._thread, None, None
+        self._cancel = None
+        _join_qthread(th)
+        self._btn_scan.setEnabled(True)
+        if exc is not None:
+            self._info.setText(f"Scan failed: {exc}")
+            self._update_buttons()
+            return
+        self._groups = result or []
+        self._render()
+
+    def _render(self):
+        self._tree.blockSignals(True)
+        self._tree.clear()
+        for index, group in enumerate(self._groups):
+            confirmed = group["confirmed"]
+            title = (
+                f"{group['count']} copies · {_human_bytes(group['size'])} each "
+                f"· {_human_bytes(group['wasted'])} reclaimable"
+            )
+            if not confirmed:
+                title += "  — same size, ETags cannot confirm"
+            parent = QTreeWidgetItem([title, "", "", group["etag"]])
+            parent.setFirstColumnSpanned(False)
+            parent.setData(0, Qt.ItemDataRole.UserRole, ("group", index))
+            self._tree.addTopLevelItem(parent)
+            for key, modified in group["members"]:
+                child = QTreeWidgetItem([
+                    key,
+                    _human_bytes(group["size"]),
+                    "" if modified is None else str(modified),
+                    group["etag"],
+                ])
+                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                child.setCheckState(0, Qt.CheckState.Unchecked)
+                child.setData(0, Qt.ItemDataRole.UserRole, ("key", key))
+                parent.addChild(child)
+            parent.setExpanded(True)
+        self._tree.blockSignals(False)
+
+        summary = summarize_duplicate_groups(self._groups)
+        if not self._groups:
+            self._info.setText("No duplicates found.")
+        else:
+            self._info.setText(
+                f"{summary['groups']} group(s), {summary['redundant']} "
+                f"redundant copy(ies), {_human_bytes(summary['wasted'])} "
+                "reclaimable from confirmed matches. Nothing is selected until "
+                "you choose — review before deleting."
+            )
+        self._update_buttons()
+
+    def _on_item_changed(self, _item, _column):
+        self._update_buttons()
+
+    def _iter_key_items(self):
+        for i in range(self._tree.topLevelItemCount()):
+            parent = self._tree.topLevelItem(i)
+            for j in range(parent.childCount()):
+                yield parent.child(j)
+
+    def selected_keys(self) -> list:
+        out = []
+        for item in self._iter_key_items():
+            if item.checkState(0) == Qt.CheckState.Checked:
+                kind, key = item.data(0, Qt.ItemDataRole.UserRole)
+                if kind == "key":
+                    out.append(key)
+        return out
+
+    def _auto_select(self, keep):
+        chosen = select_redundant_keys(self._groups, keep=keep)
+        self._tree.blockSignals(True)
+        for item in self._iter_key_items():
+            _kind, key = item.data(0, Qt.ItemDataRole.UserRole)
+            item.setCheckState(
+                0,
+                Qt.CheckState.Checked if key in chosen else Qt.CheckState.Unchecked,
+            )
+        self._tree.blockSignals(False)
+        self._update_buttons()
+
+    def _clear_selection(self):
+        self._tree.blockSignals(True)
+        for item in self._iter_key_items():
+            item.setCheckState(0, Qt.CheckState.Unchecked)
+        self._tree.blockSignals(False)
+        self._update_buttons()
+
+    def _selection_would_empty_a_group(self) -> bool:
+        """True if every copy in some group is checked — that deletes the
+        content outright rather than de-duplicating it."""
+        checked = set(self.selected_keys())
+        for group in self._groups:
+            keys = [k for k, _m in group["members"]]
+            if keys and all(k in checked for k in keys):
+                return True
+        return False
+
+    def _update_buttons(self):
+        busy = self._thread is not None
+        has_groups = bool(self._groups)
+        writable = not self._mw.is_read_only()
+        self._btn_keep_newest.setEnabled(has_groups and not busy)
+        self._btn_keep_oldest.setEnabled(has_groups and not busy)
+        self._btn_clear.setEnabled(has_groups and not busy)
+        self._btn_delete.setEnabled(
+            bool(self.selected_keys()) and not busy and writable)
+
+    def _delete_selected(self):
+        keys = self.selected_keys()
+        if not keys:
+            return
+        total = 0
+        for group in self._groups:
+            for key, _m in group["members"]:
+                if key in keys:
+                    total += group["size"]
+        warning = ""
+        if self._selection_would_empty_a_group():
+            warning = (
+                "\n\nWARNING: every copy in at least one group is selected — "
+                "that deletes the content entirely, not just the duplicates."
+            )
+        if QMessageBox.question(
+            self, "Delete duplicates",
+            f"Permanently delete {len(keys)} object(s), freeing about "
+            f"{_human_bytes(total)}?{warning}",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.accept()
+        self._mw.delete_duplicate_keys(keys)
 
 
 class BookmarksDialog(QDialog):
@@ -4539,6 +4924,7 @@ class MainWindow(QMainWindow):
         self.tBar.addAction(self.btnTransferSettings)
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnQueuePanel)
+        self._build_tools_button()
         self.tBar.addAction(self.btnAbout)
         self._build_theme_button()
         self.tBar.setIconSize(QSize(26, 26))
@@ -4614,6 +5000,9 @@ class MainWindow(QMainWindow):
 
         self._deep_search_shortcut = QShortcut(QKeySequence("Ctrl+Shift+F"), self)
         self._deep_search_shortcut.activated.connect(self.open_search)
+
+        self._duplicates_shortcut = QShortcut(QKeySequence("Ctrl+Shift+D"), self)
+        self._duplicates_shortcut.activated.connect(self.find_duplicates)
 
         self._bookmark_shortcut = QShortcut(QKeySequence("Ctrl+B"), self)
         self._bookmark_shortcut.activated.connect(self.add_bookmark)
@@ -4923,6 +5312,58 @@ class MainWindow(QMainWindow):
                     f"s3://{entry.get('bucket', '')}/{entry.get('prefix', '')}")
                 act.triggered.connect(
                     lambda _checked=False, e=dict(entry): self.go_to_bookmark(e))
+
+    def find_duplicates(self):
+        """Tools → Find duplicates: group objects by size + ETag."""
+        if self.in_bucket_list_mode() or not self.data_model.bucket:
+            self.statusBar().showMessage("Open a bucket to scan", 2000)
+            return
+        DuplicateFinderDialog(
+            self, self, self.data_model, self.data_model.current_folder or ""
+        ).exec()
+
+    def delete_duplicate_keys(self, keys):
+        """Queue the deletion chosen in the duplicate finder."""
+        keys = [k for k in (keys or []) if k]
+        if not keys:
+            return
+        if self.is_read_only():
+            self.statusBar().showMessage("Profile is read-only", 2000)
+            return
+        self.log(f"deleting {len(keys)} duplicate object(s)")
+        self.assign_thread_operation("delete", keys)
+        self.statusBar().showMessage(
+            f"Deleting {len(keys)} duplicate(s)…", 3000)
+
+    def _build_tools_button(self):
+        self.toolsButton = QToolButton()
+        self.toolsButton.setIcon(
+            QIcon.fromTheme(
+                "applications-utilities",
+                QIcon(os.path.join(self.current_dir, "icons", "settings_24px.svg")),
+            )
+        )
+        self.toolsButton.setIconSize(QSize(26, 26))
+        self.toolsButton.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.toolsButton.setToolTip("Tools")
+        self.toolsButton.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(self.toolsButton)
+        self.actFindDuplicates = menu.addAction("Find duplicates… (Ctrl+Shift+D)")
+        self.actFindDuplicates.triggered.connect(lambda: self.find_duplicates())
+        menu.addSeparator()
+        act_usage = menu.addAction("Bucket usage…")
+        act_usage.triggered.connect(lambda: self.request_bucket_usage())
+        act_incomplete = menu.addAction("Incomplete uploads…")
+        act_incomplete.triggered.connect(lambda: self.show_incomplete_uploads())
+        act_sync = menu.addAction("Sync with local folder…")
+        act_sync.triggered.connect(lambda: self.open_sync())
+        menu.addSeparator()
+        act_settings = menu.addAction("Transfer settings…")
+        act_settings.triggered.connect(lambda: self.transfer_settings())
+        self.toolsButton.setMenu(menu)
+        self.tBar.addWidget(self.toolsButton)
 
     def _build_bookmark_button(self):
         self.bookmarkButton = QToolButton()
@@ -6405,7 +6846,16 @@ class MainWindow(QMainWindow):
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
-        prog.exec()  # returns when reset() above runs, or the user cancels
+        # Deliberately not prog.exec(): a fast worker can finish (and call
+        # reset()) before exec() is entered, and exec() would then block
+        # forever with nothing left to close it. Pumping events with a bounded
+        # wait cannot deadlock however the race falls out.
+        prog.show()
+        while not state["done"] and not prog.wasCanceled():
+            QApplication.processEvents(
+                QEventLoop.ProcessEventsFlag.WaitForMoreEvents, 50)
+        prog.close()
+
         if not state["done"]:
             state["exc"] = None
             state["result"] = None
