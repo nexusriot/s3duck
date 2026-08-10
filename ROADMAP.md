@@ -6,10 +6,6 @@ limitations worth fixing. Items move up or down based on review findings.
 
 ## Tier 1 — high value
 
-- **Upload overwrite protection** — downloads, copies, moves, renames and
-  pastes all detect existing destinations, but uploads (dialog, folder upload
-  and drag-in) silently replace remote objects. Same Skip / Overwrite prompt,
-  driven by one listing of the target prefix.
 - **Restore last location** — reopen the previous bucket/prefix per profile on
   startup (bookmarks landed; this is the second half of that request).
 - **Remote ↔ remote compare & sync** — the dry-run sync engine only pairs
@@ -36,10 +32,25 @@ limitations worth fixing. Items move up or down based on review findings.
 - **Requester-pays support** — a per-profile toggle adding
   `RequestPayer=requester` to reads, without which such buckets are unusable.
 
+## Launcher (profiles window)
+
+The connect probe, the two-line rows and keyboard handling landed in 0.13.0;
+the `[read-only]` / `[TLS unverified]` badges in 0.14.0; per-profile accent
+colours in 0.15.0. What is left:
+
+- **Reorder profiles** — drag to reorder, or sort by last used; the list is
+  stored as a QSettings array, so order is already persisted and just needs a
+  handle in the UI.
+- **Filter box** — type to narrow the list once a user has more than a screen
+  of profiles.
+- **Duplicate-name validation** — Add/Edit accept a name already in use, and
+  only import de-duplicates (`-imported` suffix).
+- **Remember the last-used profile** — preselect it instead of always row 0.
+- **Connection state per row** — show the result of the last probe (reachable
+  / refused / never tried) so a broken profile is visible before Run.
+
 ## Tier 3 — polish
 
-- **Overwrite check for folder downloads** — the existing prompt covers file
-  rows only; folder downloads overwrite local trees silently.
 - **Pause / resume for the transfer queue** — cancel+retry exists; a true
   pause that keeps partial state would round it out.
 - **Trash convention** — optional "move to `.trash/` prefix" instead of
@@ -49,13 +60,18 @@ limitations worth fixing. Items move up or down based on review findings.
   size + ETag; confirming the "same size, ETags cannot compare" candidates
   would mean downloading and hashing them, which is worth offering explicitly
   for small files.
+- **Cross-profile move** — copying between profiles landed; deleting the
+  source afterwards (a true move) is the obvious follow-up, and needs the
+  same are-you-sure care as any cross-account delete.
+- **CRC32C checksums** — CRC32/SHA1/SHA256 are supported because they can be
+  recomputed locally from the standard library. CRC32C would need
+  `google-crc32c`; offering an algorithm we cannot verify would silently pass
+  every download.
 - **S3 Select preview** — run simple SQL over CSV/JSON objects in the preview
   dialog instead of downloading them.
 - **QR code for presigned links** — hand a download link to a phone.
 - **Watch mode** — monitor a local folder and auto-sync changes up on an
   interval (the sync engine already computes minimal plans).
-- **Temp-file cleanup** — previews, drag-out staging and "open with default
-  app" leave files in per-session temp dirs until the OS clears them.
 - **Localization** — externalize user-facing strings.
 
 ## Known limitations (accepted for now)
@@ -67,8 +83,12 @@ limitations worth fixing. Items move up or down based on review findings.
 - A whole-folder download inside a parallel batch multiplies workers
   (files-in-flight × chunk fan-out); concurrency is bounded but can exceed
   the configured file parallelism.
-- Multipart ETags cannot be checksum-verified without the original part
-  boundaries; verification reports them as "not comparable" and passes.
+- A multipart ETag still cannot be verified without the original part
+  boundaries. Uploading with an additional CRC32 checksum (Transfer settings)
+  makes those objects verifiable; without one, verification reports them as
+  "not comparable" and passes.
+- The command palette lists the toolbar and window-level actions. Context-menu
+  entries are built on demand when the menu opens, so they are not in it.
 - Cancelling a background scan (destination check, drag-out measure, duplicate
   scan) abandons the worker thread; it finishes quietly in the background.
 - The duplicate finder compares ETags, so identical content uploaded with

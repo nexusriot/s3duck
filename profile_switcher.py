@@ -6,9 +6,8 @@ from PyQt6.QtWidgets import (
     QDialog, QListWidget, QPushButton, QHBoxLayout, QVBoxLayout,
     QMessageBox, QLabel
 )
-from cryptography.fernet import Fernet
 
-from utils import str_to_bool
+from utils import str_to_bool, Crypto, decrypt_optional, normalize_accent
 
 
 @dataclass
@@ -23,31 +22,7 @@ class Profile:
     use_path: bool
     session_token: str = ""
     read_only: bool = False
-
-
-class Crypto:
-    def __init__(self, key: str):
-        self.fernet = Fernet(key.encode() if isinstance(key, str) else key)
-
-    def decrypt(self, value: str) -> str:
-        # QSettings sometimes returns QByteArray/str; handle both
-        if value is None:
-            return ""
-        if isinstance(value, bytes):
-            enc = value
-        else:
-            enc = str(value).encode()
-        return self.fernet.decrypt(enc).decode()
-
-
-def _decrypt_optional(crypto: "Crypto", value) -> str:
-    """Decrypt an optional/legacy field without failing the whole profile."""
-    if not value:
-        return ""
-    try:
-        return crypto.decrypt(value)
-    except Exception:
-        return ""
+    color: str = ""
 
 
 def load_profiles(settings: QSettings) -> List[dict]:
@@ -67,6 +42,7 @@ def load_profiles(settings: QSettings) -> List[dict]:
             "use_path": settings.value("use_path", "false"),
             "session_token": settings.value("session_token", ""),
             "read_only": settings.value("read_only", "false"),
+            "color": settings.value("color", ""),
         })
     settings.endArray()
     settings.endGroup()
@@ -78,9 +54,6 @@ def decrypt_profile(settings: QSettings, raw: dict) -> Profile:
     key = settings.value("key", "")
     settings.endGroup()
 
-    if not key:
-        raise RuntimeError("Encryption key is missing in settings (group: common/key)")
-
     crypto = Crypto(key)
     return Profile(
         name=str(raw.get("name") or ""),
@@ -91,8 +64,9 @@ def decrypt_profile(settings: QSettings, raw: dict) -> Profile:
         secret_key=crypto.decrypt(raw.get("secret_key")),
         no_ssl_check=str_to_bool(raw.get("no_ssl_check", "false")),
         use_path=str_to_bool(raw.get("use_path", "false")),
-        session_token=_decrypt_optional(crypto, raw.get("session_token")),
+        session_token=decrypt_optional(crypto, raw.get("session_token")),
         read_only=str_to_bool(raw.get("read_only", "false")),
+        color=normalize_accent(raw.get("color", "")),
     )
 
 

@@ -3,9 +3,12 @@ from PyQt6.QtCore import *
 from PyQt6.QtWidgets import *
 from PyQt6.QtGui import *
 
-from utils import str_to_bool, center_on_screen, load_aws_profiles
+from utils import (
+    str_to_bool, center_on_screen, load_aws_profiles, PROFILE_ACCENTS,
+    normalize_accent,
+)
 
-EMPTY_SETTINGS = ("", "", "", "", "", "", "false", "true", "", "false")
+EMPTY_SETTINGS = ("", "", "", "", "", "", "false", "true", "", "false", "")
 
 
 class SettingsWindow(QDialog):
@@ -25,6 +28,7 @@ class SettingsWindow(QDialog):
             use_path,
             session_token,
             read_only,
+            color,
         ) = settings
         self.setWindowTitle("Profile settings")
         self.resize(600, 250)
@@ -41,6 +45,11 @@ class SettingsWindow(QDialog):
         self.noSslCheck = QCheckBox()
         self.usePath = QCheckBox()
         self.readOnly = QCheckBox()
+        self.accent = QComboBox()
+        for label, value in PROFILE_ACCENTS:
+            self.accent.addItem(label, value)
+        index = self.accent.findData(normalize_accent(color))
+        self.accent.setCurrentIndex(max(index, 0))
 
         self.createForm()
         self.importButton = QPushButton("Import from ~/.aws…")
@@ -138,6 +147,7 @@ class SettingsWindow(QDialog):
             self.usePath.isChecked(),
             self.sessionTokenEdit.text(),
             self.readOnly.isChecked(),
+            self.accent.currentData() or "",
         )
         self.close()
 
@@ -162,5 +172,8 @@ class SettingsWindow(QDialog):
         layout.addRow(QLabel("Use path in config (minio support)"), self.usePath)
         layout.addRow(
             QLabel("Read-only (block all writes and deletes)"), self.readOnly
+        )
+        layout.addRow(
+            QLabel("Accent colour (marks this profile's window)"), self.accent
         )
         self.formGroupBox.setLayout(layout)

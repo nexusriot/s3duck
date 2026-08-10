@@ -9,10 +9,13 @@ Simple cross-platform GUI client for S3-compatible object storage (AWS S3, MinIO
 
 ## Features
 
-- **Multi-profile management** — create, edit, copy, and delete named connection profiles; credentials are encrypted at rest using Fernet symmetric encryption
+- **Multi-profile management** — create, edit, copy, and delete named connection profiles; credentials are encrypted at rest using Fernet symmetric encryption. Each row shows its endpoint, region and pinned bucket, with colour-coded `[read-only]` / `[TLS unverified]` badges beside the name, and the list is keyboard-driven (`Enter` opens, `F2` edits, `Del` removes). Connecting runs off the UI thread behind a cancellable dialog, so an unreachable endpoint no longer freezes the launcher
 - **Profile export / import** — move profiles between machines as a bundle whose credentials are encrypted with a passphrase you choose (never written in the clear)
 - **Read-only profiles** — mark a profile read-only to block every write and delete; the toolbar and context menus hide mutating actions, the title bar shows `[read-only]`, and the data layer refuses writes as a backstop
 - **Temporary credentials** — session-token support for STS / SSO / assumed-role / MFA keys, with one-click import of any profile from `~/.aws/credentials`
+- **Per-profile accent colour** — mark a profile with a colour; the launcher row and the open window both carry it, so prod is distinguishable from dev at a glance
+- **Command palette** (`Ctrl+K`) — type-to-run index of every available action, built from the live actions so it cannot drift
+- **Copy to another profile** — stream objects (or whole prefixes) into a different account or provider; a server-side copy cannot use two sets of credentials, so the bytes travel through this machine
 - **Bucket browser** — list, create, and delete buckets; recursive delete runs through the transfer queue (progress + cancel, UI stays responsive)
 - **Empty bucket** — delete every object, version, delete marker and in-flight upload while keeping the bucket, queued with progress and cancel
 - **Incomplete uploads** — find and abort in-flight multipart uploads that are invisible to normal listings but keep their parts billed; shows how much space they waste and can abort everything older than N days
@@ -20,12 +23,13 @@ Simple cross-platform GUI client for S3-compatible object storage (AWS S3, MinIO
 - **Upload** — single/multiple files via dialog or drag-and-drop from the OS file manager; whole directory trees via "Upload folder" (`Ctrl+Shift+U`) or drag-and-drop
 - **Download** — single files or entire folder prefixes, recreating the directory tree locally
 - **Download as ZIP** — stream a selection (files and whole folders) straight into one archive, without staging it on disk twice
-- **Drag out** — drag objects from the list onto a file manager; the selection is downloaded to a temp folder first, with progress and a size warning
+- **Drag out** — drag objects from the list onto a file manager; the selection is downloaded to a temp folder first, with progress and a size warning. Staged payloads are removed when the app exits, and a crashed run's leftovers are reclaimed on the next start
 - **Resumable downloads** — large files download as parallel ranges into a `.s3duckpart` file with a progress sidecar, so an interrupted transfer picks up where it stopped instead of restarting (a changed ETag discards the stale partial)
-- **Checksum verification** — optionally compare each downloaded file against the object's ETag and fail the transfer on a mismatch (multipart ETags are reported as not comparable)
+- **Additional checksums** — upload with CRC32/SHA1/SHA256; CRC32 is requested as a whole-object checksum so multipart objects stay verifiable, unlike a multipart ETag
+- **Checksum verification** — optionally compare each downloaded file against the object's stored digest and fail the transfer on a mismatch; a full-object checksum is preferred over the ETag, which cannot be checked for multipart objects
 - **Parallel transfers** — configurable number of files moving at once *and* multipart connections within each file; applies to uploads, downloads (including whole prefixes) and sync
 - **Transfer settings** — files in flight, connections per file, plus the storage class and server-side encryption (SSE-S3 / SSE-KMS) applied to uploads, persisted across sessions
-- **Overwrite protection** — downloads, copies, moves and renames detect existing destinations and offer Skip / Overwrite / Cancel
+- **Overwrite protection** — uploads (dialog, folder upload and drag-in), downloads (single files *and* whole folders), copies, moves, renames and pastes all detect existing destinations and offer Skip / Overwrite / Cancel
 - **Sync with a local folder** (`Ctrl+E`) — compare a directory against a prefix in either direction, review a dry-run plan (upload / download / delete / skip with a reason per file), then run it through the queue; supports exclude globs (`*.tmp`, `node_modules/`) and optionally deleting extras at the destination
 - **Transfer queue** — queued jobs with per-row progress, cancel, and retry for failed or cancelled entries
 - **Transfer history** — a persisted log of past jobs (when, what, bytes, outcome) with one-click re-run for small jobs, from the queue panel

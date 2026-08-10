@@ -1,7 +1,11 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timezone
 from enum import Enum
+from typing import NamedTuple
+import base64
 import hashlib
+import struct
+import zlib
 import json
 import platform
 import re
@@ -83,6 +87,55 @@ def as_epoch(value) -> float:
         return float(value.timestamp())
     except Exception:
         return 0.0
+
+
+# Checksums S3 can store that we can also recompute locally. CRC32C is
+# deliberately absent: it needs a third-party module, and an algorithm we
+# cannot verify would pass every download unchecked.
+CHECKSUM_ALGORITHMS = ("CRC32", "SHA1", "SHA256")
+
+
+def prefix_of(key) -> str:
+    """A folder key as a listing prefix — always trailing-slashed."""
+    text = str(key or "")
+    return text if text.endswith("/") else text + "/"
+
+
+class PrefixDownloadPlan(NamedTuple):
+    base_dir: str
+    dirs: list
+    files: list      # [(key, out_path, size)]
+    unsafe: list     # keys that would escape base_dir
+
+
+def plan_prefix_download(key, folder_path, entries) -> PrefixDownloadPlan:
+    """
+    Map the objects under a prefix to the local paths a download would write.
+
+    Pure, so the overwrite check in the UI and the download itself derive
+    their destinations from the same rules and cannot drift. *entries* is an
+    iterable of ``(key, size)``.
+    """
+    prefix = prefix_of(key)
+    base_dir = os.path.join(folder_path, os.path.basename(prefix.rstrip("/")))
+    root = os.path.abspath(base_dir) + os.sep
+    dirs, files, unsafe = [], [], []
+    for k, size in entries:
+        if not k:
+            continue
+        rel = os.path.relpath(k, prefix)
+        if rel == ".":
+            continue
+        out_path = os.path.join(base_dir, rel)
+        # Keys may contain ".." segments; never write outside base_dir.
+        if not os.path.abspath(out_path).startswith(root):
+            unsafe.append(k)
+            continue
+        if str(k).endswith("/"):
+            dirs.append(out_path)
+        else:
+            files.append((k, out_path, size))
+    return PrefixDownloadPlan(base_dir, dirs, files, unsafe)
 
 
 class FSObjectType(Enum):
@@ -269,6 +322,7 @@ class Model:
 
         # Compare the downloaded bytes against the object's ETag afterwards.
         self.verify_downloads = False
+        self.checksum_algorithm = ""
         # Downloads at or above this size use the resumable ranged path.
         self.resume_threshold = self.RESUME_THRESHOLD
 
@@ -334,11 +388,12 @@ class Model:
     # Server-side encryption modes offered in the UI.
     SSE_MODES = ("", "AES256", "aws:kms")
 
-    def set_upload_options(self, storage_class=None, sse=None, kms_key_id=None):
+    def set_upload_options(self, storage_class=None, sse=None, kms_key_id=None,
+                           checksum_algorithm=None):
         """
         Configure what every subsequent upload sends alongside the body:
-        a non-default storage class and/or server-side encryption.
-        Returns the resulting ExtraArgs dict.
+        a non-default storage class, server-side encryption and/or an
+        additional checksum. Returns the resulting ExtraArgs dict.
         """
         args = {}
         if storage_class and storage_class != "STANDARD":
@@ -347,6 +402,17 @@ class Model:
             args["ServerSideEncryption"] = sse
             if sse == "aws:kms" and kms_key_id:
                 args["SSEKMSKeyId"] = kms_key_id
+        algorithm = str(checksum_algorithm or "").upper()
+        if algorithm in CHECKSUM_ALGORITHMS:
+            args["ChecksumAlgorithm"] = algorithm
+            if algorithm == "CRC32":
+                # Without this a multipart upload stores a per-part composite,
+                # which is as unverifiable as a multipart ETag. Only the CRC
+                # algorithms support a whole-object checksum.
+                args["ChecksumType"] = "FULL_OBJECT"
+            self.checksum_algorithm = algorithm
+        else:
+            self.checksum_algorithm = ""
         self.upload_extra_args = args
         return args
 
@@ -377,6 +443,7 @@ class Model:
         m.parallel_files = self.parallel_files
         m.rate_limiter = self.rate_limiter
         m.verify_downloads = self.verify_downloads
+        m.checksum_algorithm = self.checksum_algorithm
         m.resume_threshold = self.resume_threshold
         m._rebind_lock = threading.RLock()
         m.bucket = self.bucket
@@ -1170,43 +1237,26 @@ class Model:
                 _do()
 
         if not local_name:
-            prefix = key if str(key).endswith("/") else (str(key) + "/")
-            base_name = os.path.basename(prefix.rstrip("/"))
-            base_dir = os.path.join(folder_path, base_name)
-            os.makedirs(base_dir, exist_ok=True)
-
-            pending = []
-            for k, size in self.get_keys(prefix, log_fn=log_fn):
-                if not k:
-                    continue
-
+            entries = []
+            for k, size in self.get_keys(prefix_of(key), log_fn=log_fn):
                 if cancel_event is not None and cancel_event.is_set():
                     raise TransferCancelled("cancelled")
+                entries.append((k, size))
 
-                rel = os.path.relpath(k, prefix)
-                if rel == ".":
-                    continue
-
-                out_path = os.path.join(base_dir, rel)
-
-                # Keys may contain ".." segments; never write outside base_dir.
-                if not os.path.abspath(out_path).startswith(
-                        os.path.abspath(base_dir) + os.sep):
-                    if log_fn:
-                        log_fn(f"skipped unsafe key (escapes target dir): {k}")
-                    continue
-
-                if k.endswith("/"):
-                    os.makedirs(out_path, exist_ok=True)
-                    continue
-
+            plan = plan_prefix_download(key, folder_path, entries)
+            os.makedirs(plan.base_dir, exist_ok=True)
+            if log_fn:
+                for k in plan.unsafe:
+                    log_fn(f"skipped unsafe key (escapes target dir): {k}")
+            for out_path in plan.dirs:
+                os.makedirs(out_path, exist_ok=True)
+            for _k, out_path, _size in plan.files:
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                pending.append((k, out_path, size))
 
             # Whole-prefix downloads are one job entry, so without this the
             # parallel-files setting would do nothing for "download a folder".
             run_parallel(
-                pending,
+                plan.files,
                 lambda item: _download_one(self.bucket, item[0], item[1], item[2]),
                 self.parallel_files,
                 cancel_event=cancel_event,
@@ -1215,10 +1265,11 @@ class Model:
 
         size = None
         etag = ""
+        head = None
         try:
             if cancel_event is not None and cancel_event.is_set():
                 raise TransferCancelled("cancelled")
-            head = self.client.head_object(Bucket=self.bucket, Key=key)
+            head = self.head_with_checksum(key)
             size = head.get("ContentLength")
             etag = self.normalize_etag(head.get("ETag"))
         except TransferCancelled:
@@ -1229,7 +1280,7 @@ class Model:
                     log_fn(f"Region error on head_object for '{key}': {exc}")
                 self.rebind_bucket(log_fn=log_fn)
                 try:
-                    head = self.client.head_object(Bucket=self.bucket, Key=key)
+                    head = self.head_with_checksum(key)
                     size = head.get("ContentLength")
                     etag = self.normalize_etag(head.get("ETag"))
                 except Exception:
@@ -1257,11 +1308,12 @@ class Model:
 
         _download_one(self.bucket, key, local_name, size)
 
-        if self.verify_downloads and etag:
-            if not self.verify_download(local_name, etag, log_fn=log_fn):
+        if self.verify_downloads and (etag or head):
+            if not self.verify_download(local_name, etag, head=head,
+                                        log_fn=log_fn):
                 raise Exception(
                     f"Checksum mismatch after downloading '{key}'; the local "
-                    "file does not match the object's ETag"
+                    "file does not match the object's stored digest"
                 )
 
     @staticmethod
@@ -1286,13 +1338,95 @@ class Model:
                 digest.update(block)
         return digest.hexdigest()
 
-    def verify_download(self, path, etag, log_fn=None) -> bool:
+    @staticmethod
+    def file_checksum(path, algorithm, chunk_size: int = 1024 * 1024) -> str:
         """
-        Compare a downloaded file with the object's ETag.
+        The object checksum S3 would report for this file, base64-encoded.
 
-        Returns True when they match, False on mismatch, and True (with a log
-        line) when the ETag is multipart and therefore not comparable.
+        Only algorithms computable from the standard library are offered —
+        CRC32C would need a third-party module, and a checksum we cannot
+        recompute locally is worse than none because it would silently pass.
         """
+        name = str(algorithm or "").upper()
+        if name not in CHECKSUM_ALGORITHMS:
+            raise ValueError(f"unsupported checksum algorithm: {algorithm}")
+        if name == "CRC32":
+            crc = 0
+            with open(path, "rb") as handle:
+                for block in iter(lambda: handle.read(chunk_size), b""):
+                    crc = zlib.crc32(block, crc)
+            return base64.b64encode(struct.pack(">I", crc & 0xFFFFFFFF)).decode()
+        digest = hashlib.new("sha1" if name == "SHA1" else "sha256")
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(chunk_size), b""):
+                digest.update(block)
+        return base64.b64encode(digest.digest()).decode()
+
+    def head_with_checksum(self, key) -> dict:
+        """
+        head_object asking for the stored checksum.
+
+        ChecksumMode is a newer parameter, and S3-compatible backends that
+        reject it would otherwise turn every download's HEAD into an error, so
+        an unrecognised-parameter failure retries without it.
+        """
+        try:
+            return self.client.head_object(
+                Bucket=self.bucket, Key=key, ChecksumMode="ENABLED")
+        except TransferCancelled:
+            raise
+        except Exception as exc:
+            if self._is_region_error(exc):
+                raise
+            return self.client.head_object(Bucket=self.bucket, Key=key)
+
+    @staticmethod
+    def checksum_is_composite(value) -> bool:
+        """
+        Whether a stored checksum is a per-part composite ('<digest>-<parts>').
+
+        A composite cannot be reproduced without the original part boundaries,
+        exactly like a multipart ETag. Full-object checksums (what CRC32 with
+        ChecksumType=FULL_OBJECT produces) have no suffix and are comparable.
+        """
+        text = str(value or "")
+        head, sep, tail = text.rpartition("-")
+        return bool(sep and head and tail.isdigit())
+
+    @staticmethod
+    def stored_checksum(head) -> tuple:
+        """(algorithm, value) from a head_object response, or ("", "")."""
+        for name in CHECKSUM_ALGORITHMS:
+            value = (head or {}).get(f"Checksum{name}")
+            if value:
+                return name, str(value)
+        return "", ""
+
+    def verify_download(self, path, etag, head=None, log_fn=None) -> bool:
+        """
+        Check a downloaded file against the object's stored digest.
+
+        Prefers an additional checksum, which — unlike an ETag — stays
+        comparable for multipart objects when it is a full-object one. Falls
+        back to the ETag when the object carries no checksum, and reports
+        "not comparable" only when neither can settle it.
+        """
+        algorithm, expected = self.stored_checksum(head)
+        if algorithm and expected:
+            if self.checksum_is_composite(expected):
+                if log_fn:
+                    log_fn(f"checksum skipped (per-part {algorithm}): {path}")
+            else:
+                actual = self.file_checksum(path, algorithm)
+                if actual != expected:
+                    if log_fn:
+                        log_fn(f"CHECKSUM MISMATCH for {path}: "
+                               f"{algorithm} {actual} != {expected}")
+                    return False
+                if log_fn:
+                    log_fn(f"checksum ok ({algorithm}): {path}")
+                return True
+
         if not self.etag_is_md5(etag):
             if log_fn:
                 log_fn(f"checksum skipped (multipart ETag): {path}")
@@ -2098,6 +2232,77 @@ class Model:
         "InvalidRequest", "NoSuchBucket",
     )
 
+    @staticmethod
+    def _carried_extra_args(resp, upload_extra_args) -> dict:
+        """
+        The ExtraArgs a streamed copy must re-send so the new object is not a
+        bare octet-stream: streaming loses everything CopyObject would have
+        preserved server-side. The destination's own upload policy wins.
+        """
+        extra = {}
+        for field in ("ContentType", "CacheControl", "ContentDisposition",
+                      "ContentEncoding"):
+            value = (resp or {}).get(field)
+            if value:
+                extra[field] = value
+        metadata = (resp or {}).get("Metadata") or {}
+        if metadata:
+            extra["Metadata"] = dict(metadata)
+        extra.update(upload_extra_args or {})
+        return extra
+
+    def copy_to_model(self, src_key: str, dst_model, dst_key: str,
+                      progress_cb=None, cancel_event=None, log_fn=None):
+        """
+        Copy one object into a DIFFERENT profile's storage.
+
+        CopyObject is server-side and cannot cross credentials at all, so the
+        bytes are read with this model's client and written with the
+        destination model's — the only way to move data between accounts or
+        between unrelated providers (MinIO to AWS, say).
+        """
+        dst_model._guard_write()
+        if cancel_event is not None and cancel_event.is_set():
+            raise TransferCancelled("cancelled")
+        resp = self.client.get_object(Bucket=self.bucket, Key=src_key)
+        body = resp["Body"]
+        extra = self._carried_extra_args(resp, dst_model.upload_extra_args)
+        callback = None
+        if progress_cb is not None:
+            callback = _BotoProgressAdapter(
+                resp.get("ContentLength"), dst_key, progress_cb,
+                cancel_event=cancel_event, limiter=self.rate_limiter)
+        dst_model.client.upload_fileobj(
+            body, dst_model.bucket, dst_key,
+            ExtraArgs=extra or None,
+            Callback=callback,
+            Config=dst_model.transfer_cfg_upload,
+        )
+        if log_fn:
+            log_fn(f"copied {self.bucket}/{src_key} -> "
+                   f"{dst_model.bucket}/{dst_key}")
+
+    def copy_prefix_to_model(self, src_prefix: str, dst_model, dst_prefix: str,
+                             progress_cb=None, cancel_event=None, log_fn=None):
+        """Copy a whole prefix into another profile, preserving its shape."""
+        dst_model._guard_write()
+        source = prefix_of(src_prefix)
+        target = prefix_of(dst_prefix) if dst_prefix else ""
+        for key, _size in self.get_keys(source, log_fn=log_fn):
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+            if not key:
+                continue
+            rel = key[len(source):] if key.startswith(source) else ""
+            if not rel:
+                continue
+            if key.endswith("/"):
+                dst_model.create_folder(target + rel, log_fn=log_fn)
+                continue
+            self.copy_to_model(
+                key, dst_model, target + rel, progress_cb=progress_cb,
+                cancel_event=cancel_event, log_fn=log_fn)
+
     def _stream_copy(self, src_key: str, dst_key: str, dst_bucket: str,
                      log_fn=None):
         """
@@ -2111,21 +2316,7 @@ class Model:
         dst_client, _endpoint, _region, _use_path = self._try_bind_bucket(dst_bucket)
         resp = self.client.get_object(Bucket=self.bucket, Key=src_key)
         body = resp["Body"]
-
-        extra = {}
-        for field, header in (
-            ("ContentType", "ContentType"),
-            ("CacheControl", "CacheControl"),
-            ("ContentDisposition", "ContentDisposition"),
-            ("ContentEncoding", "ContentEncoding"),
-        ):
-            value = resp.get(header)
-            if value:
-                extra[field] = value
-        metadata = resp.get("Metadata") or {}
-        if metadata:
-            extra["Metadata"] = dict(metadata)
-        extra.update(self.upload_extra_args)
+        extra = self._carried_extra_args(resp, self.upload_extra_args)
 
         dst_client.upload_fileobj(
             body, dst_bucket, dst_key,

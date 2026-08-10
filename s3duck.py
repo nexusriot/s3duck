@@ -5,12 +5,12 @@ import os
 import pathlib
 import urllib3
 from copy import deepcopy
-from PyQt6.QtGui import QIcon, QFont, QAction
-from cryptography.fernet import Fernet
+from PyQt6.QtGui import QIcon, QColor, QFont, QFontMetrics, QAction
 from PyQt6 import QtCore
 from PyQt6.QtCore import *
 from PyQt6.QtWidgets import (
     QListWidget,
+    QListWidgetItem,
     QPushButton,
     QHBoxLayout,
     QApplication,
@@ -21,6 +21,9 @@ from PyQt6.QtWidgets import (
     QInputDialog,
     QLineEdit,
     QMenu,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
 )
 
 from model import Model as DataModel
@@ -28,33 +31,28 @@ from settings import SettingsWindow
 from main_window import MainWindow
 from utils import (
     str_to_bool, center_on_screen, export_profile_bundle,
-    import_profile_bundle, BundleError,
+    import_profile_bundle, BundleError, Crypto, CredentialError,
+    require_crypto, decrypt_optional, run_with_progress,
+    normalize_accent, themed_icon,
 )
 from theme import apply_theme
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
-class Crypto:
-    def __init__(self, key):
-        self.key = key
-        self._fernet = None
+def load_profile_secrets(key, item) -> tuple:
+    """
+    Decrypt a profile's stored secrets as (access_key, secret_key, token).
 
-    @property
-    def fernet(self):
-        if self._fernet is None:
-            self._fernet = Fernet(self.key.encode())
-        return self._fernet
-
-    def encrypt(self, value):
-        return self.fernet.encrypt(value.encode())
-
-    @staticmethod
-    def generate_key():
-        return Fernet.generate_key().decode()
-
-    def decrypt_cred(self, val):
-        return self.fernet.decrypt(val).decode()
+    Raises CredentialError — never the underlying AttributeError/ValueError/
+    InvalidToken, which would abort the process from a Qt slot.
+    """
+    crypto = Crypto(key)
+    return (
+        crypto.decrypt(item.enc_access_key),
+        crypto.decrypt(item.enc_secret_key),
+        decrypt_optional(crypto, item.enc_session_token),
+    )
 
 
 def selected_row_index(row, item_count) -> int:
@@ -70,14 +68,160 @@ def selected_row_index(row, item_count) -> int:
     return int(row)
 
 
-def decrypt_optional(crypto, value) -> str:
-    """Decrypt a possibly absent/legacy field without failing the whole load."""
-    if not value:
-        return ""
-    try:
-        return crypto.decrypt_cred(value)
-    except Exception:
-        return ""
+READ_ONLY_BADGE = "read-only"
+INSECURE_BADGE = "TLS unverified"
+
+# Badges are colour-coded by what they mean for the user: amber for a mode
+# worth knowing about, red for an actual exposure. Fixed colours rather than
+# palette roles, because both must stay legible under every theme.
+BADGE_COLORS = {
+    READ_ONLY_BADGE: QColor("#b26a00"),
+    INSECURE_BADGE: QColor("#c62828"),
+}
+
+
+def profile_summary(item) -> str:
+    """
+    Second line of a profile row: where this profile points.
+
+    The list used to show only the name, so two profiles differing solely by
+    endpoint or region were indistinguishable.
+    """
+    parts = [str(item.url or "").strip() or "(no endpoint)"]
+    for value in (item.region, item.bucket_name):
+        text = str(value or "").strip()
+        if text:
+            parts.append(text)
+    return " · ".join(parts)
+
+
+def profile_badges(item) -> list:
+    """
+    Safety flags, shown beside the name rather than inside the summary.
+
+    read-only decides whether this window can destroy data and TLS-unverified
+    means the connection is interceptable. Appended to the dim endpoint line
+    they read as more metadata; the point of a badge is that it does not.
+    """
+    badges = []
+    if str_to_bool(item.read_only):
+        badges.append(READ_ONLY_BADGE)
+    if str_to_bool(item.no_ssl_check):
+        badges.append(INSECURE_BADGE)
+    return badges
+
+
+def badge_color(name, palette, selected: bool) -> QColor:
+    """A badge keeps its own colour except on a selected row, where it would
+    sit on the highlight brush and lose contrast."""
+    if selected:
+        return QColor(palette.highlightedText().color())
+    return QColor(BADGE_COLORS.get(name, palette.text().color()))
+
+
+def _summary_font(base: QFont) -> QFont:
+    """The subtitle font: a notch smaller than the row's, with a floor so it
+    stays legible when the user runs a small UI font."""
+    font = QFont(base)
+    size = base.pointSizeF()
+    if size > 0:
+        font.setPointSizeF(max(size - 1.0, 7.0))
+    return font
+
+
+def row_text_color(palette, selected: bool) -> QColor:
+    """Pen for a profile row. A selected row is painted on the highlight
+    brush, where the ordinary text colour can be unreadable."""
+    brush = palette.highlightedText() if selected else palette.text()
+    return QColor(brush.color())
+
+
+class ProfileRowDelegate(QStyledItemDelegate):
+    """
+    Draws a profile row as a name plus safety badges above a dimmed summary.
+
+    A plain two-line item renders both lines identically, which reads as two
+    profiles rather than one with a subtitle. Endpoints are elided in the
+    middle so the scheme and the distinguishing host tail both survive; the
+    name is elided only after the badges have been given their room, because
+    a truncated badge would be worse than a truncated name.
+    """
+
+    BADGE_GAP = 6
+    SWATCH_WIDTH = 4
+
+    def _parts(self, index):
+        text = index.data(Qt.ItemDataRole.DisplayRole) or ""
+        name, _, summary = str(text).partition("\n")
+        return name, summary
+
+    def _badges(self, index):
+        return list(index.data(Qt.ItemDataRole.UserRole) or [])
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        name, summary = self._parts(index)
+        badges = self._badges(index)
+        opt.text = ""
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        style.drawControl(
+            QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+
+        selected = bool(opt.state & QStyle.StateFlag.State_Selected)
+        colour = row_text_color(opt.palette, selected)
+        rect = opt.rect.adjusted(6, 3, -6, -3)
+        small = _summary_font(opt.font)
+
+        # The profile's accent, same colour the open window is banded with.
+        accent = normalize_accent(index.data(Qt.ItemDataRole.UserRole + 1))
+        if accent:
+            swatch = QRect(rect.left(), rect.top(),
+                           self.SWATCH_WIDTH, rect.height())
+            painter.fillRect(swatch, QColor(accent))
+            rect = rect.adjusted(self.SWATCH_WIDTH + 5, 0, 0, 0)
+
+        painter.save()
+        painter.setPen(colour)
+        painter.setFont(opt.font)
+        top = QFontMetrics(opt.font)
+
+        # Reserve the badges' width before eliding the name, so a long name
+        # cannot push a safety flag off the row.
+        badge_metrics = QFontMetrics(small)
+        labels = [f"[{text}]" for text in badges]
+        reserved = sum(
+            badge_metrics.horizontalAdvance(label) + self.BADGE_GAP
+            for label in labels)
+        name_width = max(rect.width() - reserved, 0)
+        shown = top.elidedText(name, Qt.TextElideMode.ElideRight, name_width)
+        painter.drawText(rect.left(), rect.top() + top.ascent(), shown)
+
+        x = rect.left() + top.horizontalAdvance(shown) + self.BADGE_GAP
+        painter.setFont(small)
+        for text, label in zip(badges, labels):
+            painter.setPen(badge_color(text, opt.palette, selected))
+            painter.drawText(x, rect.top() + top.ascent(), label)
+            x += badge_metrics.horizontalAdvance(label) + self.BADGE_GAP
+
+        if summary:
+            faded = QColor(colour)
+            faded.setAlphaF(0.7)
+            painter.setPen(faded)
+            painter.drawText(
+                rect.left(), rect.top() + top.height() + badge_metrics.ascent(),
+                badge_metrics.elidedText(
+                    summary, Qt.TextElideMode.ElideMiddle, rect.width()))
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        _, summary = self._parts(index)
+        height = QFontMetrics(opt.font).height() + 6
+        if summary:
+            height += QFontMetrics(_summary_font(opt.font)).height()
+        return QSize(opt.rect.width(), height)
 
 
 class SettingsItem:
@@ -93,6 +237,7 @@ class SettingsItem:
         use_path,
         enc_session_token="",
         read_only="false",
+        color="",
     ):
         self.name = name
         self.url = url
@@ -104,6 +249,7 @@ class SettingsItem:
         self.use_path = use_path
         self.enc_session_token = enc_session_token
         self.read_only = read_only
+        self.color = color
 
 
 def get_current_dir():
@@ -115,6 +261,15 @@ def get_current_dir():
 
 
 class Profiles(QDialog):
+    # Keys handled on the profile list. Enter opens the selected profile the
+    # same way a double-click does; the rest mirror the context menu.
+    KEY_ACTIONS = {
+        Qt.Key.Key_Return: "onStart",
+        Qt.Key.Key_Enter: "onStart",
+        Qt.Key.Key_Delete: "onDelete",
+        Qt.Key.Key_F2: "onEdit",
+    }
+
     def __init__(self):
         super().__init__()
         self.current_dir = get_current_dir()
@@ -125,6 +280,7 @@ class Profiles(QDialog):
         hbox = QHBoxLayout()
 
         self.listWidget = QListWidget(self)
+        self.listWidget.setItemDelegate(ProfileRowDelegate(self.listWidget))
 
         self.btnRun = QPushButton("Run", self)
         self.btnAdd = QPushButton("Add", self)
@@ -135,6 +291,11 @@ class Profiles(QDialog):
         self.btnAdd.clicked.connect(self.onAdd)
         self.btnEdit.clicked.connect(self.onEdit)
         self.btnDelete.clicked.connect(self.onDelete)
+        # Buttons in a QDialog are autoDefault, so Enter anywhere fired the
+        # first one (Add) instead of opening the selected profile.
+        for button in (self.btnRun, self.btnAdd, self.btnEdit, self.btnDelete):
+            button.setAutoDefault(False)
+            button.setDefault(False)
         self.main_window = None
 
         vbox.addWidget(self.listWidget)
@@ -168,6 +329,36 @@ class Profiles(QDialog):
         super().showEvent(event)
         center_on_screen(self)
 
+    def _stored_key(self):
+        self.settings.beginGroup("common")
+        key = self.settings.value("key")
+        self.settings.endGroup()
+        return key
+
+    def _secrets_or_warn(self, item):
+        """(access, secret, token) for a profile, or None after reporting."""
+        try:
+            return load_profile_secrets(self._stored_key(), item)
+        except CredentialError as exc:
+            QMessageBox.critical(
+                self, "Credentials",
+                f"Profile '{item.name}':\n\n{exc}")
+            return None
+
+    def _crypto_or_warn(self):
+        """A validated Crypto for write paths, or None after reporting."""
+        self.settings.beginGroup("common")
+        key = self.settings.value("key")
+        if not key:
+            key = Crypto.generate_key()
+            self.settings.setValue("key", key)
+        self.settings.endGroup()
+        try:
+            return require_crypto(key)
+        except CredentialError as exc:
+            QMessageBox.critical(self, "Credentials", str(exc))
+            return None
+
     def _current_item_index(self) -> int:
         model = self.listWidget.selectionModel()
         row = model.currentIndex().row() if model is not None else -1
@@ -199,22 +390,29 @@ class Profiles(QDialog):
         if elem < 0:
             return
         item = self.items[elem]
-        self.settings.beginGroup("common")
-        key = self.settings.value("key")
-        self.settings.endGroup()
-        crypto = Crypto(key)
+        secrets = self._secrets_or_warn(item)
+        if secrets is None:
+            return
+        acc_key, secret_key, session_token = secrets
         dm = DataModel(
             item.url,
             item.region,
-            crypto.decrypt_cred(item.enc_access_key),
-            crypto.decrypt_cred(item.enc_secret_key),
+            acc_key,
+            secret_key,
             item.bucket_name,
             str_to_bool(item.no_ssl_check),
             str_to_bool(item.use_path),
-            session_token=decrypt_optional(crypto, item.enc_session_token),
+            session_token=session_token,
             read_only=str_to_bool(item.read_only),
         )
-        ok, reason = dm.check_profile()
+        # Same reasoning as onStart: this reaches the network (and may create
+        # and delete a probe key), so it cannot run on the GUI thread.
+        result, exc = run_with_progress(
+            self, "Checking %s…" % item.name, lambda worker: dm.check_profile())
+        if result is None and exc is None:
+            return  # cancelled
+        ok, reason = (False, str(exc)) if exc is not None else result
+
         msgBox = QMessageBox()
         msgBox.setWindowTitle("Profile check")
         msgBox.setStandardButtons(QMessageBox.StandardButton.Ok)
@@ -228,6 +426,15 @@ class Profiles(QDialog):
 
     def eventFilter(self, source, event):
         if (
+            event.type() == QtCore.QEvent.Type.KeyPress
+            and source is self.listWidget
+        ):
+            key = event.key()
+            handler = self.KEY_ACTIONS.get(key)
+            if handler is not None:
+                getattr(self, handler)()
+                return True
+        if (
             event.type() == QtCore.QEvent.Type.ContextMenu
             and source is self.listWidget
         ):
@@ -238,69 +445,44 @@ class Profiles(QDialog):
             menu = QMenu()
             ixs = self.listWidget.selectedIndexes()
             add_profile_action = QAction(
-                QIcon.fromTheme(
-                    "list-add",
-                    QIcon(
-                        os.path.join(
+                themed_icon("list-add", os.path.join(
                             self.current_dir, "icons", "plus_24px.svg"
-                        )
-                    ),
-                ),
+                        )),
                 "Add profile",
             )
             menu.addAction(add_profile_action)
             import_action = QAction(
-                QIcon.fromTheme("document-open"), "Import profiles…")
+                themed_icon("document-open", os.path.join(self.current_dir, "icons", "folder_24px.svg")), "Import profiles…")
             export_action = QAction(
-                QIcon.fromTheme("document-save"), "Export profiles…")
+                themed_icon("document-save", os.path.join(self.current_dir, "icons", "download_24px.svg")), "Export profiles…")
             menu.addAction(import_action)
             if self.items:
                 menu.addAction(export_action)
             if ixs:
                 copy_profile_action = QAction(
-                    QIcon.fromTheme(
-                        "edit-copy",
-                        QIcon(
-                            os.path.join(
+                    themed_icon("edit-copy", os.path.join(
                                 self.current_dir, "icons", "copy_24px.svg"
-                            )
-                        ),
-                    ),
+                            )),
                     "Copy profile",
                 )
                 edit_profile_action = QAction(
-                    QIcon.fromTheme(
-                        "edit-clear",
-                        QIcon(
-                            os.path.join(
+                    themed_icon("edit-clear", os.path.join(
                                 self.current_dir, "icons", "edit_24px.svg"
-                            )
-                        ),
-                    ),
+                            )),
                     "Edit profile",
                 )
                 check_action = QAction(
-                    QIcon.fromTheme(
-                        "applications-utilities",
-                        QIcon(
-                            os.path.join(
+                    themed_icon("applications-utilities", os.path.join(
                                 self.current_dir, "icons", "ok_24px.svg"
-                            )
-                        ),
-                    ),
+                            )),
                     "Check profile",
                 )
                 delete_action = QAction(
-                    QIcon.fromTheme(
-                        "edit-delete",
-                        QIcon(
-                            os.path.join(
+                    themed_icon("edit-delete", os.path.join(
                                 self.current_dir,
                                 "icons",
                                 "delete_24px.svg",
-                            )
-                        ),
-                    ),
+                            )),
                     "Delete profile",
                 )
                 menu.addAction(copy_profile_action)
@@ -346,6 +528,7 @@ class Profiles(QDialog):
                     self.settings.value("use_path", "false"),
                     self.settings.value("session_token", ""),
                     self.settings.value("read_only", "false"),
+                    self.settings.value("color", ""),
                 )
             )
         self.settings.endArray()
@@ -356,14 +539,10 @@ class Profiles(QDialog):
         if elem < 0:
             return
         item = self.items[elem]
-        self.settings.beginGroup("common")
-        key = self.settings.value("key")
-        self.settings.endGroup()
-        crypto = Crypto(key)
-
-        acc_key = crypto.decrypt_cred(item.enc_access_key)
-        secret_key = crypto.decrypt_cred(item.enc_secret_key)
-        session_token = decrypt_optional(crypto, item.enc_session_token)
+        secrets = self._secrets_or_warn(item)
+        if secrets is None:
+            return
+        acc_key, secret_key, session_token = secrets
         no_ssl_check = str_to_bool(item.no_ssl_check)
         use_path = str_to_bool(item.use_path)
         read_only = str_to_bool(item.read_only)
@@ -381,14 +560,19 @@ class Profiles(QDialog):
             read_only=read_only,
         )
 
-        # Sanity check creds: try to list buckets
-        ok = False
-        reason = None
-        try:
+        # Sanity check creds: try to list buckets. Off the GUI thread, because
+        # an unreachable endpoint blocks for the full botocore connect timeout
+        # and the launcher would sit there frozen with no way to back out.
+        def _probe(worker):
             dm.list_buckets()
-            ok = True
-        except Exception as exc:
-            reason = str(exc)
+            return True
+
+        probed, exc = run_with_progress(
+            self, "Connecting to %s…" % item.name, _probe)
+        if probed is None and exc is None:
+            return  # cancelled
+        ok = probed is True
+        reason = str(exc) if exc is not None else None
 
         if ok:
             # Pass empty bucket so MainWindow starts in bucket-list mode
@@ -405,6 +589,7 @@ class Profiles(QDialog):
                 use_path,
                 session_token,
                 read_only,
+                item.color,
             )
             self.main_settings = settings
             self.main_window = MainWindow(settings=self.main_settings)
@@ -420,17 +605,6 @@ class Profiles(QDialog):
             else:
                 msgBox.setText("Cannot list buckets")
             msgBox.exec()
-
-    def _crypto(self):
-        self.settings.beginGroup("common")
-        key = self.settings.value("key")
-        self.settings.endGroup()
-        if not key:
-            key = Crypto.generate_key()
-            self.settings.beginGroup("common")
-            self.settings.setValue("key", key)
-            self.settings.endGroup()
-        return Crypto(key)
 
     def _ask_passphrase(self, title, prompt):
         text, ok = QInputDialog.getText(
@@ -453,20 +627,29 @@ class Profiles(QDialog):
             "Passphrase to protect the exported credentials:")
         if passphrase is None:
             return
-        crypto = self._crypto()
+        key = self._stored_key()
         payload = []
         for item in self.items:
+            try:
+                acc, sec, tok = load_profile_secrets(key, item)
+            except CredentialError as exc:
+                QMessageBox.critical(
+                    self, "Export profiles",
+                    f"Profile '{item.name}' could not be decrypted, so nothing "
+                    f"was exported:\n\n{exc}")
+                return
             payload.append({
                 "name": item.name,
                 "url": item.url,
                 "region": item.region,
                 "bucket_name": item.bucket_name,
-                "access_key": crypto.decrypt_cred(item.enc_access_key),
-                "secret_key": crypto.decrypt_cred(item.enc_secret_key),
-                "session_token": decrypt_optional(crypto, item.enc_session_token),
+                "access_key": acc,
+                "secret_key": sec,
+                "session_token": tok,
                 "no_ssl_check": str(item.no_ssl_check),
                 "use_path": str(item.use_path),
                 "read_only": str(item.read_only),
+                "color": str(item.color or ""),
             })
         try:
             blob = export_profile_bundle(payload, passphrase)
@@ -497,7 +680,9 @@ class Profiles(QDialog):
             QMessageBox.critical(self, "Import profiles", str(exc))
             return
 
-        crypto = self._crypto()
+        crypto = self._crypto_or_warn()
+        if crypto is None:
+            return
         existing = {item.name for item in self.items}
         added = 0
         for entry in profiles:
@@ -520,6 +705,7 @@ class Profiles(QDialog):
                     str(entry.get("use_path", "false")).lower(),
                     crypto.encrypt(str(entry.get("session_token") or "")),
                     str(entry.get("read_only", "false")).lower(),
+                    normalize_accent(entry.get("color", "")),
                 )
             )
             added += 1
@@ -548,26 +734,29 @@ class Profiles(QDialog):
             self.settings.setValue("use_path", item.use_path)
             self.settings.setValue("session_token", item.enc_session_token)
             self.settings.setValue("read_only", item.read_only)
+            self.settings.setValue("color", item.color)
         self.settings.endArray()
         self.settings.endGroup()
 
     def populate_list(self):
         self.listWidget.clear()
-        elems = [x.name for x in self.items]
-        self.listWidget.addItems(elems)
+        for item in self.items:
+            summary = profile_summary(item)
+            badges = profile_badges(item)
+            row = QListWidgetItem(f"{item.name}\n{summary}")
+            row.setData(Qt.ItemDataRole.UserRole, badges)
+            row.setData(Qt.ItemDataRole.UserRole + 1, item.color)
+            # The row elides; the tooltip is where the whole truth stays.
+            row.setToolTip(" · ".join([summary] + badges))
+            self.listWidget.addItem(row)
 
     def onAdd(self):
         settings = SettingsWindow(self)
         value = settings.exec()
         if value:
-            self.settings.beginGroup("common")
-            key = self.settings.value("key")
-            self.settings.endGroup()
-            if not key:
-                key = Crypto.generate_key()
-                self.settings.beginGroup("common")
-                self.settings.setValue("key", key)
-                self.settings.endGroup()
+            crypto = self._crypto_or_warn()
+            if crypto is None:
+                return
             (
                 name,
                 url,
@@ -579,8 +768,8 @@ class Profiles(QDialog):
                 use_path,
                 session_token,
                 read_only,
+                color,
             ) = value
-            crypto = Crypto(key)
             enc_access_key = crypto.encrypt(access_key)
             enc_secret_key = crypto.encrypt(secret_key)
             enc_session_token = crypto.encrypt(session_token or "")
@@ -596,6 +785,7 @@ class Profiles(QDialog):
                     use_path,
                     enc_session_token,
                     str(bool(read_only)).lower(),
+                    normalize_accent(color),
                 )
             )
             self.save_settings()
@@ -608,21 +798,25 @@ class Profiles(QDialog):
         if elem < 0:
             return
         item = self.items[elem]
-        self.settings.beginGroup("common")
-        key = self.settings.value("key")
-        self.settings.endGroup()
-        crypto = Crypto(key)
+        secrets = self._secrets_or_warn(item)
+        if secrets is None:
+            return
+        crypto = self._crypto_or_warn()
+        if crypto is None:
+            return
+        acc_key, secret_key, session_token = secrets
         settings = (
             item.name,
             item.url,
             item.region,
             item.bucket_name,
-            crypto.decrypt_cred(item.enc_access_key),
-            crypto.decrypt_cred(item.enc_secret_key),
+            acc_key,
+            secret_key,
             item.no_ssl_check,
             item.use_path,
-            decrypt_optional(crypto, item.enc_session_token),
+            session_token,
             item.read_only,
+            item.color,
         )
         settings = SettingsWindow(self, settings=settings)
         value = settings.exec()
@@ -638,6 +832,7 @@ class Profiles(QDialog):
                 use_path,
                 session_token,
                 read_only,
+                color,
             ) = value
             enc_access_key = crypto.encrypt(access_key)
             enc_secret_key = crypto.encrypt(secret_key)
@@ -653,6 +848,7 @@ class Profiles(QDialog):
                 use_path,
                 enc_session_token,
                 str(bool(read_only)).lower(),
+                normalize_accent(color),
             )
             self.save_settings()
             self.populate_list()

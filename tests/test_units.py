@@ -8,10 +8,16 @@ Several tests are explicit regression guards for previously fixed bugs and
 are marked with "REGRESSION:" in their docstrings.
 """
 
+import base64
+import contextlib
 import hashlib
 import io
 import json
 import os
+import re
+import shutil
+import struct
+import zlib
 import sys
 import tempfile
 import threading
@@ -27,17 +33,33 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import botocore.exceptions
-from PyQt6.QtCore import QSettings, Qt
-from PyQt6.QtGui import QAction, QKeySequence, QPalette
+from PyQt6.QtCore import QByteArray, QEvent, QRect, QSettings, Qt, QUrl
+from PyQt6.QtGui import (
+    QAction, QColor, QFont, QFontMetrics, QIcon, QIconEngine, QKeyEvent,
+    QKeySequence, QPainter, QPalette, QPixmap,
+)
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QDialogButtonBox, QMessageBox, QToolButton,
+    QApplication, QDialog, QDialogButtonBox, QMessageBox, QStyle,
+    QStyleOptionViewItem, QToolButton, QWidgetAction,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main_window
+from main_window import command_entries, filter_commands, palette_score
+import profile_switcher
 import theme
-from s3duck import selected_row_index
+import utils
+from cryptography.fernet import Fernet
+import s3duck
+from s3duck import (
+    selected_row_index, SettingsItem, load_profile_secrets, profile_summary,
+    profile_badges,
+)
+from utils import (
+    Crypto, CredentialError, require_crypto, TempWorkspace, pid_is_alive,
+    normalize_accent, themed_icon, icon_is_visible,
+)
 from utils import (
     str_to_bool, load_aws_profiles, scan_local_tree,
     export_profile_bundle, import_profile_bundle, BundleError,
@@ -58,9 +80,10 @@ from main_window import (
 import model as model_module
 from model import (
     Model, Item, FSObjectType, TransferCancelled, ReadOnlyError, run_parallel,
-    RateLimiter,
+    RateLimiter, plan_prefix_download, prefix_of, CHECKSUM_ALGORITHMS,
 )
 from properties_window import PropertiesWindow
+from settings import SettingsWindow
 
 
 def _ensure_qapp():
@@ -1604,6 +1627,99 @@ class ProfileBundleTests(unittest.TestCase):
         with self.assertRaises(BundleError):
             export_profile_bundle(self.PROFILES, "")
 
+    @staticmethod
+    def _forge(payload, passphrase="pw"):
+        """A well-formed, correctly-encrypted bundle wrapping arbitrary bytes,
+        so the checks *after* decryption can be reached."""
+        salt = b"0123456789abcdef"
+        token = Fernet(utils._bundle_key(passphrase, salt)).encrypt(payload)
+        return json.dumps({
+            "version": utils.PROFILE_BUNDLE_VERSION,
+            "salt": base64.b64encode(salt).decode(),
+            "data": token.decode(),
+        }).encode()
+
+    def test_non_string_data_field_is_rejected(self):
+        document = json.loads(export_profile_bundle(self.PROFILES, "pw").decode())
+        document["data"] = 12345
+        with self.assertRaises(BundleError) as ctx:
+            import_profile_bundle(json.dumps(document).encode(), "pw")
+        self.assertIn("decrypt", str(ctx.exception).lower())
+
+    def test_payload_that_is_not_json_is_rejected(self):
+        with self.assertRaises(BundleError) as ctx:
+            import_profile_bundle(self._forge(b"\x00not json"), "pw")
+        self.assertIn("corrupt", str(ctx.exception).lower())
+
+    def test_payload_that_is_not_a_list_is_rejected(self):
+        with self.assertRaises(BundleError) as ctx:
+            import_profile_bundle(self._forge(b'{"name": "prod"}'), "pw")
+        self.assertIn("list of profiles", str(ctx.exception))
+
+    def test_corrupt_salt_is_rejected(self):
+        document = json.loads(export_profile_bundle(self.PROFILES, "pw").decode())
+        document["salt"] = "!!! not base64 !!!"
+        with self.assertRaises(BundleError) as ctx:
+            import_profile_bundle(json.dumps(document).encode(), "pw")
+        self.assertIn("salt", str(ctx.exception).lower())
+
+    def test_unicode_passphrase_round_trips(self):
+        blob = export_profile_bundle(self.PROFILES, "паролü-🦆")
+        self.assertEqual(import_profile_bundle(blob, "паролü-🦆"), self.PROFILES)
+        with self.assertRaises(BundleError):
+            import_profile_bundle(blob, "паролu-🦆")
+
+    def test_bundle_key_is_bound_to_the_salt(self):
+        """Why every export re-salts: same passphrase must not yield the same
+        key twice, or two bundles would be interchangeable ciphertexts."""
+        salt = b"0123456789abcdef"
+        self.assertEqual(utils._bundle_key("pw", salt), utils._bundle_key("pw", salt))
+        self.assertNotEqual(utils._bundle_key("pw", salt),
+                            utils._bundle_key("pw", b"fedcba9876543210"))
+        self.assertNotEqual(utils._bundle_key("pw", salt),
+                            utils._bundle_key("other", salt))
+
+    def test_key_derivation_is_not_weakened(self):
+        """A security parameter, not an implementation detail — a careless edit
+        that drops it turns the passphrase into a fast offline guess."""
+        self.assertGreaterEqual(utils.PROFILE_BUNDLE_ITERATIONS, 480000)
+        self.assertEqual(len(base64.urlsafe_b64decode(
+            utils._bundle_key("pw", b"0123456789abcdef"))), 32)
+
+    def test_a_bundle_carries_profiles_to_another_installation(self):
+        """The end-to-end story the bundle exists for: credentials encrypted
+        under this machine's Fernet key are exported under a passphrase and
+        re-encrypted under a *different* machine's key, still readable."""
+        source_key, target_key = Crypto.generate_key(), Crypto.generate_key()
+        self.assertNotEqual(source_key, target_key)
+        source = Crypto(source_key)
+        stored = SettingsItem(
+            name="prod", url="https://s3.amazonaws.com", region="us-east-1",
+            bucket_name="b", enc_access_key=source.encrypt("AKPROD"),
+            enc_secret_key=source.encrypt("SUPERSECRET"), no_ssl_check="false",
+            use_path="false", enc_session_token=source.encrypt("tok"))
+
+        access, secret, token = load_profile_secrets(source_key, stored)
+        blob = export_profile_bundle(
+            [{"name": stored.name, "access_key": access,
+              "secret_key": secret, "session_token": token}], "transfer pw")
+        self.assertNotIn(b"SUPERSECRET", blob)
+
+        restored = import_profile_bundle(blob, "transfer pw")[0]
+        target = Crypto(target_key)
+        migrated = SettingsItem(
+            name=restored["name"], url="", region="", bucket_name="",
+            enc_access_key=target.encrypt(restored["access_key"]),
+            enc_secret_key=target.encrypt(restored["secret_key"]),
+            no_ssl_check="false", use_path="false",
+            enc_session_token=target.encrypt(restored["session_token"]))
+
+        self.assertEqual(load_profile_secrets(target_key, migrated),
+                         ("AKPROD", "SUPERSECRET", "tok"))
+        # and the old key is now useless against the migrated copy
+        with self.assertRaises(CredentialError):
+            load_profile_secrets(source_key, migrated)
+
 
 class SetBucketVersioningTests(unittest.TestCase):
     def setUp(self):
@@ -2884,6 +3000,1348 @@ class TransferSettingsDialogTests(unittest.TestCase):
         self.assertFalse(dlg.verify_downloads())
 
 
+class _HollowIconEngine(QIconEngine):
+    """An icon that exists but draws nothing — what a theme entry with no
+    usable file behaves like, and the reason isNull() is not enough."""
+
+    def pixmap(self, size, mode, state):
+        return QPixmap()
+
+    def paint(self, painter, rect, mode, state):
+        pass
+
+    def clone(self):
+        return _HollowIconEngine()
+
+
+class IconFallbackTests(unittest.TestCase):
+    """REGRESSION (blank toolbar buttons on Linux Mint): every icon went
+    through QIcon.fromTheme, which uses its fallback only when the theme has NO
+    entry for the name. A theme that registers the name but ships nothing
+    drawable at our size therefore rendered an empty button, and 19 call sites
+    passed no fallback at all."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    ICONS = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "icons")
+
+    def _bundled(self, name="home_24px.svg"):
+        return os.path.join(self.ICONS, name)
+
+    def test_a_bundled_icon_is_used_when_the_theme_has_nothing(self):
+        icon = themed_icon("definitely-not-a-theme-icon", self._bundled())
+        self.assertFalse(icon.isNull())
+        self.assertFalse(icon.pixmap(24, 24).isNull())
+
+    def setUp(self):
+        # The resolver caches, so each test starts from a clean slate.
+        utils._icon_cache.clear()
+        self.addCleanup(utils._icon_cache.clear)
+
+    def test_a_transparent_theme_icon_is_rejected(self):
+        """The remaining Mint case: the theme resolves the name to a fully
+        transparent placeholder. It is not null, its pixmap is not null, and it
+        still paints an empty button — only real alpha proves otherwise."""
+        blank = QPixmap(24, 24)
+        blank.fill(Qt.GlobalColor.transparent)
+        invisible = QIcon(blank)
+        self.assertFalse(invisible.isNull())
+        self.assertFalse(invisible.pixmap(24, 24).isNull())
+        self.assertFalse(icon_is_visible(invisible))
+        with patch.object(utils.QIcon, "fromTheme",
+                          staticmethod(lambda *a, **kw: invisible)):
+            icon = themed_icon("view-statistics", self._bundled())
+        self.assertTrue(icon_is_visible(icon))
+
+    def test_visibility_accepts_a_real_icon(self):
+        self.assertTrue(icon_is_visible(QIcon(self._bundled())))
+        self.assertFalse(icon_is_visible(QIcon()))
+        self.assertFalse(icon_is_visible(None))
+
+    def test_every_bundled_icon_paints_visible_pixels(self):
+        """A fallback that renders nothing is no fallback at all."""
+        invisible = []
+        for name in sorted(os.listdir(self.ICONS)):
+            if not name.endswith(".svg"):
+                continue
+            if not icon_is_visible(QIcon(os.path.join(self.ICONS, name))):
+                invisible.append(name)
+        self.assertEqual(invisible, [])
+
+    def test_the_cache_keys_on_the_name(self):
+        """Two names sharing one fallback must not collide — otherwise the
+        first answer is reused for every later icon."""
+        blank = QPixmap(24, 24)
+        blank.fill(Qt.GlobalColor.transparent)
+        answers = {"hollow-name": QIcon(blank),
+                   "good-name": QIcon(self._bundled("bucket_24px.svg"))}
+        with patch.object(utils.QIcon, "fromTheme",
+                          staticmethod(lambda n, *a, **kw: answers[n])):
+            first = themed_icon("hollow-name", self._bundled("home_24px.svg"))
+            second = themed_icon("good-name", self._bundled("home_24px.svg"))
+        self.assertIsNot(first, second)
+        self.assertIs(second, answers["good-name"])
+
+    def test_results_are_cached_so_menus_stay_cheap(self):
+        """Context menus rebuild their icons on every right-click."""
+        calls = []
+        real = utils.QIcon.fromTheme
+
+        def counting(*args, **kwargs):
+            calls.append(args[:1])
+            return real(*args, **kwargs)
+
+        with patch.object(utils.QIcon, "fromTheme", staticmethod(counting)):
+            themed_icon("go-home", self._bundled())
+            themed_icon("go-home", self._bundled())
+            themed_icon("go-home", self._bundled())
+        self.assertEqual(len(calls), 1)
+
+    def test_a_theme_icon_that_draws_nothing_is_rejected(self):
+        """The actual Mint failure: the theme HAS the name, so the icon is not
+        null, but nothing is drawable at the size we paint. isNull() alone
+        cannot see that, which is why the pixmap is probed."""
+        hollow = QIcon(_HollowIconEngine())
+        self.assertFalse(hollow.isNull())          # the trap: it looks fine
+        self.assertTrue(hollow.pixmap(24, 24).isNull())
+        with patch.object(utils.QIcon, "fromTheme",
+                          staticmethod(lambda *a, **kw: hollow)):
+            icon = themed_icon("go-home", self._bundled())
+        self.assertFalse(icon.pixmap(24, 24).isNull())
+
+    def test_a_null_theme_icon_is_also_rejected(self):
+        with patch.object(utils.QIcon, "fromTheme",
+                          staticmethod(lambda *a, **kw: QIcon())):
+            icon = themed_icon("go-home", self._bundled())
+        self.assertFalse(icon.pixmap(24, 24).isNull())
+
+    def test_a_usable_theme_icon_is_preferred(self):
+        """Desktop integration still wins when the theme actually delivers."""
+        real = QIcon(self._bundled("bucket_24px.svg"))
+        with patch.object(utils.QIcon, "fromTheme",
+                          staticmethod(lambda *a, **kw: real)):
+            icon = themed_icon("go-home", self._bundled("home_24px.svg"))
+        self.assertIs(icon, real)
+
+    def test_no_fallback_and_no_theme_yields_an_explicit_empty_icon(self):
+        self.assertTrue(themed_icon("nope-not-here", "").isNull())
+
+    def test_every_bundled_icon_file_referenced_actually_exists(self):
+        """A typo'd filename is a silent blank, since QIcon(bad_path) is
+        simply null."""
+        missing = []
+        for source in ("main_window.py", "s3duck.py", "settings.py",
+                       "properties_window.py", "profile_switcher.py"):
+            path = os.path.join(os.path.dirname(self.ICONS), source)
+            with open(path) as handle:
+                referenced = re.findall(r'"icons",\s*"([^"]+)"', handle.read())
+            for name in referenced:
+                if not os.path.exists(os.path.join(self.ICONS, name)):
+                    missing.append(f"{source}: {name}")
+        self.assertEqual(missing, [])
+
+    def test_nothing_calls_fromTheme_without_going_through_the_helper(self):
+        """Any direct fromTheme call re-opens the hole, because it trusts the
+        theme's claim that the name exists."""
+        offenders = []
+        for source in ("main_window.py", "s3duck.py", "settings.py",
+                       "properties_window.py", "profile_switcher.py"):
+            path = os.path.join(os.path.dirname(self.ICONS), source)
+            with open(path) as handle:
+                lines = handle.read().splitlines()
+            for i, line in enumerate(lines, 1):
+                if "QIcon.fromTheme" in line:
+                    offenders.append(f"{source}:{i}")
+        self.assertEqual(offenders, [])
+
+    def _win(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                os.path.dirname(self.ICONS), settings, "prof",
+                "https://s3.amazonaws.com", "us-east-1", "", "AK", "SK",
+                False, False,
+            ))
+        self.addCleanup(win.close)
+        return win
+
+    def test_every_toolbar_button_draws_something(self):
+        """The failure the screenshots showed: buttons present, icons blank.
+
+        A QWidgetAction (the Theme / Bookmarks / Tools dropdowns) carries no
+        icon itself — the QToolButton it wraps does — so those are checked
+        through their widget rather than skipped.
+        """
+        win = self._win()
+        blank, checked = [], 0
+        for action in win.tBar.actions():
+            if action.isSeparator():
+                continue
+            holder = action
+            if isinstance(action, QWidgetAction):
+                widget = action.defaultWidget()
+                if widget is None:
+                    continue
+                holder = widget
+            checked += 1
+            if holder.icon().pixmap(24, 24).isNull():
+                blank.append(action.text() or type(holder).__name__)
+        self.assertEqual(blank, [], f"blank toolbar icons: {blank}")
+        # Guard the guard: an empty toolbar would pass the assertion above.
+        self.assertGreaterEqual(checked, 15)
+
+
+class CommandPaletteTests(unittest.TestCase):
+    """The action surface outgrew the toolbar: toolbar + Tools menu + several
+    context menus + ~20 shortcuts, with no way to reach a rare command."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    @staticmethod
+    def _action(text, keys=(), enabled=True, visible=True, separator=False):
+        action = QAction(text)
+        action.setShortcuts([QKeySequence(k) for k in keys])
+        action.setEnabled(enabled)
+        action.setVisible(visible)
+        action.setSeparator(separator)
+        return action
+
+    def test_entries_are_built_from_live_actions(self):
+        entries = command_entries([
+            self._action("Refresh", ["F5", "Ctrl+R"]),
+            self._action("Upload…"),
+        ])
+        self.assertEqual([(label, keys) for label, keys, _a in entries],
+                         [("Refresh", "F5, Ctrl+R"), ("Upload", "")])
+
+    def test_unusable_actions_are_left_out(self):
+        """Running a disabled or hidden action would do nothing. Qt reports a
+        hidden action as disabled too, so one check covers both."""
+        hidden = self._action("Hidden", visible=False)
+        self.assertFalse(hidden.isEnabled())
+        entries = command_entries([
+            self._action("Disabled", enabled=False),
+            hidden,
+            self._action("Real"),
+        ])
+        self.assertEqual([label for label, _k, _a in entries], ["Real"])
+
+    def test_separators_are_left_out_even_when_they_carry_text(self):
+        """A separator is enabled and visible, so only the separator flag
+        keeps it out of the list."""
+        entries = command_entries([
+            self._action("Divider", separator=True),
+            self._action("Real"),
+        ])
+        self.assertEqual([label for label, _k, _a in entries], ["Real"])
+
+    def test_labels_are_cleaned_up(self):
+        entries = command_entries([self._action("&Copy (Ctrl+C)…")])
+        self.assertEqual(entries[0][0], "Copy")
+
+    def test_duplicate_labels_collapse(self):
+        """The same action reaches the palette from the toolbar and from
+        findChildren; it should be offered once."""
+        entries = command_entries(
+            [self._action("Refresh", ["F5"]), self._action("refresh")])
+        self.assertEqual(len(entries), 1)
+
+    def test_matches_are_ranked_not_left_in_input_order(self):
+        """Deliberately fed worst-first, so returning the input order fails."""
+        entries = [("Clean old parts", "", None), ("Recopy files", "", None),
+                   ("Copy", "", None), ("Delete", "", None)]
+        self.assertEqual(
+            [label for label, _k, _a in filter_commands(entries, "co")],
+            ["Copy", "Recopy files", "Clean old parts"])
+
+    def test_a_contiguous_match_beats_a_scattered_one(self):
+        self.assertLess(palette_score("Copy", "co"),
+                        palette_score("Clean old parts", "co"))
+
+    def test_a_contiguous_match_wins_even_when_it_is_the_longer_label(self):
+        """Guards the tier itself: 'Clo' is shorter, and would sort first if
+        substring and subsequence shared a tier."""
+        self.assertLess(palette_score("Incomplete uploads", "co"),
+                        palette_score("Clo", "co"))
+        self.assertEqual(
+            [label for label, _k, _a in filter_commands(
+                [("Clo", "", None), ("Incomplete uploads", "", None)], "co")],
+            ["Incomplete uploads", "Clo"])
+
+    def test_an_earlier_match_wins_within_a_tier(self):
+        self.assertLess(palette_score("Copy", "co"),
+                        palette_score("Recopy files", "co"))
+
+    def test_position_beats_alphabetical_order(self):
+        """Guards the position component: 'Abort copy' sorts first
+        alphabetically but matches later."""
+        self.assertLess(palette_score("Copy", "co"),
+                        palette_score("Abort copy", "co"))
+        self.assertEqual(
+            [label for label, _k, _a in filter_commands(
+                [("Abort copy", "", None), ("Copy", "", None)], "co")],
+            ["Copy", "Abort copy"])
+
+    def test_a_subsequence_must_be_in_order(self):
+        """'yc' appears in 'Copy' only out of order, and must not match."""
+        self.assertIsNone(palette_score("Copy", "yc"))
+        self.assertIsNotNone(palette_score("Copy", "cy"))
+
+    def test_an_empty_query_keeps_everything(self):
+        entries = [("B", "", None), ("A", "", None)]
+        self.assertEqual(len(filter_commands(entries, "")), 2)
+        self.assertEqual(len(filter_commands(entries, "   ")), 2)
+
+    def test_matching_ignores_case(self):
+        entries = [("Upload folder", "", None)]
+        self.assertEqual(len(filter_commands(entries, "UPLOAD")), 1)
+
+    def test_a_query_that_matches_nothing_returns_nothing(self):
+        entries = [("Copy", "", None)]
+        self.assertEqual(filter_commands(entries, "zzz"), [])
+        self.assertIsNone(palette_score("Copy", "zzz"))
+
+    def test_the_dialog_runs_the_selected_action(self):
+        fired = []
+        action = self._action("Refresh", ["F5"])
+        action.triggered.connect(lambda: fired.append(1))
+        dlg = main_window.CommandPaletteDialog(
+            None, command_entries([action, self._action("Delete")]))
+        self.addCleanup(dlg.close)
+        dlg._query.setText("refr")
+        chosen = dlg.chosen_action()
+        self.assertIs(chosen, action)
+        chosen.trigger()
+        self.assertEqual(fired, [1])
+
+    def test_the_highlighted_row_is_what_runs(self):
+        """Not simply the first match — the arrows move the selection."""
+        wanted = self._action("Download")
+        dlg = main_window.CommandPaletteDialog(None, command_entries([
+            self._action("Delete"), wanted]))
+        self.addCleanup(dlg.close)
+        self.assertEqual(dlg._list.currentRow(), 0)
+        dlg._list.setCurrentRow(1)
+        self.assertIs(dlg.chosen_action(), wanted)
+
+    def test_typing_narrows_the_list(self):
+        dlg = main_window.CommandPaletteDialog(None, command_entries([
+            self._action("Copy"), self._action("Delete"),
+            self._action("Download")]))
+        self.addCleanup(dlg.close)
+        self.assertEqual(dlg._list.count(), 3)
+        dlg._query.setText("del")
+        self.assertEqual(dlg._list.count(), 1)
+        dlg._query.setText("")
+        self.assertEqual(dlg._list.count(), 3)
+
+    def test_arrow_keys_move_the_selection_while_typing(self):
+        """The cursor stays in the box, so the list needs the arrows."""
+        dlg = main_window.CommandPaletteDialog(None, command_entries([
+            self._action("Copy"), self._action("Delete"),
+            self._action("Download")]))
+        self.addCleanup(dlg.close)
+        self.assertEqual(dlg._list.currentRow(), 0)
+        event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Down,
+                          Qt.KeyboardModifier.NoModifier)
+        self.assertTrue(dlg.eventFilter(dlg._query, event))
+        self.assertEqual(dlg._list.currentRow(), 1)
+        up = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Up,
+                       Qt.KeyboardModifier.NoModifier)
+        dlg.eventFilter(dlg._query, up)
+        self.assertEqual(dlg._list.currentRow(), 0)
+
+    def test_the_selection_cannot_run_off_the_ends(self):
+        dlg = main_window.CommandPaletteDialog(
+            None, command_entries([self._action("Copy")]))
+        self.addCleanup(dlg.close)
+        for key in (Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_Down):
+            dlg.eventFilter(dlg._query, QKeyEvent(
+                QEvent.Type.KeyPress, key, Qt.KeyboardModifier.NoModifier))
+            self.assertEqual(dlg._list.currentRow(), 0)
+
+    def test_nothing_is_chosen_when_the_query_matches_nothing(self):
+        dlg = main_window.CommandPaletteDialog(
+            None, command_entries([self._action("Copy")]))
+        self.addCleanup(dlg.close)
+        dlg._query.setText("zzzz")
+        self.assertEqual(dlg._list.count(), 0)
+        self.assertIsNone(dlg.chosen_action())
+
+    def test_the_window_binds_ctrl_k(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        self.assertEqual(win._palette_shortcut.key(), QKeySequence("Ctrl+K"))
+
+    def test_the_palette_offers_the_windows_real_actions(self):
+        """Built from the live QActions, so it cannot drift from the app —
+        and most are created parentless, which findChildren alone misses."""
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        labels = [label for label, _k, _a in
+                  command_entries(win._live_actions())]
+        self.assertTrue(labels)
+        self.assertTrue(any("refresh" in label.lower() for label in labels),
+                        f"toolbar actions missing from {labels}")
+
+
+class ProfileAccentTests(unittest.TestCase):
+    """The launcher's badges only help while picking a profile; once a window
+    is open nothing distinguished prod from dev."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def test_normalize_accepts_hex_and_rejects_everything_else(self):
+        self.assertEqual(normalize_accent("#C62828"), "#c62828")
+        self.assertEqual(normalize_accent("#abc"), "#abc")
+        self.assertEqual(normalize_accent("  #abc  "), "#abc")
+        for bad in ("", None, "red", "c62828", "#12345", "#gggggg",
+                    "#abc; drop table", 42):
+            with self.subTest(value=bad):
+                self.assertEqual(normalize_accent(bad), "")
+
+    def _win(self, accent=""):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        base = (os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                settings, "prof", "https://s3.amazonaws.com", "us-east-1", "",
+                "AK", "SK", False, False, "", "false")
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=base + (accent,))
+        self.addCleanup(win.close)
+        return win
+
+    def test_an_accent_bands_the_window(self):
+        win = self._win("#c62828")
+        self.assertEqual(win.accent, "#c62828")
+        self.assertFalse(win.accent_bar.isHidden())
+        self.assertEqual(
+            win.accent_bar.palette().color(QPalette.ColorRole.Window),
+            QColor("#c62828"))
+
+    def test_no_accent_hides_the_band(self):
+        win = self._win("")
+        self.assertEqual(win.accent, "")
+        self.assertTrue(win.accent_bar.isHidden())
+
+    def test_a_malformed_accent_hides_the_band(self):
+        """Settings are user-editable text; garbage must not paint a band that
+        looks like a rendering fault."""
+        win = self._win("not-a-colour")
+        self.assertEqual(win.accent, "")
+        self.assertTrue(win.accent_bar.isHidden())
+
+    def test_the_band_uses_the_palette_not_a_stylesheet(self):
+        """Any stylesheet makes a widget stop following the palette, which is
+        how theming breaks elsewhere in this app."""
+        win = self._win("#1565c0")
+        self.assertEqual(win.accent_bar.styleSheet(), "")
+        self.assertTrue(win.accent_bar.autoFillBackground())
+
+    def test_the_accent_can_be_changed_at_runtime(self):
+        """Switching profiles without restarting must re-mark the window."""
+        win = self._win("#c62828")
+        self.assertEqual(win.set_accent("#2e7d32"), "#2e7d32")
+        self.assertEqual(
+            win.accent_bar.palette().color(QPalette.ColorRole.Window),
+            QColor("#2e7d32"))
+        win.set_accent("")
+        self.assertTrue(win.accent_bar.isHidden())
+        # Back to a colour: the band was explicitly hidden above, so this is
+        # the only path where showing it again actually matters.
+        win.set_accent("#1565c0")
+        self.assertFalse(win.accent_bar.isHidden())
+        self.assertEqual(
+            win.accent_bar.palette().color(QPalette.ColorRole.Window),
+            QColor("#1565c0"))
+
+    def test_a_profile_without_an_accent_still_opens(self):
+        """Profiles saved before this feature pass a shorter tuple."""
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        self.assertEqual(win.accent, "")
+
+    def test_the_switcher_carries_the_colour(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        crypto = Crypto(Fernet.generate_key().decode())
+        settings.beginGroup("common")
+        settings.setValue("key", crypto.key)
+        settings.endGroup()
+        raw = {"name": "prod", "url": "u", "region": "r", "bucket_name": "b",
+               "access_key": crypto.encrypt("AK"),
+               "secret_key": crypto.encrypt("SK"),
+               "no_ssl_check": "false", "use_path": "false",
+               "session_token": "", "read_only": "false", "color": "#C62828"}
+        profile = profile_switcher.decrypt_profile(settings, raw)
+        self.assertEqual(profile.color, "#c62828")
+
+    def test_the_switcher_normalizes_a_bad_colour(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        crypto = Crypto(Fernet.generate_key().decode())
+        settings.beginGroup("common")
+        settings.setValue("key", crypto.key)
+        settings.endGroup()
+        raw = {"name": "p", "url": "u", "region": "r", "bucket_name": "",
+               "access_key": crypto.encrypt("AK"),
+               "secret_key": crypto.encrypt("SK"),
+               "no_ssl_check": "false", "use_path": "false",
+               "session_token": "", "read_only": "false", "color": "bogus"}
+        self.assertEqual(
+            profile_switcher.decrypt_profile(settings, raw).color, "")
+
+    def test_the_profile_form_round_trips_the_colour(self):
+        dlg = SettingsWindow(settings=(
+            "n", "u", "r", "b", "AK", "SK", "false", "true", "", "false",
+            "#2e7d32"))
+        self.addCleanup(dlg.close)
+        dlg.setRetVal()
+        self.assertEqual(dlg.retrunVal[10], "#2e7d32")
+
+    def test_the_profile_form_defaults_to_no_colour(self):
+        dlg = SettingsWindow()
+        self.addCleanup(dlg.close)
+        dlg.setRetVal()
+        self.assertEqual(dlg.retrunVal[10], "")
+
+
+class LauncherAccentTests(unittest.TestCase):
+    """The same colour marks the row in the picker and the open window."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _launcher(self, items):
+        win = s3duck.Profiles()
+        win.settings = QSettings("s3duck-tests", "s3duck-tests")
+        win.items = list(items)
+        win.populate_list()
+        self.addCleanup(win.close)
+        return win
+
+    @staticmethod
+    def _item(color=""):
+        return SettingsItem(
+            "prod", "https://s3.amazonaws.com", "us-east-1", "", b"", b"",
+            "false", "false", b"", "false", color)
+
+    def test_the_row_carries_the_colour(self):
+        win = self._launcher([self._item("#c62828")])
+        self.assertEqual(
+            win.listWidget.item(0).data(Qt.ItemDataRole.UserRole + 1),
+            "#c62828")
+
+    def _swatches(self, win):
+        filled = []
+        delegate = win.listWidget.itemDelegate()
+        pixmap = QPixmap(400, 60)
+        pixmap.fill()
+        painter = QPainter(pixmap)
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 400, 60)
+        option.font = win.listWidget.font()
+        option.palette = win.listWidget.palette()
+        with patch.object(QPainter, "fillRect",
+                          lambda _s, rect, colour: filled.append(
+                              (rect.width(), QColor(colour).name()))):
+            delegate.paint(painter, option,
+                           win.listWidget.model().index(0, 0))
+        painter.end()
+        return filled
+
+    def test_a_coloured_profile_gets_a_swatch(self):
+        win = self._launcher([self._item("#c62828")])
+        self.assertIn((4, "#c62828"), self._swatches(win))
+
+    def test_an_uncoloured_profile_gets_no_swatch(self):
+        win = self._launcher([self._item("")])
+        self.assertEqual(self._swatches(win), [])
+
+    def test_a_malformed_colour_paints_nothing(self):
+        win = self._launcher([self._item("nonsense")])
+        self.assertEqual(self._swatches(win), [])
+
+
+class _RecordingDest:
+    """A stand-in destination model that records what was written to it."""
+
+    def __init__(self, bucket="dst", read_only=False):
+        self.bucket = bucket
+        self.read_only = read_only
+        self.upload_extra_args = {}
+        self.transfer_cfg_upload = None
+        self.uploads = []
+        self.folders = []
+        self.client = self
+
+    def _guard_write(self):
+        if self.read_only:
+            raise ReadOnlyError("profile is read-only")
+
+    def upload_fileobj(self, body, bucket, key, ExtraArgs=None, Callback=None,
+                       Config=None):
+        self.uploads.append((bucket, key, body.read(), ExtraArgs))
+
+    def create_folder(self, key, log_fn=None):
+        self.folders.append(key)
+
+
+class CrossProfileCopyTests(unittest.TestCase):
+    """Server-side copy cannot use two sets of credentials, so moving objects
+    between accounts or providers had no route at all."""
+
+    def setUp(self):
+        self.src = Model("https://s3.amazonaws.com", "us-east-1",
+                         "AK", "SK", "srcbkt", False, False)
+        self.dest = _RecordingDest()
+
+    def _source_object(self, body=b"payload", **extra):
+        resp = {"Body": io.BytesIO(body), "ContentLength": len(body)}
+        resp.update(extra)
+        self.src._client = types.SimpleNamespace(
+            get_object=lambda **kw: resp)
+        return resp
+
+    def test_an_object_is_read_here_and_written_there(self):
+        self._source_object(b"hello")
+        self.src.copy_to_model("a/b.txt", self.dest, "into/b.txt")
+        self.assertEqual(self.dest.uploads,
+                         [("dst", "into/b.txt", b"hello", None)])
+
+    def test_content_type_and_metadata_survive_the_stream(self):
+        """Streaming loses everything CopyObject would have preserved."""
+        self._source_object(ContentType="text/csv",
+                            Metadata={"owner": "vlad"},
+                            ContentEncoding="gzip")
+        self.src.copy_to_model("a.csv", self.dest, "a.csv")
+        extra = self.dest.uploads[0][3]
+        self.assertEqual(extra["ContentType"], "text/csv")
+        self.assertEqual(extra["Metadata"], {"owner": "vlad"})
+        self.assertEqual(extra["ContentEncoding"], "gzip")
+
+    def test_the_destinations_upload_policy_wins(self):
+        """Storage class and encryption belong to where the object lands."""
+        self._source_object(ContentType="text/plain")
+        self.dest.upload_extra_args = {"StorageClass": "GLACIER"}
+        self.src.copy_to_model("a.txt", self.dest, "a.txt")
+        self.assertEqual(self.dest.uploads[0][3]["StorageClass"], "GLACIER")
+
+    def test_a_read_only_destination_is_refused(self):
+        """The source profile's flag says nothing about the target's."""
+        self._source_object()
+        self.dest.read_only = True
+        with self.assertRaises(ReadOnlyError):
+            self.src.copy_to_model("a.txt", self.dest, "a.txt")
+        self.assertEqual(self.dest.uploads, [])
+
+    def test_a_read_only_source_can_still_copy_out(self):
+        """Read-only protects the source's data; copying it elsewhere does not
+        modify it, so it must not be blocked."""
+        self.src.read_only = True
+        self._source_object(b"x")
+        self.src.copy_to_model("a.txt", self.dest, "a.txt")
+        self.assertEqual(len(self.dest.uploads), 1)
+
+    def test_cancelling_before_the_read_writes_nothing(self):
+        self._source_object()
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(TransferCancelled):
+            self.src.copy_to_model("a.txt", self.dest, "a.txt",
+                                   cancel_event=cancel)
+        self.assertEqual(self.dest.uploads, [])
+
+    def test_a_prefix_keeps_its_shape(self):
+        listed = [("src/a.txt", 1), ("src/sub/", 0), ("src/sub/b.txt", 2)]
+        self.src._client = types.SimpleNamespace(
+            get_object=lambda **kw: {"Body": io.BytesIO(b"z"),
+                                     "ContentLength": 1})
+        with patch.object(Model, "get_keys", lambda _s, p, **kw: listed):
+            self.src.copy_prefix_to_model("src/", self.dest, "into/")
+        self.assertEqual([key for _b, key, _d, _e in self.dest.uploads],
+                         ["into/a.txt", "into/sub/b.txt"])
+        self.assertEqual(self.dest.folders, ["into/sub/"])
+
+    def test_a_prefix_can_land_at_the_bucket_root(self):
+        self.src._client = types.SimpleNamespace(
+            get_object=lambda **kw: {"Body": io.BytesIO(b"z"),
+                                     "ContentLength": 1})
+        with patch.object(Model, "get_keys",
+                          lambda _s, p, **kw: [("src/a.txt", 1)]):
+            self.src.copy_prefix_to_model("src/", self.dest, "")
+        self.assertEqual(self.dest.uploads[0][1], "a.txt")
+
+    def test_a_read_only_destination_refuses_a_whole_prefix(self):
+        """And refuses it BEFORE listing: the per-file guard would also stop
+        the copy, but only after a full recursive listing has been paid for."""
+        self.dest.read_only = True
+        listed = []
+        with patch.object(Model, "get_keys",
+                          lambda _s, p, **kw: listed.append(p) or [("a", 1)]):
+            with self.assertRaises(ReadOnlyError):
+                self.src.copy_prefix_to_model("src/", self.dest, "into/")
+        self.assertEqual(self.dest.uploads, [])
+        self.assertEqual(listed, [], "listed the prefix before refusing")
+
+    def test_the_worker_refuses_a_job_with_no_destination(self):
+        """A queued entry that lost its destination model must fail loudly
+        rather than silently doing nothing."""
+        worker = main_window.Worker(self.src, [("a.txt", "a.txt", False)])
+        errors = []
+        worker.error.connect(errors.append)
+        worker.copy_to_profile()
+        self.assertTrue(errors)
+        self.assertIn("destination", errors[0])
+
+    def test_the_worker_dispatches_files_and_folders(self):
+        seen = []
+        worker = main_window.Worker(
+            self.src,
+            [("f.txt", "to/f.txt", False), ("d/", "to/d/", True)],
+            dest_model=self.dest)
+        with patch.object(Model, "copy_to_model",
+                          lambda _s, k, m, t, **kw: seen.append(("file", k, t))), \
+             patch.object(Model, "copy_prefix_to_model",
+                          lambda _s, k, m, t, **kw: seen.append(("dir", k, t))):
+            worker.copy_to_profile()
+        self.assertEqual(seen, [("file", "f.txt", "to/f.txt"),
+                                ("dir", "d/", "to/d/")])
+
+
+class AdditionalChecksumTests(unittest.TestCase):
+    """Multipart ETags are unverifiable, so verification silently passed for
+    exactly the large objects most worth checking. An additional full-object
+    checksum stays comparable."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.path = os.path.join(self.dir, "payload.bin")
+        self.data = b"duck" * 5000
+        with open(self.path, "wb") as fh:
+            fh.write(self.data)
+        self.model = Model("https://s3.amazonaws.com", "us-east-1",
+                           "AK", "SK", "bkt", False, False)
+
+    def _expected(self, algorithm):
+        if algorithm == "CRC32":
+            return base64.b64encode(
+                struct.pack(">I", zlib.crc32(self.data) & 0xFFFFFFFF)).decode()
+        digest = hashlib.new(algorithm.lower(), self.data).digest()
+        return base64.b64encode(digest).decode()
+
+    def test_file_checksum_matches_what_s3_would_store(self):
+        for algorithm in CHECKSUM_ALGORITHMS:
+            with self.subTest(algorithm=algorithm):
+                self.assertEqual(Model.file_checksum(self.path, algorithm),
+                                 self._expected(algorithm))
+
+    def test_an_algorithm_we_cannot_compute_is_refused(self):
+        """CRC32C needs a third-party module; accepting it would mean
+        'verified' downloads that were never actually checked."""
+        for bad in ("CRC32C", "MD5", "", None):
+            with self.subTest(algorithm=bad):
+                with self.assertRaises(ValueError):
+                    Model.file_checksum(self.path, bad)
+
+    def test_composite_checksums_are_recognised(self):
+        self.assertTrue(Model.checksum_is_composite("abcDEF==-4"))
+        self.assertFalse(Model.checksum_is_composite("abcDEF=="))
+        self.assertFalse(Model.checksum_is_composite("abc-DEF"))
+        self.assertFalse(Model.checksum_is_composite(""))
+        self.assertFalse(Model.checksum_is_composite(None))
+
+    def test_a_matching_checksum_verifies(self):
+        head = {"ChecksumSHA256": self._expected("SHA256")}
+        self.assertTrue(self.model.verify_download(self.path, "", head=head))
+
+    def test_a_mismatched_checksum_fails_even_with_a_good_etag(self):
+        """The checksum is the stronger signal and must win."""
+        head = {"ChecksumSHA256": base64.b64encode(b"x" * 32).decode()}
+        etag = hashlib.md5(self.data).hexdigest()
+        self.assertFalse(
+            self.model.verify_download(self.path, etag, head=head))
+
+    def test_a_full_object_checksum_verifies_a_multipart_object(self):
+        """THE POINT: a multipart ETag cannot be checked, but a full-object
+        CRC32 on the same object can."""
+        multipart_etag = hashlib.md5(self.data).hexdigest() + "-4"
+        self.assertFalse(Model.etag_is_md5(multipart_etag))
+        head = {"ChecksumCRC32": self._expected("CRC32")}
+        logs = []
+        self.assertTrue(self.model.verify_download(
+            self.path, multipart_etag, head=head, log_fn=logs.append))
+        self.assertTrue(any("checksum ok (CRC32)" in m for m in logs))
+
+    def test_a_per_part_checksum_falls_back_to_the_etag(self):
+        head = {"ChecksumCRC32": self._expected("CRC32") + "-4"}
+        etag = hashlib.md5(self.data).hexdigest()
+        logs = []
+        self.assertTrue(self.model.verify_download(
+            self.path, etag, head=head, log_fn=logs.append))
+        self.assertTrue(any("per-part" in m for m in logs))
+        self.assertTrue(any("checksum ok" in m for m in logs))
+
+    def test_no_checksum_still_uses_the_etag(self):
+        etag = hashlib.md5(self.data).hexdigest()
+        self.assertTrue(self.model.verify_download(self.path, etag, head={}))
+        self.assertFalse(
+            self.model.verify_download(self.path, "0" * 32, head={}))
+
+    def test_stored_checksum_reads_the_head_response(self):
+        self.assertEqual(
+            Model.stored_checksum({"ChecksumSHA256": "abc"}), ("SHA256", "abc"))
+        self.assertEqual(Model.stored_checksum({}), ("", ""))
+        self.assertEqual(Model.stored_checksum(None), ("", ""))
+
+    def test_uploads_request_the_checksum(self):
+        args = self.model.set_upload_options(checksum_algorithm="SHA256")
+        self.assertEqual(args["ChecksumAlgorithm"], "SHA256")
+        self.assertEqual(self.model.checksum_algorithm, "SHA256")
+
+    def test_crc32_uploads_ask_for_a_whole_object_checksum(self):
+        """Without ChecksumType a multipart upload stores a per-part
+        composite, which is as unverifiable as the ETag it replaces."""
+        args = self.model.set_upload_options(checksum_algorithm="CRC32")
+        self.assertEqual(args["ChecksumType"], "FULL_OBJECT")
+
+    def test_sha_uploads_do_not_ask_for_full_object(self):
+        """S3 only supports FULL_OBJECT for the CRC algorithms."""
+        args = self.model.set_upload_options(checksum_algorithm="SHA256")
+        self.assertNotIn("ChecksumType", args)
+
+    def test_an_unsupported_algorithm_is_not_sent(self):
+        args = self.model.set_upload_options(checksum_algorithm="CRC32C")
+        self.assertNotIn("ChecksumAlgorithm", args)
+        self.assertEqual(self.model.checksum_algorithm, "")
+
+    def test_the_setting_survives_a_worker_clone(self):
+        self.model.set_upload_options(checksum_algorithm="SHA1")
+        self.assertEqual(
+            self.model.clone_for_worker().checksum_algorithm, "SHA1")
+
+    def test_head_asks_for_the_checksum(self):
+        calls = []
+
+        class _Client:
+            def head_object(self, **kw):
+                calls.append(kw)
+                return {"ContentLength": 1}
+
+        self.model._client = _Client()
+        self.model.head_with_checksum("k")
+        self.assertEqual(calls[0].get("ChecksumMode"), "ENABLED")
+
+    def test_a_backend_rejecting_checksum_mode_still_works(self):
+        """Older S3-compatible servers reject the parameter; without the retry
+        every download's HEAD would fail."""
+        calls = []
+
+        class _Client:
+            def head_object(self, **kw):
+                calls.append(kw)
+                if "ChecksumMode" in kw:
+                    raise botocore.exceptions.ParamValidationError(
+                        report="unknown parameter ChecksumMode")
+                return {"ContentLength": 7}
+
+        self.model._client = _Client()
+        self.assertEqual(
+            self.model.head_with_checksum("k"), {"ContentLength": 7})
+        self.assertEqual(len(calls), 2)
+
+
+class TempWorkspaceTests(unittest.TestCase):
+    """REGRESSION (data left behind): previews, 'open with default app' and
+    drag-out staging wrote decrypted object payloads into the system temp
+    directory and nothing ever removed them."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+    def test_directories_are_created_under_one_session_root(self):
+        ws = TempWorkspace(root=self.root, pid=1234)
+        first, second = ws.make(prefix="preview_"), ws.make(prefix="drag_")
+        self.assertTrue(os.path.isdir(first))
+        self.assertTrue(os.path.isdir(second))
+        self.assertEqual(os.path.dirname(first), ws.session_dir)
+        self.assertEqual(os.path.dirname(second), ws.session_dir)
+        self.assertTrue(
+            os.path.basename(ws.session_dir).startswith("s3duck_1234_"))
+
+    def test_cleanup_removes_everything_including_staged_payloads(self):
+        ws = TempWorkspace(root=self.root, pid=1234)
+        staged = os.path.join(ws.make(), "secret.txt")
+        with open(staged, "w") as fh:
+            fh.write("payload")
+        session = ws.session_dir
+        ws.cleanup()
+        self.assertFalse(os.path.exists(staged))
+        self.assertFalse(os.path.exists(session))
+
+    def test_cleanup_is_safe_to_repeat(self):
+        ws = TempWorkspace(root=self.root, pid=1234)
+        ws.make()
+        ws.cleanup()
+        ws.cleanup()          # must not raise on an already-removed root
+
+    def test_a_later_make_after_cleanup_starts_a_new_root(self):
+        ws = TempWorkspace(root=self.root, pid=1234)
+        first = ws.session_dir
+        ws.cleanup()
+        self.assertNotEqual(ws.session_dir, first)
+        self.assertTrue(os.path.isdir(ws.session_dir))
+
+    def test_sweep_reclaims_roots_whose_owner_is_gone(self):
+        os.makedirs(os.path.join(self.root, "s3duck_4242_abc"))
+        ws = TempWorkspace(root=self.root, pid=1234)
+        removed = ws.sweep(is_alive=lambda pid: False)
+        self.assertEqual(
+            removed, [os.path.join(self.root, "s3duck_4242_abc")])
+        self.assertFalse(os.path.exists(removed[0]))
+
+    def test_sweep_never_touches_a_running_instance(self):
+        """A second s3duck may be using its own staging right now."""
+        live = os.path.join(self.root, "s3duck_4242_abc")
+        os.makedirs(live)
+        ws = TempWorkspace(root=self.root, pid=1234)
+        self.assertEqual(ws.sweep(is_alive=lambda pid: True), [])
+        self.assertTrue(os.path.isdir(live))
+
+    def test_sweep_never_touches_our_own_root(self):
+        ws = TempWorkspace(root=self.root, pid=1234)
+        mine = ws.session_dir
+        self.assertEqual(ws.sweep(is_alive=lambda pid: False), [])
+        self.assertTrue(os.path.isdir(mine))
+
+    def test_sweep_ignores_unrelated_directories(self):
+        # "aaaaaaa9999_x" is the dangerous shape: drop the prefix check and
+        # its 8th character onward parses as a PID, so another application's
+        # temp directory would be deleted.
+        names = ("not-ours", "s3duck_notanumber_x", "s3duck_", "aaaaaaa9999_x")
+        for name in names:
+            os.makedirs(os.path.join(self.root, name))
+        ws = TempWorkspace(root=self.root, pid=1234)
+        self.assertEqual(ws.sweep(is_alive=lambda pid: False), [])
+        for name in names:
+            self.assertTrue(os.path.isdir(os.path.join(self.root, name)),
+                            f"{name} was swept")
+
+    def test_owner_pid_only_reads_our_own_names(self):
+        ws = TempWorkspace(root=self.root, pid=1234)
+        self.assertEqual(ws.owner_pid("s3duck_42_abc"), 42)
+        self.assertIsNone(ws.owner_pid("aaaaaaa9999_x"))
+        self.assertIsNone(ws.owner_pid("s3duck_nope_x"))
+
+    def test_sweep_survives_a_missing_root(self):
+        ws = TempWorkspace(root=os.path.join(self.root, "gone"), pid=1)
+        self.assertEqual(ws.sweep(is_alive=lambda pid: False), [])
+
+    def test_pid_liveness_errs_towards_keeping_files(self):
+        """An unknown answer must never authorise a delete."""
+        self.assertTrue(pid_is_alive(os.getpid()))
+        self.assertTrue(pid_is_alive("not-a-pid"))
+        self.assertTrue(pid_is_alive(None))
+        with patch.object(utils.os, "kill", side_effect=PermissionError):
+            self.assertTrue(pid_is_alive(1))
+        with patch.object(utils.os, "kill", side_effect=ProcessLookupError):
+            self.assertFalse(pid_is_alive(999999))
+
+    def test_the_window_cleans_up_on_close(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        win.temp_workspace = TempWorkspace(root=self.root, pid=1234)
+        staged = win.temp_workspace.make()
+        win.close()
+        self.assertFalse(os.path.exists(staged))
+
+
+class PrefixDownloadPlanTests(unittest.TestCase):
+    """The destination mapping shared by the download itself and the overwrite
+    check, so the two cannot disagree about what a folder download writes."""
+
+    def test_maps_keys_under_the_prefix_basename(self):
+        plan = plan_prefix_download(
+            "pics/2024/", "/out", [("pics/2024/a.jpg", 10),
+                                   ("pics/2024/sub/b.jpg", 20)])
+        self.assertEqual(plan.base_dir, os.path.join("/out", "2024"))
+        self.assertEqual(
+            [(k, p) for k, p, _s in plan.files],
+            [("pics/2024/a.jpg", os.path.join("/out", "2024", "a.jpg")),
+             ("pics/2024/sub/b.jpg",
+              os.path.join("/out", "2024", "sub", "b.jpg"))])
+
+    def test_a_key_without_a_trailing_slash_still_works(self):
+        plan = plan_prefix_download("pics", "/out", [("pics/a.jpg", 1)])
+        self.assertEqual(plan.base_dir, os.path.join("/out", "pics"))
+        self.assertEqual(len(plan.files), 1)
+
+    def test_directory_markers_become_dirs_not_files(self):
+        plan = plan_prefix_download(
+            "p/", "/out", [("p/sub/", 0), ("p/sub/f.txt", 3)])
+        self.assertEqual(plan.dirs, [os.path.join("/out", "p", "sub")])
+        self.assertEqual(len(plan.files), 1)
+
+    def test_the_prefix_itself_is_not_a_file(self):
+        plan = plan_prefix_download("p/", "/out", [("p/", 0)])
+        self.assertEqual(plan.files, [])
+        self.assertEqual(plan.dirs, [])
+
+    def test_keys_escaping_the_target_are_refused(self):
+        """S3 keys may contain '..'; a download must not write outside the
+        chosen directory."""
+        plan = plan_prefix_download(
+            "p/", "/out", [("p/../../etc/passwd", 1), ("p/ok.txt", 1)])
+        self.assertEqual(plan.unsafe, ["p/../../etc/passwd"])
+        self.assertEqual([k for k, _p, _s in plan.files], ["p/ok.txt"])
+
+    def test_blank_keys_are_ignored(self):
+        plan = plan_prefix_download("p/", "/out", [("", 0), (None, 0)])
+        self.assertEqual((plan.files, plan.dirs, plan.unsafe), ([], [], []))
+
+    def test_prefix_of_always_trailing_slashes(self):
+        """Listings keyed on a bare name also match sibling prefixes — 'pics'
+        matches 'pics-old/…' — so the slash is load-bearing."""
+        self.assertEqual(prefix_of("pics"), "pics/")
+        self.assertEqual(prefix_of("pics/"), "pics/")
+        self.assertEqual(prefix_of(""), "/")
+        self.assertEqual(prefix_of(None), "/")
+
+
+class UploadOverwriteTests(unittest.TestCase):
+    """REGRESSION (silent data loss): download, copy/move, paste and rename all
+    checked their destination, but every upload path replaced remote objects
+    with no prompt."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def setUp(self):
+        self.settings = QSettings("s3duck-tests", "s3duck-tests")
+        self.settings.clear()
+        self.addCleanup(self.settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            self.win = main_window.MainWindow(settings=(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                self.settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(self.win.close)
+        self.win.data_model.bucket = "bkt"
+        self.win.data_model.current_folder = ""
+
+    @staticmethod
+    @contextlib.contextmanager
+    def answering(choice, accepted=True):
+        """
+        Drive the REAL OverwriteDialog's exec/choice.
+
+        Patching the whole class instead would make `OverwriteDialog.SKIP` in
+        the code under test a mock attribute, so a Skip assertion would pass
+        even when the code took the Overwrite branch.
+        """
+        verdict = (QDialog.DialogCode.Accepted if accepted
+                   else QDialog.DialogCode.Rejected)
+        with patch.object(main_window.OverwriteDialog, "exec",
+                          lambda _s: verdict), \
+             patch.object(main_window.OverwriteDialog, "choice",
+                          lambda _s: choice):
+            yield
+
+    def _run_upload(self, files, conflicts, choice=None, cancel_prompt=False):
+        started = []
+        with patch.object(main_window, "QFileDialog") as fd, \
+             patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: set(conflicts)), \
+             self.answering(choice, accepted=not cancel_prompt), \
+             patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append((m, j))):
+            fd.return_value.getOpenFileNames.return_value = (files, "All (*)")
+            self.win.upload()
+        return started
+
+    def test_upload_skips_existing_objects_when_asked(self):
+        started = self._run_upload(
+            ["/tmp/a.txt", "/tmp/b.txt"], conflicts={"a.txt"},
+            choice=OverwriteDialog.SKIP)
+        self.assertEqual(len(started), 1)
+        self.assertEqual([k for k, _local in started[0][1]], ["b.txt"])
+
+    def test_upload_overwrite_keeps_everything(self):
+        started = self._run_upload(
+            ["/tmp/a.txt", "/tmp/b.txt"], conflicts={"a.txt"},
+            choice=OverwriteDialog.OVERWRITE)
+        self.assertEqual([k for k, _local in started[0][1]], ["a.txt", "b.txt"])
+
+    def test_cancelling_the_prompt_uploads_nothing(self):
+        self.assertEqual(
+            self._run_upload(["/tmp/a.txt"], conflicts={"a.txt"},
+                             choice=OverwriteDialog.OVERWRITE,
+                             cancel_prompt=True),
+            [])
+
+    def test_no_conflicts_means_no_prompt(self):
+        started = []
+        shown = []
+        with patch.object(main_window, "QFileDialog") as fd, \
+             patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: set()), \
+             patch.object(main_window.OverwriteDialog, "exec",
+                          lambda _s: shown.append(1)), \
+             patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append((m, j))):
+            fd.return_value.getOpenFileNames.return_value = (
+                ["/tmp/a.txt"], "All (*)")
+            self.win.upload()
+        self.assertEqual(shown, [])
+        self.assertEqual(len(started), 1)
+
+    def test_a_failed_destination_scan_aborts(self):
+        """_destination_conflicts returns None when the lookup failed or was
+        cancelled — uploading anyway would be the silent overwrite again."""
+        started = []
+        with patch.object(main_window, "QFileDialog") as fd, \
+             patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: None), \
+             patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append((m, j))):
+            fd.return_value.getOpenFileNames.return_value = (
+                ["/tmp/a.txt"], "All (*)")
+            self.win.upload()
+        self.assertEqual(started, [])
+
+    def test_folder_markers_are_not_treated_as_conflicts(self):
+        """A directory placeholder only creates a prefix, so it must never be
+        offered as an object about to be overwritten."""
+        asked = []
+
+        def _conflicts(_s, keys, bucket=None):
+            asked.append(list(keys))
+            return set()
+
+        job = [("dir/", None), ("dir/f.txt", "/tmp/f.txt")]
+        with patch.object(main_window.MainWindow, "_destination_conflicts",
+                          _conflicts):
+            self.win._guard_upload(job)
+        self.assertEqual(asked, [["dir/f.txt"]])
+
+    def test_skipping_every_file_uploads_nothing(self):
+        """Only folder markers left is not a job worth queueing."""
+        job = [("dir/", None), ("dir/f.txt", "/tmp/f.txt")]
+        with patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: {"dir/f.txt"}), \
+             self.answering(OverwriteDialog.SKIP):
+            self.assertIsNone(self.win._guard_upload(job))
+
+    def test_upload_folder_is_guarded(self):
+        started = []
+        with patch.object(main_window, "QFileDialog") as fd, \
+             patch.object(main_window, "_build_upload_job_for_path",
+                          lambda path, dest: [("a.txt", "/tmp/a.txt"),
+                                              ("b.txt", "/tmp/b.txt")]), \
+             patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: {"a.txt"}), \
+             self.answering(OverwriteDialog.SKIP), \
+             patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append((m, j))):
+            fd.getExistingDirectory.return_value = "/tmp/src"
+            self.win.upload_folder()
+        self.assertEqual([k for k, _l in started[0][1]], ["b.txt"])
+
+    def test_drag_and_drop_is_guarded(self):
+        """The third upload entry point — dropping files onto the list."""
+        started = []
+        event = types.SimpleNamespace(
+            source=lambda: None,
+            setDropAction=lambda _a: None,
+            accept=lambda: None,
+            ignore=lambda: None,
+            mimeData=lambda: types.SimpleNamespace(
+                hasUrls=lambda: True,
+                urls=lambda: [QUrl.fromLocalFile("/tmp/a.txt")]),
+        )
+        with patch.object(main_window, "_build_upload_job_for_path",
+                          lambda path, dest: [("a.txt", "/tmp/a.txt")]), \
+             patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: {"a.txt"}), \
+             self.answering(OverwriteDialog.SKIP), \
+             patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append((m, j))):
+            self.win.listview.dropEvent(event)
+        self.assertEqual(started, [])
+
+
+class FolderDownloadOverwriteTests(unittest.TestCase):
+    """REGRESSION: the download prompt covered file rows only, so downloading a
+    folder overwrote a whole local tree with no warning."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def setUp(self):
+        self.settings = QSettings("s3duck-tests", "s3duck-tests")
+        self.settings.clear()
+        self.addCleanup(self.settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            self.win = main_window.MainWindow(settings=(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                self.settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(self.win.close)
+
+    def test_download_target_resolves_folders_to_their_local_root(self):
+        self.assertEqual(
+            self.win._download_target(("k/f.txt", "/out/f.txt", 1, "/out")),
+            "/out/f.txt")
+        self.assertEqual(
+            self.win._download_target(("pics/2024/", None, None, "/out")),
+            os.path.join("/out", "2024"))
+
+    def test_a_folder_with_existing_local_files_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "pics"))
+            with open(os.path.join(tmp, "pics", "a.jpg"), "w") as fh:
+                fh.write("x")
+            with patch.object(_StubModel, "get_keys",
+                              lambda _s, p, **kw: [("pics/a.jpg", 1)]):
+                hits = self.win._folder_download_conflicts(
+                    [("pics/", None, None, tmp)])
+        self.assertEqual(hits, {os.path.join(tmp, "pics")})
+
+    def test_a_folder_whose_files_are_absent_is_not_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "pics"))
+            with patch.object(_StubModel, "get_keys",
+                              lambda _s, p, **kw: [("pics/a.jpg", 1)]):
+                hits = self.win._folder_download_conflicts(
+                    [("pics/", None, None, tmp)])
+        self.assertEqual(hits, set())
+
+    def test_no_folders_means_no_scan(self):
+        called = []
+        with patch.object(main_window.MainWindow, "_run_with_progress",
+                          lambda _s, t, fn: called.append(t) or (set(), None)):
+            self.assertEqual(self.win._folder_download_conflicts([]), set())
+        self.assertEqual(called, [])
+
+    def test_a_cancelled_scan_aborts_the_download(self):
+        with patch.object(main_window.MainWindow, "_run_with_progress",
+                          lambda _s, t, fn: (None, None)):
+            self.assertIsNone(self.win._folder_download_conflicts(
+                [("pics/", None, None, "/out")]))
+
+    def test_the_scan_lists_a_trailing_slashed_prefix(self):
+        """Listing 'pics' instead of 'pics/' also matches the sibling prefix
+        'pics-old/', so the check would scan the wrong objects."""
+        asked = []
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(_StubModel, "get_keys",
+                              lambda _s, p, **kw: asked.append(p) or []):
+                self.win._folder_download_conflicts(
+                    [("pics", None, None, tmp)])
+        self.assertEqual(asked, ["pics/"])
+
+    def _download_folder(self, choice, folder_hits):
+        """Drive download() with a single folder row selected."""
+        started = []
+        index = types.SimpleNamespace(column=lambda: 0)
+        item = types.SimpleNamespace(size=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(main_window, "QFileDialog") as fd, \
+                 patch.object(self.win.listview, "selectionModel",
+                              lambda: types.SimpleNamespace(
+                                  selectedIndexes=lambda: [index])), \
+                 patch.object(main_window.MainWindow, "get_row_primary_item",
+                              lambda _s, _ix: (item, "pics",
+                                               FSObjectType.FOLDER)), \
+                 patch.object(main_window.MainWindow,
+                              "_folder_download_conflicts",
+                              lambda _s, entries: {
+                                  os.path.join(tmp, "pics")} if folder_hits
+                              else set()), \
+                 patch.object(main_window.OverwriteDialog, "exec",
+                              lambda _s: QDialog.DialogCode.Accepted), \
+                 patch.object(main_window.OverwriteDialog, "choice",
+                              lambda _s: choice), \
+                 patch.object(main_window.MainWindow,
+                              "assign_thread_operation",
+                              lambda _s, m, j, **kw: started.append((m, j))):
+                fd.getExistingDirectory.return_value = tmp
+                self.win.data_model.bucket = "bkt"   # else download() no-ops
+                self.win.data_model.current_folder = ""
+                self.win.download()
+        return started
+
+    def test_downloading_a_folder_onto_existing_files_can_be_skipped(self):
+        """END-TO-END: the whole point — a folder download used to overwrite a
+        local tree with no prompt at all."""
+        self.assertEqual(
+            self._download_folder(OverwriteDialog.SKIP, folder_hits=True), [])
+
+    def test_downloading_a_folder_proceeds_when_overwrite_is_chosen(self):
+        started = self._download_folder(
+            OverwriteDialog.OVERWRITE, folder_hits=True)
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0][1][0][0], "pics/")
+
+    def test_a_clean_destination_downloads_without_a_prompt(self):
+        started = self._download_folder(OverwriteDialog.SKIP, folder_hits=False)
+        self.assertEqual(len(started), 1)
+
+
 class OverwriteDialogTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -3495,6 +4953,606 @@ class SyncPlanExcludeTests(unittest.TestCase):
             {"a.txt": (1, 1.0), "b.txt": (1, 1.0)}, {},
             direction="upload", exclude=lambda rel: rel == "a.txt")
         self.assertEqual([a["rel"] for a in actions], ["b.txt"])
+
+
+class CredentialGuardTests(unittest.TestCase):
+    """REGRESSION (crash): a missing, malformed or mismatched encryption key
+    raised AttributeError / ValueError / InvalidToken straight out of a Qt slot
+    (onStart, onEdit, check_profile, export), and PyQt6 turns an exception that
+    escapes a slot into a process ABORT — the launcher died instead of saying
+    the credentials could not be read. profile_switcher.py already handled the
+    same failure gracefully; this path did not."""
+
+    def _crypto(self):
+        return Crypto(Fernet.generate_key().decode())
+
+    def _item(self, crypto):
+        return SettingsItem(
+            "prod", "https://s3.amazonaws.com", "us-east-1", "",
+            crypto.encrypt("AKID"), crypto.encrypt("SECRET"),
+            "false", "true", crypto.encrypt("TOKEN"), "false",
+        )
+
+    def test_missing_key_reports_instead_of_crashing(self):
+        """A missing key and a corrupt key need different remedies, so the two
+        messages must stay distinct rather than collapsing into one."""
+        item = self._item(self._crypto())
+        for missing in (None, ""):
+            with self.subTest(key=missing):
+                with self.assertRaises(CredentialError) as ctx:
+                    load_profile_secrets(missing, item)
+                self.assertIn("missing", str(ctx.exception).lower())
+                self.assertIn("common/key", str(ctx.exception))
+
+    def test_malformed_key_reports_instead_of_crashing(self):
+        item = self._item(self._crypto())
+        with self.assertRaises(CredentialError) as ctx:
+            load_profile_secrets("this-is-not-a-fernet-key", item)
+        # not the "missing key" wording — the key is present but unusable
+        self.assertNotIn("missing", str(ctx.exception).lower())
+
+    def test_wrong_key_reports_instead_of_crashing(self):
+        """Settings restored from another machine, or a regenerated key."""
+        item = self._item(self._crypto())
+        other = Fernet.generate_key().decode()
+        with self.assertRaises(CredentialError) as ctx:
+            load_profile_secrets(other, item)
+        self.assertIn("decrypt", str(ctx.exception).lower())
+
+    def test_corrupt_blob_reports_instead_of_crashing(self):
+        crypto = self._crypto()
+        item = self._item(crypto)
+        item.enc_secret_key = b"not-a-token"
+        with self.assertRaises(CredentialError):
+            load_profile_secrets(crypto.key, item)
+
+    def test_absent_blob_reports_instead_of_crashing(self):
+        crypto = self._crypto()
+        item = self._item(crypto)
+        item.enc_access_key = None
+        with self.assertRaises(CredentialError):
+            load_profile_secrets(crypto.key, item)
+
+    def test_good_key_round_trips(self):
+        crypto = self._crypto()
+        item = self._item(crypto)
+        self.assertEqual(
+            load_profile_secrets(crypto.key, item), ("AKID", "SECRET", "TOKEN"))
+
+    def test_optional_token_absent_is_not_an_error(self):
+        crypto = self._crypto()
+        item = self._item(crypto)
+        item.enc_session_token = ""
+        self.assertEqual(load_profile_secrets(crypto.key, item)[2], "")
+
+    def test_encrypting_with_a_bad_key_reports_instead_of_crashing(self):
+        for bad in (None, "", "not-a-fernet-key"):
+            with self.subTest(key=bad):
+                with self.assertRaises(CredentialError):
+                    Crypto(bad).encrypt("secret")
+
+    def test_require_crypto_validates_eagerly(self):
+        """The write paths must fail before a half-written profile is stored."""
+        with self.assertRaises(CredentialError):
+            require_crypto(None)
+        with self.assertRaises(CredentialError):
+            require_crypto("not-a-fernet-key")
+        good = Fernet.generate_key().decode()
+        self.assertEqual(require_crypto(good).decrypt(
+            require_crypto(good).encrypt("x")), "x")
+
+
+class SharedCryptoTests(unittest.TestCase):
+    """The launcher and the runtime profile switcher must use ONE Crypto.
+    They previously had separate classes: only the launcher's was hardened,
+    and the switcher's coerced values differently."""
+
+    def test_one_class_shared_by_every_module(self):
+        self.assertIs(s3duck.Crypto, utils.Crypto)
+        self.assertIs(profile_switcher.Crypto, utils.Crypto)
+        self.assertIs(s3duck.CredentialError, utils.CredentialError)
+
+    def test_decrypt_accepts_bytes_str_and_qbytearray(self):
+        """QSettings hands back bytes or QByteArray depending on the backend.
+        REGRESSION: the switcher coerced with `str(value).encode()`, which for
+        a QByteArray yields the literal repr b\"b'…'\" and never decrypts."""
+        crypto = Crypto(Fernet.generate_key().decode())
+        token = crypto.encrypt("secret")
+        self.assertEqual(crypto.decrypt(token), "secret")
+        self.assertEqual(crypto.decrypt(token.decode()), "secret")
+        self.assertEqual(crypto.decrypt(QByteArray(token)), "secret")
+
+    def test_missing_value_is_an_error_for_a_required_field(self):
+        """An absent stored value and a key mismatch need different remedies,
+        so blaming the key for an empty field would misdirect the user."""
+        crypto = Crypto(Fernet.generate_key().decode())
+        for empty in (None, ""):
+            with self.subTest(value=empty):
+                with self.assertRaises(CredentialError) as ctx:
+                    crypto.decrypt(empty)
+                self.assertIn("empty", str(ctx.exception).lower())
+                self.assertNotIn("different one", str(ctx.exception))
+
+    def test_decrypt_optional_is_shared_and_forgiving(self):
+        crypto = Crypto(Fernet.generate_key().decode())
+        self.assertEqual(utils.decrypt_optional(crypto, None), "")
+        self.assertEqual(utils.decrypt_optional(crypto, b"garbage"), "")
+        self.assertEqual(
+            utils.decrypt_optional(crypto, crypto.encrypt("tok")), "tok")
+
+
+class ProfileSummaryTests(unittest.TestCase):
+    """The launcher list showed names only, so profiles differing only by
+    endpoint/region were indistinguishable and the read-only and
+    TLS-unverified flags were invisible until after connecting."""
+
+    @staticmethod
+    def _item(**kw):
+        fields = dict(
+            name="prod", url="https://s3.amazonaws.com", region="us-east-1",
+            bucket_name="", enc_access_key=b"", enc_secret_key=b"",
+            no_ssl_check="false", use_path="false", enc_session_token=b"",
+            read_only="false")
+        fields.update(kw)
+        return SettingsItem(**fields)
+
+    def test_endpoint_and_region(self):
+        self.assertEqual(profile_summary(self._item()),
+                         "https://s3.amazonaws.com · us-east-1")
+
+    def test_bucket_is_included_when_pinned(self):
+        self.assertIn("logs", profile_summary(self._item(bucket_name="logs")))
+
+    def test_flags_are_badges_not_summary_text(self):
+        """A safety flag appended to the dim endpoint line reads as more
+        metadata, so the flags live beside the name instead."""
+        item = self._item(read_only="true", no_ssl_check="true")
+        self.assertEqual(profile_badges(item), ["read-only", "TLS unverified"])
+        summary = profile_summary(item)
+        self.assertNotIn("read-only", summary)
+        self.assertNotIn("TLS unverified", summary)
+
+    def test_badges_are_absent_when_flags_are_off(self):
+        self.assertEqual(profile_badges(self._item()), [])
+
+    def test_each_flag_stands_alone(self):
+        self.assertEqual(profile_badges(self._item(read_only="true")),
+                         ["read-only"])
+        self.assertEqual(profile_badges(self._item(no_ssl_check="true")),
+                         ["TLS unverified"])
+
+    def test_missing_endpoint_is_called_out(self):
+        self.assertIn("(no endpoint)", profile_summary(self._item(url="")))
+
+    def test_blank_optional_fields_leave_no_empty_separators(self):
+        summary = profile_summary(self._item(region="", bucket_name=""))
+        self.assertEqual(summary, "https://s3.amazonaws.com")
+        self.assertNotIn("··", summary)
+        self.assertFalse(summary.endswith("·"))
+
+
+class LauncherListTests(unittest.TestCase):
+    """Rows, keyboard handling and the non-blocking connect probe."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _launcher(self, items=()):
+        win = s3duck.Profiles()
+        # Never write to the real config from a test.
+        win.settings = QSettings("s3duck-tests", "s3duck-tests")
+        win.items = list(items)
+        win.populate_list()
+        if win.items:
+            win.listWidget.setCurrentRow(0)
+        self.addCleanup(win.close)
+        return win
+
+    @staticmethod
+    def _item(name="prod", **kw):
+        fields = dict(
+            name=name, url="https://s3.amazonaws.com", region="us-east-1",
+            bucket_name="", enc_access_key=b"", enc_secret_key=b"",
+            no_ssl_check="false", use_path="false", enc_session_token=b"",
+            read_only="false")
+        fields.update(kw)
+        return SettingsItem(**fields)
+
+    def test_rows_show_the_name_and_the_summary(self):
+        win = self._launcher([self._item(read_only="true")])
+        row = win.listWidget.item(0)
+        first, _, second = row.text().partition("\n")
+        self.assertEqual(first, "prod")
+        self.assertIn("us-east-1", second)
+
+    def test_rows_carry_their_badges_for_the_delegate(self):
+        win = self._launcher([self._item(read_only="true", no_ssl_check="true"),
+                              self._item("plain")])
+        self.assertEqual(
+            win.listWidget.item(0).data(Qt.ItemDataRole.UserRole),
+            ["read-only", "TLS unverified"])
+        self.assertEqual(
+            win.listWidget.item(1).data(Qt.ItemDataRole.UserRole), [])
+
+    def test_the_tooltip_still_carries_everything(self):
+        """The row elides; the tooltip is the fallback for the full truth."""
+        win = self._launcher([self._item(read_only="true")])
+        tip = win.listWidget.item(0).toolTip()
+        self.assertIn("s3.amazonaws.com", tip)
+        self.assertIn("us-east-1", tip)
+        self.assertIn("read-only", tip)
+
+    def _paint_row(self, win, row, selected=False, width=400):
+        """Drive the delegate directly. Qt swallows a Python error raised
+        inside a virtual call into a process abort, so calling paint() from
+        the test is what turns a mistake there into a test failure."""
+        delegate = win.listWidget.itemDelegate()
+        pixmap = QPixmap(width, 60)
+        pixmap.fill()
+        painter = QPainter(pixmap)
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, width, 60)
+        option.font = win.listWidget.font()
+        option.palette = win.listWidget.palette()
+        if selected:
+            option.state |= QStyle.StateFlag.State_Selected
+        try:
+            delegate.paint(painter, option,
+                           win.listWidget.model().index(row, 0))
+        finally:
+            painter.end()
+        return delegate, option
+
+    def test_rows_paint_in_both_states(self):
+        """REGRESSION: paint() referenced a name the launcher never imported;
+        every unit test passed while the real window crashed on first draw."""
+        win = self._launcher([self._item(read_only="true"),
+                              self._item("dev", url="", region="")])
+        for row in (0, 1):
+            for selected in (False, True):
+                with self.subTest(row=row, selected=selected):
+                    self._paint_row(win, row, selected)
+
+    def test_the_summary_font_is_smaller_but_stays_legible(self):
+        base = QFont()
+        base.setPointSizeF(11.0)
+        self.assertLess(s3duck._summary_font(base).pointSizeF(), 11.0)
+
+        tiny = QFont()
+        tiny.setPointSizeF(7.0)
+        self.assertGreaterEqual(s3duck._summary_font(tiny).pointSizeF(), 7.0)
+
+    def test_a_pixel_sized_font_is_left_alone(self):
+        """pointSizeF() is -1 for a pixel-sized font; subtracting from it
+        would ask Qt for a negative point size."""
+        pixels = QFont()
+        pixels.setPixelSize(14)
+        self.assertEqual(s3duck._summary_font(pixels).pixelSize(), 14)
+
+    def test_the_list_uses_the_profile_delegate(self):
+        win = self._launcher([self._item()])
+        self.assertIsInstance(win.listWidget.itemDelegate(),
+                              s3duck.ProfileRowDelegate)
+
+    def test_badges_paint_and_keep_their_own_colours(self):
+        win = self._launcher([self._item(read_only="true", no_ssl_check="true")])
+        for selected in (False, True):
+            with self.subTest(selected=selected):
+                self._paint_row(win, 0, selected)
+
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        read_only = s3duck.badge_color("read-only", palette, False)
+        insecure = s3duck.badge_color("TLS unverified", palette, False)
+        self.assertNotEqual(read_only, insecure)
+        self.assertEqual(read_only, s3duck.BADGE_COLORS["read-only"])
+
+    def test_a_selected_badge_stays_readable_on_the_highlight(self):
+        """Its own colour would sit on the highlight brush and lose contrast."""
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        self.assertEqual(s3duck.badge_color("read-only", palette, True),
+                         QColor("#ffffff"))
+
+    def test_a_long_name_cannot_push_a_badge_off_the_row(self):
+        """A truncated safety flag is worse than a truncated name, so badge
+        width is reserved before the name is elided."""
+        long_name = "a" * 400
+        win = self._launcher([self._item(long_name, read_only="true")])
+        badge_width = QFontMetrics(
+            s3duck._summary_font(win.listWidget.font())
+        ).horizontalAdvance("[read-only]")
+
+        painted = []
+        with patch.object(QPainter, "drawText",
+                          lambda self, x, y, text: painted.append((x, text))):
+            _, option = self._paint_row(win, 0, width=240)
+
+        drawn = [t for _, t in painted]
+        self.assertIn("[read-only]", drawn)
+        name_text = painted[0][1]
+        self.assertTrue(name_text.endswith("…"), f"name not elided: {name_text}")
+        # The badge must end inside the row. paint() insets by 6px a side, so
+        # the usable right edge is rect.right() - 6.
+        badge_x = next(x for x, t in painted if t == "[read-only]")
+        self.assertLessEqual(badge_x + badge_width, option.rect.right() - 6)
+
+    def test_a_selected_row_uses_the_highlight_pen(self):
+        """Without the switch the name is drawn in the ordinary text colour on
+        top of the highlight brush — dark on dark on most themes."""
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.Text, QColor("#101010"))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        self.assertEqual(s3duck.row_text_color(palette, True),
+                         QColor("#ffffff"))
+        self.assertEqual(s3duck.row_text_color(palette, False),
+                         QColor("#101010"))
+
+    def test_a_row_is_tall_enough_for_both_lines(self):
+        win = self._launcher([self._item()])
+        delegate, option = self._paint_row(win, 0)
+        index = win.listWidget.model().index(0, 0)
+        two_line = delegate.sizeHint(option, index).height()
+        single = QFontMetrics(win.listWidget.font()).height()
+        self.assertGreater(two_line, single * 1.5)
+
+    def test_a_row_without_a_summary_stays_compact(self):
+        win = self._launcher([self._item()])
+        win.listWidget.item(0).setText("just-a-name")
+        delegate, option = self._paint_row(win, 0)
+        index = win.listWidget.model().index(0, 0)
+        bare = delegate.sizeHint(option, index).height()
+        win.listWidget.item(0).setText("just-a-name\nwith a summary")
+        tall = delegate.sizeHint(option, index).height()
+        self.assertLess(bare, tall)
+
+    def test_buttons_do_not_steal_enter(self):
+        """REGRESSION: QDialog buttons are autoDefault, so Enter on the list
+        fired Add — the first button — instead of opening the profile."""
+        win = self._launcher([self._item()])
+        for button in (win.btnRun, win.btnAdd, win.btnEdit, win.btnDelete):
+            with self.subTest(button=button.text()):
+                self.assertFalse(button.autoDefault())
+                self.assertFalse(button.isDefault())
+
+    def _press(self, win, key):
+        event = QKeyEvent(QEvent.Type.KeyPress, key, Qt.KeyboardModifier.NoModifier)
+        return win.eventFilter(win.listWidget, event)
+
+    def test_keys_drive_the_matching_actions(self):
+        for key, handler in ((Qt.Key.Key_Return, "onStart"),
+                             (Qt.Key.Key_Enter, "onStart"),
+                             (Qt.Key.Key_Delete, "onDelete"),
+                             (Qt.Key.Key_F2, "onEdit")):
+            with self.subTest(key=key):
+                win = self._launcher([self._item()])
+                with patch.object(s3duck.Profiles, handler) as called:
+                    self.assertTrue(self._press(win, key))
+                called.assert_called_once_with()
+
+    def test_other_keys_are_left_to_the_list(self):
+        """Arrow keys and type-ahead must keep working."""
+        win = self._launcher([self._item()])
+        for key in (Qt.Key.Key_Down, Qt.Key.Key_A, Qt.Key.Key_Escape):
+            with self.subTest(key=key):
+                self.assertFalse(self._press(win, key))
+
+    def test_connect_probe_runs_off_the_gui_thread(self):
+        """REGRESSION (freeze): list_buckets() ran inline in the slot, so an
+        unreachable endpoint locked the launcher for the whole connect
+        timeout with no way to cancel."""
+        win = self._launcher([self._item()])
+        win._secrets_or_warn = lambda item: ("AK", "SK", "")
+        with patch.object(s3duck, "DataModel") as model, \
+                patch.object(s3duck, "MainWindow") as main, \
+                patch.object(s3duck, "run_with_progress",
+                             return_value=(True, None)) as runner:
+            win.onStart()
+        runner.assert_called_once()
+        self.assertIs(runner.call_args.args[0], win)
+        # the probe must be handed over as a callable, not already invoked
+        self.assertFalse(model.return_value.list_buckets.called)
+        main.assert_called_once()
+
+    def test_cancelling_the_probe_does_not_open_a_window(self):
+        win = self._launcher([self._item()])
+        win._secrets_or_warn = lambda item: ("AK", "SK", "")
+        with patch.object(s3duck, "DataModel"), \
+                patch.object(s3duck, "MainWindow") as main, \
+                patch.object(s3duck, "QMessageBox") as box, \
+                patch.object(s3duck, "run_with_progress",
+                             return_value=(None, None)):
+            win.onStart()
+        main.assert_not_called()
+        box.assert_not_called()          # a cancel is not an error
+
+    def test_a_failed_probe_reports_and_does_not_open_a_window(self):
+        win = self._launcher([self._item()])
+        win._secrets_or_warn = lambda item: ("AK", "SK", "")
+        with patch.object(s3duck, "DataModel"), \
+                patch.object(s3duck, "MainWindow") as main, \
+                patch.object(s3duck, "QMessageBox") as box, \
+                patch.object(s3duck, "run_with_progress",
+                             return_value=(None, RuntimeError("host down"))):
+            win.onStart()
+        main.assert_not_called()
+        shown = " ".join(str(c) for c in box.return_value.setText.call_args_list)
+        self.assertIn("host down", shown)
+
+    def test_check_profile_runs_off_the_gui_thread(self):
+        win = self._launcher([self._item()])
+        win._secrets_or_warn = lambda item: ("AK", "SK", "")
+        with patch.object(s3duck, "DataModel") as model, \
+                patch.object(s3duck, "QMessageBox") as box, \
+                patch.object(s3duck, "run_with_progress",
+                             return_value=((False, "denied"), None)) as runner:
+            win.check_profile()
+        runner.assert_called_once()
+        self.assertFalse(model.return_value.check_profile.called)
+        shown = " ".join(str(c) for c in box.return_value.setText.call_args_list)
+        self.assertIn("denied", shown)
+
+    def test_check_profile_reports_a_raised_error(self):
+        """run_with_progress returns the exception rather than raising it, and
+        an unhandled one here would abort the process from a Qt slot."""
+        win = self._launcher([self._item()])
+        win._secrets_or_warn = lambda item: ("AK", "SK", "")
+        with patch.object(s3duck, "DataModel"), \
+                patch.object(s3duck, "QMessageBox") as box, \
+                patch.object(s3duck, "run_with_progress",
+                             return_value=(None, RuntimeError("no route"))):
+            win.check_profile()
+        shown = " ".join(str(c) for c in box.return_value.setText.call_args_list)
+        self.assertIn("no route", shown)
+
+    def test_cancelling_check_profile_reports_nothing(self):
+        win = self._launcher([self._item()])
+        win._secrets_or_warn = lambda item: ("AK", "SK", "")
+        with patch.object(s3duck, "DataModel"), \
+                patch.object(s3duck, "QMessageBox") as box, \
+                patch.object(s3duck, "run_with_progress",
+                             return_value=(None, None)):
+            win.check_profile()
+        box.assert_not_called()
+
+
+class EncryptionPropertiesTests(unittest.TestCase):
+    """Properties a credential store must actually hold, as opposed to lines
+    merely being executed: secrets must not be recoverable from the stored
+    blob, and a value written in one process must read back in another."""
+
+    SECRET = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+    def test_generate_key_yields_a_usable_and_unique_key(self):
+        first, second = Crypto.generate_key(), Crypto.generate_key()
+        self.assertNotEqual(first, second)
+        self.assertIsInstance(first, str)
+        crypto = Crypto(first)
+        self.assertEqual(crypto.decrypt(crypto.encrypt(self.SECRET)), self.SECRET)
+
+    def test_plaintext_never_appears_in_the_stored_blob(self):
+        """The whole point of encrypting credentials at rest."""
+        crypto = Crypto(Crypto.generate_key())
+        token = crypto.encrypt(self.SECRET)
+        self.assertNotIn(self.SECRET.encode(), token)
+        self.assertNotIn(b"wJalrXUt", token)
+
+    def test_the_same_value_encrypts_differently_each_time(self):
+        """Fernet randomises the IV; identical ciphertexts would leak that two
+        profiles share a secret."""
+        crypto = Crypto(Crypto.generate_key())
+        first = crypto.encrypt(self.SECRET)
+        second = crypto.encrypt(self.SECRET)
+        self.assertNotEqual(first, second)
+        self.assertEqual(crypto.decrypt(first), crypto.decrypt(second))
+
+    def test_a_token_survives_a_new_crypto_instance(self):
+        """Written on save, read back by a later process — the real lifecycle."""
+        key = Crypto.generate_key()
+        token = Crypto(key).encrypt(self.SECRET)
+        self.assertEqual(Crypto(key).decrypt(token), self.SECRET)
+
+    def test_a_bytes_key_is_accepted(self):
+        key = Fernet.generate_key()          # bytes, not str
+        crypto = Crypto(key)
+        self.assertEqual(crypto.decrypt(crypto.encrypt("v")), "v")
+
+    def test_round_trips_awkward_values(self):
+        crypto = Crypto(Crypto.generate_key())
+        for value in ("", "ünïcødé-Ключ-🦆", "x" * 4096, "line\nbreak\ttab",
+                      "aws/session+token=="):
+            with self.subTest(value=value[:20]):
+                self.assertEqual(crypto.decrypt(crypto.encrypt(value)), value)
+
+    def test_empty_plaintext_round_trips_but_an_empty_token_errors(self):
+        """Two different things that both look 'empty': a stored empty secret
+        is valid and returns ''; a missing stored value is an error."""
+        crypto = Crypto(Crypto.generate_key())
+        token = crypto.encrypt("")
+        self.assertTrue(token)
+        self.assertEqual(crypto.decrypt(token), "")
+        with self.assertRaises(CredentialError):
+            crypto.decrypt("")
+
+    def test_encrypt_coerces_none_to_empty(self):
+        crypto = Crypto(Crypto.generate_key())
+        self.assertEqual(crypto.decrypt(crypto.encrypt(None)), "")
+
+    def test_decrypt_falls_back_to_str_for_exotic_values(self):
+        """QSettings-like wrappers that are neither bytes nor str and cannot
+        be bytes()-converted still have to decrypt."""
+        crypto = Crypto(Crypto.generate_key())
+        token = crypto.encrypt(self.SECRET)
+
+        class Wrapped:
+            def __init__(self, raw):
+                self._raw = raw
+
+            def __str__(self):
+                return self._raw.decode()
+
+        with self.assertRaises(TypeError):
+            bytes(Wrapped(token))            # the fallback really is needed
+        self.assertEqual(crypto.decrypt(Wrapped(token)), self.SECRET)
+
+    def test_a_token_is_worthless_without_the_key(self):
+        token = Crypto(Crypto.generate_key()).encrypt(self.SECRET)
+        with self.assertRaises(CredentialError):
+            Crypto(Crypto.generate_key()).decrypt(token)
+
+
+class ProfileSwitcherCryptoTests(unittest.TestCase):
+    """The runtime profile switcher shows `str(exc)` in a warning box."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _settings(self, key):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        settings.beginGroup("common")
+        settings.setValue("key", key)
+        settings.endGroup()
+        return settings
+
+    def _raw(self, crypto):
+        return {
+            "name": "prod", "url": "https://s3.amazonaws.com",
+            "region": "us-east-1", "bucket_name": "",
+            "access_key": crypto.encrypt("AKID"),
+            "secret_key": crypto.encrypt("SECRET"),
+            "no_ssl_check": "false", "use_path": "true",
+            "session_token": crypto.encrypt("TOK"), "read_only": "false",
+        }
+
+    def test_good_key_round_trips(self):
+        crypto = Crypto(Fernet.generate_key().decode())
+        prof = profile_switcher.decrypt_profile(
+            self._settings(crypto.key), self._raw(crypto))
+        self.assertEqual(prof.access_key, "AKID")
+        self.assertEqual(prof.secret_key, "SECRET")
+        self.assertEqual(prof.session_token, "TOK")
+
+    def test_wrong_key_error_message_is_not_blank(self):
+        """REGRESSION: a mismatched key raised InvalidToken, whose str() is
+        EMPTY — the switcher then showed a warning box with no text at all."""
+        crypto = Crypto(Fernet.generate_key().decode())
+        raw = self._raw(crypto)
+        other = Fernet.generate_key().decode()
+        with self.assertRaises(CredentialError) as ctx:
+            profile_switcher.decrypt_profile(self._settings(other), raw)
+        self.assertTrue(str(ctx.exception).strip())
+        self.assertIn("decrypt", str(ctx.exception).lower())
+
+    def test_missing_key_is_reported(self):
+        crypto = Crypto(Fernet.generate_key().decode())
+        with self.assertRaises(CredentialError) as ctx:
+            profile_switcher.decrypt_profile(
+                self._settings(""), self._raw(crypto))
+        self.assertIn("missing", str(ctx.exception).lower())
 
 
 class SelectedRowIndexTests(unittest.TestCase):
