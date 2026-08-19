@@ -231,6 +231,27 @@ def icon_is_visible(icon, probe_size: int = ICON_PROBE_SIZE) -> bool:
     return False
 
 
+def bundled_icon(path, probe_size: int = ICON_PROBE_SIZE):
+    """
+    A bundled icon in a format this Qt build can actually read.
+
+    Debian/Mint's ``python3-pyqt6`` ships no QtSvg and its Qt has no SVG image
+    plugin, so ``QIcon("x.svg")`` there is NOT null — it just paints nothing.
+    Every .svg therefore has a same-stem .png twin, and the first candidate
+    that renders visibly wins: SVG when it works (crisper at any size), PNG
+    otherwise.
+    """
+    candidates = [path] if path else []
+    stem, ext = os.path.splitext(path or "")
+    if ext.lower() == ".svg":
+        candidates.append(stem + ".png")
+    for candidate in candidates:
+        icon = QIcon(candidate)
+        if icon_is_visible(icon, probe_size):
+            return icon
+    return QIcon()
+
+
 def themed_icon(name, fallback_path="", probe_size: int = ICON_PROBE_SIZE):
     """
     A toolbar/menu icon that is never blank.
@@ -250,7 +271,7 @@ def themed_icon(name, fallback_path="", probe_size: int = ICON_PROBE_SIZE):
         return _icon_cache[key]
     icon = QIcon.fromTheme(name) if name else QIcon()
     if not icon_is_visible(icon, probe_size):
-        icon = QIcon(fallback_path) if fallback_path else QIcon()
+        icon = bundled_icon(fallback_path, probe_size)
     _icon_cache[key] = icon
     return icon
 

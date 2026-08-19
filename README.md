@@ -7,13 +7,35 @@ Simple cross-platform GUI client for S3-compatible object storage (AWS S3, MinIO
 
 ---
 
+## Continuous integration
+
+GitHub Actions (`.github/workflows/ci.yml`) runs three jobs on every push and
+pull request:
+
+- **tests** — the offscreen suite on Python 3.11 and 3.12, against both the
+  pinned PyQt6 from `requirements.txt` and the newest wheel. The same code has
+  behaved differently on a wheel, a pinned older wheel and Debian's
+  `python3-pyqt6`, so more than one Qt is covered on purpose.
+- **icons without the Qt SVG plugin** — strips PyQt6's SVG icon engine to
+  reproduce Debian/Mint's `python3-pyqt6`, then requires every icon to still
+  render from its bundled PNG twin. This is the environment that produced blank
+  toolbar buttons.
+- **.deb package** — builds the package and checks that the build substituted
+  every control placeholder, that `Installed-Size` is measured rather than
+  hardcoded, that the Qt SVG/PDF dependencies are declared, and that a PNG twin
+  ships for every bundled SVG.
+
 ## Features
 
 - **Multi-profile management** — create, edit, copy, and delete named connection profiles; credentials are encrypted at rest using Fernet symmetric encryption. Each row shows its endpoint, region and pinned bucket, with colour-coded `[read-only]` / `[TLS unverified]` badges beside the name, and the list is keyboard-driven (`Enter` opens, `F2` edits, `Del` removes). Connecting runs off the UI thread behind a cancellable dialog, so an unreachable endpoint no longer freezes the launcher
 - **Profile export / import** — move profiles between machines as a bundle whose credentials are encrypted with a passphrase you choose (never written in the clear)
 - **Read-only profiles** — mark a profile read-only to block every write and delete; the toolbar and context menus hide mutating actions, the title bar shows `[read-only]`, and the data layer refuses writes as a backstop
 - **Temporary credentials** — session-token support for STS / SSO / assumed-role / MFA keys, with one-click import of any profile from `~/.aws/credentials`
+- **Icons that survive a minimal Qt** — the toolbar prefers your desktop icon theme, but falls back to bundled art whenever the theme has no entry *or* paints nothing visible; each bundled SVG has a PNG twin, so icons still appear on a Qt build without the SVG plugin (Debian/Mint's `python3-pyqt6` ships none). Run `python3 tools/icon_report.py` to see what your desktop resolves
 - **Per-profile accent colour** — mark a profile with a colour; the launcher row and the open window both carry it, so prod is distinguishable from dev at a glance
+- **Diagnostics** (Tools → Diagnostics…) — Qt plugin availability, how every icon resolves, library versions and the active transfer settings, in one copyable report
+- **Quick open** (`Ctrl+P`) — type-to-jump across buckets and bookmarks, using the command palette's matcher
+- **Sync to another profile** — compare this prefix against one in a different account or provider, review the dry-run plan, then run it; the bytes stream through this machine because no server-side copy can span two credentials
 - **Command palette** (`Ctrl+K`) — type-to-run index of every available action, built from the live actions so it cannot drift
 - **Copy to another profile** — stream objects (or whole prefixes) into a different account or provider; a server-side copy cannot use two sets of credentials, so the bytes travel through this machine
 - **Bucket browser** — list, create, and delete buckets; recursive delete runs through the transfer queue (progress + cancel, UI stays responsive)
@@ -24,11 +46,12 @@ Simple cross-platform GUI client for S3-compatible object storage (AWS S3, MinIO
 - **Download** — single files or entire folder prefixes, recreating the directory tree locally
 - **Download as ZIP** — stream a selection (files and whole folders) straight into one archive, without staging it on disk twice
 - **Drag out** — drag objects from the list onto a file manager; the selection is downloaded to a temp folder first, with progress and a size warning. Staged payloads are removed when the app exits, and a crashed run's leftovers are reclaimed on the next start
+- **Resumable uploads** — a large upload is sent part by part with its upload id recorded, so an interrupted transfer resumes instead of restarting; a cancelled one deliberately leaves the parts on the server (clean them up from Incomplete uploads)
 - **Resumable downloads** — large files download as parallel ranges into a `.s3duckpart` file with a progress sidecar, so an interrupted transfer picks up where it stopped instead of restarting (a changed ETag discards the stale partial)
 - **Additional checksums** — upload with CRC32/SHA1/SHA256; CRC32 is requested as a whole-object checksum so multipart objects stay verifiable, unlike a multipart ETag
 - **Checksum verification** — optionally compare each downloaded file against the object's stored digest and fail the transfer on a mismatch; a full-object checksum is preferred over the ETag, which cannot be checked for multipart objects
 - **Parallel transfers** — configurable number of files moving at once *and* multipart connections within each file; applies to uploads, downloads (including whole prefixes) and sync
-- **Transfer settings** — files in flight, connections per file, plus the storage class and server-side encryption (SSE-S3 / SSE-KMS) applied to uploads, persisted across sessions
+- **Transfer settings** — files in flight, connections per file, multipart part size and threshold, resumable uploads, plus the storage class, checksum and server-side encryption (SSE-S3 / SSE-KMS) applied to uploads, persisted across sessions
 - **Overwrite protection** — uploads (dialog, folder upload and drag-in), downloads (single files *and* whole folders), copies, moves, renames and pastes all detect existing destinations and offer Skip / Overwrite / Cancel
 - **Sync with a local folder** (`Ctrl+E`) — compare a directory against a prefix in either direction, review a dry-run plan (upload / download / delete / skip with a reason per file), then run it through the queue; supports exclude globs (`*.tmp`, `node_modules/`) and optionally deleting extras at the destination
 - **Transfer queue** — queued jobs with per-row progress, cancel, and retry for failed or cancelled entries
@@ -54,6 +77,7 @@ Simple cross-platform GUI client for S3-compatible object storage (AWS S3, MinIO
 - **Make public** — set `public-read` ACL and copy direct URL; when the ACL is refused, Block Public Access and Object Ownership settings are reported as the reason
 - **Clickable breadcrumb** — jump straight to any parent prefix, the bucket root, or the bucket list from the path bar
 - **Go to location** (`Ctrl+L`) — paste an `s3://bucket/prefix` (or a bare prefix) and jump straight there, across buckets
+- **Restore last location** — each profile reopens the bucket and prefix you left it in, and the launcher preselects the profile you used last
 - **Bookmarks** (`Ctrl+B`) — save any bucket/prefix and return to it from the toolbar menu, with rename/remove management; stored per profile
 - **Remembered layout** — splitter position, column widths and sort order persist between sessions
 - **Listing summary** — folder/file counts and total size of the current listing in the status bar

@@ -6,15 +6,6 @@ limitations worth fixing. Items move up or down based on review findings.
 
 ## Tier 1 — high value
 
-- **Restore last location** — reopen the previous bucket/prefix per profile on
-  startup (bookmarks landed; this is the second half of that request).
-- **Remote ↔ remote compare & sync** — the dry-run sync engine only pairs
-  local↔remote today; comparing two prefixes (same or different buckets) would
-  reuse `list_tree` + `build_sync_plan` nearly unchanged.
-- **Resumable multipart uploads** — downloads resume from a `.s3duckpart`
-  sidecar; interrupted large uploads still restart from zero. boto3's
-  low-level multipart API + the incomplete-uploads machinery already in place
-  make this tractable.
 - **Dual-pane mode** — two listings side by side (local↔remote or
   remote↔remote) with F5/F6-style copy/move between them; the clipboard and
   cross-bucket transfer plumbing already exists.
@@ -45,7 +36,6 @@ colours in 0.15.0. What is left:
   of profiles.
 - **Duplicate-name validation** — Add/Edit accept a name already in use, and
   only import de-duplicates (`-imported` suffix).
-- **Remember the last-used profile** — preselect it instead of always row 0.
 - **Connection state per row** — show the result of the last probe (reachable
   / refused / never tried) so a broken profile is visible before Run.
 
@@ -60,6 +50,9 @@ colours in 0.15.0. What is left:
   size + ETag; confirming the "same size, ETags cannot compare" candidates
   would mean downloading and hashing them, which is worth offering explicitly
   for small files.
+- **Same-bucket remote↔remote sync** — cross-profile sync landed, which also
+  covers two prefixes in different accounts; comparing two prefixes inside one
+  profile still goes through the local-folder dialog.
 - **Cross-profile move** — copying between profiles landed; deleting the
   source afterwards (a true move) is the obvious follow-up, and needs the
   same are-you-sure care as any cross-account delete.
@@ -76,6 +69,13 @@ colours in 0.15.0. What is left:
 
 ## Known limitations (accepted for now)
 
+- A cross-profile copy or sync cannot be re-run from transfer history: the
+  stored record is JSON and never held the other profile's connection. The
+  history dialog says so rather than queueing a job that must fail.
+- Cancelling a resumable upload leaves its parts on the server on purpose,
+  since that is what the next attempt resumes from. Abandoned ones are cleaned
+  up from Tools -> Incomplete uploads.
+
 - The preview's syntax highlighter is deliberately language-agnostic; a `#`
   inside a string literal is coloured as a comment.
 - Drag-out must download the selection before the drag can start (Qt drags
@@ -87,6 +87,9 @@ colours in 0.15.0. What is left:
   boundaries. Uploading with an additional CRC32 checksum (Transfer settings)
   makes those objects verifiable; without one, verification reports them as
   "not comparable" and passes.
+- Bundled PNG twins are a fixed 48px raster, so on a Qt build without the SVG
+  plugin icons do not scale as crisply as the SVGs would. Installing
+  `python3-pyqt6.qtsvg` restores vector icons; the .deb recommends it.
 - The command palette lists the toolbar and window-level actions. Context-menu
   entries are built on demand when the menu opens, so they are not in it.
 - Cancelling a background scan (destination check, drag-out measure, duplicate

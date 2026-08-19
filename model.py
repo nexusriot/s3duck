@@ -253,7 +253,13 @@ class Model:
     MAX_PARALLEL_FILES = 32
     # Downloads this size or larger go through the resumable ranged path.
     RESUME_THRESHOLD = 16 * 1024 * 1024
-    RESUME_CHUNK_SIZE = 8 * 1024 * 1024
+
+    # Multipart tuning. Non-AWS backends often want a different part size, and
+    # the part size also decides how a resumable upload is chunked.
+    DEFAULT_MULTIPART_THRESHOLD_MB = 16
+    DEFAULT_MULTIPART_CHUNKSIZE_MB = 8
+    MIN_MULTIPART_CHUNKSIZE_MB = 5      # S3's own floor for a non-final part
+    MAX_MULTIPART_CHUNKSIZE_MB = 512
     PART_SUFFIX = ".s3duckpart"
 
     def __init__(
@@ -332,6 +338,20 @@ class Model:
             self.DEFAULT_PARALLEL_FILES if parallel_files is None else parallel_files
         )
 
+        self.multipart_threshold_mb = self.DEFAULT_MULTIPART_THRESHOLD_MB
+        self.multipart_chunksize_mb = self.DEFAULT_MULTIPART_CHUNKSIZE_MB
+        # Ranged downloads chunk at the part size by default; kept as its own
+        # attribute so a test can use a size the MiB setting cannot express.
+        self.resume_chunk_size = self.multipart_chunksize_bytes
+        # Part size actually used when chunking an upload; its own attribute
+        # for the same reason as resume_chunk_size — a test needs a size the
+        # MiB setting cannot express.
+        self.upload_chunk_size = self.multipart_chunksize_bytes
+        self.resumable_uploads = True
+        # Resume records must outlive the process, so they live in the user's
+        # config tree rather than a temp dir. Overridable for tests.
+        self.upload_state_dir = os.path.join(
+            os.path.expanduser("~"), ".config", "s3duck", "uploads")
         self.set_transfer_concurrency(
             self.DEFAULT_TRANSFER_CONCURRENCY
             if transfer_concurrency is None else transfer_concurrency
@@ -350,16 +370,60 @@ class Model:
             n = self.DEFAULT_TRANSFER_CONCURRENCY
         n = max(1, min(n, self.MAX_TRANSFER_CONCURRENCY))
         self.transfer_concurrency = n
+        self._rebuild_transfer_configs()
+        return n
+
+    def _rebuild_transfer_configs(self):
+        """Both TransferConfigs from the current concurrency and part sizes."""
         cfg = dict(
-            multipart_threshold=16 * 1024 * 1024,  # 16MB
-            multipart_chunksize=8 * 1024 * 1024,   # 8MB
+            multipart_threshold=self.multipart_threshold_bytes,
+            multipart_chunksize=self.multipart_chunksize_bytes,
             io_chunksize=256 * 1024,
-            max_concurrency=n,
+            max_concurrency=self.transfer_concurrency,
             use_threads=True,
         )
         self.transfer_cfg_download = TransferConfig(**cfg)
         self.transfer_cfg_upload = TransferConfig(**cfg)
-        return n
+
+    @property
+    def multipart_threshold_bytes(self) -> int:
+        return int(self.multipart_threshold_mb) * 1024 * 1024
+
+    @property
+    def multipart_chunksize_bytes(self) -> int:
+        return int(self.multipart_chunksize_mb) * 1024 * 1024
+
+    def set_multipart_sizes(self, threshold_mb=None, chunksize_mb=None) -> tuple:
+        """
+        Set the multipart threshold and part size, in MiB.
+
+        The part size is clamped to S3's own 5 MiB floor for non-final parts —
+        a smaller one makes every multipart upload fail on completion — and the
+        threshold is never allowed below the part size, which would ask boto3
+        to split a file into a single part.
+        """
+        if chunksize_mb is not None:
+            try:
+                chunk = int(chunksize_mb)
+            except (TypeError, ValueError):
+                chunk = self.DEFAULT_MULTIPART_CHUNKSIZE_MB
+            self.multipart_chunksize_mb = max(
+                self.MIN_MULTIPART_CHUNKSIZE_MB,
+                min(chunk, self.MAX_MULTIPART_CHUNKSIZE_MB))
+        if threshold_mb is not None:
+            try:
+                threshold = int(threshold_mb)
+            except (TypeError, ValueError):
+                threshold = self.DEFAULT_MULTIPART_THRESHOLD_MB
+            self.multipart_threshold_mb = max(
+                self.multipart_chunksize_mb, threshold)
+        self._rebuild_transfer_configs()
+        # Ranged downloads resume in part-sized chunks, so they follow the
+        # same settings rather than keeping a second, stale pair.
+        self.resume_threshold = self.multipart_threshold_bytes
+        self.resume_chunk_size = self.multipart_chunksize_bytes
+        self.upload_chunk_size = self.multipart_chunksize_bytes
+        return self.multipart_threshold_mb, self.multipart_chunksize_mb
 
     def set_parallel_files(self, n) -> int:
         """How many files transfer simultaneously (1 = strictly sequential)."""
@@ -444,6 +508,12 @@ class Model:
         m.rate_limiter = self.rate_limiter
         m.verify_downloads = self.verify_downloads
         m.checksum_algorithm = self.checksum_algorithm
+        m.multipart_threshold_mb = self.multipart_threshold_mb
+        m.multipart_chunksize_mb = self.multipart_chunksize_mb
+        m.resume_chunk_size = self.resume_chunk_size
+        m.upload_chunk_size = self.upload_chunk_size
+        m.resumable_uploads = self.resumable_uploads
+        m.upload_state_dir = self.upload_state_dir
         m.resume_threshold = self.resume_threshold
         m._rebind_lock = threading.RLock()
         m.bucket = self.bucket
@@ -1453,7 +1523,10 @@ class Model:
         of restarting, and the chunks still download in parallel.
         """
         size = int(size)
-        chunk_size = int(self.RESUME_CHUNK_SIZE)
+        # Follows the configured part size, so one setting governs how both
+        # uploads and resumable downloads are chunked. A sidecar written with a
+        # different size is discarded below rather than misread.
+        chunk_size = int(self.resume_chunk_size)
         total_chunks = max(1, (size + chunk_size - 1) // chunk_size)
         part_path, meta_path = self._resume_paths(out_path)
         etag = self.normalize_etag(etag)
@@ -1953,6 +2026,195 @@ class Model:
             self.rebind_bucket(log_fn=log_fn)
             _do()
 
+    def _upload_state_path(self, key, local_file) -> str:
+        """
+        Where the resume record for one upload lives.
+
+        Not beside the source file: uploads read from directories that may be
+        read-only or that the user would rather not have littered, and the
+        record has to outlive the process to be useful at all.
+        """
+        # The PROFILE endpoint, not the live one: endpoint_url moves when a
+        # bucket is rebound to another region, and keying on it made the
+        # record unfindable on the retry — which silently started a second
+        # multipart upload and orphaned the first one's parts.
+        identity = "|".join([
+            str(self.profile_endpoint_url or self.endpoint_url or ""),
+            str(self.bucket or ""), str(key), os.path.abspath(local_file),
+        ])
+        digest = hashlib.sha256(identity.encode()).hexdigest()[:32]
+        return os.path.join(self.upload_state_dir, digest + ".json")
+
+    def _read_upload_state(self, path, key, size, mtime, chunk_size):
+        """
+        The stored upload id, but only if it still describes this exact upload.
+
+        A changed size, mtime or part size means the parts already on the
+        server no longer line up with what we would send, so resuming would
+        assemble a corrupt object.
+        """
+        try:
+            with open(path) as handle:
+                saved = json.load(handle)
+        except Exception:
+            return None
+        try:
+            same = (
+                saved.get("key") == key
+                and saved.get("bucket") == self.bucket
+                and int(saved.get("size", -1)) == int(size)
+                and int(saved.get("chunk_size", -1)) == int(chunk_size)
+                and abs(float(saved.get("mtime", -1)) - float(mtime)) < 0.001
+            )
+        except (TypeError, ValueError):
+            return None
+        return str(saved.get("upload_id") or "") if same else None
+
+    def _write_upload_state(self, path, key, upload_id, size, mtime, chunk_size):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            json.dump({
+                "bucket": self.bucket, "key": key, "upload_id": upload_id,
+                "size": int(size), "mtime": float(mtime),
+                "chunk_size": int(chunk_size),
+            }, handle)
+
+    def _uploaded_parts(self, key, upload_id) -> dict:
+        """
+        Parts already stored server-side, as ``{number: part_dict}``.
+
+        Read from the service rather than from our own record: the server is
+        the only authority on what actually landed, and a part we *think* we
+        sent may have failed after the record was written.
+        """
+        parts = {}
+        marker = 0
+        while True:
+            resp = self.client.list_parts(
+                Bucket=self.bucket, Key=key, UploadId=upload_id,
+                PartNumberMarker=marker)
+            for part in resp.get("Parts", []) or []:
+                number = int(part.get("PartNumber", 0))
+                if not number:
+                    continue
+                entry = {"PartNumber": number, "ETag": part.get("ETag"),
+                         "Size": int(part.get("Size") or 0)}
+                for field, value in part.items():
+                    if field.startswith("Checksum"):
+                        entry[field] = value
+                parts[number] = entry
+            if not resp.get("IsTruncated"):
+                return parts
+            try:
+                following = int(resp.get("NextPartNumberMarker") or 0)
+            except (TypeError, ValueError):
+                return parts
+            # S3-compatible backends differ in what they return; a marker that
+            # does not move on would spin this thread forever, so take what we
+            # have rather than hang the transfer.
+            if following <= marker:
+                return parts
+            marker = following
+
+    def _upload_resumable(self, local_file, key, size, progress_cb=None,
+                          cancel_event=None, log_fn=None):
+        """
+        Upload a large file part by part so an interruption can resume.
+
+        boto3's managed upload restarts from zero, which on a slow link makes a
+        big file effectively untransferable. A failure or cancellation here
+        deliberately leaves the multipart upload OPEN and its record on disk,
+        because that is exactly what the next attempt resumes from — the
+        Incomplete-uploads tool is how an abandoned one gets cleaned up.
+        """
+        chunk = int(self.upload_chunk_size)
+        total_parts = max(1, (int(size) + chunk - 1) // chunk)
+        mtime = os.path.getmtime(local_file)
+        state_path = self._upload_state_path(key, local_file)
+        extra = dict(self.upload_extra_args)
+
+        upload_id = self._read_upload_state(
+            state_path, key, size, mtime, chunk)
+        done = {}
+        if upload_id:
+            try:
+                done = self._uploaded_parts(key, upload_id)
+            except Exception as exc:
+                if log_fn:
+                    log_fn(f"cannot resume '{key}' ({exc}); starting over")
+                upload_id = None
+        if not upload_id:
+            upload_id = self.client.create_multipart_upload(
+                Bucket=self.bucket, Key=key, **extra)["UploadId"]
+            done = {}
+        self._write_upload_state(
+            state_path, key, upload_id, size, mtime, chunk)
+
+        # A stored part whose length disagrees with what we would send cannot
+        # be trusted, so it is re-sent rather than reused.
+        for number in list(done):
+            start = (number - 1) * chunk
+            expected = min(chunk, int(size) - start)
+            if int(done[number].get("Size") or 0) != expected:
+                del done[number]
+        if done and log_fn:
+            log_fn(f"resuming {key}: {len(done)}/{total_parts} part(s) "
+                   "already uploaded")
+
+        algorithm = extra.get("ChecksumAlgorithm")
+        sent = sum(int(p.get("Size") or 0) for p in done.values())
+        lock = threading.Lock()
+
+        def _send(number):
+            nonlocal sent
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+            start = (number - 1) * chunk
+            length = min(chunk, int(size) - start)
+            with open(local_file, "rb") as handle:
+                handle.seek(start)
+                body = handle.read(length)
+            # Paced before the request so the shared ceiling actually throttles
+            # rather than being charged after the bytes are already gone.
+            if self.rate_limiter is not None:
+                self.rate_limiter.consume(len(body))
+            params = dict(Bucket=self.bucket, Key=key, UploadId=upload_id,
+                          PartNumber=number, Body=body)
+            if algorithm:
+                params["ChecksumAlgorithm"] = algorithm
+            resp = self.client.upload_part(**params)
+            entry = {"PartNumber": number, "ETag": resp.get("ETag")}
+            for field, value in (resp or {}).items():
+                if field.startswith("Checksum"):
+                    entry[field] = value
+            with lock:
+                done[number] = entry
+                sent += len(body)
+                if progress_cb is not None:
+                    progress_cb(max(1, int(size)), min(sent, int(size)), key)
+
+        pending = [n for n in range(1, total_parts + 1) if n not in done]
+        run_parallel(pending, _send, self.transfer_concurrency,
+                     cancel_event=cancel_event)
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise TransferCancelled("cancelled")
+
+        parts = [{field: value for field, value in entry.items()
+                  if field != "Size"}
+                 for entry in sorted(done.values(),
+                                     key=lambda p: p["PartNumber"])]
+        self.client.complete_multipart_upload(
+            Bucket=self.bucket, Key=key, UploadId=upload_id,
+            MultipartUpload={"Parts": parts})
+        # Only now is the record useless.
+        try:
+            os.remove(state_path)
+        except OSError:
+            pass
+        if log_fn:
+            log_fn(f"uploaded {key} in {total_parts} part(s)")
+
     def upload_file(self, local_file, key, progress_cb=None, cancel_event=None, log_fn=None):
         """
         Upload a file (with progress) or create a folder placeholder if local_file is None.
@@ -1970,6 +2232,30 @@ class Model:
             total = os.path.getsize(local_file)
         except Exception:
             total = None
+
+        if (self.resumable_uploads and total is not None
+                and int(total) >= self.multipart_threshold_bytes):
+            def _do_resumable():
+                self._upload_resumable(
+                    local_file, key, total, progress_cb=progress_cb,
+                    cancel_event=cancel_event, log_fn=log_fn)
+
+            # Same one-shot rebind the managed upload does. Without it the same
+            # bucket failed for a large file and succeeded for a small one.
+            # The retry resumes from the record just written, and an upload id
+            # the new endpoint rejects is simply started over.
+            try:
+                _do_resumable()
+            except TransferCancelled:
+                raise
+            except Exception as exc:
+                if not self._is_region_error(exc):
+                    raise
+                if log_fn:
+                    log_fn(f"Region error uploading '{key}': {exc}")
+                self.rebind_bucket(log_fn=log_fn)
+                _do_resumable()
+            return
 
         extra_args = dict(self.upload_extra_args) or None
 

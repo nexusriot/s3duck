@@ -42,12 +42,13 @@ from utils import (
     run_with_progress, scan_local_tree, themed_icon,
 )
 from properties_window import PropertiesWindow
+import diagnostics
 from profile_switcher import ProfileSwitchWindow, load_profiles, decrypt_profile
 from theme import apply_theme, THEMES
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.15.1"
+__VERSION__ = "0.17.0"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -709,6 +710,7 @@ def summarize_sync_plan(actions) -> dict:
 # filter or by a bare QShortcut — so scanning actions cannot find them.
 LISTVIEW_KEY_HELP = (
     ("Ctrl+K", "Run any command by name"),
+    ("Ctrl+P", "Go to a bucket or bookmark by name"),
     ("Ctrl+F", "Quick filter the current listing"),
     ("Ctrl+Shift+F", "Recursive search under this prefix"),
     ("Ctrl+E", "Sync with a local folder"),
@@ -770,6 +772,89 @@ def collect_shortcuts(actions, extra=()) -> list:
         rows.append((keys, label))
     rows.sort(key=lambda row: row[1].lower())
     return rows + list(extra)
+
+
+def location_entries(buckets, bookmarks, current_bucket="") -> list:
+    """
+    ``(label, hint, (bucket, prefix))`` rows for the quick-open switcher.
+
+    Bookmarks come first because a saved place is almost always what someone
+    is reaching for; the bucket that is already open is dropped, since jumping
+    to where you already are is not a useful result.
+    """
+    rows, seen = [], set()
+    for entry in bookmarks or []:
+        bucket = str((entry or {}).get("bucket") or "").strip()
+        if not bucket:
+            continue
+        prefix = str((entry or {}).get("prefix") or "").strip()
+        label = str((entry or {}).get("name") or "").strip() or \
+            serialize_location(bucket, prefix)
+        key = (bucket, prefix)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((label, serialize_location(bucket, prefix), key))
+    for name in buckets or []:
+        bucket = str(name or "").strip()
+        if not bucket or bucket == str(current_bucket or "").strip():
+            continue
+        key = (bucket, "")
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((bucket, "bucket", key))
+    return rows
+
+
+def build_profile_sync_job(actions, source_prefix, dest_prefix) -> list:
+    """
+    Map a sync plan onto ``(operation, src_key, dst_key)`` rows.
+
+    The planner is reused unchanged by feeding it the two profiles' trees as
+    source and destination, so its "upload"/"delete_remote" verbs mean
+    "copy to the other profile" and "delete over there" here.
+    """
+    rows = []
+    for action in actions or []:
+        rel = str(action.get("rel") or "")
+        if not rel:
+            continue
+        kind = action.get("action")
+        if kind == "upload":
+            rows.append(("copy", source_prefix + rel, dest_prefix + rel))
+        elif kind == "delete_remote":
+            rows.append(("delete", "", dest_prefix + rel))
+    return rows
+
+
+# Jobs that hold a live connection to another profile, so they cannot be
+# reconstructed from persisted history.
+CROSS_PROFILE_METHODS = ("copy_to_profile", "sync_to_profile")
+
+
+def serialize_location(bucket, prefix) -> str:
+    """
+    A browsing location as one settings string, or "" in bucket-list mode.
+
+    Its own codec rather than reusing the s3:// parser, whose meaning depends
+    on which bucket happens to be open when it runs.
+    """
+    name = str(bucket or "").strip().strip("/")
+    if not name:
+        return ""
+    inner = str(prefix or "").strip().strip("/")
+    return f"{name}/{inner}/" if inner else name
+
+
+def parse_location(text) -> tuple:
+    """Reverse serialize_location as (bucket, prefix); prefix ends with "/"."""
+    raw = str(text or "").strip().lstrip("/")
+    if not raw:
+        return "", ""
+    name, _, inner = raw.partition("/")
+    inner = inner.strip("/")
+    return name.strip(), (inner + "/" if inner else "")
 
 
 def command_entries(actions) -> list:
@@ -836,24 +921,66 @@ def filter_commands(entries, query) -> list:
     return [entry for _score, entry in scored]
 
 
-class CommandPaletteDialog(QDialog):
+class DiagnosticsDialog(QDialog):
     """
-    Type-to-run access to every action.
+    Read-only environment report with a one-click copy.
 
-    The action surface outgrew the toolbar — toolbar, Tools menu, several
-    context menus and ~20 shortcuts — so a keyboard-first index is the only
-    way to reach a rarely-used command without hunting.
+    Copying matters more than reading it here: the whole point is to get these
+    facts into a bug report, where "the venv has QtSvg but the .deb does not"
+    is the kind of detail nobody thinks to mention.
     """
 
-    def __init__(self, parent, entries):
+    def __init__(self, parent, report):
         super().__init__(parent)
-        self.setWindowTitle("Commands")
+        self.setWindowTitle("Diagnostics")
+        self.resize(640, 520)
+        self._report = report
+
+        self._text = QPlainTextEdit()
+        self._text.setPlainText(report)
+        self._text.setReadOnly(True)
+        self._text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._text.setFont(QFontDatabase.systemFont(
+            QFontDatabase.SystemFont.FixedFont))
+
+        self._copy = QPushButton("Copy to clipboard")
+        self._copy.clicked.connect(self.copy_report)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+
+        row = QHBoxLayout()
+        row.addWidget(self._copy)
+        row.addStretch(1)
+        row.addWidget(close)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self._text)
+        lay.addLayout(row)
+
+    def copy_report(self):
+        QApplication.clipboard().setText(self._report)
+        self._copy.setText("Copied")
+
+
+class FilterListDialog(QDialog):
+    """
+    A query box over a filtered list: type to narrow, arrow to move, Enter to
+    pick.
+
+    Shared by the command palette and the quick-open switcher, which were
+    identical down to the row-selection accessor. Entries are
+    ``(label, extra, payload)``; only the payload's meaning differs.
+    """
+
+    def __init__(self, parent, entries, title, placeholder):
+        super().__init__(parent)
+        self.setWindowTitle(title)
         self.resize(520, 380)
         self._entries = list(entries or [])
-        self._chosen = None
+        self._visible = []
 
         self._query = QLineEdit()
-        self._query.setPlaceholderText("Type a command…")
+        self._query.setPlaceholderText(placeholder)
         self._query.textChanged.connect(self._refresh)
         self._query.installEventFilter(self)
 
@@ -869,13 +996,13 @@ class CommandPaletteDialog(QDialog):
     def _refresh(self, text):
         self._visible = filter_commands(self._entries, text)
         self._list.clear()
-        for label, keys, _action in self._visible:
-            self._list.addItem(f"{label}\t{keys}" if keys else label)
+        for label, extra, _payload in self._visible:
+            self._list.addItem(f"{label}\t{extra}" if extra else label)
         if self._visible:
             self._list.setCurrentRow(0)
 
     def eventFilter(self, source, event):
-        """Arrows and Enter belong to the list while typing in the box."""
+        """Arrows and Enter belong to the list while the cursor is in the box."""
         if source is self._query and event.type() == QEvent.Type.KeyPress:
             key = event.key()
             if key in (Qt.Key.Key_Down, Qt.Key.Key_Up):
@@ -890,12 +1017,46 @@ class CommandPaletteDialog(QDialog):
                 return True
         return super().eventFilter(source, event)
 
-    def chosen_action(self):
-        """The QAction to trigger, or None."""
+    def selected_payload(self):
+        """The highlighted row's payload, or None."""
         row = self._list.currentRow()
         if row < 0 or row >= len(self._visible):
             return None
         return self._visible[row][2]
+
+
+class QuickOpenDialog(FilterListDialog):
+    """
+    Type-to-jump across bookmarks and buckets.
+
+    Uses the command palette's matcher, so ranking behaves the same in both
+    places rather than drifting into two notions of "best match".
+    """
+
+    def __init__(self, parent, entries):
+        super().__init__(parent, entries, "Go to",
+                         "Type a bucket or bookmark…")
+
+    def chosen_location(self):
+        """``(bucket, prefix)`` for the highlighted row, or None."""
+        return self.selected_payload()
+
+
+class CommandPaletteDialog(FilterListDialog):
+    """
+    Type-to-run access to every action.
+
+    The action surface outgrew the toolbar — toolbar, Tools menu, several
+    context menus and ~20 shortcuts — so a keyboard-first index is the only
+    way to reach a rarely-used command without hunting.
+    """
+
+    def __init__(self, parent, entries):
+        super().__init__(parent, entries, "Commands", "Type a command…")
+
+    def chosen_action(self):
+        """The QAction to trigger, or None."""
+        return self.selected_payload()
 
 
 def format_completion_notification(stats) -> tuple:
@@ -1454,6 +1615,38 @@ class Worker(QObject):
                 self.progress.emit(f"upload failed: {msg}")
                 self.error.emit(msg)
 
+        finally:
+            self.finished.emit(cancelled)
+
+    def sync_to_profile(self):
+        # job = [(operation, src_key, dst_key)] against self.dest_model
+        cancelled = False
+        try:
+            if self.dest_model is None:
+                raise Exception("no destination profile for this sync")
+            for operation, src_key, dst_key in self.job:
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                if operation == "copy":
+                    self.progress.emit(
+                        f"copying {src_key} -> {self.dest_model.bucket}/{dst_key}")
+                    self.data_model.copy_to_model(
+                        src_key, self.dest_model, dst_key,
+                        cancel_event=self._cancel_event,
+                        log_fn=self.progress.emit)
+                elif operation == "delete":
+                    self.progress.emit(
+                        f"deleting {self.dest_model.bucket}/{dst_key}")
+                    self.dest_model.delete(
+                        dst_key, log_fn=self.progress.emit,
+                        cancel_event=self._cancel_event)
+        except Exception as exc:
+            msg = str(exc) or exc.__class__.__name__
+            if "cancelled" in msg.lower():
+                cancelled = True
+            else:
+                self.progress.emit(f"sync to profile failed: {msg}")
+                self.error.emit(msg)
         finally:
             self.finished.emit(cancelled)
 
@@ -2262,7 +2455,8 @@ class TransferSettingsDialog(QDialog):
                  sse_modes, storage_class="", sse="", kms_key_id="",
                  notify=True, parallel_files=4, max_parallel_files=32,
                  verify_downloads=False, rate_limit_kbps=0,
-                 checksum_algorithm=""):
+                 checksum_algorithm="", multipart_threshold_mb=16,
+                 multipart_chunksize_mb=8, resumable_uploads=True):
         super().__init__(parent)
         self.setWindowTitle("Transfer settings")
         self.setMinimumWidth(460)
@@ -2304,6 +2498,22 @@ class TransferSettingsDialog(QDialog):
             "(re-reads each file)")
         self._verify.setChecked(bool(verify_downloads))
 
+        self._resumable = QCheckBox(
+            "Resume interrupted uploads (multipart, leaves parts on the "
+            "server until the transfer finishes)")
+        self._resumable.setChecked(bool(resumable_uploads))
+
+        self._chunk = QSpinBox()
+        self._chunk.setRange(DataModel.MIN_MULTIPART_CHUNKSIZE_MB,
+                             DataModel.MAX_MULTIPART_CHUNKSIZE_MB)
+        self._chunk.setSuffix(" MiB")
+        self._chunk.setValue(int(multipart_chunksize_mb))
+
+        self._threshold = QSpinBox()
+        self._threshold.setRange(DataModel.MIN_MULTIPART_CHUNKSIZE_MB, 4096)
+        self._threshold.setSuffix(" MiB")
+        self._threshold.setValue(int(multipart_threshold_mb))
+
         self._checksum = QComboBox()
         self._checksum.addItem("None (ETag only)", "")
         for name in CHECKSUM_ALGORITHMS:
@@ -2315,10 +2525,13 @@ class TransferSettingsDialog(QDialog):
         form.addRow(QLabel("Files transferred at once"), self._parallel_files)
         form.addRow(QLabel("Connections per file (multipart)"), self._concurrency)
         form.addRow(QLabel("Bandwidth limit (all transfers)"), self._rate_limit)
+        form.addRow(QLabel("Multipart part size"), self._chunk)
+        form.addRow(QLabel("Use multipart above"), self._threshold)
         form.addRow(QLabel("Upload storage class"), self._storage)
         form.addRow(QLabel("Upload encryption"), self._sse)
         form.addRow(QLabel("KMS key"), self._kms)
         form.addRow(QLabel("Upload checksum"), self._checksum)
+        form.addRow(self._resumable)
         form.addRow(self._verify)
         form.addRow(self._notify)
 
@@ -2374,6 +2587,15 @@ class TransferSettingsDialog(QDialog):
     def checksum_algorithm(self) -> str:
         return self._checksum.currentData() or ""
 
+    def resumable_uploads(self) -> bool:
+        return self._resumable.isChecked()
+
+    def multipart_chunksize_mb(self) -> int:
+        return self._chunk.value()
+
+    def multipart_threshold_mb(self) -> int:
+        return self._threshold.value()
+
     def rate_limit_kbps(self) -> int:
         return self._rate_limit.value()
 
@@ -2393,100 +2615,87 @@ def build_profile_model(profile, bucket=""):
     )
 
 
-class CrossProfileCopyDialog(QDialog):
+class ProfilePicker(QWidget):
     """
-    Choose another profile, bucket and prefix to copy the selection into.
+    Pick another profile, one of its buckets and a prefix.
 
-    Server-side copy cannot cross credentials, so this is the only way to move
-    objects between accounts or providers; the bytes travel through this
-    process, which the note makes explicit.
+    Shared by the cross-profile copy and sync dialogs. Extracted rather than
+    copied because the bucket list is fetched off the GUI thread — a different
+    endpoint may be slow or unreachable — and a second copy of that thread
+    plumbing is a second chance to leak a QThread.
     """
 
-    def __init__(self, parent, settings, count, current_profile=""):
+    def __init__(self, parent, settings, current_profile=""):
         super().__init__(parent)
-        self.setWindowTitle("Copy to another profile")
-        self.setMinimumWidth(480)
         self._settings = settings
         self._thread = None
         self._worker = None
-        self._model = None
+        self.note = QLabel("")
+        self.note.setWordWrap(True)
 
         self._raw = [
             raw for raw in load_profiles(settings)
             if str(raw.get("name") or "") != current_profile
         ]
 
-        self._profile = QComboBox()
+        self.profile = QComboBox()
         for raw in self._raw:
-            self._profile.addItem(str(raw.get("name") or "<unnamed>"))
-        self._profile.currentIndexChanged.connect(self._on_profile_changed)
+            self.profile.addItem(str(raw.get("name") or "<unnamed>"))
+        self.profile.currentIndexChanged.connect(self._on_profile_changed)
 
-        self._bucket = QComboBox()
-        self._bucket.setEditable(True)
-        self._prefix = QLineEdit()
-        self._prefix.setPlaceholderText("destination prefix (blank = root)")
+        self.bucket = QComboBox()
+        self.bucket.setEditable(True)
+        self.prefix = QLineEdit()
+        self.prefix.setPlaceholderText("prefix (blank = bucket root)")
 
-        self._note = QLabel(
-            "Objects are streamed through this machine, because a server-side "
-            "copy cannot use two sets of credentials.")
-        self._note.setWordWrap(True)
+        form = QFormLayout(self)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.addRow(QLabel("Profile"), self.profile)
+        form.addRow(QLabel("Bucket"), self.bucket)
+        form.addRow(QLabel("Prefix"), self.prefix)
 
-        form = QFormLayout()
-        form.addRow(QLabel("Profile"), self._profile)
-        form.addRow(QLabel("Bucket"), self._bucket)
-        form.addRow(QLabel("Prefix"), self._prefix)
+        if isinstance(parent, QDialog):
+            # accept() does not fire closeEvent, so a dialog dismissed while a
+            # bucket listing is in flight would be destroyed with a live
+            # QThread — which aborts the process in PyQt6. finished covers
+            # accept, reject and close alike.
+            parent.finished.connect(lambda _result: self.stop_loader())
 
-        self._buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel)
-        self._buttons.accepted.connect(self.accept)
-        self._buttons.rejected.connect(self.reject)
-
-        lay = QVBoxLayout()
-        lay.addWidget(QLabel(f"Copying {count} item(s)."))
-        lay.addLayout(form)
-        lay.addWidget(self._note)
-        lay.addWidget(self._buttons)
-        self.setLayout(lay)
-
-        if not self._raw:
-            self._note.setText("No other profile is configured.")
-            self._buttons.button(
-                QDialogButtonBox.StandardButton.Ok).setEnabled(False)
-        else:
+        if self._raw:
             self._on_profile_changed(0)
+
+    def has_profiles(self) -> bool:
+        return bool(self._raw)
 
     def selected_profile(self):
         """The decrypted target Profile, or None."""
-        index = self._profile.currentIndex()
+        index = self.profile.currentIndex()
         if index < 0 or index >= len(self._raw):
             return None
         return decrypt_profile(self._settings, self._raw[index])
 
     def destination_bucket(self) -> str:
-        return self._bucket.currentText().strip()
+        return self.bucket.currentText().strip()
 
     def destination_prefix(self) -> str:
-        text = self._prefix.text().strip().lstrip("/")
+        text = self.prefix.text().strip().lstrip("/")
         return prefix_of(text) if text else ""
 
     def _on_profile_changed(self, _index):
-        self._bucket.clear()
+        self.bucket.clear()
         try:
             profile = self.selected_profile()
         except Exception as exc:
-            self._note.setText(f"Could not read that profile: {exc}")
+            self.note.setText(f"Could not read that profile: {exc}")
             return
         if profile is None:
             return
         if profile.bucket:
-            self._bucket.setCurrentText(profile.bucket)
+            self.bucket.setCurrentText(profile.bucket)
         self._load_buckets(profile)
 
     def _load_buckets(self, profile):
-        """Fill the bucket list without blocking — a different endpoint may be
-        slow or unreachable, and that must not freeze the dialog."""
-        self._stop_loader()
+        self.stop_loader()
         model = build_profile_model(profile)
 
         def _fetch(_w):
@@ -2503,23 +2712,240 @@ class CrossProfileCopyDialog(QDialog):
         self._thread.start()
 
     def _on_buckets(self, result, exc):
-        self._stop_loader()
+        self.stop_loader()
         if exc is not None:
-            self._note.setText(f"Could not list that profile's buckets: {exc}")
+            self.note.setText(f"Could not list that profile's buckets: {exc}")
             return
-        typed = self._bucket.currentText()
-        self._bucket.blockSignals(True)
-        self._bucket.clear()
-        self._bucket.addItems(result or [])
-        self._bucket.setCurrentText(typed)
-        self._bucket.blockSignals(False)
+        typed = self.bucket.currentText()
+        self.bucket.blockSignals(True)
+        self.bucket.clear()
+        self.bucket.addItems(result or [])
+        self.bucket.setCurrentText(typed)
+        self.bucket.blockSignals(False)
 
-    def _stop_loader(self):
+    def stop_loader(self):
         th, self._thread, self._worker = self._thread, None, None
         join_qthread(th)
 
+
+class CrossProfileCopyDialog(QDialog):
+    """
+    Choose another profile, bucket and prefix to copy the selection into.
+
+    Server-side copy cannot cross credentials, so this is the only way to move
+    objects between accounts or providers; the bytes travel through this
+    process, which the note makes explicit.
+    """
+
+    def __init__(self, parent, settings, count, current_profile=""):
+        super().__init__(parent)
+        self.setWindowTitle("Copy to another profile")
+        self.setMinimumWidth(480)
+        self.picker = ProfilePicker(self, settings, current_profile)
+        self.picker.note.setText(
+            "Objects are streamed through this machine, because a server-side "
+            "copy cannot use two sets of credentials.")
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(f"Copying {count} item(s)."))
+        lay.addWidget(self.picker)
+        lay.addWidget(self.picker.note)
+        lay.addWidget(self._buttons)
+
+        if not self.picker.has_profiles():
+            self.picker.note.setText("No other profile is configured.")
+            self._buttons.button(
+                QDialogButtonBox.StandardButton.Ok).setEnabled(False)
+
+    def selected_profile(self):
+        return self.picker.selected_profile()
+
+    def destination_bucket(self) -> str:
+        return self.picker.destination_bucket()
+
+    def destination_prefix(self) -> str:
+        return self.picker.destination_prefix()
+
     def closeEvent(self, event):
-        self._stop_loader()
+        self.picker.stop_loader()
+        super().closeEvent(event)
+
+
+class CrossProfileSyncDialog(QDialog):
+    """
+    Compare this prefix against a prefix in another profile, then run the plan.
+
+    The dry run is the point: a cross-account sync moves bytes through this
+    machine and can delete at the far end, so nothing happens until the plan
+    has been seen.
+    """
+
+    def __init__(self, parent, main_window, model, prefix, settings,
+                 current_profile=""):
+        super().__init__(parent)
+        self._mw = main_window
+        self._model = model
+        self._prefix = prefix or ""
+        self._actions = []
+        self._dest_model = None
+        self.setWindowTitle(f"Sync to another profile — "
+                            f"{model.bucket}/{self._prefix}")
+        self.resize(820, 560)
+
+        self.picker = ProfilePicker(self, settings, current_profile)
+
+        self._direction = QComboBox()
+        self._direction.addItem("Push: this profile → the other", "push")
+        self._direction.addItem("Pull: the other → this profile", "pull")
+
+        self._delete_extra = QCheckBox(
+            "Delete items at the destination that the source does not have")
+        self._exclude = QLineEdit()
+        self._exclude.setPlaceholderText("exclude globs, comma separated")
+
+        self._compare = QPushButton("Compare")
+        self._compare.clicked.connect(self.compare)
+
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(
+            ["Action", "Path", "Size", "Why"])
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+
+        self._summary = QLabel("Nothing compared yet.")
+        self._summary.setWordWrap(True)
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        self._buttons.button(
+            QDialogButtonBox.StandardButton.Ok).setText("Run plan")
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        self._ok_enabled(False)
+
+        row = QHBoxLayout()
+        row.addWidget(self._direction, 1)
+        row.addWidget(self._compare)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.picker)
+        lay.addLayout(row)
+        lay.addWidget(self._exclude)
+        lay.addWidget(self._delete_extra)
+        lay.addWidget(self._table, 1)
+        lay.addWidget(self._summary)
+        lay.addWidget(self.picker.note)
+        lay.addWidget(self._buttons)
+
+        # A reviewed plan belongs to the inputs it was built from. Leaving it
+        # runnable after they change let a plan reviewed as a push execute
+        # after switching to pull, deleting on the side believed to be the
+        # source.
+        self._direction.currentIndexChanged.connect(self.invalidate_plan)
+        self.picker.profile.currentIndexChanged.connect(self.invalidate_plan)
+        self.picker.bucket.currentTextChanged.connect(self.invalidate_plan)
+        self.picker.prefix.textChanged.connect(self.invalidate_plan)
+        self._exclude.textChanged.connect(self.invalidate_plan)
+        self._delete_extra.toggled.connect(self.invalidate_plan)
+
+        if not self.picker.has_profiles():
+            self.picker.note.setText("No other profile is configured.")
+            self._compare.setEnabled(False)
+
+    def invalidate_plan(self, *_args):
+        """Drop the computed plan and everything derived from it."""
+        if not self._actions:
+            return
+        self._actions = []
+        self._dest_model = None
+        self._source_model = None
+        self._source_prefix = ""
+        self._dest_prefix = ""
+        self._table.setRowCount(0)
+        self._summary.setText("Inputs changed — compare again.")
+        self._ok_enabled(False)
+
+    def _ok_enabled(self, enabled):
+        self._buttons.button(
+            QDialogButtonBox.StandardButton.Ok).setEnabled(bool(enabled))
+
+    def direction(self) -> str:
+        return self._direction.currentData() or "push"
+
+    def compare(self):
+        """Build the dry-run plan, listing both trees off the GUI thread."""
+        bucket = self.picker.destination_bucket()
+        if not bucket:
+            self.picker.note.setText("Choose a bucket in the other profile.")
+            return
+        try:
+            profile = self.picker.selected_profile()
+        except Exception as exc:
+            self.picker.note.setText(f"Could not read that profile: {exc}")
+            return
+        if profile is None:
+            return
+
+        other = build_profile_model(profile, bucket)
+        here = self._model.clone_for_worker()
+        other_prefix = self.picker.destination_prefix()
+        mine_prefix = self._prefix
+        excludes = self._exclude.text()
+        delete_extra = self._delete_extra.isChecked()
+        pushing = self.direction() == "push"
+
+        def _scan(_worker):
+            mine = here.list_tree(mine_prefix)
+            theirs = other.list_tree(other_prefix)
+            source, dest = (mine, theirs) if pushing else (theirs, mine)
+            return build_sync_plan(
+                source, dest, direction="upload",
+                delete_extra=delete_extra, exclude=excludes)
+
+        actions, exc = self._mw._run_with_progress("Comparing…", _scan)
+        if exc is not None:
+            QMessageBox.warning(self, "Sync to another profile",
+                                f"Could not compare:\n{exc}")
+            return
+        if actions is None:
+            return
+
+        self._actions = actions
+        self._dest_model = other if pushing else self._model.clone_for_worker()
+        self._source_prefix = mine_prefix if pushing else other_prefix
+        self._dest_prefix = other_prefix if pushing else mine_prefix
+        self._source_model = here if pushing else other
+        self._render(actions)
+
+    def _render(self, actions):
+        self._table.setRowCount(0)
+        for action in actions:
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+            self._table.setItem(row, 0, QTableWidgetItem(action["action"]))
+            self._table.setItem(row, 1, QTableWidgetItem(action["rel"]))
+            self._table.setItem(
+                row, 2, QTableWidgetItem(_human_bytes(action.get("size") or 0)))
+            self._table.setItem(row, 3, QTableWidgetItem(action.get("reason", "")))
+        self._summary.setText(summarize_sync_plan(actions))
+        self._ok_enabled(any(a["action"] != "skip" for a in actions))
+
+    def plan(self) -> tuple:
+        """``(source_model, dest_model, job)`` for the transfer queue."""
+        job = build_profile_sync_job(
+            self._actions, getattr(self, "_source_prefix", ""),
+            getattr(self, "_dest_prefix", ""))
+        return getattr(self, "_source_model", None), self._dest_model, job
+
+    def closeEvent(self, event):
+        self.picker.stop_loader()
         super().closeEvent(event)
 
 
@@ -4770,7 +5196,7 @@ class PresignedLinkDialog(QDialog):
 
 class _QEntry:
     def __init__(self, entry_id, method, job, need_refresh=True, label="",
-                 source_bucket="", dest_model=None):
+                 source_bucket="", dest_model=None, source_model=None):
         self.entry_id = entry_id
         self.method = method
         self.job = job
@@ -4783,6 +5209,9 @@ class _QEntry:
         # Set for a cross-profile copy: a second model, built from another
         # profile's credentials, that the worker writes through.
         self.dest_model = dest_model
+        # Set when the job reads from a model other than the window's — a pull
+        # from another profile.
+        self.source_model = source_model
         self.status = "queued"
         self.thread = None
         self.worker = None
@@ -5310,6 +5739,9 @@ class MainWindow(QMainWindow):
         self._palette_shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
         self._palette_shortcut.activated.connect(self.show_command_palette)
 
+        self._quick_open_shortcut = QShortcut(QKeySequence("Ctrl+P"), self)
+        self._quick_open_shortcut.activated.connect(self.show_quick_open)
+
         self._search_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
         self._search_shortcut.activated.connect(self._toggle_search)
 
@@ -5348,6 +5780,9 @@ class MainWindow(QMainWindow):
         self.select_first()
 
         self.navigate(show_loading=True)
+        # After the first listing, so a failed reopen leaves a usable window
+        # showing the bucket list rather than nothing at all.
+        self.restore_last_location()
 
         self.listview.header().setSortIndicatorShown(True)
         self.listview.setSortingEnabled(True)
@@ -5671,9 +6106,15 @@ class MainWindow(QMainWindow):
         act_incomplete.triggered.connect(lambda: self.show_incomplete_uploads())
         act_sync = menu.addAction("Sync with local folder…")
         act_sync.triggered.connect(lambda: self.open_sync())
+        self.actSyncProfile = menu.addAction("Sync to another profile…")
+        self.actSyncProfile.triggered.connect(lambda: self.sync_to_profile())
         menu.addSeparator()
         act_settings = menu.addAction("Transfer settings…")
         act_settings.triggered.connect(lambda: self.transfer_settings())
+        # The menu is a descendant of the window, so its actions are reachable
+        # through findChildren and reach the command palette like the rest.
+        self.actDiagnostics = menu.addAction("Diagnostics…")
+        self.actDiagnostics.triggered.connect(lambda: self.show_diagnostics())
         self.toolsButton.setMenu(menu)
         self.tBar.addWidget(self.toolsButton)
 
@@ -5696,6 +6137,8 @@ class MainWindow(QMainWindow):
         self.settings.beginGroup("common")
         self.data_model.verify_downloads = str(
             self.settings.value("verify_downloads", "false")).lower() in ("true", "1")
+        self.data_model.resumable_uploads = str(
+            self.settings.value("resumable_uploads", "true")).lower() in ("true", "1")
         try:
             self.data_model.set_rate_limit(
                 int(self.settings.value("rate_limit_kbps", 0) or 0) * 1024)
@@ -5705,7 +6148,11 @@ class MainWindow(QMainWindow):
         sse = self.settings.value("upload_sse", "") or ""
         kms = self.settings.value("upload_kms_key", "") or ""
         checksum = self.settings.value("upload_checksum", "") or ""
+        threshold_mb = self.settings.value("multipart_threshold_mb", None)
+        chunk_mb = self.settings.value("multipart_chunksize_mb", None)
         self.settings.endGroup()
+        self.data_model.set_multipart_sizes(
+            threshold_mb=threshold_mb, chunksize_mb=chunk_mb)
         self.data_model.set_upload_options(
             storage_class=storage_class, sse=sse, kms_key_id=kms,
             checksum_algorithm=checksum)
@@ -6622,6 +7069,9 @@ class MainWindow(QMainWindow):
         Apply a new profile without restarting the app.
         """
         old_profile = getattr(self, "profile_name", None)
+        # Before the name changes: the location is stored per profile, so the
+        # one being left behind has to record where it was first.
+        self._save_last_location()
 
         self.profile_name = prof.name
 
@@ -7190,7 +7640,8 @@ class MainWindow(QMainWindow):
         self.assign_thread_operation("download", job, need_refresh=False)
 
     def assign_thread_operation(self, method, job, need_refresh=True,
-                                source_bucket="", dest_model=None):
+                                source_bucket="", dest_model=None,
+                                source_model=None):
         if not job:
             return
 
@@ -7203,6 +7654,7 @@ class MainWindow(QMainWindow):
             label=label,
             source_bucket=source_bucket,
             dest_model=dest_model,
+            source_model=source_model,
         )
         self._queue_next_id += 1
         # Kept so a failed/cancelled row can be re-run from the queue panel.
@@ -7230,6 +7682,7 @@ class MainWindow(QMainWindow):
             "set_tags": "Tag",
             "zip_download": "Zip",
             "copy_to_profile": "Copy to profile",
+            "sync_to_profile": "Sync to profile",
         }.get(method, method.capitalize())
         return f"{verb} {n} item(s)"
 
@@ -7381,6 +7834,8 @@ class MainWindow(QMainWindow):
         bucket), so navigation and connection state are reset to the profile
         root and the usual probing rebinds the source on first use.
         """
+        if entry.source_model is not None:
+            return entry.source_model
         model = self.data_model.clone_for_worker()
         if entry.source_bucket:
             model.bucket = entry.source_bucket
@@ -7523,6 +7978,15 @@ class MainWindow(QMainWindow):
         method = entry.get("method")
         if not job or not method:
             return
+        if method in CROSS_PROFILE_METHODS:
+            # History is JSON; another profile's live credentials were never in
+            # it, so this could only queue a job destined to fail.
+            QMessageBox.information(
+                self, "Transfer history",
+                f"'{method}' cannot be re-run from history because it needs "
+                "the other profile's connection. Start it again from the "
+                "Tools menu.")
+            return
         # JSON turned the tuples into lists; the workers unpack either.
         self.log(f"re-running {method} from history ({len(job)} item(s))")
         self.assign_thread_operation(
@@ -7540,6 +8004,55 @@ class MainWindow(QMainWindow):
         ShortcutsDialog(
             self,
             collect_shortcuts(self._live_actions(), LISTVIEW_KEY_HELP)).exec()
+
+    def show_diagnostics(self):
+        """Environment facts, gathered off the GUI thread."""
+        def _collect(_worker):
+            return diagnostics.collect(
+                self.current_dir, version=__VERSION__,
+                model=self.data_model, profile_name=self.profile_name)
+
+        sections, exc = self._run_with_progress("Collecting diagnostics…",
+                                                _collect)
+        if exc is not None:
+            QMessageBox.warning(self, "Diagnostics",
+                                f"Could not collect diagnostics:\n{exc}")
+            return
+        if sections is None:
+            return
+        DiagnosticsDialog(self, diagnostics.format_report(sections)).exec()
+
+    def show_quick_open(self):
+        """Jump to a bookmark or bucket by name."""
+        clone = self.data_model.clone_for_worker()
+
+        def _fetch(_worker):
+            # Off the GUI thread: reaching the endpoint from a slot is the
+            # freeze this app has been stamping out everywhere else.
+            return [item.name for item in clone.list_buckets()]
+
+        buckets, exc = self._run_with_progress("Listing buckets…", _fetch)
+        if buckets is None and exc is None:
+            return  # cancelled
+        if exc is not None:
+            self.log(f"quick open: could not list buckets ({exc})")
+            buckets = []
+
+        entries = location_entries(
+            buckets or [], self._bookmarks, self.data_model.bucket)
+        if not entries:
+            self.statusBar().showMessage("Nowhere to go yet", 2000)
+            return
+        dlg = QuickOpenDialog(self, entries)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        target = dlg.chosen_location()
+        if target is None:
+            return
+        bucket, prefix = target
+        # Same navigation the bookmark menu uses, including the same-bucket
+        # shortcut that avoids a pointless re-entry.
+        self.go_to_bookmark({"bucket": bucket, "prefix": prefix})
 
     def show_command_palette(self):
         """Type-to-run index of every action currently available."""
@@ -7605,9 +8118,12 @@ class MainWindow(QMainWindow):
         if entry is None or entry.status not in ("cancelled", "error"):
             return
         self.log(f"retrying {entry.method}: {entry.label}")
+        # The cross-profile jobs carry live models; dropping them re-queued a
+        # job the worker could only refuse.
         self.assign_thread_operation(
             entry.method, entry.job, need_refresh=entry.need_refresh,
-            source_bucket=entry.source_bucket)
+            source_bucket=entry.source_bucket, dest_model=entry.dest_model,
+            source_model=entry.source_model)
 
     def _toggle_queue_panel(self):
         if self._queue_panel.isVisible():
@@ -7850,6 +8366,16 @@ class MainWindow(QMainWindow):
         cur_sse = self.settings.value("upload_sse", "") or ""
         cur_kms = self.settings.value("upload_kms_key", "") or ""
         cur_checksum = self.settings.value("upload_checksum", "") or ""
+        cur_resumable = str(self.settings.value(
+            "resumable_uploads", "true")).lower() in ("true", "1")
+        cur_threshold = int(self.settings.value(
+            "multipart_threshold_mb",
+            DataModel.DEFAULT_MULTIPART_THRESHOLD_MB) or
+            DataModel.DEFAULT_MULTIPART_THRESHOLD_MB)
+        cur_chunk = int(self.settings.value(
+            "multipart_chunksize_mb",
+            DataModel.DEFAULT_MULTIPART_CHUNKSIZE_MB) or
+            DataModel.DEFAULT_MULTIPART_CHUNKSIZE_MB)
         cur_notify = str(
             self.settings.value("notify_on_complete", "true")).lower() in ("true", "1")
         self.settings.endGroup()
@@ -7876,13 +8402,20 @@ class MainWindow(QMainWindow):
             verify_downloads=cur_verify,
             rate_limit_kbps=cur_rate,
             checksum_algorithm=cur_checksum,
+            multipart_threshold_mb=cur_threshold,
+            multipart_chunksize_mb=cur_chunk,
+            resumable_uploads=cur_resumable,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
+        threshold_mb, chunk_mb = self.data_model.set_multipart_sizes(
+            threshold_mb=dlg.multipart_threshold_mb(),
+            chunksize_mb=dlg.multipart_chunksize_mb())
         applied = self.data_model.set_transfer_concurrency(dlg.concurrency())
         files = self.data_model.set_parallel_files(dlg.parallel_files())
         self.data_model.verify_downloads = dlg.verify_downloads()
+        self.data_model.resumable_uploads = dlg.resumable_uploads()
         self.data_model.set_rate_limit(dlg.rate_limit_kbps() * 1024)
         extra = self.data_model.set_upload_options(
             storage_class=dlg.storage_class(),
@@ -7900,6 +8433,10 @@ class MainWindow(QMainWindow):
         self.settings.setValue("upload_sse", dlg.sse())
         self.settings.setValue("upload_kms_key", dlg.kms_key_id())
         self.settings.setValue("upload_checksum", dlg.checksum_algorithm())
+        self.settings.setValue(
+            "resumable_uploads", "true" if dlg.resumable_uploads() else "false")
+        self.settings.setValue("multipart_threshold_mb", threshold_mb)
+        self.settings.setValue("multipart_chunksize_mb", chunk_mb)
         self.settings.setValue(
             "notify_on_complete", "true" if dlg.notify() else "false")
         self.settings.endGroup()
@@ -8356,6 +8893,38 @@ class MainWindow(QMainWindow):
         self.settings.endGroup()
         self._save_view_state()
         self._save_binding_cache()
+        self._save_last_location()
+
+    def _last_location_key(self) -> str:
+        return f"last_location/{self.profile_name or 'default'}"
+
+    def _save_last_location(self):
+        """Remember where this profile was browsing, per profile."""
+        self.settings.beginGroup("common")
+        self.settings.setValue(
+            self._last_location_key(),
+            serialize_location(self.data_model.bucket,
+                               self.data_model.current_folder))
+        self.settings.endGroup()
+
+    def restore_last_location(self) -> str:
+        """
+        Reopen the stored location, if there is one.
+
+        Returns the bucket it is opening, or "" when it stays on the bucket
+        list. Entering a bucket makes S3 calls, so this goes through the same
+        async path as a double-click — and a bucket that has since been
+        deleted simply leaves the bucket list showing.
+        """
+        self.settings.beginGroup("common")
+        stored = self.settings.value(self._last_location_key(), "") or ""
+        self.settings.endGroup()
+        bucket, prefix = parse_location(stored)
+        if not bucket:
+            return ""
+        self.log(f"reopening {serialize_location(bucket, prefix)}")
+        self.enter_bucket_async(bucket, target_prefix=prefix)
+        return bucket
 
     def share_link(self, key: str):
         """Open the presigned-link dialog (download/upload, configurable expiry)."""
@@ -8416,6 +8985,32 @@ class MainWindow(QMainWindow):
                 key += "/"
             items.append((name, key, is_folder))
         return items
+
+    def sync_to_profile(self):
+        """Compare this prefix with one in another profile and run the plan."""
+        if self.in_bucket_list_mode():
+            self.statusBar().showMessage("Enter a bucket first", 2000)
+            return
+        dlg = CrossProfileSyncDialog(
+            self, self, self.data_model, self.data_model.current_folder,
+            self.settings, current_profile=self.profile_name)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        source_model, dest_model, job = dlg.plan()
+        if not job or dest_model is None:
+            self.statusBar().showMessage("Nothing to sync", 2000)
+            return
+        if getattr(dest_model, "read_only", False):
+            QMessageBox.warning(
+                self, "Sync to another profile",
+                "The destination profile is read-only.")
+            return
+        # The source may be the OTHER profile (a pull), so the worker cannot
+        # just use this window's model.
+        self.assign_thread_operation(
+            "sync_to_profile", job, need_refresh=True, dest_model=dest_model,
+            source_model=source_model)
+        self.statusBar().showMessage(f"Syncing {len(job)} item(s)…", 3000)
 
     def copy_to_profile(self):
         """Stream the selection into another profile's bucket."""

@@ -8,6 +8,7 @@ Several tests are explicit regression guards for previously fixed bugs and
 are marked with "REGRESSION:" in their docstrings.
 """
 
+import ast
 import base64
 import contextlib
 import hashlib
@@ -28,10 +29,6 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-# Widget tests need a Qt platform plugin; use the headless one before any Qt
-# import so the suite runs without a display.
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
 import botocore.exceptions
 from PyQt6.QtCore import QByteArray, QEvent, QRect, QSettings, Qt, QUrl
 from PyQt6.QtGui import (
@@ -43,8 +40,7 @@ from PyQt6.QtWidgets import (
     QStyleOptionViewItem, QToolButton, QWidgetAction,
 )
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+import diagnostics
 import main_window
 from main_window import command_entries, filter_commands, palette_score
 import profile_switcher
@@ -54,11 +50,11 @@ from cryptography.fernet import Fernet
 import s3duck
 from s3duck import (
     selected_row_index, SettingsItem, load_profile_secrets, profile_summary,
-    profile_badges,
+    profile_badges, preselect_row,
 )
 from utils import (
     Crypto, CredentialError, require_crypto, TempWorkspace, pid_is_alive,
-    normalize_accent, themed_icon, icon_is_visible,
+    normalize_accent, themed_icon, icon_is_visible, bundled_icon,
 )
 from utils import (
     str_to_bool, load_aws_profiles, scan_local_tree,
@@ -69,6 +65,8 @@ from main_window import (
     _dest_inside_source, _build_upload_job_for_path, _listing_summary,
     bulk_rename_plan, build_sync_plan, summarize_sync_plan, build_exclude_matcher,
     collect_shortcuts, LIST_COLUMNS, LIST_OPTIONAL_COLUMNS,
+    serialize_location, parse_location, build_profile_sync_job,
+    location_entries,
     build_paste_job, hex_dump, bookmark_label, parse_bookmarks,
     find_duplicate_groups, summarize_duplicate_groups, select_redundant_keys,
     serialize_bookmarks, add_bookmark_to,
@@ -1383,7 +1381,7 @@ class ResumableDownloadTests(unittest.TestCase):
 
     def _model(self, payload, fail_on_chunk=None):
         m = make_model(bucket="b")
-        m.RESUME_CHUNK_SIZE = 1024
+        m.resume_chunk_size = 1024
         m.resume_threshold = 1
         m.parallel_files = 1          # deterministic chunk order
         m._client = _RangedClient(payload, fail_on_chunk)
@@ -3014,6 +3012,1133 @@ class _HollowIconEngine(QIconEngine):
         return _HollowIconEngine()
 
 
+class QuickOpenTests(unittest.TestCase):
+    """Ctrl+P: reach a bucket or saved place by name instead of clicking back
+    to the bucket list."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    BOOKMARKS = [
+        {"name": "logs 2026", "bucket": "logs", "prefix": "2026/"},
+        {"name": "", "bucket": "media", "prefix": ""},
+    ]
+
+    def test_bookmarks_come_before_buckets(self):
+        """A saved place is almost always what someone is reaching for."""
+        rows = location_entries(["assets", "logs"], self.BOOKMARKS)
+        self.assertEqual([label for label, _h, _t in rows][:2],
+                         ["logs 2026", "media"])
+
+    def test_a_nameless_bookmark_falls_back_to_its_location(self):
+        rows = location_entries([], [{"bucket": "media", "prefix": "raw/"}])
+        self.assertEqual(rows, [("media/raw/", "media/raw/", ("media", "raw/"))])
+
+    def test_the_open_bucket_is_not_offered(self):
+        """Jumping to where you already are is not a useful result."""
+        rows = location_entries(["assets", "logs"], [], current_bucket="logs")
+        self.assertEqual([label for label, _h, _t in rows], ["assets"])
+
+    def test_a_bookmark_for_the_open_bucket_is_still_offered(self):
+        """Its prefix is a different place, even in the same bucket."""
+        rows = location_entries([], self.BOOKMARKS, current_bucket="logs")
+        self.assertIn("logs 2026", [label for label, _h, _t in rows])
+
+    def test_duplicates_collapse(self):
+        rows = location_entries(
+            ["media", "media"], [{"bucket": "media", "prefix": ""}])
+        self.assertEqual(len(rows), 1)
+
+    def test_blank_entries_are_ignored(self):
+        rows = location_entries(["", None], [{"bucket": ""}, None])
+        self.assertEqual(rows, [])
+
+    def test_targets_carry_the_bucket_and_prefix(self):
+        rows = location_entries([], self.BOOKMARKS)
+        self.assertEqual(rows[0][2], ("logs", "2026/"))
+
+    def test_the_dialog_filters_with_the_palette_matcher(self):
+        dlg = main_window.QuickOpenDialog(
+            None, location_entries(["assets", "logs"], self.BOOKMARKS))
+        self.addCleanup(dlg.close)
+        self.assertEqual(dlg._list.count(), 4)
+        dlg._query.setText("med")
+        self.assertEqual(dlg._list.count(), 1)
+        self.assertEqual(dlg.chosen_location(), ("media", ""))
+
+    def test_arrow_keys_move_the_selection(self):
+        dlg = main_window.QuickOpenDialog(
+            None, location_entries(["assets", "logs"], []))
+        self.addCleanup(dlg.close)
+        event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Down,
+                          Qt.KeyboardModifier.NoModifier)
+        self.assertTrue(dlg.eventFilter(dlg._query, event))
+        self.assertEqual(dlg._list.currentRow(), 1)
+
+    def test_the_highlighted_row_is_what_opens(self):
+        """Not simply the first match — the arrows move the selection."""
+        dlg = main_window.QuickOpenDialog(
+            None, location_entries(["assets", "logs"], []))
+        self.addCleanup(dlg.close)
+        self.assertEqual(dlg.chosen_location(), ("assets", ""))
+        dlg._list.setCurrentRow(1)
+        self.assertEqual(dlg.chosen_location(), ("logs", ""))
+
+    def test_nothing_is_chosen_when_nothing_matches(self):
+        dlg = main_window.QuickOpenDialog(
+            None, location_entries(["assets"], []))
+        self.addCleanup(dlg.close)
+        dlg._query.setText("zzzz")
+        self.assertIsNone(dlg.chosen_location())
+
+    def test_the_window_binds_ctrl_p(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                root, settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        self.assertEqual(win._quick_open_shortcut.key(), QKeySequence("Ctrl+P"))
+
+    def test_choosing_a_location_navigates_there(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                root, settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        win._bookmarks = list(self.BOOKMARKS)
+        jumped = []
+        with patch.object(main_window.MainWindow, "_run_with_progress",
+                          lambda _s, t, fn: (["logs", "media"], None)), \
+             patch.object(main_window.QuickOpenDialog, "exec",
+                          lambda _s: QDialog.DialogCode.Accepted), \
+             patch.object(main_window.QuickOpenDialog, "chosen_location",
+                          lambda _s: ("logs", "2026/")), \
+             patch.object(main_window.MainWindow, "go_to_bookmark",
+                          lambda _s, entry: jumped.append(entry)):
+            win.show_quick_open()
+        self.assertEqual(jumped, [{"bucket": "logs", "prefix": "2026/"}])
+
+    def test_a_failed_bucket_listing_still_offers_bookmarks(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                root, settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        win._bookmarks = list(self.BOOKMARKS)
+        shown = []
+        with patch.object(main_window.MainWindow, "_run_with_progress",
+                          lambda _s, t, fn: (None, RuntimeError("no route"))), \
+             patch.object(main_window, "QuickOpenDialog") as dlg_cls:
+            dlg_cls.return_value.exec.return_value = QDialog.DialogCode.Rejected
+            win.show_quick_open()
+            shown = list(dlg_cls.call_args.args[1])
+        self.assertEqual([label for label, _h, _t in shown],
+                         ["logs 2026", "media"])
+
+    def test_cancelling_the_bucket_listing_opens_nothing(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                root, settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        # Bookmarks exist, so "nothing to show" cannot stand in for the
+        # cancellation check the way an empty list would.
+        win._bookmarks = list(self.BOOKMARKS)
+        with patch.object(main_window.MainWindow, "_run_with_progress",
+                          lambda _s, t, fn: (None, None)), \
+             patch.object(main_window, "QuickOpenDialog") as dlg_cls:
+            win.show_quick_open()
+        dlg_cls.assert_not_called()
+
+
+class CrossProfileSyncTests(unittest.TestCase):
+    """Cross-profile copy landed first; syncing reuses the same planner by
+    feeding it the two profiles' trees as source and destination."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def test_the_plan_becomes_copy_and_delete_rows(self):
+        actions = [
+            {"action": "upload", "rel": "a.txt", "size": 1, "reason": "missing"},
+            {"action": "skip", "rel": "b.txt", "size": 1, "reason": "same"},
+            {"action": "delete_remote", "rel": "old.txt", "size": 0,
+             "reason": "not at source"},
+        ]
+        self.assertEqual(
+            build_profile_sync_job(actions, "src/", "dst/"),
+            [("copy", "src/a.txt", "dst/a.txt"),
+             ("delete", "", "dst/old.txt")])
+
+    def test_skips_never_become_work(self):
+        actions = [{"action": "skip", "rel": "a", "size": 1, "reason": "same"}]
+        self.assertEqual(build_profile_sync_job(actions, "", ""), [])
+
+    def test_a_root_to_root_sync_keeps_bare_keys(self):
+        actions = [{"action": "upload", "rel": "a/b.txt", "size": 1,
+                    "reason": "missing"}]
+        self.assertEqual(build_profile_sync_job(actions, "", ""),
+                         [("copy", "a/b.txt", "a/b.txt")])
+
+    def test_rows_without_a_path_are_ignored(self):
+        self.assertEqual(
+            build_profile_sync_job([{"action": "upload", "rel": ""}], "s/", "d/"),
+            [])
+        self.assertEqual(build_profile_sync_job(None, "s/", "d/"), [])
+
+    def test_the_worker_copies_and_deletes_against_the_right_models(self):
+        source = Model("https://a", "us-east-1", "AK", "SK", "src", False, False)
+        dest = _RecordingDest(bucket="dst")
+        dest.deleted = []
+        dest.delete = lambda key, log_fn=None, cancel_event=None: \
+            dest.deleted.append(key)
+        copied = []
+        worker = main_window.Worker(
+            source,
+            [("copy", "src/a.txt", "dst/a.txt"), ("delete", "", "dst/old.txt")],
+            dest_model=dest)
+        with patch.object(Model, "copy_to_model",
+                          lambda _s, src, model, dst, **kw:
+                          copied.append((src, dst, model))):
+            worker.sync_to_profile()
+        self.assertEqual(copied, [("src/a.txt", "dst/a.txt", dest)])
+        self.assertEqual(dest.deleted, ["dst/old.txt"])
+
+    def test_the_worker_refuses_without_a_destination(self):
+        source = Model("https://a", "us-east-1", "AK", "SK", "src", False, False)
+        worker = main_window.Worker(source, [("copy", "a", "b")])
+        errors = []
+        worker.error.connect(errors.append)
+        worker.sync_to_profile()
+        self.assertIn("destination", errors[0])
+
+    def test_cancelling_stops_before_the_next_item(self):
+        source = Model("https://a", "us-east-1", "AK", "SK", "src", False, False)
+        dest = _RecordingDest(bucket="dst")
+        worker = main_window.Worker(
+            source, [("copy", "a", "a"), ("copy", "b", "b")], dest_model=dest)
+        worker._cancel_event.set()
+        done = []
+        worker.finished.connect(lambda cancelled: done.append(cancelled))
+        with patch.object(Model, "copy_to_model",
+                          lambda *a, **kw: self.fail("copied after cancel")):
+            worker.sync_to_profile()
+        self.assertEqual(done, [True])
+
+    def test_a_pull_reads_from_the_other_profile(self):
+        """The queue entry carries its own source model, because a pull does
+        not read from the window's model at all."""
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                root, settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        other = Model("https://b", "us-east-1", "AK", "SK", "other", False, False)
+        entry = main_window._QEntry(
+            entry_id=1, method="sync_to_profile", job=[], source_model=other)
+        self.assertIs(win._worker_model_for(entry), other)
+
+    def test_an_ordinary_entry_still_gets_a_clone(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                root, settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        entry = main_window._QEntry(entry_id=1, method="upload", job=[])
+        model = win._worker_model_for(entry)
+        self.assertIsNot(model, win.data_model)
+        self.assertIsInstance(model, Model)
+
+
+class LocationRestoreTests(unittest.TestCase):
+    """Bookmarks landed earlier; this is the other half — come back to where
+    you were, in the profile you were using."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_a_location_round_trips(self):
+        for bucket, prefix in (("logs", "2026/08/"), ("logs", ""),
+                               ("logs", "deep/nested/path/")):
+            with self.subTest(bucket=bucket, prefix=prefix):
+                text = serialize_location(bucket, prefix)
+                self.assertEqual(parse_location(text), (bucket, prefix))
+
+    def test_bucket_list_mode_stores_nothing(self):
+        self.assertEqual(serialize_location("", ""), "")
+        self.assertEqual(serialize_location(None, "x/"), "")
+        self.assertEqual(parse_location(""), ("", ""))
+        self.assertEqual(parse_location(None), ("", ""))
+
+    def test_stray_slashes_do_not_change_the_meaning(self):
+        self.assertEqual(parse_location("/logs/a/b/"), ("logs", "a/b/"))
+        self.assertEqual(serialize_location("/logs/", "/a/"), "logs/a/")
+
+    def test_a_prefix_without_a_trailing_slash_is_normalised(self):
+        """Navigation treats a prefix as a folder, so the slash is not
+        cosmetic — a hand-edited setting must still work."""
+        self.assertEqual(parse_location("logs/a/b"), ("logs", "a/b/"))
+        self.assertEqual(parse_location("logs"), ("logs", ""))
+
+    def _win(self, profile="prof", settings=None):
+        settings = settings or QSettings("s3duck-tests", "s3duck-tests")
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, profile, "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        return win
+
+    def test_the_location_is_saved_per_profile(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        win = self._win("prod", settings)
+        win.data_model.bucket = "logs"
+        win.data_model.current_folder = "2026/"
+        win._save_last_location()
+        settings.beginGroup("common")
+        self.assertEqual(settings.value("last_location/prod"), "logs/2026/")
+        self.assertIsNone(settings.value("last_location/dev"))
+        settings.endGroup()
+
+    def test_closing_the_window_persists_the_location(self):
+        """Saved through writeSettings, so the hook itself is covered rather
+        than only the helper it calls."""
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        win = self._win("prod", settings)
+        win.data_model.bucket = "logs"
+        win.data_model.current_folder = "deep/"
+        win.close()
+        settings.beginGroup("common")
+        self.assertEqual(settings.value("last_location/prod"), "logs/deep/")
+        settings.endGroup()
+
+    def test_the_stored_location_is_reopened(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        settings.beginGroup("common")
+        settings.setValue("last_location/prod", "logs/2026/")
+        settings.endGroup()
+        entered = []
+        with patch.object(main_window.MainWindow, "enter_bucket_async",
+                          lambda _s, name, target_prefix=None:
+                          entered.append((name, target_prefix))):
+            win = self._win("prod", settings)
+            entered.clear()          # ignore whatever startup already did
+            self.assertEqual(win.restore_last_location(), "logs")
+        self.assertEqual(entered, [("logs", "2026/")])
+
+    def test_no_stored_location_stays_on_the_bucket_list(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        entered = []
+        with patch.object(main_window.MainWindow, "enter_bucket_async",
+                          lambda _s, name, target_prefix=None:
+                          entered.append(name)):
+            win = self._win("prod", settings)
+            entered.clear()
+            self.assertEqual(win.restore_last_location(), "")
+        self.assertEqual(entered, [])
+
+    def test_preselect_falls_back_when_the_profile_is_gone(self):
+        """A deleted or renamed profile must not leave the list unselected."""
+        items = [SettingsItem("dev", "u", "r", "", b"", b"", "false", "false",
+                              b"", "false", ""),
+                 SettingsItem("prod", "u", "r", "", b"", b"", "false", "false",
+                              b"", "false", "")]
+        self.assertEqual(preselect_row(items, "prod"), 1)
+        self.assertEqual(preselect_row(items, "dev"), 0)
+        self.assertEqual(preselect_row(items, "vanished"), 0)
+        # An unnamed profile must not be matched by an empty remembered name.
+        # It sits at index 1 on purpose: at index 0 the fallback and the bug
+        # would both answer 0, and the test would prove nothing.
+        unnamed = SettingsItem("", "u", "r", "", b"", b"", "false", "false",
+                               b"", "false", "")
+        mixed = [items[0], unnamed, items[1]]
+        self.assertEqual(preselect_row(mixed, ""), 0)
+        self.assertEqual(preselect_row(mixed, "prod"), 2)
+        self.assertEqual(preselect_row(items, ""), 0)
+        self.assertEqual(preselect_row(items, None), 0)
+        self.assertEqual(preselect_row([], "prod"), -1)
+
+    def test_the_launcher_preselects_the_remembered_profile(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        win = s3duck.Profiles()
+        self.addCleanup(win.close)
+        win.settings = settings
+        win.items = [
+            SettingsItem("dev", "u", "r", "", b"", b"", "false", "false",
+                         b"", "false", ""),
+            SettingsItem("prod", "u", "r", "", b"", b"", "false", "false",
+                         b"", "false", ""),
+        ]
+        win.populate_list()
+        win.listWidget.setCurrentIndex(
+            win.listWidget.model().index(preselect_row(win.items, "prod"), 0))
+        self.assertEqual(win.listWidget.currentRow(), 1)
+
+
+class DiagnosticsTests(unittest.TestCase):
+    """Exists because a blank-icon report took three rounds to explain: the
+    venv's PyQt6 wheel bundles QtSvg, the distribution package does not, and
+    nothing in the app said so."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_the_report_names_the_facts_that_explain_icon_trouble(self):
+        sections = diagnostics.collect(self.ROOT, version="9.9.9")
+        text = diagnostics.format_report(sections)
+        for label in ("SVG icons render", "QtSvg module",
+                      "QtPdf module (PDF preview)", "Icon theme",
+                      "Would render blank"):
+            self.assertIn(label, text)
+
+    def test_the_version_reaches_the_report(self):
+        text = diagnostics.format_report(
+            diagnostics.collect(self.ROOT, version="9.9.9"))
+        self.assertIn("9.9.9", text)
+
+    def test_svg_support_is_measured_by_rendering_not_by_format_list(self):
+        """REGRESSION: the report read "svg" out of supportedImageFormats and
+        said SVG was unreadable on a Qt where every SVG icon drew fine — QIcon
+        reaches SVG through the icon-engine plugin, not the image format."""
+        self.assertTrue(diagnostics.svg_supported(self.ROOT))
+        # The format list alone must not decide it.
+        with patch.object(diagnostics, "image_formats",
+                          staticmethod(lambda: ["png"])):
+            self.assertTrue(diagnostics.svg_supported(self.ROOT))
+        # A Qt that cannot draw the sample reports no support.
+        with patch.object(diagnostics, "icon_is_visible",
+                          staticmethod(lambda *a, **kw: False)):
+            self.assertFalse(diagnostics.svg_supported(self.ROOT))
+
+    def test_svg_support_falls_back_to_the_format_list_without_a_sample(self):
+        with patch.object(diagnostics.os.path, "exists",
+                          staticmethod(lambda _p: False)), \
+             patch.object(diagnostics, "image_formats",
+                          staticmethod(lambda: ["png"])):
+            self.assertFalse(diagnostics.svg_supported(self.ROOT))
+
+    def test_icon_status_counts_every_requested_icon(self):
+        status = diagnostics.icon_status(self.ROOT)
+        self.assertGreater(status["total"], 30)
+        self.assertEqual(status["blank"], 0)
+        self.assertEqual(status["themed"] + status["bundled"] + status["blank"],
+                         status["total"])
+
+    def test_icon_status_counts_hollow_theme_entries(self):
+        """The Mint case: the theme claims the name, so no fallback is used,
+        yet nothing is painted. Counting these is what points at the cause."""
+        hollow = QIcon(_HollowIconEngine())
+        with patch.object(diagnostics.QIcon, "hasThemeIcon",
+                          staticmethod(lambda name: True)), \
+             patch.object(diagnostics.QIcon, "fromTheme",
+                          staticmethod(lambda *a, **kw: hollow)):
+            status = diagnostics.icon_status(self.ROOT)
+        self.assertEqual(status["hollow"], status["total"])
+        self.assertEqual(status["themed"], 0)
+        self.assertEqual(status["blank"], 0, "bundled art should cover them")
+
+    def test_icon_status_reports_blanks_when_nothing_can_render(self):
+        """The symptom the user actually saw."""
+        with patch.object(diagnostics, "bundled_icon",
+                          staticmethod(lambda *a, **kw: QIcon())):
+            status = diagnostics.icon_status(self.ROOT)
+        self.assertEqual(status["bundled"], 0)
+        self.assertGreater(status["blank"], 0)
+
+    def test_icon_calls_reads_multi_line_calls(self):
+        """A line-oriented regex reported a present fallback as missing."""
+        source = (
+            'x = themed_icon("go-home", os.path.join(\n'
+            '    self.current_dir,\n'
+            '    "icons",\n'
+            '    "home_24px.svg",\n'
+            '))\n'
+            'y = themed_icon("no-fallback")\n')
+        self.assertEqual(
+            sorted(diagnostics.icon_calls(source)),
+            [("go-home", "home_24px.svg"), ("no-fallback", "")])
+
+    def test_profile_and_transfer_settings_are_included(self):
+        model = Model("https://minio.local", "us-east-1", "AK", "SK",
+                      "bkt", True, True)
+        model.set_multipart_sizes(threshold_mb=64, chunksize_mb=32)
+        model.read_only = True
+        sections = diagnostics.collect(
+            self.ROOT, model=model, profile_name="prod")
+        text = diagnostics.format_report(sections)
+        self.assertIn("prod", text)
+        self.assertIn("32 MiB", text)
+        self.assertIn("64 MiB", text)
+        # no_ssl_check=True means verification is OFF; the report must not
+        # invert a security-relevant flag
+        rows = dict(next(r for t, r in sections if t == "Profile"))
+        self.assertEqual(rows["TLS verification"], "no")
+        self.assertEqual(rows["Read-only"], "yes")
+
+    def test_a_model_is_optional(self):
+        """The launcher may want a report before any profile is opened."""
+        titles = [title for title, _rows in diagnostics.collect(self.ROOT)]
+        self.assertNotIn("Profile", titles)
+        self.assertIn("Qt", titles)
+
+    def test_the_report_is_aligned_plain_text(self):
+        text = diagnostics.format_report(
+            [("Bit", [("a", "1"), ("longer label", "2")])])
+        self.assertEqual(
+            text, "== Bit ==\na            : 1\nlonger label : 2\n")
+
+    def test_the_dialog_copies_the_report_to_the_clipboard(self):
+        dlg = main_window.DiagnosticsDialog(None, "== X ==\nk : v\n")
+        self.addCleanup(dlg.close)
+        dlg.copy_report()
+        self.assertEqual(QApplication.clipboard().text(), "== X ==\nk : v\n")
+
+    def test_the_action_is_reachable_from_the_command_palette(self):
+        """Tools-menu actions are descendants of the window, so findChildren
+        reaches them; this pins that the new entry is genuinely offered."""
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        labels = [label for label, _k, _a in
+                  command_entries(win._live_actions())]
+        self.assertIn("Diagnostics", labels)
+
+
+class _MultipartClient:
+    """Records a manual multipart upload, optionally failing one part once."""
+
+    def __init__(self, fail_on_part=None, page_size=None, cancel_on_part=None,
+                 cancel_event=None):
+        self.cancel_on_part = cancel_on_part
+        self.cancel_event = cancel_event
+        self.uploads = {}          # upload_id -> {key, parts}
+        self.completed = {}        # key -> assembled bytes
+        self.fail_on_part = fail_on_part
+        self.page_size = page_size
+        self.created = 0
+        self.part_calls = []
+        self.managed = []          # upload_file() calls (the boto3 fast path)
+        self.aborted = []
+
+    def create_multipart_upload(self, Bucket, Key, **kw):
+        self.created += 1
+        upload_id = f"upload-{self.created}"
+        self.uploads[upload_id] = {"key": Key, "parts": {}, "kw": kw}
+        return {"UploadId": upload_id}
+
+    def upload_part(self, Bucket, Key, UploadId, PartNumber, Body, **kw):
+        self.part_calls.append((PartNumber, kw.get("ChecksumAlgorithm")))
+        if self.cancel_on_part == PartNumber and self.cancel_event is not None:
+            self.cancel_event.set()
+        if self.fail_on_part == PartNumber:
+            self.fail_on_part = None
+            raise RuntimeError("connection reset")
+        self.uploads[UploadId]["parts"][PartNumber] = bytes(Body)
+        out = {"ETag": f'"etag{PartNumber}"'}
+        if kw.get("ChecksumAlgorithm") == "CRC32":
+            out["ChecksumCRC32"] = f"crc{PartNumber}"
+        return out
+
+    def list_parts(self, Bucket, Key, UploadId, PartNumberMarker=0):
+        stored = sorted(self.uploads.get(UploadId, {}).get("parts", {}).items())
+        rows = [{"PartNumber": n, "ETag": f'"etag{n}"', "Size": len(b)}
+                for n, b in stored if n > PartNumberMarker]
+        if self.page_size and len(rows) > self.page_size:
+            head = rows[:self.page_size]
+            return {"Parts": head, "IsTruncated": True,
+                    "NextPartNumberMarker": head[-1]["PartNumber"]}
+        return {"Parts": rows, "IsTruncated": False}
+
+    def complete_multipart_upload(self, Bucket, Key, UploadId, MultipartUpload):
+        parts = self.uploads[UploadId]["parts"]
+        order = [p["PartNumber"] for p in MultipartUpload["Parts"]]
+        self.completed[Key] = b"".join(parts[n] for n in order)
+        self.completed_parts = MultipartUpload["Parts"]
+        return {"ETag": '"assembled"'}
+
+    def upload_file(self, local, Bucket, Key, **kw):
+        self.managed.append(Key)
+
+    def abort_multipart_upload(self, Bucket, Key, UploadId):
+        self.aborted.append(UploadId)
+
+
+class ResumableUploadTests(unittest.TestCase):
+    """boto3's managed upload restarts from zero, so on a slow link a large
+    file was effectively untransferable."""
+
+    PART = 1024
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.payload = os.urandom(self.PART * 3 + 17)   # 4 parts, last short
+        self.path = os.path.join(self.dir, "big.bin")
+        with open(self.path, "wb") as handle:
+            handle.write(self.payload)
+
+    def _model(self, client):
+        model = Model("https://s3.amazonaws.com", "us-east-1",
+                      "AK", "SK", "bkt", False, False)
+        model.upload_chunk_size = self.PART
+        model.multipart_threshold_mb = 0        # every file takes this path
+        model.transfer_concurrency = 1          # deterministic part order
+        model.upload_state_dir = os.path.join(self.dir, "state")
+        model._client = client
+        return model
+
+    def _state_files(self):
+        directory = os.path.join(self.dir, "state")
+        return sorted(os.listdir(directory)) if os.path.isdir(directory) else []
+
+    def test_a_large_file_is_assembled_byte_for_byte(self):
+        client = _MultipartClient()
+        self._model(client).upload_file(self.path, "big.bin")
+        self.assertEqual(client.completed["big.bin"], self.payload)
+        self.assertEqual(sorted(n for n, _c in client.part_calls),
+                         [1, 2, 3, 4])
+
+    def test_the_record_is_removed_once_the_upload_completes(self):
+        self._model(_MultipartClient()).upload_file(self.path, "big.bin")
+        self.assertEqual(self._state_files(), [])
+
+    def test_an_interrupted_upload_resumes_instead_of_restarting(self):
+        """THE POINT: the second attempt re-sends only what is missing."""
+        client = _MultipartClient(fail_on_part=3)
+        model = self._model(client)
+        with self.assertRaises(Exception):
+            model.upload_file(self.path, "big.bin")
+        self.assertEqual(len(self._state_files()), 1, "no resume record kept")
+        first_round = list(client.part_calls)
+
+        client.part_calls.clear()
+        model.upload_file(self.path, "big.bin")
+
+        self.assertEqual(client.completed["big.bin"], self.payload)
+        self.assertEqual(client.created, 1, "started a second multipart upload")
+        resent = sorted(n for n, _c in client.part_calls)
+        self.assertNotIn(1, resent, "re-sent a part the server already had")
+        self.assertIn(3, resent, "did not re-send the failed part")
+        self.assertLess(len(client.part_calls), len(first_round))
+
+    def test_cancelling_mid_upload_keeps_the_record_so_it_can_resume(self):
+        """Cancel is not an abort: the open upload and its record are exactly
+        what the next attempt continues from."""
+        cancel = threading.Event()
+        client = _MultipartClient(cancel_on_part=2, cancel_event=cancel)
+        model = self._model(client)
+        with self.assertRaises(TransferCancelled):
+            model.upload_file(self.path, "big.bin", cancel_event=cancel)
+        self.assertEqual(len(self._state_files()), 1)
+        self.assertEqual(client.aborted, [], "aborted the resumable upload")
+        self.assertNotIn("big.bin", client.completed)
+
+        cancel.clear()
+        client.cancel_on_part = None
+        client.part_calls.clear()
+        model.upload_file(self.path, "big.bin")
+        self.assertEqual(client.completed["big.bin"], self.payload)
+        self.assertEqual(client.created, 1)
+        self.assertNotIn(1, [n for n, _c in client.part_calls])
+
+    def test_cancelling_before_anything_starts_creates_no_upload(self):
+        client = _MultipartClient()
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(TransferCancelled):
+            self._model(client).upload_file(
+                self.path, "big.bin", cancel_event=cancel)
+        self.assertEqual(client.created, 0)
+        self.assertEqual(self._state_files(), [])
+
+    def test_a_changed_local_file_starts_a_fresh_upload(self):
+        """Parts already on the server no longer line up, so reusing them
+        would assemble a corrupt object."""
+        client = _MultipartClient(fail_on_part=2)
+        model = self._model(client)
+        with self.assertRaises(Exception):
+            model.upload_file(self.path, "big.bin")
+        with open(self.path, "wb") as handle:
+            handle.write(os.urandom(self.PART * 2))
+        model.upload_file(self.path, "big.bin")
+        self.assertEqual(client.created, 2, "reused a stale upload id")
+
+    def _seed_record(self, client, parts=(), size=None, mtime=None,
+                     chunk=None, upload_id=None):
+        """A prior attempt: an open upload with some parts already stored."""
+        model = self._model(client)
+        if upload_id is None:
+            upload_id = client.create_multipart_upload("bkt", "big.bin")["UploadId"]
+        for number in parts:
+            start = (number - 1) * self.PART
+            client.uploads[upload_id]["parts"][number] = \
+                self.payload[start:start + self.PART]
+        model._write_upload_state(
+            model._upload_state_path("big.bin", self.path), "big.bin",
+            upload_id,
+            len(self.payload) if size is None else size,
+            os.path.getmtime(self.path) if mtime is None else mtime,
+            self.PART if chunk is None else chunk)
+        return model
+
+    def test_only_a_size_change_invalidates_the_record(self):
+        """Each identity field is checked on its own; the others cannot be
+        relied on to notice."""
+        client = _MultipartClient()
+        mtime = os.path.getmtime(self.path)
+        model = self._seed_record(client, parts=[1], mtime=mtime)
+        with open(self.path, "wb") as handle:
+            handle.write(self.payload + b"appended")
+        os.utime(self.path, (mtime, mtime))          # size differs, mtime same
+        model.upload_file(self.path, "big.bin")
+        self.assertEqual(client.created, 2, "reused a record for a resized file")
+
+    def test_only_an_mtime_change_invalidates_the_record(self):
+        client = _MultipartClient()
+        mtime = os.path.getmtime(self.path)
+        model = self._seed_record(client, parts=[1], mtime=mtime)
+        os.utime(self.path, (mtime + 60, mtime + 60))   # same bytes, new mtime
+        model.upload_file(self.path, "big.bin")
+        self.assertEqual(client.created, 2, "reused a record for a touched file")
+
+    def test_only_a_part_size_change_invalidates_the_record(self):
+        """Parts on the server would no longer line up with what we send."""
+        client = _MultipartClient()
+        model = self._seed_record(client, parts=[1])
+        model.upload_chunk_size = self.PART * 2
+        model.upload_file(self.path, "big.bin")
+        self.assertEqual(client.created, 2, "reused a differently chunked upload")
+
+    def test_completion_lists_parts_in_number_order(self):
+        """A resumed upload learns of server parts before it sends the missing
+        ones, so insertion order is not part order — and S3 assembles the
+        object in the order given."""
+        client = _MultipartClient()
+        model = self._seed_record(client, parts=[3])
+        model.upload_file(self.path, "big.bin")
+        numbers = [p["PartNumber"] for p in client.completed_parts]
+        self.assertEqual(numbers, [1, 2, 3, 4])
+        self.assertEqual(client.completed["big.bin"], self.payload)
+
+    def test_cancelling_during_the_last_part_does_not_complete(self):
+        """Every part is in flight when the cancel lands, so the parallel run
+        finishes normally and only a final check can stop the completion."""
+        cancel = threading.Event()
+        client = _MultipartClient(cancel_on_part=4, cancel_event=cancel)
+        model = self._model(client)
+        with self.assertRaises(TransferCancelled):
+            model.upload_file(self.path, "big.bin", cancel_event=cancel)
+        self.assertNotIn("big.bin", client.completed)
+        self.assertEqual(len(self._state_files()), 1)
+
+    def test_a_stored_part_of_the_wrong_length_is_resent(self):
+        client = _MultipartClient()
+        model = self._model(client)
+        upload_id = client.create_multipart_upload("bkt", "big.bin")["UploadId"]
+        client.uploads[upload_id]["parts"][1] = b"truncated"
+        model._write_upload_state(
+            model._upload_state_path("big.bin", self.path), "big.bin",
+            upload_id, len(self.payload), os.path.getmtime(self.path),
+            self.PART)
+        model.upload_file(self.path, "big.bin")
+        self.assertIn(1, [n for n, _c in client.part_calls])
+        self.assertEqual(client.completed["big.bin"], self.payload)
+
+    def test_an_unusable_upload_id_falls_back_to_a_new_upload(self):
+        """The record survives but the service has forgotten the upload."""
+        client = _MultipartClient()
+        model = self._model(client)
+        model._write_upload_state(
+            model._upload_state_path("big.bin", self.path), "big.bin",
+            "gone", len(self.payload), os.path.getmtime(self.path), self.PART)
+
+        def _boom(**kw):
+            raise RuntimeError("NoSuchUpload")
+
+        client.list_parts = _boom
+        logs = []
+        model.upload_file(self.path, "big.bin", log_fn=logs.append)
+        self.assertEqual(client.completed["big.bin"], self.payload)
+        self.assertTrue(any("starting over" in m for m in logs))
+
+    def test_paginated_part_listings_are_followed(self):
+        client = _MultipartClient(fail_on_part=4, page_size=1)
+        model = self._model(client)
+        with self.assertRaises(Exception):
+            model.upload_file(self.path, "big.bin")
+        client.part_calls.clear()
+        model.upload_file(self.path, "big.bin")
+        self.assertEqual(client.completed["big.bin"], self.payload)
+        self.assertEqual([n for n, _c in client.part_calls], [4])
+
+    def test_progress_is_reported_and_never_exceeds_the_total(self):
+        seen = []
+        client = _MultipartClient()
+        self._model(client).upload_file(
+            self.path, "big.bin",
+            progress_cb=lambda total, cur, key: seen.append((total, cur)))
+        self.assertTrue(seen)
+        self.assertTrue(all(cur <= total for total, cur in seen))
+        self.assertEqual(seen[-1][1], len(self.payload))
+
+    def test_small_files_stay_on_the_managed_upload(self):
+        client = _MultipartClient()
+        model = self._model(client)
+        model.multipart_threshold_mb = 16
+        model.upload_file(self.path, "small.bin")
+        self.assertEqual(client.managed, ["small.bin"])
+        self.assertEqual(client.created, 0)
+
+    def test_the_feature_can_be_switched_off(self):
+        client = _MultipartClient()
+        model = self._model(client)
+        model.resumable_uploads = False
+        model.upload_file(self.path, "big.bin")
+        self.assertEqual(client.managed, ["big.bin"])
+
+    def test_upload_options_reach_the_multipart_creation(self):
+        client = _MultipartClient()
+        model = self._model(client)
+        model.set_upload_options(storage_class="GLACIER", sse="AES256")
+        model.upload_file(self.path, "big.bin")
+        created = client.uploads["upload-1"]["kw"]
+        self.assertEqual(created["StorageClass"], "GLACIER")
+        self.assertEqual(created["ServerSideEncryption"], "AES256")
+
+    def test_a_checksum_algorithm_is_applied_per_part_and_at_completion(self):
+        """Otherwise choosing a checksum would silently stop applying to
+        exactly the large objects it matters most for."""
+        client = _MultipartClient()
+        model = self._model(client)
+        model.set_upload_options(checksum_algorithm="CRC32")
+        model.upload_file(self.path, "big.bin")
+        self.assertEqual(client.uploads["upload-1"]["kw"]["ChecksumAlgorithm"],
+                         "CRC32")
+        self.assertTrue(all(alg == "CRC32" for _n, alg in client.part_calls))
+        self.assertTrue(
+            all("ChecksumCRC32" in part for part in client.completed_parts))
+
+    def test_a_read_only_profile_refuses(self):
+        client = _MultipartClient()
+        model = self._model(client)
+        model.read_only = True
+        with self.assertRaises(ReadOnlyError):
+            model.upload_file(self.path, "big.bin")
+        self.assertEqual(client.created, 0)
+
+    def test_completion_sends_parts_in_order_without_the_size_field(self):
+        """complete_multipart_upload rejects an unexpected Size member."""
+        client = _MultipartClient(fail_on_part=2)
+        model = self._model(client)
+        with self.assertRaises(Exception):
+            model.upload_file(self.path, "big.bin")
+        model.upload_file(self.path, "big.bin")
+        numbers = [p["PartNumber"] for p in client.completed_parts]
+        self.assertEqual(numbers, sorted(numbers))
+        self.assertTrue(all("Size" not in p for p in client.completed_parts))
+
+
+class MultipartSizeTests(unittest.TestCase):
+    """The part size and the multipart threshold were hardcoded at 8/16 MiB;
+    non-AWS backends often need different ones, and the part size also decides
+    how a resumable transfer is chunked."""
+
+    def setUp(self):
+        self.model = Model("https://s3.amazonaws.com", "us-east-1",
+                           "AK", "SK", "bkt", False, False)
+
+    def test_defaults_match_the_previous_hardcoded_values(self):
+        self.assertEqual(self.model.multipart_threshold_mb, 16)
+        self.assertEqual(self.model.multipart_chunksize_mb, 8)
+        self.assertEqual(self.model.multipart_chunksize_bytes, 8 * 1024 * 1024)
+
+    def test_the_sizes_reach_the_transfer_config(self):
+        self.model.set_multipart_sizes(threshold_mb=64, chunksize_mb=32)
+        for cfg in (self.model.transfer_cfg_upload,
+                    self.model.transfer_cfg_download):
+            self.assertEqual(cfg.multipart_threshold, 64 * 1024 * 1024)
+            self.assertEqual(cfg.multipart_chunksize, 32 * 1024 * 1024)
+
+    def test_the_part_size_cannot_go_below_s3s_floor(self):
+        """A non-final part under 5 MiB makes every multipart upload fail at
+        completion, so the value is clamped rather than trusted."""
+        self.model.set_multipart_sizes(chunksize_mb=1)
+        self.assertEqual(self.model.multipart_chunksize_mb, 5)
+
+    def test_the_part_size_is_capped(self):
+        self.model.set_multipart_sizes(chunksize_mb=99999)
+        self.assertEqual(self.model.multipart_chunksize_mb,
+                         Model.MAX_MULTIPART_CHUNKSIZE_MB)
+
+    def test_the_threshold_never_falls_below_the_part_size(self):
+        """Otherwise boto3 is asked to split a file into a single part."""
+        self.model.set_multipart_sizes(threshold_mb=8, chunksize_mb=32)
+        self.assertEqual(self.model.multipart_threshold_mb, 32)
+
+    def test_garbage_falls_back_to_the_defaults(self):
+        self.model.set_multipart_sizes(threshold_mb="abc", chunksize_mb="xyz")
+        self.assertEqual(self.model.multipart_chunksize_mb, 8)
+        self.assertEqual(self.model.multipart_threshold_mb, 16)
+
+    def test_ranged_downloads_follow_the_part_size(self):
+        """One setting governs how uploads and resumable downloads chunk."""
+        self.model.set_multipart_sizes(threshold_mb=64, chunksize_mb=16)
+        self.assertEqual(self.model.resume_chunk_size, 16 * 1024 * 1024)
+        self.assertEqual(self.model.resume_threshold, 64 * 1024 * 1024)
+
+    def test_the_sizes_survive_a_worker_clone(self):
+        self.model.set_multipart_sizes(threshold_mb=64, chunksize_mb=32)
+        clone = self.model.clone_for_worker()
+        self.assertEqual(clone.multipart_threshold_mb, 64)
+        self.assertEqual(clone.multipart_chunksize_mb, 32)
+        self.assertEqual(clone.resume_chunk_size, 32 * 1024 * 1024)
+
+    def test_changing_concurrency_keeps_the_sizes(self):
+        """Both settings rebuild the same TransferConfig pair, so one must not
+        reset the other."""
+        self.model.set_multipart_sizes(threshold_mb=64, chunksize_mb=32)
+        self.model.set_transfer_concurrency(9)
+        self.assertEqual(
+            self.model.transfer_cfg_upload.multipart_chunksize, 32 * 1024 * 1024)
+        self.assertEqual(self.model.transfer_cfg_upload.max_concurrency, 9)
+
+
+class CodeStyleTests(unittest.TestCase):
+    """
+    The project's standing style rules, enforced rather than re-checked by
+    hand: every import at the top of its module, and no decorative
+    section-divider comments.
+    """
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    SKIP_DIRS = {".venv", "__pycache__", ".git", "build", "dist"}
+    # Runs of punctuation are what makes a comment a divider rather than prose.
+    BANNER = re.compile(r"^\s*#\s*[-=*~_#+]{3,}\s*$|^\s*#\s*[-=*~_#]{2,}.*[-=*~_#]{2,}\s*$")
+
+    def _python_files(self):
+        found = []
+        for dirpath, dirnames, filenames in os.walk(self.ROOT):
+            dirnames[:] = [d for d in dirnames if d not in self.SKIP_DIRS]
+            found += [os.path.join(dirpath, name)
+                      for name in sorted(filenames) if name.endswith(".py")]
+        return sorted(found)
+
+    def _rel(self, path):
+        return os.path.relpath(path, self.ROOT)
+
+    def test_no_imports_inside_functions_or_classes(self):
+        """A deferred import hides a dependency and can fail mid-operation."""
+        offenders = []
+        for path in self._python_files():
+            with open(path) as handle:
+                tree = ast.parse(handle.read())
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                         ast.ClassDef)):
+                    continue
+                for sub in ast.walk(node):
+                    if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                        offenders.append(f"{self._rel(path)}:{sub.lineno}")
+        self.assertEqual(offenders, [], "imports must be at module top")
+
+    def test_no_module_level_import_sits_below_code(self):
+        """The stricter half of the same rule. Setup that genuinely must run
+        first (a Qt platform hint, a sys.path insert) belongs in a _bootstrap
+        module that is simply imported first, so the imports stay contiguous.
+        A module-level `try: import x / except ImportError:` still counts as
+        top-level — that is the optional-dependency idiom, not a late import.
+        """
+        offenders = []
+        for path in self._python_files():
+            with open(path) as handle:
+                tree = ast.parse(handle.read())
+            first_code = None
+            for node in tree.body:
+                docstring = (isinstance(node, ast.Expr)
+                             and isinstance(node.value, ast.Constant)
+                             and isinstance(node.value.value, str))
+                plain = isinstance(node, (ast.Import, ast.ImportFrom))
+                guarded = isinstance(node, ast.Try) and any(
+                    isinstance(sub, (ast.Import, ast.ImportFrom))
+                    for sub in ast.walk(node))
+                if docstring or plain or guarded:
+                    continue
+                first_code = node.lineno
+                break
+            if first_code is None:
+                continue
+            for node in tree.body:
+                if (isinstance(node, (ast.Import, ast.ImportFrom))
+                        and node.lineno > first_code):
+                    offenders.append(f"{self._rel(path)}:{node.lineno}")
+        self.assertEqual(offenders, [], "import below code at module level")
+
+    def test_no_banner_comments(self):
+        offenders = []
+        for path in self._python_files():
+            with open(path) as handle:
+                for number, line in enumerate(handle.read().splitlines(), 1):
+                    if self.BANNER.match(line):
+                        offenders.append(f"{self._rel(path)}:{number}")
+        self.assertEqual(offenders, [], "decorative divider comment")
+
+    def test_the_banner_pattern_recognises_real_dividers(self):
+        """Guard the guard: a pattern that matches nothing would pass the test
+        above no matter what the tree contained."""
+        for divider in ("# ------------", "#####", "# ==== Section ====",
+                        "    # ---- helpers ----", "# ~~~~~~~~"):
+            with self.subTest(divider=divider):
+                self.assertTrue(self.BANNER.match(divider))
+        for prose in ("# store settings in ~/.config/s3duck",
+                      "# ~75% top / ~25% bottom",
+                      "#!/usr/bin/python",
+                      "# navigation state",
+                      "# land in navigate(restore_name=...)"):
+            with self.subTest(prose=prose):
+                self.assertFalse(self.BANNER.match(prose))
+
+
+class DebianPackagingTests(unittest.TestCase):
+    """REGRESSION (blank icons on an installed .deb): the package did not
+    depend on python3-pyqt6.qtsvg, so Qt could not render the bundled SVG
+    icons and every theme-less button came out empty. A new third-party
+    import must not be able to ship a broken package again."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # Third-party module -> the Debian package that provides it.
+    PACKAGES = {
+        "PyQt6": "python3-pyqt6",
+        "boto3": "python3-boto3",
+        "botocore": "python3-botocore",
+        "cryptography": "python3-cryptography",
+        "urllib3": "python3-urllib3",
+    }
+    # Needed at runtime without being imported: Qt loads these as plugins.
+    RUNTIME_ONLY = {"python3-pyqt6.qtsvg"}
+
+    def _control(self):
+        with open(os.path.join(self.ROOT, "DEBIAN", "control")) as handle:
+            return handle.read()
+
+    def _depends(self):
+        for line in self._control().splitlines():
+            if line.startswith("Depends:"):
+                return {part.split()[0].strip()
+                        for part in line[len("Depends:"):].split(",")
+                        if part.strip()}
+        return set()
+
+    def _third_party_imports(self):
+        found = set()
+        local = {name[:-3] for name in os.listdir(self.ROOT)
+                 if name.endswith(".py")}
+        for name in sorted(os.listdir(self.ROOT)):
+            if not name.endswith(".py"):
+                continue
+            with open(os.path.join(self.ROOT, name)) as handle:
+                tree = ast.parse(handle.read())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    found.update(a.name.split(".")[0] for a in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                    found.add(node.module.split(".")[0])
+        return {m for m in found
+                if m not in sys.stdlib_module_names and m not in local}
+
+    def test_every_third_party_import_is_a_declared_dependency(self):
+        depends = self._depends()
+        unmapped, undeclared = [], []
+        for module in sorted(self._third_party_imports()):
+            package = self.PACKAGES.get(module)
+            if package is None:
+                unmapped.append(module)
+            elif package not in depends:
+                undeclared.append(f"{module} -> {package}")
+        self.assertEqual(unmapped, [], "no Debian package mapped for these "
+                                       "imports; add them to PACKAGES")
+        self.assertEqual(undeclared, [], "imported but missing from Depends")
+
+    def test_the_svg_plugin_is_a_dependency(self):
+        """It is never imported, so the import scan above cannot catch it —
+        and without it every bundled icon renders blank."""
+        self.assertTrue(self.RUNTIME_ONLY <= self._depends())
+
+    def test_the_pdf_module_is_a_dependency(self):
+        """The preview import-guards QtPdf, so a missing package degrades
+        silently rather than failing loudly."""
+        self.assertIn("python3-pyqt6.qtpdf", self._depends())
+
+    def test_the_version_and_size_are_placeholders_for_the_build(self):
+        """Both are filled in by build_deb.sh; a literal here is a value that
+        will drift, which is how the package once shipped mislabelled."""
+        control = self._control()
+        self.assertIn("Version: _version_", control)
+        self.assertIn("Installed-Size: _size_", control)
+        self.assertIn("Architecture: _arch_", control)
+
+    def test_the_build_script_fills_in_every_placeholder(self):
+        with open(os.path.join(self.ROOT, "build_deb.sh")) as handle:
+            script = handle.read()
+        for token in ("_version_", "_arch_", "_size_"):
+            self.assertIn(f"s/{token}/", script, f"{token} never substituted")
+
+
 class IconFallbackTests(unittest.TestCase):
     """REGRESSION (blank toolbar buttons on Linux Mint): every icon went
     through QIcon.fromTheme, which uses its fallback only when the theme has NO
@@ -3030,6 +4155,26 @@ class IconFallbackTests(unittest.TestCase):
 
     def _bundled(self, name="home_24px.svg"):
         return os.path.join(self.ICONS, name)
+
+    def _renderable(self, name="home_24px.svg"):
+        """
+        A bundled icon path that this Qt can actually draw.
+
+        Distributions ship Qt without SVG support, so a test that needs "an
+        icon which renders" must not assume the .svg does — that assumption is
+        the very bug this class exists to guard.
+        """
+        path = self._bundled(name)
+        if icon_is_visible(QIcon(path)):
+            return path
+        twin = os.path.splitext(path)[0] + ".png"
+        self.assertTrue(icon_is_visible(QIcon(twin)),
+                        f"neither {name} nor its PNG twin renders")
+        return twin
+
+    def _require_svg(self):
+        if not icon_is_visible(QIcon(self._bundled("pie_24px.svg"))):
+            self.skipTest("this Qt has no SVG support")
 
     def test_a_bundled_icon_is_used_when_the_theme_has_nothing(self):
         icon = themed_icon("definitely-not-a-theme-icon", self._bundled())
@@ -3057,19 +4202,112 @@ class IconFallbackTests(unittest.TestCase):
         self.assertTrue(icon_is_visible(icon))
 
     def test_visibility_accepts_a_real_icon(self):
-        self.assertTrue(icon_is_visible(QIcon(self._bundled())))
+        self.assertTrue(icon_is_visible(QIcon(self._renderable())))
         self.assertFalse(icon_is_visible(QIcon()))
         self.assertFalse(icon_is_visible(None))
 
     def test_every_bundled_icon_paints_visible_pixels(self):
-        """A fallback that renders nothing is no fallback at all."""
+        """A fallback that renders nothing is no fallback at all. Asserted
+        through bundled_icon, so a Qt without SVG passes on the PNG twins —
+        which is the whole point of having them."""
         invisible = []
         for name in sorted(os.listdir(self.ICONS)):
             if not name.endswith(".svg"):
                 continue
-            if not icon_is_visible(QIcon(os.path.join(self.ICONS, name))):
+            if not icon_is_visible(bundled_icon(os.path.join(self.ICONS, name))):
                 invisible.append(name)
         self.assertEqual(invisible, [])
+
+    @staticmethod
+    @contextlib.contextmanager
+    def no_svg_support():
+        """
+        Simulate a Qt build with no SVG plugin.
+
+        Debian/Mint's python3-pyqt6 ships no QtSvg, and there QIcon("x.svg")
+        is NOT null — it simply paints nothing. That is why the venv (whose
+        PyQt6 wheel bundles QtSvg) showed everything fine while the packaged
+        app had blank buttons.
+        """
+        real = utils.QIcon
+
+        class SvgBlindIcon(real):
+            def __init__(self, *args):
+                if args and isinstance(args[0], str) and args[0].endswith(".svg"):
+                    super().__init__()          # unreadable: paints nothing
+                else:
+                    super().__init__(*args)
+
+        with patch.object(utils, "QIcon", SvgBlindIcon):
+            yield
+
+    def test_a_png_twin_is_used_when_qt_cannot_read_svg(self):
+        """THE PACKAGED-APP BUG: SVG fallbacks silently painted nothing."""
+        with self.no_svg_support():
+            icon = bundled_icon(self._bundled("pie_24px.svg"))
+        self.assertTrue(icon_is_visible(icon))
+
+    def test_svg_is_preferred_when_it_works(self):
+        """The PNG twin is a fixed 48px raster; the SVG stays crisp at any
+        size and DPI, so it must be tried first."""
+        self._require_svg()
+        tried = []
+        real = utils.QIcon
+
+        class Recording(real):
+            def __init__(self, *args):
+                if args and isinstance(args[0], str):
+                    tried.append(os.path.basename(args[0]))
+                super().__init__(*args)
+
+        with patch.object(utils, "QIcon", Recording):
+            icon = bundled_icon(self._bundled("pie_24px.svg"))
+        self.assertTrue(icon_is_visible(icon))
+        self.assertEqual(tried[0], "pie_24px.svg")
+        self.assertNotIn("pie_24px.png", tried)
+
+    def test_an_empty_path_yields_an_empty_icon(self):
+        self.assertTrue(bundled_icon("").isNull())
+        self.assertTrue(bundled_icon(None).isNull())
+
+    def test_every_bundled_svg_has_a_png_twin(self):
+        """The twin is what keeps the app usable without the SVG plugin."""
+        missing = [
+            name for name in sorted(os.listdir(self.ICONS))
+            if name.endswith(".svg")
+            and not os.path.exists(
+                os.path.join(self.ICONS, name[:-4] + ".png"))
+        ]
+        self.assertEqual(missing, [])
+
+    def test_every_png_twin_paints_visible_pixels(self):
+        invisible = [
+            name for name in sorted(os.listdir(self.ICONS))
+            if name.endswith(".png")
+            and not icon_is_visible(QIcon(os.path.join(self.ICONS, name)))
+        ]
+        self.assertEqual(invisible, [])
+
+    def test_no_toolbar_icon_is_blank_without_svg_support(self):
+        """The end-to-end check against the reported environment: build the
+        real window on an SVG-blind Qt and assert every button still draws."""
+        with self.no_svg_support():
+            win = self._win()
+            blank, checked = [], 0
+            for action in win.tBar.actions():
+                if action.isSeparator():
+                    continue
+                holder = action
+                if isinstance(action, QWidgetAction):
+                    widget = action.defaultWidget()
+                    if widget is None:
+                        continue
+                    holder = widget
+                checked += 1
+                if not icon_is_visible(holder.icon()):
+                    blank.append(action.text() or type(holder).__name__)
+        self.assertEqual(blank, [], f"blank without SVG: {blank}")
+        self.assertGreaterEqual(checked, 15)
 
     def test_the_cache_keys_on_the_name(self):
         """Two names sharing one fallback must not collide — otherwise the
@@ -3077,7 +4315,7 @@ class IconFallbackTests(unittest.TestCase):
         blank = QPixmap(24, 24)
         blank.fill(Qt.GlobalColor.transparent)
         answers = {"hollow-name": QIcon(blank),
-                   "good-name": QIcon(self._bundled("bucket_24px.svg"))}
+                   "good-name": QIcon(self._renderable("bucket_24px.svg"))}
         with patch.object(utils.QIcon, "fromTheme",
                           staticmethod(lambda n, *a, **kw: answers[n])):
             first = themed_icon("hollow-name", self._bundled("home_24px.svg"))
@@ -3120,7 +4358,7 @@ class IconFallbackTests(unittest.TestCase):
 
     def test_a_usable_theme_icon_is_preferred(self):
         """Desktop integration still wins when the theme actually delivers."""
-        real = QIcon(self._bundled("bucket_24px.svg"))
+        real = QIcon(self._renderable("bucket_24px.svg"))
         with patch.object(utils.QIcon, "fromTheme",
                           staticmethod(lambda *a, **kw: real)):
             icon = themed_icon("go-home", self._bundled("home_24px.svg"))
@@ -7284,3 +8522,258 @@ class ThemeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    """Findings from the 0.16.0 review, each reproduced before being fixed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @staticmethod
+    def _region_error():
+        return botocore.exceptions.ClientError(
+            {"Error": {"Code": "PermanentRedirect",
+                       "Message": "The bucket is in another region"}},
+            "UploadPart")
+
+    def _big_file(self, part=1024, parts=3):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        payload = os.urandom(part * parts)
+        path = os.path.join(directory, "big.bin")
+        with open(path, "wb") as handle:
+            handle.write(payload)
+        return path, payload, directory
+
+    def _model(self, client, directory, part=1024):
+        model = Model("https://s3.amazonaws.com", "us-east-1", "AK", "SK",
+                      "bkt", False, False)
+        model.upload_chunk_size = part
+        model.multipart_threshold_mb = 0
+        model.transfer_concurrency = 1
+        model.upload_state_dir = os.path.join(directory, "state")
+        model._client = client
+        return model
+
+    def test_a_resumable_upload_retries_after_a_region_error(self):
+        """FINDING: the managed upload rebinds and retries once on a
+        region/endpoint mismatch; the multipart path did not, so the SAME
+        bucket failed for a large file and succeeded for a small one."""
+        path, payload, directory = self._big_file()
+        client = _MultipartClient()
+        model = self._model(client, directory)
+
+        real_upload_part = client.upload_part
+        state = {"raised": False}
+
+        def _once(**kw):
+            if not state["raised"]:
+                state["raised"] = True
+                raise self._region_error()
+            return real_upload_part(**kw)
+
+        client.upload_part = _once
+        rebinds = []
+
+        def _rebind(inner, log_fn=None):
+            # A real rebind MOVES the endpoint, which is what made the resume
+            # record unfindable on the retry.
+            inner.endpoint_url = "https://s3.eu-central-1.amazonaws.com"
+            rebinds.append(1)
+
+        with patch.object(Model, "rebind_bucket", _rebind):
+            model.upload_file(path, "big.bin")
+        self.assertEqual(len(rebinds), 1, "did not rebind and retry")
+        self.assertEqual(client.completed["big.bin"], payload)
+        self.assertEqual(client.created, 1,
+                         "retry started a second multipart upload, orphaning "
+                         "the first one's parts")
+
+    def test_a_non_region_error_is_not_retried(self):
+        """Retrying a genuine failure would double every upload."""
+        path, _payload, directory = self._big_file()
+        client = _MultipartClient(fail_on_part=1)
+        model = self._model(client, directory)
+        rebinds = []
+        with patch.object(Model, "rebind_bucket",
+                          lambda _s, log_fn=None: rebinds.append(1)):
+            with self.assertRaises(Exception):
+                model.upload_file(path, "big.bin")
+        self.assertEqual(rebinds, [])
+
+    def test_part_listing_cannot_loop_forever(self):
+        """FINDING: a truncated response whose marker does not advance spun
+        the transfer thread forever. S3-compatible backends differ in what
+        they return, and this app exists to talk to them."""
+        model = Model("https://s3.amazonaws.com", "us-east-1", "AK", "SK",
+                      "bkt", False, False)
+        calls = []
+
+        class _Stuck:
+            def list_parts(self, **kw):
+                calls.append(kw.get("PartNumberMarker"))
+                if len(calls) > 5:
+                    raise RuntimeError("would have looped forever")
+                # Truncated, but the marker never moves on.
+                return {"Parts": [{"PartNumber": 1, "ETag": '"e1"', "Size": 4}],
+                        "IsTruncated": True}
+
+        model._client = _Stuck()
+        parts = model._uploaded_parts("k", "upload-1")
+        self.assertEqual(sorted(parts), [1])
+        self.assertLessEqual(len(calls), 5)
+
+    def _sync_dialog(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        model = Model("https://s3.amazonaws.com", "us-east-1", "AK", "SK",
+                      "bkt", False, False)
+        dlg = main_window.CrossProfileSyncDialog(
+            None, None, model, "pre/", settings, current_profile="prof")
+        self.addCleanup(dlg.close)
+        return dlg
+
+    def test_changing_the_direction_invalidates_the_plan(self):
+        """FINDING (data loss): the plan stayed runnable after its inputs
+        changed, so a plan reviewed as a push could be executed after
+        switching to pull — deleting at the side believed to be the source."""
+        dlg = self._sync_dialog()
+        dlg._actions = [{"action": "upload", "rel": "a", "size": 1,
+                         "reason": "missing"}]
+        dlg._source_prefix, dlg._dest_prefix = "pre/", "dst/"
+        dlg._dest_model = object()
+        dlg._ok_enabled(True)
+
+        dlg._direction.setCurrentIndex(1)
+
+        self.assertEqual(dlg._actions, [])
+        self.assertEqual(dlg.plan()[2], [])
+        self.assertFalse(dlg._buttons.button(
+            QDialogButtonBox.StandardButton.Ok).isEnabled())
+
+    def test_editing_any_input_invalidates_the_plan(self):
+        for change in ("prefix", "exclude", "delete_extra"):
+            with self.subTest(change=change):
+                dlg = self._sync_dialog()
+                dlg._actions = [{"action": "upload", "rel": "a", "size": 1,
+                                 "reason": "missing"}]
+                dlg._ok_enabled(True)
+                if change == "prefix":
+                    dlg.picker.prefix.setText("other/")
+                elif change == "exclude":
+                    dlg._exclude.setText("*.tmp")
+                else:
+                    dlg._delete_extra.setChecked(True)
+                self.assertEqual(dlg._actions, [], f"{change} kept the plan")
+                self.assertFalse(dlg._buttons.button(
+                    QDialogButtonBox.StandardButton.Ok).isEnabled())
+
+    def test_accepting_a_picker_dialog_stops_its_loader(self):
+        """FINDING (crash): the bucket fetch was only stopped in closeEvent,
+        which accept() never fires — so a dialog dismissed while the listing
+        was in flight was destroyed with a live QThread, which aborts the
+        process in PyQt6."""
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        for factory in (
+            lambda: main_window.CrossProfileCopyDialog(
+                None, settings, 1, current_profile="prof"),
+            lambda: main_window.CrossProfileSyncDialog(
+                None, None,
+                Model("https://s3.amazonaws.com", "us-east-1", "AK", "SK",
+                      "bkt", False, False),
+                "pre/", settings, current_profile="prof"),
+        ):
+            stopped = []
+            with patch.object(main_window.ProfilePicker, "stop_loader",
+                              lambda _s: stopped.append(1)):
+                dlg = factory()
+                self.addCleanup(dlg.close)
+                dlg.accept()
+            self.assertTrue(stopped, "loader left running after accept()")
+
+    def _window(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, "prof", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        return win
+
+    def test_retrying_a_cross_profile_job_keeps_its_models(self):
+        """FINDING: retry re-queued the job without the destination model, so
+        the worker refused it — the retry button could never succeed."""
+        win = self._window()
+        dest = object()
+        source = object()
+        started = []
+        entry = main_window._QEntry(
+            entry_id=1, method="copy_to_profile",
+            job=[("a", "b", False)], dest_model=dest, source_model=source)
+        entry.status = "error"
+        win._queue_entries[1] = entry
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, method, job, **kw: started.append(kw)):
+            win._on_queue_retry_requested(1)
+        self.assertEqual(len(started), 1)
+        self.assertIs(started[0].get("dest_model"), dest)
+        self.assertIs(started[0].get("source_model"), source)
+
+    def test_history_refuses_to_rerun_a_cross_profile_job(self):
+        """A stored job cannot carry another profile's live credentials, so
+        queueing it would produce a job that can only fail."""
+        win = self._window()
+        started = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, method, job, **kw: started.append(method)), \
+             patch.object(main_window, "QMessageBox") as box:
+            win.rerun_history_entry(
+                {"method": "sync_to_profile", "job": [["copy", "a", "b"]]})
+        self.assertEqual(started, [])
+        self.assertTrue(box.information.called or box.warning.called)
+
+    def test_history_still_reruns_ordinary_jobs(self):
+        win = self._window()
+        started = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, method, job, **kw: started.append(method)):
+            win.rerun_history_entry(
+                {"method": "upload", "job": [["k", "/tmp/f"]]})
+        self.assertEqual(started, ["upload"])
+
+    def test_switching_profiles_saves_where_the_old_one_was(self):
+        """FINDING: the location is stored per profile, but a runtime switch
+        reassigned profile_name first, so the profile being left behind never
+        recorded where it was."""
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, "prod", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        win.data_model.bucket = "logs"
+        win.data_model.current_folder = "2026/"
+
+        profile = profile_switcher.Profile(
+            name="dev", url="https://minio.local", region="us-east-1",
+            bucket="", access_key="AK", secret_key="SK",
+            no_ssl_check=False, use_path=True)
+        win.apply_profile(profile)
+
+        settings.beginGroup("common")
+        self.assertEqual(settings.value("last_location/prod"), "logs/2026/")
+        settings.endGroup()
+        self.assertEqual(win.profile_name, "dev")

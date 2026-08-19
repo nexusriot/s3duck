@@ -80,6 +80,22 @@ BADGE_COLORS = {
 }
 
 
+def preselect_row(items, last_name) -> int:
+    """
+    Which profile row to select on startup.
+
+    Falls back to the first row when the remembered name is gone (deleted or
+    renamed), so a stale setting can never leave the list with no selection.
+    """
+    if not items:
+        return -1
+    wanted = str(last_name or "").strip()
+    for index, item in enumerate(items):
+        if str(getattr(item, "name", "") or "").strip() == wanted and wanted:
+            return index
+    return 0
+
+
 def profile_summary(item) -> str:
     """
     Second line of a profile row: where this profile points.
@@ -316,9 +332,13 @@ class Profiles(QDialog):
         self.listWidget.installEventFilter(self)
         self.load()
         self.populate_list()
-        if self.listWidget.count() > 0:
-            index = self.listWidget.model().index(0, 0)
-            self.listWidget.setCurrentIndex(index)
+        self.settings.beginGroup("common")
+        last_profile = self.settings.value("last_profile", "") or ""
+        self.settings.endGroup()
+        row = preselect_row(self.items, last_profile)
+        if row >= 0:
+            self.listWidget.setCurrentIndex(
+                self.listWidget.model().index(row, 0))
         self.listWidget.doubleClicked.connect(self.onStart)
         self.show()
 
@@ -591,6 +611,9 @@ class Profiles(QDialog):
                 read_only,
                 item.color,
             )
+            self.settings.beginGroup("common")
+            self.settings.setValue("last_profile", item.name)
+            self.settings.endGroup()
             self.main_settings = settings
             self.main_window = MainWindow(settings=self.main_settings)
             self.main_window.show()

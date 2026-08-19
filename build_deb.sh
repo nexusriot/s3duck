@@ -48,4 +48,9 @@ cp *.py $lib_dir
 sed -i "s/_version_/$version/g" $folder_name/DEBIAN/control
 sed -i "s/_arch_/$arch/g" $folder_name/DEBIAN/control
 
+# Measured, not hardcoded: the old fixed "58" had drifted far behind the real
+# tree, exactly like the version string used to.
+size=$(du -sk --exclude=DEBIAN "$folder_name" | cut -f1)
+sed -i "s/_size_/$size/g" $folder_name/DEBIAN/control
+
 cd build/ && dpkg-deb --build -Z gzip --root-owner-group $project
