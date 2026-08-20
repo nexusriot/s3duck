@@ -2,7 +2,7 @@ from PyQt6.QtCore import *
 from PyQt6.QtWidgets import *
 from PyQt6.QtGui import *
 
-from utils import center_on_screen
+from utils import center_on_screen, release_worker_on_finish
 
 
 class _SizeWorker(QObject):
@@ -120,7 +120,7 @@ class PropertiesWindow(QDialog):
         self._size_worker.moveToThread(self._size_thread)
         self._size_thread.started.connect(self._size_worker.run)
         self._size_worker.done.connect(self._on_size)
-        self._size_worker.done.connect(self._size_worker.deleteLater)
+        release_worker_on_finish(self._size_thread, self._size_worker)
         self._size_thread.finished.connect(self._size_thread.deleteLater)
         self._size_thread.start()
 

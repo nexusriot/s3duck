@@ -39,7 +39,8 @@ from model import run_parallel
 from model import CHECKSUM_ALGORITHMS, plan_prefix_download, prefix_of
 from utils import (
     FuncWorker, TempWorkspace, join_qthread, normalize_accent,
-    run_with_progress, scan_local_tree, themed_icon,
+    reap_finished_workers, release_worker_on_finish, run_with_progress,
+    scan_local_tree, themed_icon,
 )
 from properties_window import PropertiesWindow
 import diagnostics
@@ -48,7 +49,7 @@ from theme import apply_theme, THEMES
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.17.0"
+__VERSION__ = "0.17.1"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -2403,7 +2404,7 @@ class CopyMoveDialog(QDialog):
         self._thread.started.connect(self._worker.run)
         self._worker.done.connect(self._on_buckets)
         self._worker.done.connect(self._thread.quit)
-        self._worker.done.connect(self._worker.deleteLater)
+        release_worker_on_finish(self._thread, self._worker)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
@@ -2707,7 +2708,7 @@ class ProfilePicker(QWidget):
         self._thread.started.connect(self._worker.run)
         self._worker.done.connect(self._on_buckets)
         self._worker.done.connect(self._thread.quit)
-        self._worker.done.connect(self._worker.deleteLater)
+        release_worker_on_finish(self._thread, self._worker)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
@@ -3216,7 +3217,7 @@ class SyncDialog(QDialog):
         self._thread.started.connect(self._worker.run)
         self._worker.done.connect(self._on_plan)
         self._worker.done.connect(self._thread.quit)
-        self._worker.done.connect(self._worker.deleteLater)
+        release_worker_on_finish(self._thread, self._worker)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
@@ -3488,7 +3489,7 @@ class DuplicateFinderDialog(QDialog):
         self._thread.started.connect(self._worker.run)
         self._worker.done.connect(self._on_scanned)
         self._worker.done.connect(self._thread.quit)
-        self._worker.done.connect(self._worker.deleteLater)
+        release_worker_on_finish(self._thread, self._worker)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
@@ -4089,7 +4090,7 @@ class PreviewDialog(QDialog):
         self._thread.started.connect(self._worker.run)
         self._worker.done.connect(self._on_loaded)
         self._worker.done.connect(self._thread.quit)
-        self._worker.done.connect(self._worker.deleteLater)
+        release_worker_on_finish(self._thread, self._worker)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
@@ -4197,7 +4198,6 @@ class PreviewDialog(QDialog):
         def _on_done(result, exc):
             prog.close()
             self._dl_thread.quit()
-            self._dl_worker.deleteLater()
             self._dl_thread = None
             self._dl_worker = None
             self._open_btn.setEnabled(True)
@@ -4211,6 +4211,7 @@ class PreviewDialog(QDialog):
 
         self._dl_worker.progress.connect(_on_prog)
         self._dl_worker.done.connect(_on_done)
+        release_worker_on_finish(self._dl_thread, self._dl_worker)
         self._dl_thread.finished.connect(self._dl_thread.deleteLater)
         self._open_btn.setEnabled(False)
         self._dl_thread.start()
@@ -4306,7 +4307,7 @@ class VersionsDialog(QDialog):
         self._list_thread.started.connect(self._list_worker.run)
         self._list_worker.done.connect(self._on_versions_loaded)
         self._list_worker.done.connect(self._list_thread.quit)
-        self._list_worker.done.connect(self._list_worker.deleteLater)
+        release_worker_on_finish(self._list_thread, self._list_worker)
         self._list_thread.finished.connect(self._list_thread.deleteLater)
         self._list_thread.start()
 
@@ -4462,7 +4463,6 @@ class VersionsDialog(QDialog):
         def _on_done(result, exc):
             prog.close()
             self._dl_thread.quit()
-            self._dl_worker.deleteLater()
             self._dl_thread = None
             self._dl_worker = None
             if exc is not None:
@@ -4475,6 +4475,7 @@ class VersionsDialog(QDialog):
 
         self._dl_worker.progress.connect(_on_prog)
         self._dl_worker.done.connect(_on_done)
+        release_worker_on_finish(self._dl_thread, self._dl_worker)
         self._dl_thread.finished.connect(self._dl_thread.deleteLater)
         self._dl_thread.start()
         prog.show()
@@ -4597,7 +4598,7 @@ class IncompleteUploadsDialog(QDialog):
         self._thread.started.connect(self._worker.run)
         self._worker.done.connect(self._on_loaded)
         self._worker.done.connect(self._thread.quit)
-        self._worker.done.connect(self._worker.deleteLater)
+        release_worker_on_finish(self._thread, self._worker)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
@@ -4705,7 +4706,7 @@ class IncompleteUploadsDialog(QDialog):
         self._thread.started.connect(self._worker.run)
         self._worker.done.connect(self._on_aborted)
         self._worker.done.connect(self._thread.quit)
-        self._worker.done.connect(self._worker.deleteLater)
+        release_worker_on_finish(self._thread, self._worker)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
@@ -5045,7 +5046,7 @@ class SearchDialog(QDialog):
         self._thread.started.connect(self._worker.run)
         self._worker.done.connect(self._on_results)
         self._worker.done.connect(self._thread.quit)
-        self._worker.done.connect(self._worker.deleteLater)
+        release_worker_on_finish(self._thread, self._worker)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
@@ -6514,7 +6515,7 @@ class MainWindow(QMainWindow):
 
         w.finished.connect(apply_result)
         w.finished.connect(t.quit)
-        w.finished.connect(w.deleteLater)
+        release_worker_on_finish(t, w)
 
         t.finished.connect(t.deleteLater)
         t.finished.connect(_clear_refs)
@@ -7383,7 +7384,7 @@ class MainWindow(QMainWindow):
         wk.success.connect(_on_enter_success)
         wk.failure.connect(_on_enter_failure)
         wk.finished.connect(th.quit)
-        wk.finished.connect(wk.deleteLater)
+        release_worker_on_finish(th, wk)
         th.finished.connect(_clear_enter_refs)
         th.finished.connect(th.deleteLater)
 
@@ -7476,7 +7477,7 @@ class MainWindow(QMainWindow):
         th.started.connect(wk.run)
         wk.finished.connect(self._on_navigation_finished)
         wk.finished.connect(th.quit)
-        wk.finished.connect(wk.deleteLater)
+        release_worker_on_finish(th, wk)
         th.finished.connect(th.deleteLater)
 
         self._nav_thread = th
@@ -7847,7 +7848,7 @@ class MainWindow(QMainWindow):
 
         self.worker.finished.connect(_on_worker_finished)
         self.worker.finished.connect(self.thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
+        release_worker_on_finish(self.thread, self.worker)
         self.thread.finished.connect(_clear_thread_refs)
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.finished.connect(_reenable_after_thread)
@@ -8914,6 +8915,10 @@ class MainWindow(QMainWindow):
                 th.wait(3000)
             except Exception:
                 pass
+
+        # Everything is joined; let the pinned workers go while the
+        # interpreter is still in an orderly state.
+        reap_finished_workers()
 
     def writeSettings(self):
         self.settings.beginGroup("geometry")

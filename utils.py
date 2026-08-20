@@ -11,8 +11,12 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from PyQt6.QtCore import (
-    QEventLoop, QObject, QThread, Qt, pyqtSignal, pyqtSlot,
+    QEventLoop, QMetaObject, QObject, QThread, Qt, pyqtSignal, pyqtSlot,
 )
+try:
+    from PyQt6 import sip
+except ImportError:
+    sip = None
 from PyQt6.QtGui import QCursor, QIcon
 from PyQt6.QtWidgets import QApplication, QProgressDialog
 
@@ -385,6 +389,99 @@ def join_qthread(th, timeout_ms: int = 2000):
             th.wait(timeout_ms)
     except RuntimeError:
         pass  # already deleted by Qt
+    reap_finished_workers()
+
+
+_LIVE_WORKERS = {}
+
+
+def _thread_finished(th):
+    """True once ``th`` can no longer run its worker (finished or deleted)."""
+    if sip is not None:
+        try:
+            if sip.isdeleted(th):
+                return True
+        except Exception:
+            pass
+    try:
+        return th.isFinished()
+    except RuntimeError:
+        return True
+
+
+class _WorkerReaper(QObject):
+    """Releases dead workers one full trip through the GUI event queue later.
+
+    The release must not be an immediate DECREF: destroying the worker severs
+    its connections and frees the Python callables they hold, but a delivery
+    for one of those callables may already sit in the GUI queue (the worker
+    emitted just before finishing) — invoking it after the free is a segfault.
+    ``bury`` therefore parks the last reference and posts a queued ``flush``;
+    the queue is FIFO, so by the time ``flush`` drops the reference every
+    delivery that was queued ahead of it has run, and a finished thread can
+    queue nothing new. The old in-worker deleteLater got this ordering for
+    free from the queue itself — this preserves it while keeping the actual
+    destructor on the GUI thread.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._graveyard = []
+
+    def bury(self, entry):
+        self._graveyard.append(entry)
+        QMetaObject.invokeMethod(self, "flush",
+                                 Qt.ConnectionType.QueuedConnection)
+
+    @pyqtSlot()
+    def flush(self):
+        self._graveyard.clear()
+
+
+_REAPER = None
+
+
+def _reaper():
+    global _REAPER
+    if _REAPER is None:
+        _REAPER = _WorkerReaper()
+    return _REAPER
+
+
+def reap_finished_workers():
+    """Queue the release of every pinned worker whose thread is done."""
+    for key, entry in list(_LIVE_WORKERS.items()):
+        if _thread_finished(entry[1]):
+            del _LIVE_WORKERS[key]
+            _reaper().bury(entry)
+
+
+def release_worker_on_finish(thread, worker):
+    """Hold ``worker`` at least until ``thread`` has finished, then release it
+    from the GUI thread.
+
+    Replaces the old teardown — a worker signal wired to the worker's own
+    ``deleteLater`` — on objects moved to a QThread. That deleteLater runs the
+    C++ destructor on the worker thread; tearing down connections takes one of
+    Qt's pooled signal-slot mutexes and then the GIL (sip checks each
+    disconnectNotify for a Python override). The GUI thread always holds the
+    GIL, and any connect/disconnect/destroy it performs takes mutexes from that
+    same pool, so unrelated objects can collide on one mutex — the threads then
+    each hold what the other needs and the process deadlocks. Dropping the
+    last reference here instead runs the destructor on the GUI thread, where
+    the GIL and the mutex are taken by the same thread and no cycle can form.
+
+    Release is a sweep, not a signal: the next ``release_worker_on_finish``
+    or ``join_qthread`` call hands workers with a finished thread to the
+    reaper, which frees them one event-queue trip later (see _WorkerReaper for
+    why the delay is load-bearing). Connecting a Python callable to
+    ``thread.finished`` was tried first and crashed — a dialog destroyed with
+    that delivery still queued frees the callable while the call is in
+    flight. ``isFinished`` (not ``isRunning``) keeps a freshly created,
+    not-yet-started thread from having its worker swept out from under it.
+    """
+    reap_finished_workers()
+    _LIVE_WORKERS[id(worker)] = (worker, thread)
 
 
 class FuncWorker(QObject):
@@ -433,7 +530,7 @@ def run_with_progress(parent, title, fn, modality=None):
 
     worker.done.connect(_on_done)
     worker.done.connect(thread.quit)
-    worker.done.connect(worker.deleteLater)
+    release_worker_on_finish(thread, worker)
     thread.finished.connect(thread.deleteLater)
     thread.start()
 
