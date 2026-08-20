@@ -5628,6 +5628,7 @@ class MainWindow(QMainWindow):
         self._nav_seq = 0
         self._nav_thread = None
         self._nav_worker = None
+        self._nav_orphan_threads = []          # superseded, still running
         self._nav_pending_restore_name = None  # name to reselect after navigation
         self._nav_select_up_entry = False      # select [..] if present after navigation
         self._loading_dialog = None
@@ -7390,6 +7391,39 @@ class MainWindow(QMainWindow):
         self._bucket_enter_worker = wk
         th.start()
 
+    @staticmethod
+    def _thread_is_running(th) -> bool:
+        """True only for a QThread whose C++ object is still alive and busy."""
+        if sip is not None:
+            try:
+                if sip.isdeleted(th):
+                    return False
+            except Exception:
+                pass
+        try:
+            return bool(th.isRunning())
+        except RuntimeError:
+            return False
+
+    def _park_nav_thread(self):
+        """
+        Keep a superseded navigation QThread reachable until it has finished.
+
+        REGRESSION (crash): this used to drop the reference outright, on the
+        grounds that the QThread is parented to this window and deleteLater()s
+        itself once run() returns. Both are true, and neither helps when the
+        window closes first — Qt then destroys a child QThread that is still
+        running, which aborts the process. Navigating twice and quitting while
+        the first listing was in flight was enough to do it. Parked threads are
+        joined by _shutdown_threads; finished ones are pruned here.
+        """
+        self._nav_orphan_threads = [
+            th for th in (*self._nav_orphan_threads, self._nav_thread)
+            if th is not None and self._thread_is_running(th)
+        ]
+        self._nav_thread = None
+        self._nav_worker = None
+
     def navigate(self, restore_name: str = None,
                  select_up_entry: bool = False, show_loading: bool = False,
                  force: bool = False):
@@ -7433,10 +7467,8 @@ class MainWindow(QMainWindow):
         # blocked inside an S3 call that quit() can't cancel. Instead each
         # worker uses its own model clone (private boto3 client), so an
         # orphaned worker cannot race us. Stale results are discarded by the
-        # _nav_seq check in _on_navigation_finished. The previous QThread is
-        # parented to self and will deleteLater itself when its run() returns.
-        self._nav_thread = None
-        self._nav_worker = None
+        # _nav_seq check in _on_navigation_finished.
+        self._park_nav_thread()
 
         th = QThread(self)
         wk = NavigationWorker(self.data_model.clone_for_worker(), seq, bucket, prefix)
@@ -8864,25 +8896,22 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        for attr in (
+        threads = [getattr(self, attr, None) for attr in (
             "thread",
             "_nav_thread",
             "_bucket_enter_thread",
             "_bucket_usage_thread",
-        ):
-            th = getattr(self, attr, None)
-            if th is None:
+        )]
+        # Navigations superseded before they finished: the window is about to
+        # take its children down with it, so these have to be joined too.
+        threads.extend(getattr(self, "_nav_orphan_threads", ()))
+
+        for th in threads:
+            if th is None or not self._thread_is_running(th):
                 continue
-            if sip is not None:
-                try:
-                    if sip.isdeleted(th):
-                        continue
-                except Exception:
-                    pass
             try:
-                if th.isRunning():
-                    th.quit()
-                    th.wait(3000)
+                th.quit()
+                th.wait(3000)
             except Exception:
                 pass
 

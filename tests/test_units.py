@@ -1,8 +1,8 @@
 """
 Unit tests for pure-logic helpers (no network / no QApplication needed).
 
-Run with:  python -m unittest discover -s tests   (from the project root)
-or:        .venv/bin/python -m unittest discover -s tests
+Run with:  python -m unittest discover -s tests -t .   (from the project root)
+or:        .venv/bin/python -m unittest discover -s tests -t .
 
 Several tests are explicit regression guards for previously fixed bugs and
 are marked with "REGRESSION:" in their docstrings.
@@ -86,6 +86,11 @@ from settings import SettingsWindow
 
 def _ensure_qapp():
     """Return the shared QApplication, creating it once (offscreen)."""
+    # Qt reads this when the application is constructed, not on import, so
+    # setting it here still works. tests/__init__.py sets it earlier, but only
+    # when the suite is imported as a package; asking again costs nothing and
+    # keeps a stray invocation from core-dumping on a headless machine.
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     return QApplication.instance() or QApplication([])
 
 
@@ -2842,7 +2847,18 @@ class _StubModel(Model):
 class _FakeRunningThread:
     """Stands in for a QThread that is still running."""
 
+    def __init__(self):
+        self.quit_calls = 0
+        self.wait_calls = []
+
     def isRunning(self):
+        return True
+
+    def quit(self):
+        self.quit_calls += 1
+
+    def wait(self, msecs=None):
+        self.wait_calls.append(msecs)
         return True
 
 
@@ -2930,6 +2946,43 @@ class MainWindowGuardTests(unittest.TestCase):
         self.win.navigate()
         self.assertEqual(self.win._nav_seq, seq_before + 1)
         self._settle()
+
+    def test_a_superseded_navigation_thread_is_not_forgotten(self):
+        """FINDING (crash): navigate() dropped the previous nav QThread on the
+        floor whether or not it had finished. The thread is a child of this
+        window, so closing while a listing was still in flight had Qt destroy
+        a running QThread, which aborts the process — an intermittent CI
+        core dump with no failing test to show for it."""
+        stale = _FakeRunningThread()
+        self.win._nav_thread = stale
+
+        self.win.navigate()
+        self.addCleanup(self._settle)
+
+        self.assertIn(stale, self.win._nav_orphan_threads)
+        self.assertIsNot(self.win._nav_thread, stale)
+
+    def test_closing_joins_a_superseded_navigation_thread(self):
+        """Parking it is only half the fix: shutdown has to drain the list,
+        otherwise the window still outlives a thread it owns."""
+        stale = _FakeRunningThread()
+        self.win._nav_orphan_threads = [stale]
+
+        self.win._shutdown_threads()
+
+        self.assertEqual(stale.quit_calls, 1)
+        self.assertEqual(stale.wait_calls, [3000])
+
+    def test_a_finished_navigation_thread_is_pruned(self):
+        """The parking list must not grow for the lifetime of the window."""
+        class _Finished(_FakeRunningThread):
+            def isRunning(self):
+                return False
+
+        done = _Finished()
+        self.win._nav_orphan_threads = [done]
+        self.win._park_nav_thread()
+        self.assertNotIn(done, self.win._nav_orphan_threads)
 
     def test_refresh_action_does_not_pass_checked_as_restore_name(self):
         """REGRESSION: triggered=self.navigate handed QAction's 'checked' bool

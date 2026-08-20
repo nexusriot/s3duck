@@ -10,6 +10,7 @@ jobs:
   tests:
     name: tests (py${{ matrix.python }}, Qt ${{ matrix.qt }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -52,12 +53,16 @@ jobs:
 
       # QT_QPA_PLATFORM is deliberately NOT set here: tests/__init__.py sets it
       # before any Qt import, and letting the suite do it keeps that covered.
+      # -t . is what makes that happen: without it `tests` becomes the
+      # top-level directory, the module imports as `test_units` rather than
+      # `tests.test_units`, and the package init never runs.
       - name: Run the test suite
-        run: python -m unittest discover -s tests
+        run: python -m unittest discover -s tests -t .
 
   no-svg:
     name: icons without the Qt SVG plugin
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
@@ -100,6 +105,7 @@ jobs:
   package:
     name: .deb package
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
