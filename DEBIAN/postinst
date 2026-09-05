@@ -2,3 +2,9 @@
 
 mv /usr/lib/s3duck/s3duck.desktop /usr/share/applications/s3duck.desktop
 
+# The desktop entry claims x-scheme-handler/s3, which only takes effect once
+# the MIME cache knows about it.
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+

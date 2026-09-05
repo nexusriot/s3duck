@@ -12,6 +12,7 @@ import ast
 import base64
 import contextlib
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -33,15 +34,15 @@ from unittest.mock import patch
 import botocore.exceptions
 from PyQt6 import sip
 from PyQt6.QtCore import (
-    QByteArray, QEvent, QRect, QSettings, Qt, QThread, QUrl,
+    QByteArray, QEvent, QPointF, QRect, QSettings, Qt, QThread, QUrl,
 )
 from PyQt6.QtGui import (
     QAction, QColor, QFont, QFontMetrics, QIcon, QIconEngine, QKeyEvent,
-    QKeySequence, QPainter, QPalette, QPixmap,
+    QKeySequence, QMouseEvent, QPainter, QPalette, QPixmap, QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QDialogButtonBox, QMessageBox, QStyle,
-    QStyleOptionViewItem, QToolButton, QWidgetAction,
+    QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QMenu,
+    QMessageBox, QStyle, QStyleOptionViewItem, QToolButton, QWidgetAction,
 )
 
 import diagnostics
@@ -970,7 +971,7 @@ class UploadOptionsTests(unittest.TestCase):
             self.m.upload_file(path, "k.txt")
         self.assertEqual(
             c.calls_of("upload_file")[0]["kwargs"]["ExtraArgs"],
-            {"StorageClass": "STANDARD_IA"},
+            {"StorageClass": "STANDARD_IA", "ContentType": "text/plain"},
         )
 
 
@@ -2708,12 +2709,14 @@ class _FakePropsModel:
     bucket = "b"
     endpoint_url = "https://s3.amazonaws.com"
 
-    def __init__(self, head=None, size=0, head_error=False):
+    def __init__(self, head=None, size=0, head_error=False, lock=None):
         self._head = head or {}
         self._size = size
         self._head_error = head_error
+        self._lock = lock
         self.head_calls = []
         self.size_calls = []
+        self.lock_calls = []
 
     def clone_for_worker(self):
         return self
@@ -2731,6 +2734,12 @@ class _FakePropsModel:
     @staticmethod
     def parse_restore_status(v):
         return Model.parse_restore_status(v)
+
+    def get_object_lock_state(self, key):
+        self.lock_calls.append(key)
+        if self._lock is None:
+            raise RuntimeError("not supported")
+        return self._lock
 
     def direct_object_url(self, key):
         return f"{self.endpoint_url}/{self.bucket}/{key}"
@@ -2782,6 +2791,41 @@ class PropertiesWindowTests(unittest.TestCase):
         dlg = self._dlg(model, "a/implicit")
         self._settle(dlg)
         self.assertEqual(dlg.size.text(), "77 Bytes")
+
+    def _settle_lock(self, dlg, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while dlg._lock_thread is not None and time.monotonic() < deadline:
+            self._app.processEvents()
+        self._app.processEvents()
+
+    def test_object_lock_is_probed_off_the_main_thread(self):
+        """Two more round trips per object, so it must not join the two the
+        constructor already blocks on."""
+        model = _FakePropsModel(
+            head={"ContentLength": 1, "ETag": '"a"'},
+            lock={"supported": True, "mode": "GOVERNANCE",
+                  "retain_until": "2027-01-01", "legal_hold": "ON"})
+        dlg = self._dlg(model, "a/f.txt")
+        self.assertEqual(dlg.objectLock.text(), "…")
+        self._settle_lock(dlg)
+        self.assertEqual(model.lock_calls, ["a/f.txt"])
+        self.assertIn("GOVERNANCE", dlg.objectLock.text())
+        self.assertIn("legal hold ON", dlg.objectLock.text())
+        self.assertIsNone(dlg._lock_thread)
+
+    def test_a_folder_is_never_probed_for_a_lock(self):
+        model = _FakePropsModel(size=10)
+        dlg = self._dlg(model, "a/dir/")
+        self._settle(dlg)
+        self.assertEqual(model.lock_calls, [])
+        self.assertEqual(dlg.objectLock.text(), "—")
+
+    def test_a_bucket_without_object_lock_shows_a_dash(self):
+        model = _FakePropsModel(head={"ContentLength": 1})
+        dlg = self._dlg(model, "a/f.txt")
+        self._settle_lock(dlg)
+        self.assertEqual(dlg.objectLock.text(), "—")
+        self.assertIsNone(dlg._lock_thread)
 
     def test_size_failure_reports_na(self):
         class Failing(_FakePropsModel):
@@ -2839,7 +2883,7 @@ class _StubModel(Model):
     def list_buckets(self):
         return [Item("bkt", FSObjectType.BUCKET, "", 0)]
 
-    def list(self, fld):
+    def list(self, fld, page_cb=None, max_items=0):
         return []
 
     def enter_bucket(self, bucket_name):
@@ -4077,20 +4121,83 @@ class CodeStyleTests(unittest.TestCase):
     def _rel(self, path):
         return os.path.relpath(path, self.ROOT)
 
-    def test_no_imports_inside_functions_or_classes(self):
-        """A deferred import hides a dependency and can fail mid-operation."""
+    @staticmethod
+    def _top_level_imports(tree) -> set:
+        """
+        The ids of the import nodes that are genuinely at the module top.
+
+        A module-level ``try: import x / except ImportError:`` counts — that
+        is the optional-dependency idiom, not a late import.
+        """
+        allowed = set()
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                allowed.add(id(node))
+            elif isinstance(node, ast.Try):
+                for sub in ast.walk(node):
+                    if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                        allowed.add(id(sub))
+        return allowed
+
+    @classmethod
+    def _late_imports(cls, tree) -> list:
+        """Every import that is not one of the module's top-level ones."""
+        allowed = cls._top_level_imports(tree)
+        return [node.lineno for node in ast.walk(tree)
+                if isinstance(node, (ast.Import, ast.ImportFrom))
+                and id(node) not in allowed]
+
+    def test_no_late_imports_anywhere(self):
+        """
+        A deferred import hides a dependency and can fail mid-operation.
+
+        Checked against the module body rather than by looking inside
+        functions and classes: an import nested in a module-level ``if`` or
+        ``with`` is just as late, and the narrower check saw neither.
+        """
         offenders = []
         for path in self._python_files():
             with open(path) as handle:
                 tree = ast.parse(handle.read())
-            for node in ast.walk(tree):
-                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
-                                         ast.ClassDef)):
-                    continue
-                for sub in ast.walk(node):
-                    if isinstance(sub, (ast.Import, ast.ImportFrom)):
-                        offenders.append(f"{self._rel(path)}:{sub.lineno}")
+            offenders += [f"{self._rel(path)}:{line}"
+                          for line in self._late_imports(tree)]
         self.assertEqual(offenders, [], "imports must be at module top")
+
+    def test_the_late_import_check_sees_every_shape(self):
+        """Guard the guard: a check that matches nothing passes no matter what
+        the tree contains."""
+        tree = ast.parse(
+            "import os\n"
+            "try:\n"
+            "    import sip\n"
+            "except ImportError:\n"
+            "    sip = None\n"
+            "if os.name == 'nt':\n"
+            "    import msvcrt\n"
+            "with open('x') as handle:\n"
+            "    import csv\n"
+            "def go():\n"
+            "    import json\n"
+            "class Thing:\n"
+            "    import re\n")
+        # the guarded optional import is fine; the other four are not
+        self.assertEqual(self._late_imports(tree), [7, 9, 11, 13])
+
+    def test_no_dynamic_imports(self):
+        """A dynamic import defers a dependency past every AST check that
+        looks for an import statement."""
+        # Spelled in pieces so this line is not itself a hit — the scan
+        # covers every file in the tree, including this one.
+        needles = ("__" + "import__", "import" + "lib")
+        pattern = re.compile(
+            r"\b(?:%s)\b" % "|".join(re.escape(word) for word in needles))
+        offenders = []
+        for path in self._python_files():
+            with open(path) as handle:
+                for number, line in enumerate(handle.read().splitlines(), 1):
+                    if pattern.search(line):
+                        offenders.append(f"{self._rel(path)}:{number}")
+        self.assertEqual(offenders, [], "dynamic import")
 
     def test_no_module_level_import_sits_below_code(self):
         """The stricter half of the same rule. Setup that genuinely must run
@@ -4165,6 +4272,9 @@ class DebianPackagingTests(unittest.TestCase):
         "cryptography": "python3-cryptography",
         "urllib3": "python3-urllib3",
     }
+    # Imported behind a guard, so the app runs without them: these belong in
+    # Recommends, and requiring them in Depends would be wrong.
+    OPTIONAL = {"keyring": "python3-keyring"}
     # Needed at runtime without being imported: Qt loads these as plugins.
     RUNTIME_ONLY = {"python3-pyqt6.qtsvg"}
 
@@ -4172,13 +4282,19 @@ class DebianPackagingTests(unittest.TestCase):
         with open(os.path.join(self.ROOT, "DEBIAN", "control")) as handle:
             return handle.read()
 
-    def _depends(self):
+    def _field(self, name):
         for line in self._control().splitlines():
-            if line.startswith("Depends:"):
+            if line.startswith(f"{name}:"):
                 return {part.split()[0].strip()
-                        for part in line[len("Depends:"):].split(",")
+                        for part in line[len(name) + 1:].split(",")
                         if part.strip()}
         return set()
+
+    def _depends(self):
+        return self._field("Depends")
+
+    def _recommends(self):
+        return self._field("Recommends")
 
     def _third_party_imports(self):
         found = set()
@@ -4201,6 +4317,8 @@ class DebianPackagingTests(unittest.TestCase):
         depends = self._depends()
         unmapped, undeclared = [], []
         for module in sorted(self._third_party_imports()):
+            if module in self.OPTIONAL:
+                continue
             package = self.PACKAGES.get(module)
             if package is None:
                 unmapped.append(module)
@@ -4209,6 +4327,16 @@ class DebianPackagingTests(unittest.TestCase):
         self.assertEqual(unmapped, [], "no Debian package mapped for these "
                                        "imports; add them to PACKAGES")
         self.assertEqual(undeclared, [], "imported but missing from Depends")
+
+    def test_optional_imports_are_recommended_not_required(self):
+        """A guarded import must not become a hard dependency, and must not
+        be forgotten either — the OS secret store is unusable without it."""
+        recommends = self._recommends()
+        depends = self._depends()
+        for module, package in sorted(self.OPTIONAL.items()):
+            with self.subTest(module=module):
+                self.assertIn(package, recommends)
+                self.assertNotIn(package, depends)
 
     def test_the_svg_plugin_is_a_dependency(self):
         """It is never imported, so the import scan above cannot catch it —
@@ -7014,6 +7142,8 @@ class LauncherListTests(unittest.TestCase):
                 patch.object(s3duck, "MainWindow") as main, \
                 patch.object(s3duck, "run_with_progress",
                              return_value=(True, None)) as runner:
+            # A stand-in model still has to answer the pre-flight check.
+            model.return_value.check_tls_settings.return_value = ""
             win.onStart()
         runner.assert_called_once()
         self.assertIs(runner.call_args.args[0], win)
@@ -9205,3 +9335,4398 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(settings.value("last_location/prod"), "logs/2026/")
         settings.endGroup()
         self.assertEqual(win.profile_name, "dev")
+
+
+class ContentTypeDetectionTests(unittest.TestCase):
+    """boto3 never guesses a type, so an upload without this stores every
+    object as binary/octet-stream and a browser downloads it unrendered."""
+
+    def test_stdlib_table_answers_the_common_cases(self):
+        m = make_model()
+        self.assertEqual(m.guess_content_type("index.html"), "text/html")
+        self.assertEqual(m.guess_content_type("/tmp/a/photo.PNG"), "image/png")
+
+    def test_builtin_table_fills_the_stdlib_gaps(self):
+        m = make_model()
+        self.assertEqual(m.guess_content_type("README.md"), "text/markdown")
+        self.assertEqual(m.guess_content_type("ci.yaml"), "application/yaml")
+        self.assertEqual(m.guess_content_type("app.wasm"), "application/wasm")
+
+    def test_hls_segment_keeps_the_stdlib_answer(self):
+        """.ts is deliberately not in the built-in table: stamping a video
+        segment as TypeScript would break playback."""
+        m = make_model()
+        self.assertNotEqual(m.guess_content_type("seg1.ts"),
+                            "application/typescript")
+
+    def test_unknown_and_extensionless_are_empty_not_a_fallback(self):
+        m = make_model()
+        self.assertEqual(m.guess_content_type("blob.qqq"), "")
+        self.assertEqual(m.guess_content_type("Makefile"), "")
+        self.assertEqual(m.guess_content_type(""), "")
+
+    def test_compressed_archive_declines_rather_than_lying(self):
+        """mimetypes reports .tar.gz as x-tar + gzip encoding; sending the
+        inner type alone would make a browser silently decompress it."""
+        m = make_model()
+        self.assertEqual(m.guess_content_type("backup.tar.gz"), "")
+
+    def test_override_beats_both_tables(self):
+        m = make_model()
+        m.set_content_type_options(overrides={".MD": "text/x-custom"})
+        self.assertEqual(m.guess_content_type("README.md"), "text/x-custom")
+
+    def test_overrides_are_normalized_and_blank_rows_dropped(self):
+        m = make_model()
+        out = m.set_content_type_options(
+            overrides={" .Foo ": " text/foo ", "": "x", "bar": "  "})
+        self.assertEqual(out, {"foo": "text/foo"})
+
+    def test_upload_args_carry_the_shared_options_plus_the_type(self):
+        m = make_model()
+        m.set_upload_options(storage_class="GLACIER")
+        args = m.upload_args_for("/src/index.html")
+        self.assertEqual(args["StorageClass"], "GLACIER")
+        self.assertEqual(args["ContentType"], "text/html")
+        # the shared dict must not be mutated by a per-file call
+        self.assertNotIn("ContentType", m.upload_extra_args)
+
+    def test_detection_can_be_switched_off(self):
+        m = make_model()
+        m.set_content_type_options(detect=False)
+        self.assertEqual(m.upload_args_for("/src/index.html"), {})
+
+    def test_explicit_content_type_is_never_overwritten(self):
+        m = make_model()
+        m.upload_extra_args = {"ContentType": "application/x-chosen"}
+        self.assertEqual(m.upload_args_for("/src/index.html")["ContentType"],
+                         "application/x-chosen")
+
+    def test_parse_overrides_reads_both_separators_and_skips_junk(self):
+        parsed = Model.parse_content_type_overrides(
+            "\n".join([
+                "md = text/markdown",
+                "  .YAML: application/yaml ",
+                "# a comment",
+                "nonsense",
+                "",
+                "*.avif = image/avif",
+            ]))
+        self.assertEqual(parsed, {
+            "md": "text/markdown",
+            "yaml": "application/yaml",
+            "avif": "image/avif",
+        })
+
+    def test_format_overrides_round_trips(self):
+        table = {"md": "text/markdown", "avif": "image/avif"}
+        self.assertEqual(
+            Model.parse_content_type_overrides(
+                Model.format_content_type_overrides(table)),
+            table)
+
+    def test_managed_upload_sends_the_type(self):
+        client = FakeS3Client()
+        m = make_model(bucket="bkt")
+        m._client = client
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        path = os.path.join(directory, "page.html")
+        with open(path, "w") as handle:
+            handle.write("<html></html>")
+
+        m.upload_file(path, "site/page.html")
+
+        extra = client.calls_of("upload_file")[0]["kwargs"]["ExtraArgs"]
+        self.assertEqual(extra["ContentType"], "text/html")
+
+    def test_resumable_upload_sends_the_type_on_create(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        path = os.path.join(directory, "big.json")
+        with open(path, "wb") as handle:
+            handle.write(b"{}" + b" " * 4096)
+        client = _MultipartClient()
+        m = make_model(bucket="bkt")
+        m._client = client
+        m.upload_chunk_size = 1024
+        m.multipart_threshold_mb = 0
+        m.transfer_concurrency = 1
+        m.upload_state_dir = os.path.join(directory, "state")
+
+        m.upload_file(path, "data/big.json")
+
+        created = list(client.uploads.values())[0]
+        self.assertEqual(created["kw"].get("ContentType"), "application/json")
+
+    def test_clone_for_worker_carries_the_settings(self):
+        m = make_model()
+        m.set_content_type_options(detect=False, overrides={"md": "text/x"})
+        clone = m.clone_for_worker()
+        self.assertFalse(clone.detect_content_type)
+        self.assertEqual(clone.content_type_overrides, {"md": "text/x"})
+        clone.content_type_overrides["md"] = "changed"
+        self.assertEqual(m.content_type_overrides["md"], "text/x")
+
+
+class RetypeObjectTests(unittest.TestCase):
+    """Re-stamping objects uploaded before detection existed."""
+
+    def _model(self, head):
+        client = FakeS3Client(head_object_resp=head)
+        m = make_model(bucket="bkt")
+        m._client = client
+        return m, client
+
+    def test_wrong_type_is_replaced_and_the_rest_preserved(self):
+        m, client = self._model({
+            "ContentType": "binary/octet-stream",
+            "CacheControl": "max-age=60",
+            "StorageClass": "GLACIER",
+            "Metadata": {"owner": "vlad"},
+        })
+        changed, content_type = m.retype_object("site/index.html")
+        self.assertTrue(changed)
+        self.assertEqual(content_type, "text/html")
+        copy_kw = client.calls_of("copy_object")[0]
+        self.assertEqual(copy_kw["ContentType"], "text/html")
+        self.assertEqual(copy_kw["MetadataDirective"], "REPLACE")
+        self.assertEqual(copy_kw["CacheControl"], "max-age=60")
+        self.assertEqual(copy_kw["StorageClass"], "GLACIER")
+        self.assertEqual(copy_kw["Metadata"], {"owner": "vlad"})
+
+    def test_correct_type_is_left_alone(self):
+        m, client = self._model({"ContentType": "text/html"})
+        changed, content_type = m.retype_object("site/index.html")
+        self.assertFalse(changed)
+        self.assertEqual(content_type, "text/html")
+        self.assertEqual(client.calls_of("copy_object"), [])
+
+    def test_unguessable_key_is_not_stamped_with_the_fallback(self):
+        m, client = self._model({"ContentType": "binary/octet-stream"})
+        self.assertEqual(m.retype_object("dumps/LICENSE"), (False, ""))
+        self.assertEqual(client.calls_of("copy_object"), [])
+        self.assertEqual(client.calls_of("head_object"), [])
+
+    def test_read_only_profile_refuses(self):
+        m, _client = self._model({"ContentType": "x/y"})
+        m.read_only = True
+        with self.assertRaises(ReadOnlyError):
+            m.retype_object("site/index.html")
+
+
+class ExpiryHelperTests(unittest.TestCase):
+    """Credential lifetimes, as the various helpers actually write them."""
+
+    def test_parses_rfc3339_with_z_and_offset(self):
+        moment = datetime(2026, 9, 2, 18, 30, tzinfo=timezone.utc).timestamp()
+        self.assertAlmostEqual(
+            utils.parse_expiry("2026-09-02T18:30:00Z"), moment, places=0)
+        self.assertAlmostEqual(
+            utils.parse_expiry("2026-09-02T20:30:00+02:00"), moment, places=0)
+
+    def test_parses_a_bare_epoch(self):
+        self.assertEqual(utils.parse_expiry("1788296309"), 1788296309.0)
+        self.assertEqual(utils.parse_expiry(1788296309), 1788296309.0)
+
+    def test_absent_or_unparseable_is_zero_not_an_error(self):
+        for value in (None, "", "   ", "whenever", 0, -5):
+            self.assertEqual(utils.parse_expiry(value), 0.0)
+
+    def test_states_split_at_the_warning_window(self):
+        now = 1_000_000.0
+        self.assertEqual(utils.expiry_state("", now=now)[0], "none")
+        self.assertEqual(utils.expiry_state(now - 1, now=now)[0], "expired")
+        self.assertEqual(utils.expiry_state(now + 60, now=now)[0], "soon")
+        self.assertEqual(utils.expiry_state(now + 7200, now=now)[0], "ok")
+
+    def test_label_reads_as_a_countdown(self):
+        now = 1_000_000.0
+        self.assertEqual(utils.expiry_state(now + 600, now=now)[1],
+                         "expires in 10m")
+        self.assertEqual(utils.expiry_state(now + 7200, now=now)[1],
+                         "expires in 2h")
+        self.assertEqual(utils.expiry_state(now - 1, now=now)[1], "expired")
+
+    def test_duration_formats(self):
+        self.assertEqual(utils.format_duration(45), "45s")
+        self.assertEqual(utils.format_duration(90), "1m")
+        self.assertEqual(utils.format_duration(3900), "1h 5m")
+        self.assertEqual(utils.format_duration(90000), "1d 1h")
+        self.assertEqual(utils.format_duration(-5), "0s")
+
+
+class CredentialProcessTests(unittest.TestCase):
+    """The AWS SDKs' own refresh mechanism, which is the only way an SSO or
+    assumed-role session stays usable."""
+
+    def _script(self, body):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        path = os.path.join(directory, "creds.sh")
+        with open(path, "w") as handle:
+            handle.write("#!/bin/sh\n" + body + "\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def test_reads_the_documented_json_shape(self):
+        path = self._script(
+            "echo '{\"Version\":1,\"AccessKeyId\":\"AKIA1\","
+            "\"SecretAccessKey\":\"SEC\",\"SessionToken\":\"TOK\","
+            "\"Expiration\":\"2026-09-02T18:30:00Z\"}'")
+        out = utils.run_credential_process(path)
+        self.assertEqual(out, {
+            "access_key": "AKIA1", "secret_key": "SEC",
+            "session_token": "TOK", "expires": "2026-09-02T18:30:00Z",
+        })
+
+    def test_permanent_keys_without_a_token_are_fine(self):
+        path = self._script(
+            "echo '{\"AccessKeyId\":\"AKIA1\",\"SecretAccessKey\":\"SEC\"}'")
+        out = utils.run_credential_process(path)
+        self.assertEqual(out["session_token"], "")
+        self.assertEqual(out["expires"], "")
+
+    def test_a_failing_command_reports_its_last_stderr_line(self):
+        path = self._script("echo 'sso session expired' >&2; exit 3")
+        with self.assertRaises(utils.CredentialProcessError) as caught:
+            utils.run_credential_process(path)
+        self.assertIn("sso session expired", str(caught.exception))
+
+    def test_non_json_output_is_an_error_not_a_crash(self):
+        path = self._script("echo hello")
+        with self.assertRaises(utils.CredentialProcessError):
+            utils.run_credential_process(path)
+
+    def test_json_without_keys_is_rejected(self):
+        path = self._script("echo '{\"Version\":1}'")
+        with self.assertRaises(utils.CredentialProcessError):
+            utils.run_credential_process(path)
+
+    def test_missing_binary_is_reported_by_name(self):
+        with self.assertRaises(utils.CredentialProcessError) as caught:
+            utils.run_credential_process("/nonexistent/creds-helper --json")
+        self.assertIn("not found", str(caught.exception))
+
+    def test_empty_command_is_refused(self):
+        with self.assertRaises(utils.CredentialProcessError):
+            utils.run_credential_process("   ")
+
+    def test_the_command_is_not_run_through_a_shell(self):
+        """A stored profile must not be able to smuggle in a pipeline; shlex
+        splitting means the metacharacter becomes a literal argument."""
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        marker = os.path.join(directory, "pwned")
+        with self.assertRaises(utils.CredentialProcessError):
+            utils.run_credential_process(f"/bin/echo x > {marker}")
+        self.assertFalse(os.path.exists(marker))
+
+
+class AwsProfileExpiryTests(unittest.TestCase):
+    """~/.aws parsing: no standard expiry key exists, so several are read."""
+
+    def _files(self, credentials="", config=""):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        cred_path = os.path.join(directory, "credentials")
+        cfg_path = os.path.join(directory, "config")
+        with open(cred_path, "w") as handle:
+            handle.write(credentials)
+        with open(cfg_path, "w") as handle:
+            handle.write(config)
+        return cred_path, cfg_path
+
+    def test_expiry_is_read_from_any_of_the_known_keys(self):
+        for key in utils.AWS_EXPIRY_KEYS:
+            cred, cfg = self._files(
+                "[temp]\naws_access_key_id = AK\n"
+                "aws_secret_access_key = SK\n"
+                f"{key} = 2026-09-02T18:30:00Z\n")
+            profiles = utils.load_aws_profiles(cred, cfg)
+            self.assertEqual(profiles["temp"]["expires"],
+                             "2026-09-02T18:30:00Z", key)
+
+    def test_credential_process_profile_survives_without_keys(self):
+        cred, cfg = self._files(
+            config="[profile sso]\ncredential_process = aws-helper --json\n")
+        profiles = utils.load_aws_profiles(cred, cfg)
+        self.assertIn("sso", profiles)
+        self.assertEqual(profiles["sso"]["credential_process"],
+                         "aws-helper --json")
+        self.assertEqual(profiles["sso"]["access_key"], "")
+
+    def test_a_config_only_profile_with_neither_is_still_dropped(self):
+        cred, cfg = self._files(config="[profile empty]\nregion = eu-west-1\n")
+        self.assertEqual(utils.load_aws_profiles(cred, cfg), {})
+
+
+class ProfileExpiryBadgeTests(unittest.TestCase):
+    """A lapsed session used to look exactly like a working profile."""
+
+    def _item(self, expires):
+        return s3duck.SettingsItem(
+            "prod", "https://s3.amazonaws.com", "us-east-1", "",
+            "enc", "enc", "false", "false", "enc", "false", "",
+            session_expires=expires)
+
+    def test_no_expiry_means_no_badge(self):
+        self.assertEqual(s3duck.expiry_badge(self._item("")), "")
+
+    def test_expired_and_expiring_badges(self):
+        now = 1_000_000.0
+        self.assertEqual(
+            s3duck.expiry_badge(self._item(now - 1), now=now), "expired")
+        self.assertEqual(
+            s3duck.expiry_badge(self._item(now + 300), now=now),
+            "expires in 5m")
+        self.assertEqual(
+            s3duck.expiry_badge(self._item(now + 86400), now=now), "")
+
+    def test_badge_joins_the_safety_flags(self):
+        item = self._item(1.0)
+        item.read_only = "true"
+        self.assertEqual(
+            s3duck.profile_badges(item),
+            [s3duck.READ_ONLY_BADGE, s3duck.EXPIRED_BADGE])
+
+    def test_generated_badge_gets_the_warning_colour(self):
+        app = _ensure_qapp()
+        colour = s3duck.badge_color(
+            "expires in 5m", app.palette(), selected=False)
+        self.assertEqual(colour.name(), "#b26a00")
+
+
+class MainWindowCredentialTests(unittest.TestCase):
+    """The session-level half of credential expiry: the countdown, the
+    transfer guard and the in-place refresh."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self, *, expires="", aws_profile="", credential_process=""):
+        settings = QSettings("s3duck-tests-cred", "s3duck-tests-cred")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, "prod", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False, "TOK", False, "",
+                expires, aws_profile, credential_process, "", False,
+            ))
+        self.addCleanup(win.close)
+        return win, settings
+
+    def test_permanent_keys_show_no_countdown(self):
+        win, _ = self._window()
+        self.assertFalse(win.credential_status.isVisible())
+        self.assertEqual(win.credential_state()[0], "none")
+
+    def test_expired_session_is_shown_in_the_status_bar(self):
+        win, _ = self._window(expires=time.time() - 60)
+        win._update_credential_status()
+        self.assertEqual(win.credential_status.text(), "credentials expired")
+
+    def test_refreshability_follows_the_profile(self):
+        win, _ = self._window()
+        self.assertFalse(win.can_refresh_credentials())
+        win2, _ = self._window(aws_profile="prod")
+        self.assertTrue(win2.can_refresh_credentials())
+        win3, _ = self._window(credential_process="helper --json")
+        self.assertTrue(win3.can_refresh_credentials())
+
+    def test_healthy_credentials_do_not_interrupt_a_transfer(self):
+        win, _ = self._window(expires=time.time() + 86400)
+        self.assertTrue(win._credentials_ok_for_transfer())
+
+    def test_expired_and_unrefreshable_asks_before_starting(self):
+        win, _ = self._window(expires=time.time() - 60)
+        asked = []
+
+        def _question(_parent, _title, text, *_a, **_kw):
+            asked.append(text)
+            return QMessageBox.StandardButton.No
+
+        with patch.object(main_window.QMessageBox, "question", _question):
+            self.assertFalse(win._credentials_ok_for_transfer())
+        self.assertIn("expired", asked[0])
+
+    def test_queueing_is_abandoned_when_the_guard_says_no(self):
+        win, _ = self._window(expires=time.time() - 60)
+        with patch.object(main_window.QMessageBox, "question",
+                          lambda *a, **kw: QMessageBox.StandardButton.No):
+            win.assign_thread_operation("delete", [("a.txt", False)])
+        self.assertEqual(win._queue_entries, {})
+
+    def test_refresh_from_the_aws_file_updates_model_and_settings(self):
+        win, settings = self._window(aws_profile="prod",
+                                     expires=time.time() - 60)
+        # A stored row to write the refreshed secrets back onto.
+        settings.beginGroup("common")
+        settings.setValue("key", Fernet.generate_key().decode())
+        settings.endGroup()
+        settings.beginGroup("profiles")
+        settings.beginWriteArray("profiles", 1)
+        settings.setArrayIndex(0)
+        settings.setValue("name", "prod")
+        settings.endArray()
+        settings.endGroup()
+
+        fresh = {"prod": {
+            "access_key": "AKIA-NEW", "secret_key": "SEC-NEW",
+            "session_token": "TOK-NEW",
+            "expires": "2099-01-01T00:00:00Z",
+        }}
+        with patch.object(main_window, "load_aws_profiles", lambda: fresh):
+            self.assertTrue(win.refresh_credentials())
+
+        self.assertEqual(win.data_model.access_key, "AKIA-NEW")
+        self.assertEqual(win.data_model.session_token, "TOK-NEW")
+        self.assertIsNone(win.data_model._client)
+        self.assertEqual(win.session_expires, "2099-01-01T00:00:00Z")
+        self.assertEqual(win.credential_state()[0], "ok")
+
+        settings.beginGroup("profiles")
+        settings.beginReadArray("profiles")
+        settings.setArrayIndex(0)
+        stored = settings.value("session_expires")
+        cipher = settings.value("access_key")
+        settings.endArray()
+        settings.endGroup()
+        self.assertEqual(stored, "2099-01-01T00:00:00Z")
+        self.assertNotIn("AKIA-NEW", str(cipher))
+
+    def test_a_missing_aws_profile_reports_instead_of_raising(self):
+        win, _ = self._window(aws_profile="gone")
+        shown = []
+        with patch.object(main_window, "load_aws_profiles", lambda: {}), \
+                patch.object(main_window.QMessageBox, "critical",
+                             lambda _p, _t, text: shown.append(text)):
+            self.assertFalse(win.refresh_credentials())
+        self.assertIn("gone", shown[0])
+
+
+class SearchResultActionTests(unittest.TestCase):
+    """Search used to be a dead end: one row at a time, go-to or copy-key."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self, read_only=False):
+        settings = QSettings("s3duck-tests-search", "s3duck-tests-search")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, "prod", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False, "", read_only,
+            ))
+        self.addCleanup(win.close)
+        win.data_model.bucket = "bkt"
+        return win
+
+    def _dialog(self, win, rows=None):
+        dlg = main_window.SearchDialog(win, win, win.data_model, "logs/")
+        self.addCleanup(dlg.close)
+        rows = rows if rows is not None else [
+            ("logs/a/one.txt", 10, None),
+            ("logs/b/two.txt", 20, None),
+            ("logs/c/three.txt", 30, None),
+        ]
+        dlg._on_results(rows, None)
+        return dlg
+
+    def test_results_allow_a_multi_row_selection(self):
+        win = self._window()
+        dlg = self._dialog(win)
+        self.assertEqual(
+            dlg._table.selectionMode(),
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        dlg._table.selectAll()
+        self.assertEqual(dlg.selected_keys(),
+                         ["logs/a/one.txt", "logs/b/two.txt",
+                          "logs/c/three.txt"])
+
+    def test_buttons_track_what_is_selected(self):
+        win = self._window()
+        dlg = self._dialog(win)
+        self.assertFalse(dlg._btn_actions.isEnabled())
+        self.assertFalse(dlg._btn_copy.isEnabled())
+        dlg._table.selectRow(0)
+        self.assertTrue(dlg._btn_actions.isEnabled())
+        self.assertTrue(dlg._btn_goto.isEnabled())
+        dlg._table.selectAll()
+        # go-to needs exactly one row; the bulk actions do not
+        self.assertFalse(dlg._btn_goto.isEnabled())
+        self.assertTrue(dlg._btn_actions.isEnabled())
+
+    def test_action_menu_offers_the_queue_operations(self):
+        win = self._window()
+        dlg = self._dialog(win)
+        menu = QMenu()
+        dlg._build_actions_menu(menu, ["logs/a/one.txt", "logs/b/two.txt"])
+        labels = [act.text() for act in menu.actions() if act.text()]
+        self.assertIn("Download 2 object(s)…", labels)
+        self.assertIn("Delete 2 object(s)…", labels)
+        self.assertIn("Change storage class…", labels)
+        self.assertIn("Fix Content-Type from extension", labels)
+
+    def test_read_only_profile_gets_only_the_harmless_actions(self):
+        win = self._window(read_only=True)
+        dlg = self._dialog(win)
+        menu = QMenu()
+        dlg._build_actions_menu(menu, ["logs/a/one.txt"])
+        labels = [act.text() for act in menu.actions() if act.text()]
+        self.assertIn("Copy s3:// URIs", labels)
+        self.assertIn("(read-only profile)", labels)
+        for forbidden in ("Delete 1 object(s)…", "Change storage class…"):
+            self.assertNotIn(forbidden, labels)
+
+    def test_copy_uris_writes_one_line_per_key(self):
+        win = self._window()
+        dlg = self._dialog(win)
+        dlg._copy_uris(["logs/a/one.txt", "logs/b/two.txt"])
+        self.assertEqual(
+            QApplication.clipboard().text(),
+            "s3://bkt/logs/a/one.txt\ns3://bkt/logs/b/two.txt")
+
+    def test_copy_keys_copies_the_whole_selection(self):
+        win = self._window()
+        dlg = self._dialog(win)
+        dlg._table.selectAll()
+        dlg._copy_selected()
+        self.assertEqual(
+            QApplication.clipboard().text().splitlines(),
+            ["logs/a/one.txt", "logs/b/two.txt", "logs/c/three.txt"])
+
+
+class KeyListActionTests(unittest.TestCase):
+    """Main-window actions driven by an explicit key list rather than the
+    listing selection."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self, read_only=False):
+        settings = QSettings("s3duck-tests-keys", "s3duck-tests-keys")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, "prod", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False, "", read_only,
+            ))
+        self.addCleanup(win.close)
+        win.data_model.bucket = "bkt"
+        return win
+
+    def test_delete_keys_queues_after_confirmation(self):
+        win = self._window()
+        queued = []
+        with patch.object(main_window.QMessageBox, "question",
+                          lambda *a, **kw: QMessageBox.StandardButton.Yes), \
+                patch.object(main_window.MainWindow, "assign_thread_operation",
+                             lambda _s, m, j, **kw: queued.append((m, j))):
+            win.delete_keys(["logs/a.txt", "logs/b.txt"])
+        self.assertEqual(queued, [("delete", ["logs/a.txt", "logs/b.txt"])])
+
+    def test_delete_keys_does_nothing_when_declined(self):
+        win = self._window()
+        queued = []
+        with patch.object(main_window.QMessageBox, "question",
+                          lambda *a, **kw: QMessageBox.StandardButton.No), \
+                patch.object(main_window.MainWindow, "assign_thread_operation",
+                             lambda _s, m, j, **kw: queued.append((m, j))):
+            win.delete_keys(["logs/a.txt"])
+        self.assertEqual(queued, [])
+
+    def test_delete_keys_refuses_on_a_read_only_profile(self):
+        win = self._window(read_only=True)
+        queued = []
+        with patch.object(main_window.QMessageBox, "question",
+                          lambda *a, **kw: QMessageBox.StandardButton.Yes), \
+                patch.object(main_window.MainWindow, "assign_thread_operation",
+                             lambda _s, m, j, **kw: queued.append((m, j))):
+            win.delete_keys(["logs/a.txt"])
+        self.assertEqual(queued, [])
+
+    def test_download_keys_keeps_the_prefix_tree(self):
+        """Two results can share a basename; flattening would overwrite one
+        with the other without a word."""
+        win = self._window()
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        queued = []
+        with patch.object(main_window.QFileDialog, "getExistingDirectory",
+                          lambda *a, **kw: directory), \
+                patch.object(main_window.MainWindow, "assign_thread_operation",
+                             lambda _s, m, j, **kw: queued.append((m, j))):
+            win.download_keys(["logs/a/same.txt", "logs/b/same.txt"])
+        method, job = queued[0]
+        self.assertEqual(method, "download")
+        self.assertEqual(
+            [entry[1] for entry in job],
+            [os.path.join(directory, "logs", "a", "same.txt"),
+             os.path.join(directory, "logs", "b", "same.txt")])
+        for entry in job:
+            self.assertTrue(os.path.isdir(os.path.dirname(entry[1])))
+
+    def test_download_keys_ignores_folder_markers(self):
+        win = self._window()
+        queued = []
+        with patch.object(main_window.QFileDialog, "getExistingDirectory",
+                          lambda *a, **kw: ""), \
+                patch.object(main_window.MainWindow, "assign_thread_operation",
+                             lambda _s, m, j, **kw: queued.append((m, j))):
+            win.download_keys(["logs/a/"])
+        self.assertEqual(queued, [])
+
+
+class CredentialStoreTests(unittest.TestCase):
+    """Where the Fernet key lives. The default keeps it beside the ciphertext,
+    which is obfuscation; the other two modes are the actual protection."""
+
+    def setUp(self):
+        self.settings = QSettings("s3duck-tests-store", "s3duck-tests-store")
+        self.settings.clear()
+        self.addCleanup(self.settings.clear)
+        utils.set_session_key("")
+        self.addCleanup(utils.set_session_key, "")
+
+    def _store(self, ask=None):
+        return utils.CredentialStore(self.settings, ask_passphrase=ask)
+
+    def test_default_mode_is_the_historical_one(self):
+        self.assertEqual(self._store().mode(), utils.CREDENTIAL_STORE_LOCAL)
+
+    def test_an_unknown_stored_mode_falls_back_to_local(self):
+        self.settings.beginGroup("common")
+        self.settings.setValue("credential_store", "nonsense")
+        self.settings.endGroup()
+        self.assertEqual(self._store().mode(), utils.CREDENTIAL_STORE_LOCAL)
+
+    def test_first_run_generates_and_stores_a_key(self):
+        store = self._store()
+        key = store.ensure_key()
+        self.assertTrue(key)
+        self.settings.beginGroup("common")
+        stored = self.settings.value("key")
+        self.settings.endGroup()
+        self.assertEqual(stored, key)
+        # and it is a usable Fernet key
+        utils.require_crypto(key)
+
+    def test_ensure_key_is_idempotent(self):
+        store = self._store()
+        self.assertEqual(store.ensure_key(), store.ensure_key())
+
+    def test_passphrase_mode_removes_the_plaintext_key(self):
+        store = self._store()
+        original = store.ensure_key()
+        store.set_mode(utils.CREDENTIAL_STORE_PASSPHRASE, passphrase="hunter2")
+
+        self.settings.beginGroup("common")
+        plain = self.settings.value("key")
+        wrapped = self.settings.value("key_wrapped")
+        self.settings.endGroup()
+        self.assertIn(plain, (None, ""))
+        self.assertTrue(wrapped)
+        self.assertNotIn(original, str(wrapped))
+
+    def test_passphrase_mode_round_trips_the_same_key(self):
+        """The stored profiles must stay readable across the switch."""
+        store = self._store()
+        original = store.ensure_key()
+        store.set_mode(utils.CREDENTIAL_STORE_PASSPHRASE, passphrase="hunter2")
+        utils.set_session_key("")
+        reopened = self._store(ask=lambda _prompt: "hunter2")
+        self.assertEqual(reopened.load_key(), original)
+
+    def test_wrong_passphrase_reports_instead_of_returning_garbage(self):
+        store = self._store()
+        store.ensure_key()
+        store.set_mode(utils.CREDENTIAL_STORE_PASSPHRASE, passphrase="hunter2")
+        utils.set_session_key("")
+        reopened = self._store(ask=lambda _prompt: "wrong")
+        with self.assertRaises(CredentialError) as caught:
+            reopened.load_key()
+        self.assertIn("passphrase", str(caught.exception).lower())
+
+    def test_a_declined_prompt_is_an_error_not_an_empty_key(self):
+        store = self._store()
+        store.ensure_key()
+        store.set_mode(utils.CREDENTIAL_STORE_PASSPHRASE, passphrase="hunter2")
+        utils.set_session_key("")
+        reopened = self._store(ask=lambda _prompt: None)
+        with self.assertRaises(CredentialError):
+            reopened.load_key()
+
+    def test_switching_back_to_local_restores_the_same_key(self):
+        store = self._store()
+        original = store.ensure_key()
+        store.set_mode(utils.CREDENTIAL_STORE_PASSPHRASE, passphrase="pw")
+        store.set_mode(utils.CREDENTIAL_STORE_LOCAL)
+        self.settings.beginGroup("common")
+        self.assertEqual(self.settings.value("key"), original)
+        self.assertIn(self.settings.value("key_wrapped"), (None, ""))
+        self.settings.endGroup()
+
+    def test_passphrase_mode_without_a_passphrase_is_refused(self):
+        store = self._store()
+        store.ensure_key()
+        with self.assertRaises(CredentialError):
+            store.set_mode(utils.CREDENTIAL_STORE_PASSPHRASE)
+        # and the mode did not move, so nothing became unreadable
+        self.assertEqual(store.mode(), utils.CREDENTIAL_STORE_LOCAL)
+
+    def test_keyring_mode_round_trips_through_the_os_store(self):
+        vault = {}
+
+        class _FakeKeyring:
+            @staticmethod
+            def get_keyring():
+                return _FakeKeyring()
+
+            @staticmethod
+            def get_password(service, entry):
+                return vault.get((service, entry))
+
+            @staticmethod
+            def set_password(service, entry, value):
+                vault[(service, entry)] = value
+
+            @staticmethod
+            def delete_password(service, entry):
+                vault.pop((service, entry), None)
+
+        with patch.object(utils, "keyring", _FakeKeyring):
+            store = self._store()
+            original = store.ensure_key()
+            store.set_mode(utils.CREDENTIAL_STORE_KEYRING)
+            self.assertEqual(
+                vault[(utils.KEYRING_SERVICE, utils.KEYRING_ENTRY)], original)
+            self.settings.beginGroup("common")
+            self.assertIn(self.settings.value("key"), (None, ""))
+            self.settings.endGroup()
+
+            utils.set_session_key("")
+            self.assertEqual(self._store().load_key(), original)
+
+    def test_keyring_mode_is_refused_when_no_backend_exists(self):
+        with patch.object(utils, "keyring", None):
+            store = self._store()
+            store.ensure_key()
+            with self.assertRaises(CredentialError):
+                store.set_mode(utils.CREDENTIAL_STORE_KEYRING)
+
+    def test_keyring_availability_rejects_the_null_backend(self):
+        class _NullBackend:
+            pass
+
+        class _FailBackend:
+            pass
+
+        _NullBackend.__name__ = "NullKeyring"
+        _FailBackend.__name__ = "FailKeyring"
+
+        class _Stub:
+            backend = None
+
+            @classmethod
+            def get_keyring(cls):
+                return cls.backend()
+
+        for backend in (_NullBackend, _FailBackend):
+            _Stub.backend = backend
+            with patch.object(utils, "keyring", _Stub):
+                self.assertFalse(utils.keyring_available())
+
+    def test_wrap_is_salted_so_two_seals_differ(self):
+        key = utils.Crypto.generate_key()
+        self.assertNotEqual(utils.wrap_key(key, "pw"), utils.wrap_key(key, "pw"))
+        self.assertEqual(utils.unwrap_key(utils.wrap_key(key, "pw"), "pw"), key)
+
+    def test_a_corrupt_wrapped_key_is_reported(self):
+        with self.assertRaises(CredentialError):
+            utils.unwrap_key("not json", "pw")
+
+
+class ResolveCredentialKeyTests(unittest.TestCase):
+    """Components other than the launcher have to find the key too."""
+
+    def setUp(self):
+        self.settings = QSettings("s3duck-tests-resolve", "s3duck-tests-resolve")
+        self.settings.clear()
+        self.addCleanup(self.settings.clear)
+        utils.set_session_key("")
+        self.addCleanup(utils.set_session_key, "")
+
+    def test_the_settings_file_wins_when_it_holds_one(self):
+        self.settings.beginGroup("common")
+        self.settings.setValue("key", "STORED")
+        self.settings.endGroup()
+        utils.set_session_key("UNLOCKED")
+        self.assertEqual(utils.resolve_credential_key(self.settings), "STORED")
+
+    def test_the_unlocked_key_answers_when_the_file_has_none(self):
+        """This is the keyring / passphrase case: nothing is in the file."""
+        utils.set_session_key("UNLOCKED")
+        self.assertEqual(
+            utils.resolve_credential_key(self.settings), "UNLOCKED")
+
+    def test_nothing_anywhere_is_an_empty_string(self):
+        self.assertEqual(utils.resolve_credential_key(self.settings), "")
+
+
+class PublicBaseUrlTests(unittest.TestCase):
+    """A bucket served through CloudFront or a custom domain: the endpoint
+    URL is correct and useless."""
+
+    def test_the_base_url_replaces_the_endpoint(self):
+        m = make_model(bucket="assets", public_base_url="https://cdn.example.com/")
+        self.assertEqual(m.direct_object_url("img/logo.png"),
+                         "https://cdn.example.com/img/logo.png")
+
+    def test_the_bucket_is_not_repeated_in_the_cdn_path(self):
+        """The domain is mapped at the bucket root, so the bucket name is not
+        part of the path there."""
+        m = make_model(bucket="assets", public_base_url="https://cdn.example.com")
+        self.assertNotIn("assets", m.direct_object_url("a.png"))
+
+    def test_without_a_base_url_nothing_changes(self):
+        m = make_model(bucket="assets")
+        self.assertEqual(m.direct_object_url("a.png"),
+                         "https://s3.amazonaws.com/assets/a.png")
+
+    def test_presigned_urls_are_left_alone(self):
+        """Their signature covers the host, so rewriting one breaks it."""
+        m = make_model(bucket="assets", public_base_url="https://cdn.example.com")
+        m._client = FakeS3Client()
+        self.assertNotIn("cdn.example.com", m.presigned_get_url("a.png", 60))
+
+    def test_the_clone_carries_it(self):
+        m = make_model(bucket="assets", public_base_url="https://cdn.example.com")
+        self.assertEqual(m.clone_for_worker().public_base_url,
+                         "https://cdn.example.com")
+
+
+class StorageCostTests(unittest.TestCase):
+    """A size figure cannot answer 'is this bucket costing me pennies or
+    hundreds'."""
+
+    GIB = 1024 ** 3
+
+    def test_standard_bytes_are_costed_at_the_standard_price(self):
+        out = Model.estimate_storage_cost({"STANDARD": 100 * self.GIB})
+        self.assertAlmostEqual(out["total"], 2.3, places=6)
+        self.assertAlmostEqual(out["by_class"]["STANDARD"], 2.3, places=6)
+        self.assertEqual(out["unpriced"], [])
+
+    def test_classes_are_summed(self):
+        out = Model.estimate_storage_cost({
+            "STANDARD": 100 * self.GIB, "DEEP_ARCHIVE": 1000 * self.GIB})
+        self.assertAlmostEqual(out["total"], 2.3 + 0.99, places=6)
+
+    def test_an_unknown_class_is_reported_not_costed_at_zero(self):
+        out = Model.estimate_storage_cost({"SOMETHING_NEW": 10 * self.GIB})
+        self.assertEqual(out["unpriced"], ["SOMETHING_NEW"])
+        self.assertEqual(out["total"], 0.0)
+
+    def test_empty_breakdown_is_zero(self):
+        self.assertEqual(Model.estimate_storage_cost({})["total"], 0.0)
+
+    def test_colder_options_are_offered_for_standard_bytes_only(self):
+        options = Model.colder_class_options({"STANDARD": 1000 * self.GIB})
+        names = [name for name, _cost, _saving, _caveat in options]
+        self.assertEqual(names, ["STANDARD_IA", "GLACIER_IR", "DEEP_ARCHIVE"])
+        for _name, cost, saving, caveat in options:
+            self.assertGreater(saving, 0)
+            self.assertLess(cost, 23.0)
+            self.assertTrue(caveat)
+
+    def test_nothing_in_standard_means_nothing_to_suggest(self):
+        self.assertEqual(
+            Model.colder_class_options({"GLACIER": 10 * self.GIB}), [])
+
+    def test_prices_are_only_quoted_for_aws(self):
+        self.assertTrue(make_model().is_aws_endpoint())
+        self.assertFalse(
+            make_model(endpoint_url="https://minio.local:9000").is_aws_endpoint())
+        self.assertFalse(make_model(endpoint_url="").is_aws_endpoint())
+
+    def test_the_panel_is_empty_without_a_cost(self):
+        self.assertEqual(main_window.BucketUsageDialog.cost_html(None, []), "")
+
+    def test_the_panel_names_its_limits(self):
+        html = main_window.BucketUsageDialog.cost_html(
+            Model.estimate_storage_cost({"STANDARD": 100 * self.GIB}),
+            Model.colder_class_options({"STANDARD": 100 * self.GIB}))
+        self.assertIn("$2.30", html)
+        self.assertIn("storage only", html)
+        self.assertIn("DEEP_ARCHIVE", html)
+        self.assertIn("180-day minimum", html)
+
+
+class ConditionalWriteTests(unittest.TestCase):
+    """Editing an object in place is only safe if a concurrent save loses."""
+
+    def _model(self, client=None, etag='"abc"'):
+        m = make_model(bucket="bkt")
+        m._client = client or FakeS3Client(head_object_resp={"ETag": etag})
+        return m
+
+    def test_the_etag_is_sent_as_a_precondition(self):
+        client = FakeS3Client()
+        client.put_object = lambda **kw: (
+            client.calls.append(("put_object", kw)) or {"ETag": '"new"'})
+        m = self._model(client)
+        new_etag = m.put_object_body("a.txt", b"hello", if_match='"abc"')
+        kw = client.calls_of("put_object")[0]
+        self.assertEqual(kw["IfMatch"], "abc")
+        self.assertEqual(kw["Body"], b"hello")
+        self.assertEqual(new_etag, "new")
+
+    def test_the_content_type_is_stamped_from_the_key(self):
+        client = FakeS3Client()
+        client.put_object = lambda **kw: (
+            client.calls.append(("put_object", kw)) or {"ETag": '"n"'})
+        m = self._model(client)
+        m.put_object_body("site/index.html", b"<p>", if_match="")
+        self.assertEqual(
+            client.calls_of("put_object")[0]["ContentType"], "text/html")
+
+    def test_a_changed_object_refuses_the_write(self):
+        client = FakeS3Client()
+
+        def _put(**_kw):
+            raise botocore.exceptions.ClientError(
+                {"Error": {"Code": "PreconditionFailed", "Message": "no"},
+                 "ResponseMetadata": {"HTTPStatusCode": 412}}, "PutObject")
+
+        client.put_object = _put
+        m = self._model(client)
+        with self.assertRaises(Model.PreconditionFailed):
+            m.put_object_body("a.txt", b"x", if_match='"abc"')
+
+    def test_a_backend_without_conditional_writes_checks_by_hand(self):
+        """MinIO and friends reject IfMatch outright; the ETag is then
+        compared with a HEAD before writing unconditionally."""
+        client = FakeS3Client(head_object_resp={"ETag": '"abc"'})
+        attempts = []
+
+        def _put(**kw):
+            attempts.append(kw)
+            if "IfMatch" in kw:
+                raise botocore.exceptions.ClientError(
+                    {"Error": {"Code": "NotImplemented", "Message": "no"}},
+                    "PutObject")
+            return {"ETag": '"new"'}
+
+        client.put_object = _put
+        m = self._model(client)
+        self.assertEqual(
+            m.put_object_body("a.txt", b"x", if_match='"abc"'), "new")
+        self.assertEqual(len(attempts), 2)
+        self.assertNotIn("IfMatch", attempts[1])
+
+    def test_the_hand_check_still_refuses_a_changed_object(self):
+        client = FakeS3Client(head_object_resp={"ETag": '"different"'})
+
+        def _put(**kw):
+            if "IfMatch" in kw:
+                raise botocore.exceptions.ClientError(
+                    {"Error": {"Code": "NotImplemented", "Message": "no"}},
+                    "PutObject")
+            raise AssertionError("must not write after a failed check")
+
+        client.put_object = _put
+        m = self._model(client)
+        with self.assertRaises(Model.PreconditionFailed):
+            m.put_object_body("a.txt", b"x", if_match='"abc"')
+
+    def test_a_read_only_profile_refuses(self):
+        m = self._model()
+        m.read_only = True
+        with self.assertRaises(ReadOnlyError):
+            m.put_object_body("a.txt", b"x")
+
+    def test_checksum_settings_do_not_leak_into_the_write(self):
+        """A put_object carrying ChecksumAlgorithm without the body digest is
+        rejected by some backends; the editor never needs one."""
+        client = FakeS3Client()
+        client.put_object = lambda **kw: (
+            client.calls.append(("put_object", kw)) or {"ETag": '"n"'})
+        m = self._model(client)
+        m.set_upload_options(checksum_algorithm="CRC32", storage_class="GLACIER")
+        m.put_object_body("a.txt", b"x")
+        kw = client.calls_of("put_object")[0]
+        self.assertNotIn("ChecksumAlgorithm", kw)
+        self.assertEqual(kw["StorageClass"], "GLACIER")
+
+
+class IncrementalListingTests(unittest.TestCase):
+    """A prefix with a hundred thousand direct children used to be a silent
+    minute and then one enormous model."""
+
+    def _pages(self, count, per_page=100):
+        pages = []
+        made = 0
+        while made < count:
+            size = min(per_page, count - made)
+            pages.append({"Contents": [
+                {"Key": f"p/{made + i}.txt", "Size": 1,
+                 "LastModified": _dt(1), "ETag": '"x"'}
+                for i in range(size)]})
+            made += size
+        return pages
+
+    def test_every_page_reports_its_running_count(self):
+        m = make_model(bucket="b")
+        m._client = FakeS3Client(list_pages=self._pages(300))
+        seen = []
+        items = m.list("p/", page_cb=seen.append)
+        self.assertEqual(len(items), 300)
+        self.assertEqual(seen, [100, 200, 300])
+        self.assertFalse(m.last_listing_truncated)
+
+    def test_the_cap_stops_the_walk_and_says_so(self):
+        m = make_model(bucket="b")
+        m._client = FakeS3Client(list_pages=self._pages(500))
+        items = m.list("p/", max_items=250)
+        self.assertEqual(len(items), 250)
+        self.assertTrue(m.last_listing_truncated)
+
+    def test_no_cap_means_no_cap(self):
+        m = make_model(bucket="b")
+        m._client = FakeS3Client(list_pages=self._pages(500))
+        self.assertEqual(len(m.list("p/", max_items=0)), 500)
+        self.assertFalse(m.last_listing_truncated)
+
+    def test_the_truncated_flag_is_reset_per_listing(self):
+        m = make_model(bucket="b")
+        m._client = FakeS3Client(list_pages=self._pages(500))
+        m.list("p/", max_items=10)
+        self.assertTrue(m.last_listing_truncated)
+        m._client = FakeS3Client(list_pages=self._pages(5))
+        m.list("p/", max_items=10)
+        self.assertFalse(m.last_listing_truncated)
+
+
+class ListingFilterTests(unittest.TestCase):
+    """The quick-find bar: a substring by default, a glob when it looks like
+    one, and a count so an over-narrow filter is not mistaken for an empty
+    folder."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _proxy(self):
+        return main_window.UpTopProxyModel(main_window.UP_ENTRY_LABEL)
+
+    def test_no_filter_matches_everything(self):
+        proxy = self._proxy()
+        self.assertTrue(proxy.matches("anything.txt"))
+
+    def test_substring_is_case_insensitive(self):
+        proxy = self._proxy()
+        proxy.set_filter_text("LOG")
+        self.assertTrue(proxy.matches("access.log"))
+        self.assertTrue(proxy.matches("Logfile"))
+        self.assertFalse(proxy.matches("data.csv"))
+
+    def test_a_glob_pattern_is_anchored(self):
+        proxy = self._proxy()
+        proxy.set_filter_text("*.log")
+        self.assertTrue(proxy.matches("access.log"))
+        self.assertFalse(proxy.matches("access.log.gz"))
+        self.assertFalse(proxy.matches("logbook"))
+
+    def test_question_marks_and_classes_work(self):
+        proxy = self._proxy()
+        proxy.set_filter_text("2026-0?-*")
+        self.assertTrue(proxy.matches("2026-01-report"))
+        self.assertFalse(proxy.matches("2025-01-report"))
+        proxy.set_filter_text("[ab]*.txt")
+        self.assertTrue(proxy.matches("a1.txt"))
+        self.assertFalse(proxy.matches("c1.txt"))
+
+    def test_a_bracket_alone_stays_a_substring(self):
+        """A bare "[" is far more often part of a name than the start of a
+        character class; treating it as one would anchor the pattern."""
+        proxy = self._proxy()
+        proxy.set_filter_text("[draft")
+        self.assertTrue(proxy.matches("report [draft].txt"))
+
+
+class LocationTabTests(unittest.TestCase):
+    """Tabs are remembered locations for the one listing view — the model,
+    the queue and the log stay shared."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self, profile="prod"):
+        settings = QSettings("s3duck-tests-tabs", "s3duck-tests-tabs")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, profile, "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        return win, settings
+
+    def test_a_fresh_window_has_exactly_one_hidden_tab(self):
+        win, _ = self._window()
+        self.assertEqual(len(win._tabs), 1)
+        # isHidden, not isVisible: the window itself is never shown in tests.
+        self.assertTrue(win.tabbar.isHidden())
+
+    def test_labels_name_the_deepest_segment(self):
+        label = main_window.MainWindow.tab_label
+        self.assertEqual(label("", ""), "buckets")
+        self.assertEqual(label("logs", ""), "logs")
+        self.assertEqual(label("logs", "2026/"), "2026")
+        self.assertEqual(label("logs", "2026/09/"), "09")
+
+    def test_a_new_tab_appears_after_the_current_one(self):
+        win, _ = self._window()
+        win.data_model.bucket = "logs"
+        win.data_model.current_folder = "2026/"
+        win._remember_current_tab()
+        win.new_tab()
+        self.assertEqual(len(win._tabs), 2)
+        self.assertEqual(win.tabbar.currentIndex(), 1)
+        self.assertFalse(win.tabbar.isHidden())
+
+    def test_open_in_new_tab_switches_to_it(self):
+        win, _ = self._window()
+        opened = []
+        with patch.object(main_window.MainWindow, "open_location",
+                          lambda _s, b, p: opened.append((b, p))):
+            win.open_in_new_tab("logs", "2026/")
+        self.assertEqual(win.tab_locations()[-1], ("logs", "2026/"))
+        self.assertEqual(opened, [("logs", "2026/")])
+
+    def test_switching_tabs_navigates_to_what_it_remembers(self):
+        win, _ = self._window()
+        opened = []
+        with patch.object(main_window.MainWindow, "open_location",
+                          lambda _s, b, p: opened.append((b, p))):
+            win.open_in_new_tab("logs", "2026/")
+            win.open_in_new_tab("backups", "")
+            opened.clear()
+            win.tabbar.setCurrentIndex(1)
+        self.assertEqual(opened, [("logs", "2026/")])
+
+    def test_the_last_tab_never_closes(self):
+        win, _ = self._window()
+        win.close_tab()
+        self.assertEqual(len(win._tabs), 1)
+
+    def test_closing_a_tab_leaves_the_rest_in_order(self):
+        win, _ = self._window()
+        with patch.object(main_window.MainWindow, "open_location",
+                          lambda *_a: None):
+            win.open_in_new_tab("a", "")
+            win.open_in_new_tab("b", "")
+            win.close_tab(1)
+        self.assertEqual([b for b, _p in win.tab_locations()], ["", "b"])
+        self.assertEqual(win.tabbar.count(), 2)
+
+    def test_close_others_keeps_the_named_one(self):
+        win, _ = self._window()
+        with patch.object(main_window.MainWindow, "open_location",
+                          lambda *_a: None):
+            win.open_in_new_tab("a", "")
+            win.open_in_new_tab("b", "")
+            win.close_other_tabs(2)
+        self.assertEqual(win.tab_locations(), [("b", "")])
+        self.assertEqual(win.tabbar.count(), 1)
+
+    def test_next_tab_wraps_around(self):
+        win, _ = self._window()
+        with patch.object(main_window.MainWindow, "open_location",
+                          lambda *_a: None):
+            win.open_in_new_tab("a", "")
+            win.tabbar.setCurrentIndex(0)
+            win.next_tab(1)
+            self.assertEqual(win.tabbar.currentIndex(), 1)
+            win.next_tab(1)
+            self.assertEqual(win.tabbar.currentIndex(), 0)
+            win.next_tab(-1)
+            self.assertEqual(win.tabbar.currentIndex(), 1)
+
+    def test_dragging_a_tab_reorders_the_locations(self):
+        win, _ = self._window()
+        with patch.object(main_window.MainWindow, "open_location",
+                          lambda *_a: None):
+            win.open_in_new_tab("a", "")
+            win.open_in_new_tab("b", "")
+        win._on_tab_moved(0, 2)
+        self.assertEqual([b for b, _p in win.tab_locations()],
+                         ["a", "b", ""])
+
+    def test_tabs_are_persisted_per_profile(self):
+        win, settings = self._window()
+        with patch.object(main_window.MainWindow, "open_location",
+                          lambda *_a: None):
+            win.open_in_new_tab("logs", "2026/")
+        settings.beginGroup("common")
+        stored = settings.value("tabs/prod")
+        settings.endGroup()
+        self.assertIn("logs", str(stored))
+
+        win._tabs = []
+        win._load_tabs()
+        self.assertEqual(win.tab_locations()[-1], ("logs", "2026/"))
+
+    def test_a_corrupt_stored_set_falls_back_to_one_tab(self):
+        win, settings = self._window()
+        settings.beginGroup("common")
+        settings.setValue("tabs/prod", "{not json")
+        settings.endGroup()
+        win._load_tabs()
+        self.assertEqual(len(win._tabs), 1)
+
+    def test_navigation_updates_the_active_tab(self):
+        win, _ = self._window()
+        win.data_model.bucket = "logs"
+        win.data_model.current_folder = "2026/09/"
+        win._remember_current_tab()
+        self.assertEqual(win.tab_locations()[win.tabbar.currentIndex()],
+                         ("logs", "2026/09/"))
+        self.assertEqual(win.tabbar.tabText(win.tabbar.currentIndex()), "09")
+
+
+class RequesterPaysTests(unittest.TestCase):
+    """A requester-pays bucket refuses every read that does not opt in."""
+
+    def _emit(self, client, operation):
+        params = {}
+        client.meta.events.emit(
+            f"provide-client-params.s3.{operation}",
+            params=params, model=None, context={})
+        return params
+
+    def test_object_operations_opt_in(self):
+        m = make_model(bucket="b", requester_pays=True)
+        client = m.client
+        for operation in ("GetObject", "HeadObject", "ListObjectsV2",
+                          "UploadPart", "DeleteObjects", "RestoreObject"):
+            with self.subTest(operation=operation):
+                self.assertEqual(self._emit(client, operation),
+                                 {"RequestPayer": "requester"})
+
+    def test_bucket_operations_are_left_alone(self):
+        """They reject the parameter outright — it is a ParamValidationError,
+        not something the service ignores."""
+        m = make_model(bucket="b", requester_pays=True)
+        client = m.client
+        for operation in ("ListBuckets", "GetBucketVersioning",
+                          "CreateBucket", "GetBucketLifecycleConfiguration"):
+            with self.subTest(operation=operation):
+                self.assertEqual(self._emit(client, operation), {})
+
+    def test_nothing_is_added_when_the_profile_is_off(self):
+        m = make_model(bucket="b")
+        self.assertEqual(self._emit(m.client, "GetObject"), {})
+
+    def test_an_explicit_payer_is_not_overwritten(self):
+        m = make_model(bucket="b", requester_pays=True)
+        params = {"RequestPayer": "bucketowner"}
+        m.client.meta.events.emit(
+            "provide-client-params.s3.GetObject",
+            params=params, model=None, context={})
+        self.assertEqual(params["RequestPayer"], "bucketowner")
+
+    def test_a_worker_clone_keeps_the_setting(self):
+        m = make_model(bucket="b", requester_pays=True)
+        clone = m.clone_for_worker()
+        self.assertTrue(clone.requester_pays)
+        self.assertEqual(self._emit(clone.client, "GetObject"),
+                         {"RequestPayer": "requester"})
+
+
+class _BucketAdminClient(FakeS3Client):
+    """FakeS3Client plus the bucket-level documents."""
+
+    def __init__(self, **kw):
+        self.lifecycle = kw.pop("lifecycle", None)
+        self.cors = kw.pop("cors", None)
+        self.policy = kw.pop("policy", None)
+        self.lock = kw.pop("lock", None)
+        self.retention = kw.pop("retention", None)
+        self.legal_hold = kw.pop("legal_hold", None)
+        super().__init__(**kw)
+
+    @staticmethod
+    def _missing(code, operation):
+        return botocore.exceptions.ClientError(
+            {"Error": {"Code": code, "Message": "absent"}}, operation)
+
+    def get_bucket_lifecycle_configuration(self, **kw):
+        self.calls.append(("get_bucket_lifecycle_configuration", kw))
+        if self.lifecycle is None:
+            raise self._missing("NoSuchLifecycleConfiguration", "GetLifecycle")
+        return {"Rules": self.lifecycle}
+
+    def put_bucket_lifecycle_configuration(self, **kw):
+        self.calls.append(("put_bucket_lifecycle_configuration", kw))
+        return {}
+
+    def delete_bucket_lifecycle(self, **kw):
+        self.calls.append(("delete_bucket_lifecycle", kw))
+        return {}
+
+    def get_bucket_cors(self, **kw):
+        self.calls.append(("get_bucket_cors", kw))
+        if self.cors is None:
+            raise self._missing("NoSuchCORSConfiguration", "GetBucketCors")
+        return {"CORSRules": self.cors}
+
+    def put_bucket_cors(self, **kw):
+        self.calls.append(("put_bucket_cors", kw))
+        return {}
+
+    def delete_bucket_cors(self, **kw):
+        self.calls.append(("delete_bucket_cors", kw))
+        return {}
+
+    def get_bucket_policy(self, **kw):
+        self.calls.append(("get_bucket_policy", kw))
+        if self.policy is None:
+            raise self._missing("NoSuchBucketPolicy", "GetBucketPolicy")
+        return {"Policy": self.policy}
+
+    def put_bucket_policy(self, **kw):
+        self.calls.append(("put_bucket_policy", kw))
+        return {}
+
+    def delete_bucket_policy(self, **kw):
+        self.calls.append(("delete_bucket_policy", kw))
+        return {}
+
+    def get_bucket_policy_status(self, **kw):
+        self.calls.append(("get_bucket_policy_status", kw))
+        return {"PolicyStatus": {"IsPublic": True}}
+
+    def get_object_lock_configuration(self, **kw):
+        self.calls.append(("get_object_lock_configuration", kw))
+        if self.lock is None:
+            raise self._missing(
+                "ObjectLockConfigurationNotFoundError", "GetObjectLock")
+        return {"ObjectLockConfiguration": self.lock}
+
+    def get_object_retention(self, **kw):
+        self.calls.append(("get_object_retention", kw))
+        if self.retention is None:
+            raise self._missing("InvalidRequest", "GetObjectRetention")
+        return {"Retention": self.retention}
+
+    def get_object_legal_hold(self, **kw):
+        self.calls.append(("get_object_legal_hold", kw))
+        if self.legal_hold is None:
+            raise self._missing("NoSuchObjectLockConfiguration", "GetHold")
+        return {"LegalHold": {"Status": self.legal_hold}}
+
+    def put_object_legal_hold(self, **kw):
+        self.calls.append(("put_object_legal_hold", kw))
+        return {}
+
+
+class LifecycleTests(unittest.TestCase):
+    """The rules that decide what a bucket costs next month."""
+
+    def _model(self, **kw):
+        m = make_model(bucket="bkt")
+        m._client = _BucketAdminClient(**kw)
+        return m, m._client
+
+    def test_a_bucket_without_rules_reads_as_empty_not_an_error(self):
+        m, _c = self._model()
+        self.assertEqual(m.get_bucket_lifecycle(), [])
+
+    def test_rules_are_returned_as_stored(self):
+        rules = [{"ID": "r1", "Status": "Enabled"}]
+        m, _c = self._model(lifecycle=rules)
+        self.assertEqual(m.get_bucket_lifecycle(), rules)
+
+    def test_writing_an_empty_set_removes_the_configuration(self):
+        m, client = self._model(lifecycle=[{"ID": "r1"}])
+        m.put_bucket_lifecycle([])
+        self.assertEqual(len(client.calls_of("delete_bucket_lifecycle")), 1)
+        self.assertEqual(client.calls_of("put_bucket_lifecycle_configuration"),
+                         [])
+
+    def test_writing_rules_sends_them_in_one_document(self):
+        m, client = self._model()
+        rules = [{"ID": "r1", "Status": "Enabled"}]
+        m.put_bucket_lifecycle(rules)
+        sent = client.calls_of("put_bucket_lifecycle_configuration")[0]
+        self.assertEqual(sent["LifecycleConfiguration"], {"Rules": rules})
+
+    def test_a_read_only_profile_refuses(self):
+        m, _c = self._model()
+        m.read_only = True
+        with self.assertRaises(ReadOnlyError):
+            m.put_bucket_lifecycle([{"ID": "r"}])
+
+    def test_scope_is_read_from_either_filter_shape(self):
+        self.assertEqual(Model.lifecycle_rule_scope({"Prefix": "old/"}), "old/")
+        self.assertEqual(
+            Model.lifecycle_rule_scope({"Filter": {"Prefix": "logs/"}}),
+            "logs/")
+        self.assertEqual(
+            Model.lifecycle_rule_scope(
+                {"Filter": {"And": {"Prefix": "a/", "Tags": []}}}), "a/")
+        self.assertEqual(Model.lifecycle_rule_scope({"Filter": {}}), "")
+
+    def test_a_rule_summary_names_every_action(self):
+        summary = Model.summarize_lifecycle_rule({
+            "ID": "r", "Filter": {"Prefix": "logs/"},
+            "Transitions": [{"Days": 30, "StorageClass": "GLACIER"}],
+            "Expiration": {"Days": 365},
+            "NoncurrentVersionExpiration": {"NoncurrentDays": 7},
+            "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 3},
+        })
+        self.assertIn("prefix 'logs/'", summary)
+        self.assertIn("to GLACIER after 30d", summary)
+        self.assertIn("delete after 365d", summary)
+        self.assertIn("old versions after 7d", summary)
+        self.assertIn("abort incomplete uploads after 3d", summary)
+
+    def test_a_tag_filter_is_named_in_the_summary(self):
+        """A summary that omits the tag describes a rule that deletes far
+        more than the real one does."""
+        summary = Model.summarize_lifecycle_rule({
+            "ID": "r",
+            "Filter": {"And": {"Prefix": "logs/",
+                               "Tags": [{"Key": "temp", "Value": "yes"}]}},
+            "Expiration": {"Days": 7},
+        })
+        self.assertIn("prefix 'logs/'", summary)
+        self.assertIn("tagged temp=yes", summary)
+
+    def test_size_bounds_are_named_in_the_summary(self):
+        summary = Model.summarize_lifecycle_rule({
+            "ID": "r",
+            "Filter": {"ObjectSizeGreaterThan": 1024,
+                       "ObjectSizeLessThan": 4096},
+            "Expiration": {"Days": 7},
+        })
+        self.assertIn("larger than 1024 B", summary)
+        self.assertIn("smaller than 4096 B", summary)
+
+    def test_a_prefix_only_filter_is_editable(self):
+        for rule in ({"Filter": {"Prefix": "a/"}}, {"Filter": {}},
+                     {"Prefix": "a/"}, {}):
+            with self.subTest(rule=rule):
+                self.assertTrue(Model.lifecycle_filter_is_simple(rule))
+
+    def test_a_tag_or_size_filter_is_not_editable_here(self):
+        """Rebuilding one from the prefix form would drop the filter and
+        widen the rule to every object under the prefix."""
+        for rule in (
+            {"Filter": {"Tag": {"Key": "t", "Value": "v"}}},
+            {"Filter": {"And": {"Prefix": "a/",
+                                "Tags": [{"Key": "t", "Value": "v"}]}}},
+            {"Filter": {"ObjectSizeGreaterThan": 1}},
+            {"Filter": {"And": {"Prefix": "a/", "ObjectSizeLessThan": 10}}},
+        ):
+            with self.subTest(rule=rule):
+                self.assertFalse(Model.lifecycle_filter_is_simple(rule))
+
+    def test_a_rule_with_no_actions_says_so(self):
+        self.assertIn(
+            "does nothing",
+            Model.summarize_lifecycle_rule({"ID": "r", "Filter": {}}))
+
+    def test_building_a_rule_uses_the_modern_filter(self):
+        rule = Model.build_lifecycle_rule(
+            "expire", prefix="logs/", expire_days=90)
+        self.assertEqual(rule["Filter"], {"Prefix": "logs/"})
+        self.assertNotIn("Prefix", set(rule) - {"Filter"})
+        self.assertEqual(rule["Expiration"], {"Days": 90})
+        self.assertEqual(rule["Status"], "Enabled")
+
+    def test_an_actionless_rule_is_refused_rather_than_stored(self):
+        """S3 accepts one and then silently never fires it."""
+        with self.assertRaises(ValueError):
+            Model.build_lifecycle_rule("nothing", prefix="a/")
+
+    def test_a_disabled_rule_keeps_its_status(self):
+        rule = Model.build_lifecycle_rule("r", expire_days=1, enabled=False)
+        self.assertEqual(rule["Status"], "Disabled")
+
+    def test_delete_marker_cleanup_counts_as_an_action(self):
+        rule = Model.build_lifecycle_rule("r", expire_delete_markers=True)
+        self.assertEqual(rule["Expiration"],
+                         {"ExpiredObjectDeleteMarker": True})
+
+
+class CorsAndPolicyTests(unittest.TestCase):
+    def _model(self, **kw):
+        m = make_model(bucket="bkt")
+        m._client = _BucketAdminClient(**kw)
+        return m, m._client
+
+    def test_absent_cors_reads_as_empty(self):
+        m, _c = self._model()
+        self.assertEqual(m.get_bucket_cors(), [])
+
+    def test_empty_cors_removes_the_document(self):
+        m, client = self._model(cors=[{"AllowedMethods": ["GET"]}])
+        m.put_bucket_cors([])
+        self.assertEqual(len(client.calls_of("delete_bucket_cors")), 1)
+
+    def test_absent_policy_reads_as_empty_string(self):
+        m, _c = self._model()
+        self.assertEqual(m.get_bucket_policy(), "")
+
+    def test_a_policy_must_be_a_json_object_with_statements(self):
+        m, client = self._model()
+        for bad in ("{not json", "[]", '{"Version":"2012-10-17"}'):
+            with self.subTest(policy=bad):
+                with self.assertRaises(ValueError):
+                    m.put_bucket_policy(bad)
+        self.assertEqual(client.calls_of("put_bucket_policy"), [])
+
+    def test_a_valid_policy_is_sent_verbatim(self):
+        m, client = self._model()
+        policy = '{"Version": "2012-10-17", "Statement": []}'
+        m.put_bucket_policy(policy)
+        self.assertEqual(
+            client.calls_of("put_bucket_policy")[0]["Policy"], policy)
+
+    def test_an_empty_policy_removes_it(self):
+        m, client = self._model(policy="{}")
+        m.put_bucket_policy("   ")
+        self.assertEqual(len(client.calls_of("delete_bucket_policy")), 1)
+
+    def test_policy_status_is_reported_in_words(self):
+        m, _c = self._model()
+        self.assertEqual(m.get_bucket_policy_status(), "public")
+
+
+class ObjectLockTests(unittest.TestCase):
+    def _model(self, **kw):
+        m = make_model(bucket="bkt")
+        m._client = _BucketAdminClient(**kw)
+        return m, m._client
+
+    def test_a_bucket_without_object_lock_reads_as_empty(self):
+        m, _c = self._model()
+        self.assertEqual(m.get_object_lock_configuration(), {})
+
+    def test_the_default_retention_is_reported(self):
+        m, _c = self._model(lock={
+            "ObjectLockEnabled": "Enabled",
+            "Rule": {"DefaultRetention": {"Mode": "GOVERNANCE", "Days": 30}},
+        })
+        config = m.get_object_lock_configuration()
+        self.assertTrue(config["enabled"])
+        self.assertEqual(config["mode"], "GOVERNANCE")
+        self.assertEqual(config["days"], 30)
+
+    def test_an_unsupported_bucket_is_reported_not_raised(self):
+        """Most buckets have no Object Lock, which is not an error."""
+        m, _c = self._model()
+        state = m.get_object_lock_state("a.txt")
+        self.assertFalse(state["supported"])
+
+    def test_retention_and_hold_are_read_together(self):
+        m, _c = self._model(
+            retention={"Mode": "COMPLIANCE",
+                       "RetainUntilDate": "2027-01-01T00:00:00Z"},
+            legal_hold="ON")
+        state = m.get_object_lock_state("a.txt")
+        self.assertTrue(state["supported"])
+        self.assertEqual(state["mode"], "COMPLIANCE")
+        self.assertIn("2027", state["retain_until"])
+        self.assertEqual(state["legal_hold"], "ON")
+
+    def test_a_missing_hold_is_simply_off(self):
+        m, _c = self._model(retention={"Mode": "GOVERNANCE"})
+        self.assertEqual(m.get_object_lock_state("a.txt")["legal_hold"], "")
+
+    def test_placing_a_hold_sends_on(self):
+        m, client = self._model(retention={"Mode": "GOVERNANCE"})
+        m.set_object_legal_hold("a.txt", True)
+        self.assertEqual(
+            client.calls_of("put_object_legal_hold")[0]["LegalHold"],
+            {"Status": "ON"})
+
+    def test_clearing_a_hold_sends_off(self):
+        m, client = self._model(retention={"Mode": "GOVERNANCE"})
+        m.set_object_legal_hold("a.txt", False)
+        self.assertEqual(
+            client.calls_of("put_object_legal_hold")[0]["LegalHold"],
+            {"Status": "OFF"})
+
+    def test_a_read_only_profile_cannot_place_one(self):
+        m, _c = self._model()
+        m.read_only = True
+        with self.assertRaises(ReadOnlyError):
+            m.set_object_legal_hold("a.txt", True)
+
+
+class WatchModeTests(unittest.TestCase):
+    """A folder mirrored up on an interval, built on the sync planner."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self):
+        settings = QSettings("s3duck-tests-watch", "s3duck-tests-watch")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, "prod", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        win.data_model.bucket = "bkt"
+        return win, settings
+
+    def _config(self, local="/tmp/x"):
+        return {"local": local, "bucket": "bkt", "prefix": "backup/",
+                "interval": 300, "exclude": "", "delete_extra": False}
+
+    def test_a_window_starts_with_no_watch(self):
+        win, _ = self._window()
+        self.assertFalse(win.watch_active())
+        self.assertTrue(win.watch_status.isHidden())
+
+    def test_starting_shows_the_indicator_and_arms_the_timer(self):
+        win, _ = self._window()
+        with patch.object(main_window.MainWindow, "_watch_tick",
+                          lambda _s: None):
+            win.start_watch(self._config())
+        self.assertTrue(win.watch_active())
+        self.assertTrue(win._watch_timer.isActive())
+        self.assertFalse(win.watch_status.isHidden())
+        win.stop_watch()
+        self.assertFalse(win._watch_timer.isActive())
+        self.assertTrue(win.watch_status.isHidden())
+
+    def test_the_settings_are_remembered_but_never_auto_started(self):
+        """A background uploader that resumes unasked is how a folder gets
+        mirrored somewhere the user forgot about."""
+        win, settings = self._window()
+        win._watch_config = self._config()
+        win._save_watch_config()
+        win._watch_config = {}
+        win._load_watch_config()
+        self.assertEqual(win._watch_config["prefix"], "backup/")
+        self.assertFalse(win.watch_active())
+
+    def test_a_corrupt_stored_config_is_ignored(self):
+        win, settings = self._window()
+        settings.beginGroup("common")
+        settings.setValue("watch/prod", "{nope")
+        settings.endGroup()
+        win._load_watch_config()
+        self.assertEqual(win._watch_config, {})
+
+    def test_only_real_changes_are_queued(self):
+        win, _ = self._window()
+        with patch.object(main_window.MainWindow, "_watch_tick",
+                          lambda _s: None):
+            win.start_watch(self._config())
+        started = []
+        with patch.object(main_window.MainWindow, "start_sync",
+                          lambda _s, a, l, p, d: started.append((a, l, p, d))):
+            win._on_watch_planned([
+                {"action": "skip", "rel": "a.txt", "size": 1},
+                {"action": "upload", "rel": "b.txt", "size": 2},
+            ], None)
+        self.assertEqual(len(started), 1)
+        self.assertEqual([e["rel"] for e in started[0][0]], ["b.txt"])
+        self.assertEqual(started[0][3], "upload")
+
+    def test_an_all_skip_pass_queues_nothing(self):
+        win, _ = self._window()
+        with patch.object(main_window.MainWindow, "_watch_tick",
+                          lambda _s: None):
+            win.start_watch(self._config())
+        started = []
+        with patch.object(main_window.MainWindow, "start_sync",
+                          lambda *a: started.append(a)):
+            win._on_watch_planned([{"action": "skip", "rel": "a", "size": 1}],
+                                  None)
+        self.assertEqual(started, [])
+
+    def test_a_failed_comparison_is_logged_not_raised(self):
+        win, _ = self._window()
+        with patch.object(main_window.MainWindow, "_watch_tick",
+                          lambda _s: None):
+            win.start_watch(self._config())
+        win._on_watch_planned(None, RuntimeError("no network"))
+        self.assertFalse(win.transfers_active())
+
+    def test_a_stopped_watch_ignores_a_late_result(self):
+        win, _ = self._window()
+        with patch.object(main_window.MainWindow, "_watch_tick",
+                          lambda _s: None):
+            win.start_watch(self._config())
+        win.stop_watch()
+        started = []
+        with patch.object(main_window.MainWindow, "start_sync",
+                          lambda *a: started.append(a)):
+            win._on_watch_planned(
+                [{"action": "upload", "rel": "b.txt", "size": 2}], None)
+        self.assertEqual(started, [])
+
+    def test_a_tick_is_skipped_while_the_queue_is_busy(self):
+        win, _ = self._window()
+        with patch.object(main_window.MainWindow, "_watch_tick",
+                          lambda _s: None):
+            win.start_watch(self._config())
+        with patch.object(main_window.MainWindow, "transfers_active",
+                          lambda _s: True):
+            win._watch_tick()
+        self.assertIsNone(win._watch_thread)
+
+
+class DualPaneTests(unittest.TestCase):
+    """Two listings side by side, with F5/F6 running through the same queue."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self, read_only=False):
+        settings = QSettings("s3duck-tests-panes", "s3duck-tests-panes")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, "prod", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False, "", read_only,
+            ))
+        self.addCleanup(win.close)
+        win.data_model.bucket = "bkt"
+        win.data_model.current_folder = "here/"
+        return win
+
+    def _queued(self):
+        calls = []
+        return calls, patch.object(
+            main_window.MainWindow, "assign_thread_operation",
+            lambda _s, method, job, **kw: calls.append((method, job, kw)))
+
+    def test_the_pane_starts_hidden_and_toggles(self):
+        win = self._window()
+        self.assertFalse(win.dual_pane_active())
+        win.toggle_dual_pane()
+        self.assertTrue(win.dual_pane_active())
+        win.toggle_dual_pane()
+        self.assertFalse(win.dual_pane_active())
+
+    def test_a_local_pane_lists_a_real_directory(self):
+        win = self._window()
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        os.mkdir(os.path.join(directory, "sub"))
+        with open(os.path.join(directory, "a.txt"), "w") as handle:
+            handle.write("x")
+        win.second_pane.set_local(directory)
+        names = [name for name, _d, _s in win.second_pane.entries()]
+        self.assertEqual(names, ["sub", "a.txt"])   # folders first
+
+    def test_going_up_leaves_the_directory(self):
+        win = self._window()
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        child = os.path.join(directory, "sub")
+        os.mkdir(child)
+        win.second_pane.set_local(child)
+        win.second_pane.go_up()
+        self.assertEqual(win.second_pane.local_target(),
+                         os.path.abspath(directory))
+
+    def test_remote_up_trims_one_prefix_segment(self):
+        win = self._window()
+        pane = win.second_pane
+        with patch.object(main_window.SecondPane, "refresh", lambda _s: None):
+            pane.set_remote("bkt", "a/b/")
+            pane.go_up()
+            self.assertEqual(pane.remote_target(), ("bkt", "a/"))
+            pane.go_up()
+            self.assertEqual(pane.remote_target(), ("bkt", ""))
+            pane.go_up()
+            self.assertEqual(pane.remote_target(), ("bkt", ""))
+
+    def test_f5_without_the_pane_does_nothing(self):
+        win = self._window()
+        calls, patcher = self._queued()
+        with patcher:
+            win.pane_transfer()
+        self.assertEqual(calls, [])
+
+    def test_copy_to_a_local_pane_queues_a_download(self):
+        win = self._window()
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        win.toggle_dual_pane()
+        win.second_pane.set_local(directory)
+        calls, patcher = self._queued()
+        with patcher, patch.object(
+                main_window.MainWindow, "_collect_selected_targets",
+                lambda _s: [("a.txt", "here/a.txt", False)]):
+            win.pane_transfer(move=False)
+        method, job, _kw = calls[0]
+        self.assertEqual(method, "download")
+        self.assertEqual(job[0][0], "here/a.txt")
+        self.assertEqual(job[0][1], os.path.join(directory, "a.txt"))
+
+    def test_moving_to_a_local_pane_is_refused(self):
+        win = self._window()
+        win.toggle_dual_pane()
+        win.second_pane.set_local(tempfile.gettempdir())
+        calls, patcher = self._queued()
+        with patcher, patch.object(
+                main_window.MainWindow, "_collect_selected_targets",
+                lambda _s: [("a.txt", "here/a.txt", False)]):
+            win.pane_transfer(move=True)
+        self.assertEqual(calls, [])
+
+    def test_copy_to_a_remote_pane_crosses_buckets(self):
+        win = self._window()
+        win.toggle_dual_pane()
+        with patch.object(main_window.SecondPane, "refresh", lambda _s: None):
+            win.second_pane.set_remote("other", "dst/")
+        calls, patcher = self._queued()
+        with patcher, patch.object(
+                main_window.MainWindow, "_collect_selected_targets",
+                lambda _s: [("a.txt", "here/a.txt", False)]):
+            win.pane_transfer(move=False)
+        method, job, _kw = calls[0]
+        self.assertEqual(method, "copy")
+        self.assertEqual(job[0], ("here/a.txt", "dst/a.txt", False, "other"))
+
+    def test_bringing_a_remote_selection_here_binds_the_source_bucket(self):
+        """copy/move resolve CopySource against their model's bucket, so the
+        worker has to run on the SOURCE side."""
+        win = self._window()
+        win.toggle_dual_pane()
+        with patch.object(main_window.SecondPane, "refresh", lambda _s: None):
+            win.second_pane.set_remote("other", "src/")
+        win.second_pane._entries = [("a.txt", False, 10)]
+        calls, patcher = self._queued()
+        with patcher, patch.object(
+                main_window.SecondPane, "selected",
+                lambda _s: [("a.txt", False, 10)]), \
+                patch.object(win.second_pane.view, "hasFocus",
+                             lambda: True):
+            win.pane_transfer(move=False)
+        method, job, kw = calls[0]
+        self.assertEqual(method, "copy")
+        self.assertEqual(job[0], ("src/a.txt", "here/a.txt", False, "bkt"))
+        self.assertEqual(kw.get("source_bucket"), "other")
+
+    def test_uploading_a_local_selection_walks_folders(self):
+        win = self._window()
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        os.makedirs(os.path.join(directory, "sub", "deep"))
+        for path in (("a.txt",), ("sub", "b.txt"), ("sub", "deep", "c.txt")):
+            with open(os.path.join(directory, *path), "w") as handle:
+                handle.write("x")
+        win.toggle_dual_pane()
+        win.second_pane.set_local(directory)
+        calls, patcher = self._queued()
+        with patcher, patch.object(
+                main_window.SecondPane, "selected",
+                lambda _s: [("a.txt", False, 1), ("sub", True, 0)]), \
+                patch.object(win.second_pane.view, "hasFocus",
+                             lambda: True):
+            win.pane_transfer(move=False)
+        method, job, _kw = calls[0]
+        self.assertEqual(method, "upload")
+        self.assertEqual(
+            sorted(key for key, _path in job),
+            ["here/a.txt", "here/sub/b.txt", "here/sub/deep/c.txt"])
+
+    def test_a_read_only_profile_transfers_nothing(self):
+        win = self._window(read_only=True)
+        win.toggle_dual_pane()
+        calls, patcher = self._queued()
+        with patcher:
+            win.pane_transfer()
+        self.assertEqual(calls, [])
+
+
+class TabRestoreOrderTests(unittest.TestCase):
+    """The window opens wherever the remembered last location says, which is
+    not necessarily tab 0."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self):
+        settings = QSettings("s3duck-tests-tabrestore", "s3duck-tests-tabrestore")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, "prod", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        return win
+
+    def test_the_first_navigation_selects_the_matching_tab(self):
+        win = self._window()
+        win._tabs = [{"bucket": "a", "prefix": ""},
+                     {"bucket": "b", "prefix": "x/"},
+                     {"bucket": "c", "prefix": ""}]
+        win._sync_tab_bar()
+        win._tab_restore_pending = True
+        win.data_model.bucket = "b"
+        win.data_model.current_folder = "x/"
+
+        win._remember_current_tab()
+
+        self.assertEqual(win.tabbar.currentIndex(), 1)
+        # and nothing was overwritten
+        self.assertEqual([b for b, _p in win.tab_locations()], ["a", "b", "c"])
+
+    def test_an_unmatched_location_falls_back_to_recording_it(self):
+        win = self._window()
+        win._tabs = [{"bucket": "a", "prefix": ""}]
+        win._sync_tab_bar()
+        win._tab_restore_pending = True
+        win.data_model.bucket = "z"
+
+        win._remember_current_tab()
+
+        self.assertEqual(win.tab_locations(), [("z", "")])
+
+    def test_the_restore_only_happens_once(self):
+        win = self._window()
+        win._tabs = [{"bucket": "a", "prefix": ""},
+                     {"bucket": "b", "prefix": ""}]
+        win._sync_tab_bar()
+        win._tab_restore_pending = True
+        win.data_model.bucket = "b"
+        win._remember_current_tab()
+        self.assertEqual(win.tabbar.currentIndex(), 1)
+
+        # a later navigation inside that tab records, rather than jumping
+        win.data_model.current_folder = "deep/"
+        win._remember_current_tab()
+        self.assertEqual(win.tab_locations()[1], ("b", "deep/"))
+
+
+class BucketSettingsRenderTests(unittest.TestCase):
+    """The four bucket documents are read in one background pass and each
+    failure stays in its own tab."""
+
+    class _DocModel:
+        """Answers every bucket document; override one to make it fail."""
+
+        bucket = "bkt"
+
+        def get_bucket_lifecycle(self):
+            return [{"ID": "r"}]
+
+        def get_bucket_cors(self):
+            return [{"AllowedMethods": ["GET"]}]
+
+        def get_bucket_policy(self):
+            return '{"Statement": []}'
+
+        def get_object_lock_configuration(self):
+            return {"enabled": True}
+
+        def get_bucket_policy_status(self):
+            return "public"
+
+        def get_bucket_encryption(self):
+            return {"sse": "AES256", "kms_key": "", "bucket_key": False}
+
+        def get_bucket_tags(self):
+            return {"team": "infra"}
+
+        def get_bucket_website(self):
+            return {"index": "index.html", "error": "", "redirect": ""}
+
+        def get_bucket_notifications(self):
+            return [("SQS queue", "arn:aws:sqs:x", ["s3:ObjectCreated:*"])]
+
+        def get_bucket_acceleration(self):
+            return "Enabled"
+
+    def test_every_document_is_fetched_once(self):
+        payload = main_window.BucketSettingsDialog.read_documents(
+            self._DocModel())
+        self.assertEqual(payload["lifecycle"], [{"ID": "r"}])
+        self.assertEqual(payload["policy_status"], "public")
+        self.assertTrue(payload["lock"]["enabled"])
+        self.assertEqual(payload["encryption"]["sse"], "AES256")
+        self.assertEqual(payload["tags"], {"team": "infra"})
+        self.assertEqual(payload["website"]["index"], "index.html")
+        self.assertEqual(payload["acceleration"], "Enabled")
+        self.assertEqual(len(payload["events"]), 1)
+        self.assertNotIn("policy_error", payload)
+
+    def test_one_failure_does_not_hide_the_others(self):
+        class _Failing(BucketSettingsRenderTests._DocModel):
+            def get_bucket_lifecycle(self):
+                raise RuntimeError("denied")
+
+            def get_bucket_policy_status(self):
+                raise RuntimeError("also denied")
+
+            def get_bucket_tags(self):
+                raise RuntimeError("no tag permission")
+
+        payload = main_window.BucketSettingsDialog.read_documents(_Failing())
+        self.assertEqual(payload["lifecycle_error"], "denied")
+        self.assertIsNone(payload["lifecycle"])
+        self.assertEqual(payload["tags_error"], "no tag permission")
+        self.assertEqual(payload["cors"], [{"AllowedMethods": ["GET"]}])
+        self.assertEqual(payload["policy_status"], "")
+
+
+class PropertiesLockSummaryTests(unittest.TestCase):
+    """Most buckets have no Object Lock, which is not an error."""
+
+    def test_no_lock_reads_as_nothing_to_say(self):
+        self.assertEqual(
+            PropertiesWindow.lock_summary({"supported": False}), "")
+        self.assertEqual(PropertiesWindow.lock_summary(None), "")
+
+    def test_retention_and_hold_are_summarised(self):
+        summary = PropertiesWindow.lock_summary({
+            "supported": True, "mode": "GOVERNANCE",
+            "retain_until": "2027-01-01", "legal_hold": "ON"})
+        self.assertIn("GOVERNANCE until 2027-01-01", summary)
+        self.assertIn("legal hold ON", summary)
+
+    def test_an_off_hold_is_not_mentioned(self):
+        self.assertEqual(
+            PropertiesWindow.lock_summary(
+                {"supported": True, "legal_hold": "OFF"}),
+            "")
+
+
+class PaneShortcutConflictTests(unittest.TestCase):
+    """F5 was already Refresh. Two live bindings for one key make Qt call it
+    ambiguous and fire neither, so the commander keys are armed only while
+    the second pane is on screen."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self):
+        settings = QSettings("s3duck-tests-keys2", "s3duck-tests-keys2")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, "prod", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        return win
+
+    @staticmethod
+    def _keys(action):
+        return [sequence.toString() for sequence in action.shortcuts()]
+
+    def test_single_pane_keeps_f5_on_refresh(self):
+        win = self._window()
+        self.assertIn("F5", self._keys(win.btnRefresh))
+        self.assertFalse(win._pane_copy_shortcut.isEnabled())
+        self.assertFalse(win._pane_move_shortcut.isEnabled())
+
+    def test_dual_pane_hands_f5_to_the_panes(self):
+        win = self._window()
+        win.toggle_dual_pane()
+        self.assertNotIn("F5", self._keys(win.btnRefresh))
+        self.assertIn("Ctrl+R", self._keys(win.btnRefresh))
+        self.assertTrue(win._pane_copy_shortcut.isEnabled())
+        self.assertTrue(win._pane_move_shortcut.isEnabled())
+        self.assertIn("Ctrl+R", win.btnRefresh.text())
+
+    def test_closing_the_pane_gives_f5_back(self):
+        win = self._window()
+        win.toggle_dual_pane()
+        win.toggle_dual_pane()
+        self.assertIn("F5", self._keys(win.btnRefresh))
+        self.assertFalse(win._pane_copy_shortcut.isEnabled())
+        self.assertIn("F5", win.btnRefresh.text())
+
+    def test_no_two_window_shortcuts_claim_the_same_key(self):
+        """A regression net for the whole keymap, not just F5."""
+        win = self._window()
+        seen = {}
+        for shortcut in win.findChildren(QShortcut):
+            if not shortcut.isEnabled():
+                continue
+            seen.setdefault(shortcut.key().toString(), []).append("shortcut")
+        for action in win.findChildren(QAction):
+            for sequence in action.shortcuts():
+                seen.setdefault(sequence.toString(), []).append(action.text())
+        clashes = {key: owners for key, owners in seen.items()
+                   if key and len(owners) > 1}
+        self.assertEqual(clashes, {})
+
+
+class DiagnosticsSettingsTests(unittest.TestCase):
+    """The report claims to show the active transfer settings, so a setting
+    that can change what an upload does belongs in it."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def test_the_report_carries_the_upload_and_profile_settings(self):
+        model = make_model(bucket="bkt", requester_pays=True,
+                           public_base_url="https://cdn.example.com")
+        model.set_content_type_options(
+            detect=True, overrides={"md": "text/markdown"})
+        text = diagnostics.format_report(
+            diagnostics.collect(self.ROOT, version="9.9.9", model=model))
+        self.assertIn("Requester pays", text)
+        self.assertIn("cdn.example.com", text)
+        self.assertIn("Detect Content-Type", text)
+        self.assertIn("Content-Type overrides", text)
+
+    def test_a_profile_without_them_still_renders(self):
+        model = make_model(bucket="bkt")
+        text = diagnostics.format_report(
+            diagnostics.collect(self.ROOT, version="9.9.9", model=model))
+        self.assertIn("(endpoint)", text)
+
+
+class DocumentationAccuracyTests(unittest.TestCase):
+    """The README is the feature list users read before the app. A menu entry
+    it quotes that no longer exists, or a shortcut it names that nothing
+    binds, is a bug report waiting to happen."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    SOURCES = ("main_window.py", "model.py", "utils.py", "s3duck.py",
+               "settings.py", "properties_window.py", "diagnostics.py")
+    # Keys Qt binds through a StandardKey rather than a literal sequence.
+    STANDARD_KEYS = {
+        "Ctrl+F": "StandardKey.Find",
+        "Ctrl+C": "StandardKey.Copy",
+        "Ctrl+X": "StandardKey.Cut",
+        "Ctrl+V": "StandardKey.Paste",
+    }
+    # Prose spells arrows as glyphs; Qt spells them as words.
+    ARROWS = {"←": "Left", "→": "Right", "↑": "Up", "↓": "Down"}
+
+    def _readme(self):
+        with open(os.path.join(self.ROOT, "README.md")) as handle:
+            return handle.read()
+
+    def _code(self):
+        out = []
+        for name in self.SOURCES:
+            with open(os.path.join(self.ROOT, name)) as handle:
+                out.append(handle.read())
+        return "".join(out)
+
+    def test_every_menu_path_the_readme_names_exists(self):
+        """A "Tools → X" the menu no longer has is a wild goose chase."""
+        code = self._code()
+        paths = set(re.findall(r"Tools → ([^)—,|]+)", self._readme()))
+        self.assertTrue(paths, "no menu paths found — the pattern broke")
+        missing = []
+        for label in sorted(paths):
+            label = label.strip().rstrip(".")
+            if not label:
+                continue
+            # The README sometimes drops the ellipsis; the menu keeps it.
+            if f'"{label}"' in code or f'"{label}…"' in code:
+                continue
+            if f'"{label}… (' in code or f'"{label} (' in code:
+                continue
+            missing.append(label)
+        self.assertEqual(missing, [],
+                         "README points at menu entries that do not exist")
+
+    def test_every_quoted_label_exists_in_the_code(self):
+        code = self._code()
+        quoted = set(re.findall(r'"([A-Z][^"]{3,40}?)…?"', self._readme()))
+        missing = sorted(label for label in quoted
+                         if label.rstrip("…") not in code)
+        self.assertEqual(missing, [],
+                         "README quotes labels the code no longer has")
+
+    def test_every_documented_shortcut_is_bound(self):
+        code = self._code()
+        readme = self._readme()
+        keys = set(re.findall(
+            r'`((?:Ctrl|Shift|Alt)\+[A-Za-z0-9+←→↑↓]+|F\d)`', readme))
+        self.assertTrue(keys, "no shortcuts found — the pattern broke")
+        # The arrow keys are documented as glyphs; without this they were
+        # silently skipped by the pattern and never checked at all.
+        self.assertTrue(any(any(arrow in key for arrow in self.ARROWS)
+                            for key in keys),
+                        "no arrow shortcut found — has the notation changed?")
+        unbound = []
+        for key in sorted(keys):
+            spelled = key
+            for glyph, word in self.ARROWS.items():
+                spelled = spelled.replace(glyph, word)
+            if f'QKeySequence("{spelled}")' in code:
+                continue
+            if spelled in self.STANDARD_KEYS \
+                    and self.STANDARD_KEYS[spelled] in code:
+                continue
+            if f"({spelled})" in code or f"{spelled})" in code:
+                continue
+            unbound.append(key)
+        self.assertEqual(unbound, [],
+                         "README documents shortcuts nothing binds")
+
+    def test_the_roadmap_does_not_still_promise_what_shipped(self):
+        """Items move from ROADMAP.md to README.md when they land; a heading
+        left behind is how a backlog stops being trusted."""
+        with open(os.path.join(self.ROOT, "ROADMAP.md")) as handle:
+            roadmap = handle.read()
+        for shipped in ("**Dual-pane mode**", "**Lifecycle rules viewer/editor**",
+                        "**CORS editor**", "**Requester-pays support**",
+                        "**Watch mode**", "**Same-bucket remote↔remote sync**",
+                        "**Treemap", "**Saved searches**"):
+            self.assertNotIn(shipped, roadmap, f"{shipped} has shipped")
+
+    def test_the_transfer_settings_bullet_is_not_stale(self):
+        """It enumerates, which is exactly the shape of claim that drifts —
+        three settings had already been added without it noticing."""
+        readme = self._readme().lower()
+        line = next((row for row in self._readme().splitlines()
+                     if row.startswith("- **Transfer settings**")), "")
+        self.assertTrue(line, "the Transfer settings bullet is gone")
+        line = line.lower()
+        for topic in ("files in flight", "multipart", "bandwidth",
+                      "content-type", "upload rules", "listing",
+                      "retry", "log", "checksum", "encryption"):
+            with self.subTest(topic=topic):
+                self.assertIn(topic, line)
+        self.assertIn("transfer settings", readme)
+
+    def test_the_architecture_tree_lists_every_module(self):
+        readme = self._readme()
+        for name in self.SOURCES + ("theme.py", "profile_switcher.py"):
+            self.assertIn(name, readme, f"{name} is missing from the README")
+
+
+
+class _AttributesClient(FakeS3Client):
+    """FakeS3Client that answers GetObjectAttributes."""
+
+    def __init__(self, attributes=None, error=None, **kw):
+        self.attributes = attributes or {}
+        self.attributes_error = error
+        super().__init__(**kw)
+
+    def get_object_attributes(self, **kw):
+        self.calls.append(("get_object_attributes", kw))
+        if self.attributes_error is not None:
+            raise self.attributes_error
+        key = kw.get("Key")
+        payload = self.attributes.get(key, {})
+        if callable(payload):
+            return payload(kw)
+        return payload
+
+
+class MultipartVerificationTests(unittest.TestCase):
+    """A multipart ETag or a per-part checksum cannot be reproduced without
+    the original part boundaries — GetObjectAttributes supplies them."""
+
+    def _file(self, chunks):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        path = os.path.join(directory, "obj.bin")
+        with open(path, "wb") as handle:
+            for chunk in chunks:
+                handle.write(chunk)
+        return path
+
+    def _model(self, client=None):
+        m = make_model(bucket="bkt")
+        m._client = client or _AttributesClient()
+        return m
+
+    def test_composite_etag_is_rebuilt_the_way_s3_builds_one(self):
+        first, second = b"a" * 16, b"b" * 8
+        expected = hashlib.md5(
+            hashlib.md5(first).digest() + hashlib.md5(second).digest()
+        ).hexdigest() + "-2"
+        self.assertEqual(
+            Model.composite_etag([hashlib.md5(first).digest(),
+                                  hashlib.md5(second).digest()]),
+            expected)
+
+    def test_no_parts_means_no_etag(self):
+        self.assertEqual(Model.composite_etag([]), "")
+
+    def test_part_digests_split_the_file_at_the_given_sizes(self):
+        path = self._file([b"a" * 16, b"b" * 8])
+        checksums, md5s = Model.file_part_digests(path, [16, 8], "SHA256")
+        self.assertEqual(len(checksums), 2)
+        self.assertEqual(
+            checksums[0],
+            base64.b64encode(hashlib.sha256(b"a" * 16).digest()).decode())
+        self.assertEqual(md5s[1], hashlib.md5(b"b" * 8).digest())
+
+    def test_sizes_that_do_not_add_up_are_refused(self):
+        """A mismatch means the parts describe a different object; comparing
+        anyway would report a false pass."""
+        path = self._file([b"a" * 10])
+        with self.assertRaises(ValueError):
+            Model.file_part_digests(path, [4, 4], "")
+
+    def test_a_matching_multipart_etag_verifies(self):
+        first, second = b"a" * 16, b"b" * 8
+        path = self._file([first, second])
+        etag = Model.composite_etag(
+            [hashlib.md5(first).digest(), hashlib.md5(second).digest()])
+        m = self._model()
+        parts = [{"PartNumber": 1, "Size": 16}, {"PartNumber": 2, "Size": 8}]
+        self.assertIs(m.verify_parts(path, parts, etag=etag), True)
+
+    def test_a_corrupted_body_fails_the_multipart_etag(self):
+        first, second = b"a" * 16, b"b" * 8
+        etag = Model.composite_etag(
+            [hashlib.md5(first).digest(), hashlib.md5(second).digest()])
+        path = self._file([first, b"X" * 8])
+        m = self._model()
+        parts = [{"PartNumber": 1, "Size": 16}, {"PartNumber": 2, "Size": 8}]
+        self.assertIs(m.verify_parts(path, parts, etag=etag), False)
+
+    def test_per_part_checksums_are_compared_when_present(self):
+        first, second = b"a" * 16, b"b" * 8
+        path = self._file([first, second])
+        m = self._model()
+        parts = [
+            {"PartNumber": 1, "Size": 16, "ChecksumSHA256": base64.b64encode(
+                hashlib.sha256(first).digest()).decode()},
+            {"PartNumber": 2, "Size": 8, "ChecksumSHA256": base64.b64encode(
+                hashlib.sha256(second).digest()).decode()},
+        ]
+        self.assertIs(
+            m.verify_parts(path, parts, algorithm="SHA256"), True)
+        parts[1]["ChecksumSHA256"] = base64.b64encode(
+            hashlib.sha256(b"wrong").digest()).decode()
+        self.assertIs(
+            m.verify_parts(path, parts, algorithm="SHA256"), False)
+
+    def test_no_parts_is_inconclusive_rather_than_a_failure(self):
+        path = self._file([b"a" * 8])
+        m = self._model()
+        self.assertIsNone(m.verify_parts(path, []))
+        self.assertIsNone(m.verify_parts(path, [{"PartNumber": 1, "Size": 0}]))
+
+    def test_parts_are_read_across_pages(self):
+        pages = {
+            0: {"ObjectParts": {"Parts": [{"PartNumber": 1, "Size": 5}],
+                                "IsTruncated": True,
+                                "NextPartNumberMarker": 1}},
+            1: {"ObjectParts": {"Parts": [{"PartNumber": 2, "Size": 3}],
+                                "IsTruncated": False}},
+        }
+        client = _AttributesClient(attributes={
+            "k": lambda kw: pages[int(kw.get("PartNumberMarker") or 0)]})
+        m = self._model(client)
+        self.assertEqual([p["PartNumber"] for p in m.get_object_parts("k")],
+                         [1, 2])
+
+    def test_a_marker_that_never_advances_does_not_spin(self):
+        client = _AttributesClient(attributes={"k": {
+            "ObjectParts": {"Parts": [{"PartNumber": 1, "Size": 5}],
+                            "IsTruncated": True, "NextPartNumberMarker": 0}}})
+        m = self._model(client)
+        self.assertEqual(len(m.get_object_parts("k")), 1)
+
+    def test_a_backend_without_the_operation_returns_nothing(self):
+        for code in ("NotImplemented", "MethodNotAllowed", "AccessDenied"):
+            client = _AttributesClient(error=botocore.exceptions.ClientError(
+                {"Error": {"Code": code, "Message": "no"}},
+                "GetObjectAttributes"))
+            with self.subTest(code=code):
+                self.assertEqual(self._model(client).get_object_parts("k"), [])
+
+    def test_an_unexpected_error_is_not_swallowed(self):
+        client = _AttributesClient(error=botocore.exceptions.ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "gone"}},
+            "GetObjectAttributes"))
+        with self.assertRaises(botocore.exceptions.ClientError):
+            self._model(client).get_object_parts("k")
+
+    def test_verify_download_settles_a_multipart_etag(self):
+        """The headline: this used to log "checksum skipped" and pass."""
+        first, second = b"a" * 16, b"b" * 8
+        path = self._file([first, second])
+        etag = Model.composite_etag(
+            [hashlib.md5(first).digest(), hashlib.md5(second).digest()])
+        client = _AttributesClient(attributes={"obj": {"ObjectParts": {
+            "Parts": [{"PartNumber": 1, "Size": 16},
+                      {"PartNumber": 2, "Size": 8}]}}})
+        m = self._model(client)
+        messages = []
+        self.assertTrue(m.verify_download(
+            path, etag, log_fn=messages.append, key="obj"))
+        self.assertTrue(any("multipart ETag, 2 parts" in line
+                            for line in messages))
+
+    def test_verify_download_fails_a_corrupted_multipart_object(self):
+        first, second = b"a" * 16, b"b" * 8
+        etag = Model.composite_etag(
+            [hashlib.md5(first).digest(), hashlib.md5(second).digest()])
+        path = self._file([first, b"X" * 8])
+        client = _AttributesClient(attributes={"obj": {"ObjectParts": {
+            "Parts": [{"PartNumber": 1, "Size": 16},
+                      {"PartNumber": 2, "Size": 8}]}}})
+        self.assertFalse(self._model(client).verify_download(
+            path, etag, key="obj"))
+
+    def test_without_parts_it_still_degrades_to_skipping(self):
+        path = self._file([b"a" * 24])
+        client = _AttributesClient(error=botocore.exceptions.ClientError(
+            {"Error": {"Code": "NotImplemented", "Message": "no"}},
+            "GetObjectAttributes"))
+        m = self._model(client)
+        messages = []
+        self.assertTrue(m.verify_download(
+            path, "deadbeef-2", log_fn=messages.append, key="obj"))
+        self.assertTrue(any("skipped" in line for line in messages))
+
+    def test_a_composite_checksum_is_settled_by_the_parts(self):
+        first, second = b"a" * 16, b"b" * 8
+        path = self._file([first, second])
+        client = _AttributesClient(attributes={"obj": {"ObjectParts": {
+            "Parts": [
+                {"PartNumber": 1, "Size": 16,
+                 "ChecksumSHA256": base64.b64encode(
+                     hashlib.sha256(first).digest()).decode()},
+                {"PartNumber": 2, "Size": 8,
+                 "ChecksumSHA256": base64.b64encode(
+                     hashlib.sha256(second).digest()).decode()},
+            ]}}})
+        m = self._model(client)
+        head = {"ChecksumSHA256": "someCompositeValue-2"}
+        messages = []
+        self.assertTrue(m.verify_download(
+            path, "", head=head, log_fn=messages.append, key="obj"))
+        self.assertTrue(any("SHA256, 2 parts" in line for line in messages))
+
+    def test_a_single_part_object_still_uses_the_plain_etag(self):
+        path = self._file([b"hello"])
+        client = _AttributesClient()
+        m = self._model(client)
+        self.assertTrue(m.verify_download(
+            path, hashlib.md5(b"hello").hexdigest(), key="obj"))
+        # no need to ask for parts when the ETag is already an MD5
+        self.assertEqual(client.calls_of("get_object_attributes"), [])
+
+
+class ObjectFingerprintTests(unittest.TestCase):
+    """Settling a duplicate candidate without downloading either copy."""
+
+    def _model(self, attributes=None, error=None):
+        m = make_model(bucket="bkt")
+        m._client = _AttributesClient(attributes=attributes, error=error)
+        return m
+
+    def test_a_whole_object_checksum_is_a_full_fingerprint(self):
+        m = self._model({"k": {"Checksum": {"ChecksumCRC32": "abc123=="}}})
+        self.assertEqual(m.object_fingerprint("k"), ("full", "CRC32:abc123=="))
+
+    def test_a_plain_etag_is_a_full_fingerprint(self):
+        digest = hashlib.md5(b"x").hexdigest()
+        m = self._model({"k": {"ETag": f'"{digest}"'}})
+        self.assertEqual(m.object_fingerprint("k"), ("full", f"MD5:{digest}"))
+
+    def test_per_part_checksums_are_a_partial_fingerprint(self):
+        m = self._model({"k": {"ObjectParts": {"Parts": [
+            {"PartNumber": 1, "Size": 8, "ChecksumCRC32": "aa"},
+            {"PartNumber": 2, "Size": 4, "ChecksumCRC32": "bb"},
+        ]}}})
+        kind, value = m.object_fingerprint("k")
+        self.assertEqual(kind, "parts")
+        self.assertEqual(value, "8:CRC32:aa|4:CRC32:bb")
+
+    def test_a_multipart_object_with_no_digests_says_nothing(self):
+        m = self._model({"k": {"ETag": '"abc-3"', "ObjectParts": {"Parts": [
+            {"PartNumber": 1, "Size": 8}]}}})
+        self.assertEqual(m.object_fingerprint("k"), ("", ""))
+
+    def test_an_unsupported_backend_says_nothing(self):
+        m = self._model(error=botocore.exceptions.ClientError(
+            {"Error": {"Code": "NotImplemented", "Message": "no"}},
+            "GetObjectAttributes"))
+        self.assertEqual(m.object_fingerprint("k"), ("", ""))
+
+    def test_equal_full_fingerprints_are_the_same_object(self):
+        self.assertEqual(
+            Model.compare_fingerprints([("full", "A"), ("full", "A")]), "same")
+
+    def test_different_full_fingerprints_rule_the_group_out(self):
+        self.assertEqual(
+            Model.compare_fingerprints([("full", "A"), ("full", "B")]),
+            "different")
+
+    def test_equal_part_fingerprints_still_prove_a_match(self):
+        self.assertEqual(
+            Model.compare_fingerprints([("parts", "A"), ("parts", "A")]),
+            "same")
+
+    def test_different_part_fingerprints_prove_nothing(self):
+        """The same bytes split at other boundaries digest differently."""
+        self.assertEqual(
+            Model.compare_fingerprints([("parts", "A"), ("parts", "B")]),
+            "unknown")
+
+    def test_one_silent_member_makes_the_whole_group_unknown(self):
+        self.assertEqual(
+            Model.compare_fingerprints([("full", "A"), ("", "")]), "unknown")
+
+    def test_a_single_member_is_never_a_verdict(self):
+        self.assertEqual(Model.compare_fingerprints([("full", "A")]), "unknown")
+
+
+class DuplicateConfirmationTests(unittest.TestCase):
+    """The duplicate finder can now settle its own candidates."""
+
+    class _Model:
+        bucket = "bkt"
+
+        def __init__(self, fingerprints):
+            self._fingerprints = fingerprints
+            self.asked = []
+
+        def object_fingerprint(self, key, version_id=""):
+            self.asked.append(key)
+            value = self._fingerprints[key]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+    def _group(self, *keys):
+        return {"size": 10, "etag": "", "confirmed": False,
+                "members": [(key, None) for key in keys],
+                "count": len(keys), "wasted": 10}
+
+    def test_matching_digests_confirm_a_candidate(self):
+        model = self._Model({"a": ("full", "X"), "b": ("full", "X")})
+        self.assertEqual(
+            main_window.DuplicateFinderDialog.confirm_groups(
+                model, [self._group("a", "b")]),
+            ["same"])
+        self.assertEqual(model.asked, ["a", "b"])
+
+    def test_differing_whole_object_digests_rule_it_out(self):
+        model = self._Model({"a": ("full", "X"), "b": ("full", "Y")})
+        self.assertEqual(
+            main_window.DuplicateFinderDialog.confirm_groups(
+                model, [self._group("a", "b")]),
+            ["different"])
+
+    def test_a_silent_backend_leaves_it_undecided(self):
+        model = self._Model({"a": ("", ""), "b": ("full", "X")})
+        self.assertEqual(
+            main_window.DuplicateFinderDialog.confirm_groups(
+                model, [self._group("a", "b")]),
+            ["unknown"])
+
+    def test_a_failing_member_does_not_abort_the_pass(self):
+        model = self._Model({"a": RuntimeError("denied"), "b": ("full", "X")})
+        self.assertEqual(
+            main_window.DuplicateFinderDialog.confirm_groups(
+                model, [self._group("a", "b")]),
+            ["unknown"])
+
+    def test_cancellation_stops_between_groups(self):
+        model = self._Model({"a": ("full", "X"), "b": ("full", "X")})
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(TransferCancelled):
+            main_window.DuplicateFinderDialog.confirm_groups(
+                model, [self._group("a", "b")], cancel_event=cancel)
+        self.assertEqual(model.asked, [])
+
+
+class NavigationHistoryTests(unittest.TestCase):
+    """Back used to mean "the folder I was in a moment ago", one level, same
+    bucket. Each tab now keeps a real trail."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self):
+        settings = QSettings("s3duck-tests-hist", "s3duck-tests-hist")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, "prod", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        return win
+
+    def _visit(self, win, bucket, prefix):
+        win.data_model.bucket = bucket
+        win.data_model.current_folder = prefix
+        win._remember_current_tab()
+
+    def test_a_fresh_tab_can_go_nowhere(self):
+        win = self._window()
+        self.assertFalse(win.can_go_back())
+        self.assertFalse(win.can_go_forward())
+        self.assertFalse(win.btnBack.isEnabled())
+        self.assertFalse(win.btnForward.isEnabled())
+
+    def test_each_move_is_recorded(self):
+        win = self._window()
+        self._visit(win, "bkt", "")
+        self._visit(win, "bkt", "a/")
+        self._visit(win, "bkt", "a/b/")
+        entry = win.current_tab_entry()
+        self.assertEqual(entry["history"][-3:],
+                         [("bkt", ""), ("bkt", "a/"), ("bkt", "a/b/")])
+        self.assertTrue(win.can_go_back())
+        self.assertFalse(win.can_go_forward())
+
+    def test_the_same_location_twice_is_recorded_once(self):
+        win = self._window()
+        self._visit(win, "bkt", "a/")
+        before = len(win.current_tab_entry()["history"])
+        self._visit(win, "bkt", "a/")
+        self.assertEqual(len(win.current_tab_entry()["history"]), before)
+
+    def test_back_then_forward_returns_to_the_same_place(self):
+        win = self._window()
+        self._visit(win, "bkt", "")
+        self._visit(win, "bkt", "a/")
+        visited = []
+        with patch.object(main_window.MainWindow, "open_location",
+                          lambda _s, b, p: visited.append((b, p))):
+            win.goBack()
+            self.assertEqual(visited[-1], ("bkt", ""))
+            self.assertTrue(win.can_go_forward())
+            win.goForward()
+            self.assertEqual(visited[-1], ("bkt", "a/"))
+            self.assertFalse(win.can_go_forward())
+
+    def test_a_history_move_is_not_itself_recorded(self):
+        """Otherwise Back would bounce between two entries forever."""
+        win = self._window()
+        self._visit(win, "bkt", "")
+        self._visit(win, "bkt", "a/")
+        with patch.object(main_window.MainWindow, "open_location",
+                          lambda *_a: None):
+            win.goBack()
+        # the navigation the move causes lands here
+        self._visit(win, "bkt", "")
+        entry = win.current_tab_entry()
+        # ("", "") is the bucket list the window opened on, and Back from the
+        # first bucket legitimately returns to it.
+        self.assertEqual(entry["history"],
+                         [("", ""), ("bkt", ""), ("bkt", "a/")])
+        self.assertEqual(entry["pos"], 1)
+        self.assertTrue(win.can_go_forward())
+
+    def test_a_new_move_after_going_back_drops_the_forward_branch(self):
+        win = self._window()
+        self._visit(win, "bkt", "")
+        self._visit(win, "bkt", "a/")
+        with patch.object(main_window.MainWindow, "open_location",
+                          lambda *_a: None):
+            win.goBack()
+        self._visit(win, "bkt", "")      # the back landing
+        self._visit(win, "bkt", "c/")    # a fresh move
+        entry = win.current_tab_entry()
+        self.assertEqual(entry["history"],
+                         [("", ""), ("bkt", ""), ("bkt", "c/")])
+        self.assertFalse(win.can_go_forward())
+
+    def test_back_at_the_start_does_nothing(self):
+        win = self._window()
+        self._visit(win, "bkt", "a/")
+        visited = []
+        with patch.object(main_window.MainWindow, "open_location",
+                          lambda _s, b, p: visited.append((b, p))):
+            win.goBack()
+            win.goBack()
+            win.goBack()
+        self.assertEqual(len(visited), 1)
+
+    def test_history_crosses_buckets(self):
+        win = self._window()
+        self._visit(win, "one", "")
+        self._visit(win, "two", "x/")
+        visited = []
+        with patch.object(main_window.MainWindow, "open_location",
+                          lambda _s, b, p: visited.append((b, p))):
+            win.goBack()
+        self.assertEqual(visited[-1], ("one", ""))
+
+    def test_each_tab_keeps_its_own_trail(self):
+        win = self._window()
+        self._visit(win, "bkt", "a/")
+        with patch.object(main_window.MainWindow, "open_location",
+                          lambda *_a: None):
+            win.open_in_new_tab("other", "")
+        self._visit(win, "other", "z/")
+        first, second = win._tabs[0], win._tabs[1]
+        self.assertEqual(first["history"][-1], ("bkt", "a/"))
+        self.assertEqual(second["history"][-1], ("other", "z/"))
+
+    def test_the_trail_is_capped(self):
+        entry = main_window.MainWindow._new_tab_entry("b", "")
+        for index in range(main_window.MainWindow.HISTORY_DEPTH + 25):
+            main_window.MainWindow.push_history(entry, ("b", f"{index}/"))
+        self.assertEqual(len(entry["history"]),
+                         main_window.MainWindow.HISTORY_DEPTH)
+        self.assertEqual(entry["pos"], len(entry["history"]) - 1)
+
+    def test_a_restored_tab_starts_with_a_clean_trail(self):
+        win = self._window()
+        self._visit(win, "bkt", "a/")
+        win._save_tabs()
+        win._load_tabs()
+        entry = win._tabs[0]
+        self.assertEqual(entry["history"], [("bkt", "a/")])
+        self.assertFalse(win.can_go_back())
+
+
+class ForwardIconTests(unittest.TestCase):
+    """Forward is Back pointing the other way — no second asset, so no second
+    PNG twin to keep in step for the no-SVG builds."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_a_mirrored_icon_still_draws_something(self):
+        back = utils.themed_icon(
+            "go-previous",
+            os.path.join(self.ROOT, "icons", "arrow_back_24px.svg"))
+        mirrored = utils.mirrored_icon(back)
+        self.assertTrue(utils.icon_is_visible(mirrored))
+
+    def test_mirroring_actually_flips_the_pixels(self):
+        back = utils.themed_icon(
+            "go-previous",
+            os.path.join(self.ROOT, "icons", "arrow_back_24px.svg"))
+        original = back.pixmap(24, 24).toImage()
+        flipped = utils.mirrored_icon(back).pixmap(24, 24).toImage()
+        self.assertNotEqual(original, flipped)
+
+    def test_an_empty_icon_is_returned_unchanged(self):
+        self.assertTrue(utils.mirrored_icon(QIcon()).isNull())
+        self.assertTrue(utils.mirrored_icon(None).isNull())
+
+    def test_the_forward_icon_is_never_blank(self):
+        back = utils.themed_icon(
+            "go-previous",
+            os.path.join(self.ROOT, "icons", "arrow_back_24px.svg"))
+        self.assertTrue(utils.icon_is_visible(utils.forward_icon(back)))
+
+
+class ProxyAndCaBundleTests(unittest.TestCase):
+    """The only TLS escape hatch used to be turning verification off; a
+    private CA should be trusted by path instead."""
+
+    def test_no_proxy_by_default(self):
+        self.assertEqual(make_model().proxy_settings(), {})
+
+    def test_a_bare_host_gets_a_scheme(self):
+        m = make_model(proxy_url="proxy.corp:3128")
+        self.assertEqual(m.proxy_settings(),
+                         {"http": "http://proxy.corp:3128",
+                          "https": "http://proxy.corp:3128"})
+
+    def test_an_explicit_scheme_is_kept(self):
+        m = make_model(proxy_url="https://proxy.corp:8443")
+        self.assertEqual(m.proxy_settings()["https"],
+                         "https://proxy.corp:8443")
+
+    def test_the_proxy_reaches_the_botocore_config(self):
+        m = make_model(proxy_url="http://proxy.corp:3128")
+        self.assertEqual(m.client.meta.config.proxies,
+                         {"http": "http://proxy.corp:3128",
+                          "https": "http://proxy.corp:3128"})
+
+    def test_a_ca_bundle_is_a_path_not_a_boolean(self):
+        """Trusting one extra CA is not the same as trusting anything that
+        answers."""
+        with tempfile.NamedTemporaryFile(suffix=".pem") as bundle:
+            m = make_model(ca_bundle=bundle.name)
+            self.assertEqual(m.check_tls_settings(), "")
+            # botocore stores it on the endpoint's verify setting
+            self.assertEqual(m.client.meta.endpoint_url,
+                             "https://s3.amazonaws.com")
+
+    def test_a_missing_bundle_is_reported_before_it_becomes_an_sslerror(self):
+        m = make_model(ca_bundle="/nonexistent/ca.pem")
+        self.assertIn("not found", m.check_tls_settings())
+
+    def test_switching_verification_off_makes_the_bundle_meaningless(self):
+        with tempfile.NamedTemporaryFile(suffix=".pem") as bundle:
+            m = make_model(ca_bundle=bundle.name, no_ssl_check=True)
+            self.assertIn("ignored", m.check_tls_settings())
+
+    def test_a_clean_profile_has_nothing_to_report(self):
+        self.assertEqual(make_model().check_tls_settings(), "")
+
+    def test_a_worker_clone_keeps_both(self):
+        m = make_model(proxy_url="http://p:1", ca_bundle="/tmp/ca.pem")
+        clone = m.clone_for_worker()
+        self.assertEqual(clone.proxy_url, "http://p:1")
+        self.assertEqual(clone.ca_bundle, "/tmp/ca.pem")
+
+    def test_diagnostics_names_both(self):
+        m = make_model(proxy_url="http://p:1", ca_bundle="/tmp/ca.pem")
+        text = diagnostics.format_report(diagnostics.collect(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            version="9.9.9", model=m))
+        self.assertIn("/tmp/ca.pem", text)
+        self.assertIn("http://p:1", text)
+
+    def test_diagnostics_says_direct_when_unset(self):
+        text = diagnostics.format_report(diagnostics.collect(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            version="9.9.9", model=make_model()))
+        self.assertIn("(direct)", text)
+        self.assertIn("(system trust store)", text)
+
+
+class FailureDetailTests(unittest.TestCase):
+    """str(exc) throws away the request id, which is the first thing any
+    provider's support desk asks for."""
+
+    def _client_error(self):
+        return botocore.exceptions.ClientError(
+            {
+                "Error": {"Code": "AccessDenied", "Message": "no soup"},
+                "ResponseMetadata": {
+                    "HTTPStatusCode": 403,
+                    "RequestId": "REQ123",
+                    "HostId": "HOST456",
+                    "RetryAttempts": 2,
+                    "HTTPHeaders": {"x-amz-request-id": "REQ123",
+                                    "x-amz-id-2": "HOST456"},
+                },
+            },
+            "GetObject")
+
+    def test_the_report_carries_what_support_asks_for(self):
+        text = utils.describe_client_error(self._client_error())
+        for fragment in ("AccessDenied", "no soup", "403", "REQ123",
+                         "HOST456", "GetObject"):
+            self.assertIn(fragment, text)
+
+    def test_retry_count_is_included_when_there_was_one(self):
+        self.assertIn("Retries: 2",
+                      utils.describe_client_error(self._client_error()))
+
+    def test_a_plain_exception_still_produces_something_useful(self):
+        text = utils.describe_client_error(RuntimeError("disk full"))
+        self.assertIn("disk full", text)
+        self.assertIn("RuntimeError", text)
+
+    def test_empty_metadata_is_not_rendered_as_blank_rows(self):
+        exc = botocore.exceptions.ClientError(
+            {"Error": {"Code": "Slow", "Message": ""},
+             "ResponseMetadata": {}}, "PutObject")
+        text = utils.describe_client_error(exc)
+        self.assertNotIn("Request id:", text)
+        self.assertNotIn("Message:", text)
+        self.assertIn("Code: Slow", text)
+
+
+class QueueFailureDetailTests(unittest.TestCase):
+    """A failed row keeps its details so the job can still be reported
+    accurately hours later."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self):
+        settings = QSettings("s3duck-tests-fail", "s3duck-tests-fail")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, "prod", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        return win
+
+    def test_a_fresh_entry_has_no_details(self):
+        entry = main_window._QEntry(1, "upload", [("k", "/tmp/f")])
+        self.assertEqual(entry.error_details, "")
+
+    def test_a_failed_row_offers_the_details_button(self):
+        entry = main_window._QEntry(1, "upload", [("k", "/tmp/f")])
+        row = main_window._QueueRow(entry)
+        self.addCleanup(row.deleteLater)
+        self.assertTrue(row._details_btn.isHidden())
+        row.set_status("error")
+        self.assertFalse(row._details_btn.isHidden())
+        row.set_status("done")
+        self.assertTrue(row._details_btn.isHidden())
+
+    def test_the_dialog_shows_and_copies_what_was_recorded(self):
+        win = self._window()
+        entry = main_window._QEntry(7, "download", [], label="logs/a.txt")
+        entry.error = "AccessDenied"
+        entry.error_details = "Code: AccessDenied\nRequest id: REQ123"
+        win._queue_entries[7] = entry
+
+        shown = {}
+
+        class _Box:
+            # The real class is also the namespace for Icon/ButtonRole, so a
+            # stand-in has to carry them too.
+            Icon = QMessageBox.Icon
+            ButtonRole = QMessageBox.ButtonRole
+            StandardButton = QMessageBox.StandardButton
+
+            def __init__(self, _parent):
+                pass
+
+            def setWindowTitle(self, text):
+                shown["title"] = text
+
+            def setIcon(self, _icon):
+                pass
+
+            def setText(self, text):
+                shown["text"] = text
+
+            def setDetailedText(self, text):
+                shown["details"] = text
+
+            def addButton(self, *args):
+                return object()
+
+            def exec(self):
+                return 0
+
+            def clickedButton(self):
+                return None
+
+        with patch.object(main_window, "QMessageBox", _Box):
+            win.show_failure_details(7)
+        self.assertIn("logs/a.txt", shown["text"])
+        self.assertIn("REQ123", shown["details"])
+
+    def test_an_unknown_entry_is_ignored(self):
+        win = self._window()
+        win.show_failure_details(999)   # must not raise
+
+    def test_every_worker_failure_path_reports_details(self):
+        """All sixteen except-blocks emit on the details signal, not just the
+        one that was wired first."""
+        source = inspect.getsource(main_window.Worker)
+        self.assertEqual(source.count("self.error.emit(msg)"),
+                         source.count("self.details.emit("))
+        self.assertGreaterEqual(source.count("self.details.emit("), 10)
+
+
+class HistoryButtonStateTests(unittest.TestCase):
+    """The toolbar has to say where the trail can go, not just carry the
+    actions."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self):
+        settings = QSettings("s3duck-tests-histbtn", "s3duck-tests-histbtn")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, "prod", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        return win
+
+    def test_the_buttons_follow_the_trail(self):
+        win = self._window()
+        self.assertFalse(win.btnBack.isEnabled())
+        self.assertFalse(win.btnForward.isEnabled())
+
+        win.data_model.bucket = "bkt"
+        win._remember_current_tab()
+        win.data_model.current_folder = "a/"
+        win._remember_current_tab()
+        self.assertTrue(win.btnBack.isEnabled())
+        self.assertFalse(win.btnForward.isEnabled())
+
+        with patch.object(main_window.MainWindow, "open_location",
+                          lambda *_a: None):
+            win.goBack()
+        self.assertTrue(win.btnForward.isEnabled())
+
+    def test_both_actions_carry_their_shortcuts(self):
+        win = self._window()
+        self.assertEqual(
+            [k.toString() for k in win.btnBack.shortcuts()], ["Alt+Left"])
+        self.assertEqual(
+            [k.toString() for k in win.btnForward.shortcuts()], ["Alt+Right"])
+
+
+class _DocumentClient(FakeS3Client):
+    """FakeS3Client answering the remaining bucket documents."""
+
+    def __init__(self, **kw):
+        self.docs = kw.pop("docs", {})
+        super().__init__(**kw)
+
+    def _absent(self, code):
+        return botocore.exceptions.ClientError(
+            {"Error": {"Code": code, "Message": "absent"}}, "Get")
+
+    def _doc(self, name, code, **kw):
+        self.calls.append((name, kw))
+        if name not in self.docs:
+            raise self._absent(code)
+        return self.docs[name]
+
+    def get_bucket_encryption(self, **kw):
+        return self._doc("get_bucket_encryption",
+                         "ServerSideEncryptionConfigurationNotFoundError", **kw)
+
+    def put_bucket_encryption(self, **kw):
+        self.calls.append(("put_bucket_encryption", kw))
+        return {}
+
+    def delete_bucket_encryption(self, **kw):
+        self.calls.append(("delete_bucket_encryption", kw))
+        return {}
+
+    def get_bucket_tagging(self, **kw):
+        return self._doc("get_bucket_tagging", "NoSuchTagSet", **kw)
+
+    def put_bucket_tagging(self, **kw):
+        self.calls.append(("put_bucket_tagging", kw))
+        return {}
+
+    def delete_bucket_tagging(self, **kw):
+        self.calls.append(("delete_bucket_tagging", kw))
+        return {}
+
+    def get_bucket_website(self, **kw):
+        return self._doc("get_bucket_website", "NoSuchWebsiteConfiguration", **kw)
+
+    def put_bucket_website(self, **kw):
+        self.calls.append(("put_bucket_website", kw))
+        return {}
+
+    def delete_bucket_website(self, **kw):
+        self.calls.append(("delete_bucket_website", kw))
+        return {}
+
+    def get_bucket_notification_configuration(self, **kw):
+        return self._doc("get_bucket_notification_configuration",
+                         "NotImplemented", **kw)
+
+    def get_bucket_accelerate_configuration(self, **kw):
+        return self._doc("get_bucket_accelerate_configuration",
+                         "UnsupportedOperation", **kw)
+
+    def put_bucket_accelerate_configuration(self, **kw):
+        self.calls.append(("put_bucket_accelerate_configuration", kw))
+        return {}
+
+
+class BucketDocumentTests(unittest.TestCase):
+    """Encryption, tags, website hosting, events and acceleration — each is
+    absent far more often than it is set, and absent is not an error."""
+
+    def _model(self, **docs):
+        m = make_model(bucket="bkt")
+        m._client = _DocumentClient(docs=docs)
+        return m, m._client
+
+    def test_absent_documents_all_read_as_empty(self):
+        m, _c = self._model()
+        self.assertEqual(m.get_bucket_encryption(), {})
+        self.assertEqual(m.get_bucket_tags(), {})
+        self.assertEqual(m.get_bucket_website(), {})
+        self.assertEqual(m.get_bucket_notifications(), [])
+        self.assertEqual(m.get_bucket_acceleration(), "")
+
+    def test_default_encryption_is_flattened(self):
+        m, _c = self._model(get_bucket_encryption={
+            "ServerSideEncryptionConfiguration": {"Rules": [{
+                "ApplyServerSideEncryptionByDefault": {
+                    "SSEAlgorithm": "aws:kms",
+                    "KMSMasterKeyID": "arn:key"},
+                "BucketKeyEnabled": True}]}})
+        self.assertEqual(m.get_bucket_encryption(), {
+            "sse": "aws:kms", "kms_key": "arn:key", "bucket_key": True})
+
+    def test_setting_kms_encryption_sends_the_key(self):
+        m, client = self._model()
+        m.put_bucket_encryption(sse="aws:kms", kms_key="arn:key",
+                                bucket_key=True)
+        rule = client.calls_of("put_bucket_encryption")[0][
+            "ServerSideEncryptionConfiguration"]["Rules"][0]
+        self.assertEqual(rule["ApplyServerSideEncryptionByDefault"],
+                         {"SSEAlgorithm": "aws:kms",
+                          "KMSMasterKeyID": "arn:key"})
+        self.assertTrue(rule["BucketKeyEnabled"])
+
+    def test_a_key_without_kms_mode_is_not_sent(self):
+        m, client = self._model()
+        m.put_bucket_encryption(sse="AES256", kms_key="arn:key")
+        rule = client.calls_of("put_bucket_encryption")[0][
+            "ServerSideEncryptionConfiguration"]["Rules"][0]
+        self.assertNotIn("KMSMasterKeyID",
+                         rule["ApplyServerSideEncryptionByDefault"])
+
+    def test_clearing_encryption_deletes_the_document(self):
+        m, client = self._model()
+        m.put_bucket_encryption(sse="")
+        self.assertEqual(len(client.calls_of("delete_bucket_encryption")), 1)
+
+    def test_an_unknown_mode_is_refused(self):
+        m, _c = self._model()
+        with self.assertRaises(ValueError):
+            m.put_bucket_encryption(sse="rot13")
+
+    def test_bucket_tags_round_trip(self):
+        m, client = self._model(get_bucket_tagging={"TagSet": [
+            {"Key": "team", "Value": "infra"}]})
+        self.assertEqual(m.get_bucket_tags(), {"team": "infra"})
+        m.put_bucket_tags({"b": "2", "a": "1"})
+        sent = client.calls_of("put_bucket_tagging")[0]["Tagging"]["TagSet"]
+        self.assertEqual([t["Key"] for t in sent], ["a", "b"])  # sorted
+
+    def test_empty_tags_delete_the_set(self):
+        m, client = self._model()
+        m.put_bucket_tags({})
+        self.assertEqual(len(client.calls_of("delete_bucket_tagging")), 1)
+
+    def test_website_hosting_round_trips(self):
+        m, client = self._model(get_bucket_website={
+            "IndexDocument": {"Suffix": "index.html"},
+            "ErrorDocument": {"Key": "404.html"}})
+        self.assertEqual(m.get_bucket_website(),
+                         {"index": "index.html", "error": "404.html",
+                          "redirect": ""})
+        m.put_bucket_website(index="main.html", error="e.html")
+        config = client.calls_of("put_bucket_website")[0][
+            "WebsiteConfiguration"]
+        self.assertEqual(config["IndexDocument"], {"Suffix": "main.html"})
+        self.assertEqual(config["ErrorDocument"], {"Key": "e.html"})
+
+    def test_a_redirect_replaces_the_documents(self):
+        """The API rejects both at once, so the redirect wins rather than
+        sending something the service refuses."""
+        m, client = self._model()
+        m.put_bucket_website(index="index.html", redirect="example.com")
+        config = client.calls_of("put_bucket_website")[0][
+            "WebsiteConfiguration"]
+        self.assertEqual(config, {"RedirectAllRequestsTo":
+                                  {"HostName": "example.com"}})
+
+    def test_blank_website_settings_remove_it(self):
+        m, client = self._model()
+        m.put_bucket_website()
+        self.assertEqual(len(client.calls_of("delete_bucket_website")), 1)
+
+    def test_notifications_are_flattened_by_destination(self):
+        m, _c = self._model(get_bucket_notification_configuration={
+            "QueueConfigurations": [
+                {"QueueArn": "arn:sqs", "Events": ["s3:ObjectCreated:*"]}],
+            "TopicConfigurations": [{"TopicArn": "arn:sns", "Events": []}],
+            "EventBridgeConfiguration": {},
+        })
+        events = m.get_bucket_notifications()
+        self.assertIn(("SQS queue", "arn:sqs", ["s3:ObjectCreated:*"]), events)
+        self.assertIn(("SNS topic", "arn:sns", []), events)
+
+    def test_acceleration_is_reported_and_set(self):
+        m, client = self._model(
+            get_bucket_accelerate_configuration={"Status": "Enabled"})
+        self.assertEqual(m.get_bucket_acceleration(), "Enabled")
+        m.set_bucket_acceleration(False)
+        self.assertEqual(
+            client.calls_of("put_bucket_accelerate_configuration")[0][
+                "AccelerateConfiguration"], {"Status": "Suspended"})
+
+    def test_a_read_only_profile_refuses_every_write(self):
+        m, _c = self._model()
+        m.read_only = True
+        for call in (lambda: m.put_bucket_encryption(sse="AES256"),
+                     lambda: m.put_bucket_tags({"a": "1"}),
+                     lambda: m.put_bucket_website(index="i.html"),
+                     lambda: m.set_bucket_acceleration(True)):
+            with self.assertRaises(ReadOnlyError):
+                call()
+
+
+class ComparePlanTests(unittest.TestCase):
+    """A direction-free diff: calling one side "the source" before the user
+    has said so is how a compare turns into a sync nobody asked for."""
+
+    def test_every_status_is_recognised(self):
+        rows = main_window.build_compare_plan(
+            {"same.txt": (10, 100), "diff.txt": (10, 100),
+             "mine.txt": (5, 100)},
+            {"same.txt": (10, 100), "diff.txt": (20, 100),
+             "yours.txt": (5, 100)})
+        by_rel = {row["rel"]: row["status"] for row in rows}
+        self.assertEqual(by_rel, {
+            "same.txt": "same", "diff.txt": "differs",
+            "mine.txt": "only_left", "yours.txt": "only_right"})
+
+    def test_a_close_mtime_is_still_the_same_file(self):
+        rows = main_window.build_compare_plan(
+            {"a": (10, 100.0)}, {"a": (10, 101.0)})
+        self.assertEqual(rows[0]["status"], "same")
+
+    def test_a_far_mtime_counts_as_a_difference(self):
+        rows = main_window.build_compare_plan(
+            {"a": (10, 100.0)}, {"a": (10, 900.0)})
+        self.assertEqual(rows[0]["status"], "differs")
+
+    def test_excludes_are_honoured(self):
+        rows = main_window.build_compare_plan(
+            {"keep.txt": (1, 1), "drop.tmp": (1, 1)}, {}, exclude="*.tmp")
+        self.assertEqual([row["rel"] for row in rows], ["keep.txt"])
+
+    def test_the_summary_counts_by_status(self):
+        rows = main_window.build_compare_plan(
+            {"a": (1, 1), "b": (1, 1)}, {"a": (1, 1)})
+        self.assertEqual(main_window.summarize_compare_plan(rows),
+                         {"only_left": 1, "only_right": 0, "differs": 0,
+                          "same": 1})
+
+    def test_sizes_are_reported_for_both_sides(self):
+        rows = main_window.build_compare_plan({"a": (10, 1)}, {"a": (20, 1)})
+        self.assertEqual((rows[0]["left_size"], rows[0]["right_size"]),
+                         (10, 20))
+
+
+class CompareJobTests(unittest.TestCase):
+    """Which queue operation a compare turns into depends entirely on the
+    pair of sides."""
+
+    build = staticmethod(main_window.PaneCompareDialog.build_job)
+
+    def test_local_to_remote_is_an_upload(self):
+        job, method, kwargs = self.build(
+            ("local", os.path.join(os.sep, "data")),
+            ("remote", "bkt", "dst/"), ["a/one.txt"])
+        self.assertEqual(method, "upload")
+        self.assertEqual(job[0][0], "dst/a/one.txt")
+        self.assertEqual(job[0][1],
+                         os.path.join(os.sep, "data", "a", "one.txt"))
+        self.assertEqual(kwargs, {})
+
+    def test_remote_to_local_is_a_download(self):
+        job, method, kwargs = self.build(
+            ("remote", "bkt", "src/"),
+            ("local", os.path.join(os.sep, "out")), ["a/one.txt"])
+        self.assertEqual(method, "download")
+        self.assertEqual(job[0][0], "src/a/one.txt")
+        self.assertEqual(job[0][1],
+                         os.path.join(os.sep, "out", "a", "one.txt"))
+        self.assertFalse(kwargs["need_refresh"])
+
+    def test_same_bucket_remote_to_remote_is_a_plain_copy(self):
+        job, method, kwargs = self.build(
+            ("remote", "bkt", "a/"), ("remote", "bkt", "b/"), ["one.txt"])
+        self.assertEqual(method, "copy")
+        self.assertEqual(job[0], ("a/one.txt", "b/one.txt", False, None))
+        self.assertEqual(kwargs["source_bucket"], "")
+
+    def test_cross_bucket_names_both_sides(self):
+        job, method, kwargs = self.build(
+            ("remote", "src", "a/"), ("remote", "dst", "b/"), ["one.txt"])
+        self.assertEqual(job[0], ("a/one.txt", "b/one.txt", False, "dst"))
+        self.assertEqual(kwargs["source_bucket"], "src")
+
+    def test_local_to_local_is_not_this_apps_job(self):
+        job, method, _kw = self.build(
+            ("local", "/a"), ("local", "/b"), ["one.txt"])
+        self.assertEqual((job, method), ([], ""))
+
+    def test_no_paths_means_no_job(self):
+        self.assertEqual(
+            self.build(("local", "/a"), ("remote", "b", ""), []),
+            ([], "", {}))
+
+    def test_a_side_is_described_for_the_header(self):
+        describe = main_window.PaneCompareDialog.describe
+        self.assertEqual(describe(("local", "/data")), "/data")
+        self.assertEqual(describe(("remote", "bkt", "p/")), "s3://bkt/p/")
+
+
+class ExcludeMatcherStringTests(unittest.TestCase):
+    """REGRESSION: the watch handed its exclude box's text straight to the
+    matcher, which iterated it character by character — the lone "*" that
+    produced then matched every path, so a watch mirrored nothing at all."""
+
+    def test_a_raw_string_is_split_not_iterated(self):
+        match = main_window.build_exclude_matcher("*.tmp")
+        self.assertTrue(match("a/b.tmp"))
+        self.assertFalse(match("a/b.txt"))
+
+    def test_several_patterns_in_one_string(self):
+        match = main_window.build_exclude_matcher("*.tmp, node_modules/ .git/")
+        self.assertTrue(match("x.tmp"))
+        self.assertTrue(match("node_modules/pkg/index.js"))
+        self.assertTrue(match(".git/config"))
+        self.assertFalse(match("src/main.py"))
+
+    def test_an_empty_string_excludes_nothing(self):
+        for value in ("", "   ", None, []):
+            with self.subTest(value=value):
+                match = main_window.build_exclude_matcher(value)
+                self.assertFalse(match("anything.txt"))
+
+    def test_a_list_still_works(self):
+        match = main_window.build_exclude_matcher(["*.log"])
+        self.assertTrue(match("deep/a.log"))
+
+    def test_the_watch_actually_excludes_what_it_is_told(self):
+        """The end of the same bug: build_sync_plan is what the watch calls."""
+        plan = build_sync_plan(
+            {"keep.txt": (1, 1), "drop.tmp": (1, 1)}, {},
+            direction="upload", exclude="*.tmp")
+        self.assertEqual([entry["rel"] for entry in plan], ["keep.txt"])
+
+
+class VersionDiffTests(unittest.TestCase):
+    """The versions list could download any version but never say what
+    changed — which is the question people open it with."""
+
+    build = staticmethod(main_window.VersionDiffDialog.build_diff)
+
+    def test_a_change_produces_a_unified_diff(self):
+        text, problem = self.build(b"one\ntwo\n", b"one\nTWO\n", "v1", "v2")
+        self.assertEqual(problem, "")
+        self.assertIn("--- v1", text)
+        self.assertIn("+++ v2", text)
+        self.assertIn("-two", text)
+        self.assertIn("+TWO", text)
+
+    def test_identical_versions_say_so_instead_of_showing_nothing(self):
+        text, problem = self.build(b"same\n", b"same\n", "v1", "v2")
+        self.assertEqual(text, "")
+        self.assertIn("identical", problem)
+
+    def test_identical_but_truncated_admits_the_caveat(self):
+        _text, problem = self.build(b"a", b"a", "v1", "v2", truncated=True)
+        self.assertIn("part that was read", problem)
+
+    def test_binary_content_is_refused(self):
+        _text, problem = self.build(b"\x00\x01", b"\x00\x02", "v1", "v2")
+        self.assertIn("binary", problem)
+
+    def test_undecodable_text_is_refused(self):
+        """A diff of replacement characters looks like a change on every
+        line."""
+        _text, problem = self.build(
+            "héllo".encode("latin-1"), b"hello", "v1", "v2")
+        self.assertIn("UTF-8", problem)
+
+    def test_an_empty_first_version_still_diffs(self):
+        text, problem = self.build(b"", b"new\n", "v1", "v2")
+        self.assertEqual(problem, "")
+        self.assertIn("+new", text)
+
+
+class VersionSelectionTests(unittest.TestCase):
+    """Two rows mean a diff; anything else does not."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    class _Model:
+        bucket = "bkt"
+
+        def list_object_versions(self, key):
+            return []
+
+        def get_bucket_versioning_status(self):
+            return "Enabled"
+
+        def clone_for_worker(self):
+            return self
+
+    def _dialog(self, versions):
+        dlg = main_window.VersionsDialog(
+            None, None, self._Model(), "a/obj.txt")
+        self.addCleanup(dlg.close)
+        dlg._versions = versions
+        dlg._render(versions, "Enabled")
+        return dlg
+
+    @staticmethod
+    def _version(vid, latest=False, marker=False):
+        return {"version_id": vid, "size": 10, "storage_class": "STANDARD",
+                "last_modified": None, "is_latest": latest,
+                "is_delete_marker": marker}
+
+    def test_no_selection_offers_no_diff(self):
+        dlg = self._dialog([self._version("v2", latest=True),
+                            self._version("v1")])
+        self.assertIsNone(dlg.diffable_pair())
+        self.assertFalse(dlg._btn_diff.isEnabled())
+
+    def test_two_versions_are_paired_oldest_first(self):
+        dlg = self._dialog([self._version("v2", latest=True),
+                            self._version("v1")])
+        dlg._table.selectAll()
+        # the table lists newest first, so the pair reads chronologically
+        self.assertEqual(dlg.diffable_pair(), ("v1", "v2"))
+        self.assertTrue(dlg._btn_diff.isEnabled())
+
+    def test_three_rows_are_not_a_pair(self):
+        dlg = self._dialog([self._version("v3", latest=True),
+                            self._version("v2"), self._version("v1")])
+        dlg._table.selectAll()
+        self.assertIsNone(dlg.diffable_pair())
+
+    def test_a_delete_marker_is_not_diffable(self):
+        dlg = self._dialog([self._version("v2", latest=True, marker=True),
+                            self._version("v1")])
+        dlg._table.selectAll()
+        self.assertIsNone(dlg.diffable_pair())
+
+    def test_the_single_row_actions_ignore_a_two_row_selection(self):
+        """Download/make-current/delete act on exactly one version."""
+        dlg = self._dialog([self._version("v2", latest=True),
+                            self._version("v1")])
+        dlg._table.selectAll()
+        self.assertIsNone(dlg._selected())
+        self.assertFalse(dlg._btn_download.isEnabled())
+        self.assertFalse(dlg._btn_delete.isEnabled())
+
+
+class VersionPreviewTests(unittest.TestCase):
+    """A preview can now be asked for one specific version."""
+
+    def test_the_version_id_reaches_get_object(self):
+        client = FakeS3Client(get_object_resp={
+            "Body": io.BytesIO(b"hello"), "ContentLength": 5,
+            "ContentType": "text/plain", "ETag": '"abc"'})
+        m = make_model(bucket="bkt")
+        m._client = client
+        m.get_object_preview("a.txt", 1024, version_id="v7")
+        self.assertEqual(client.calls_of("get_object")[0]["VersionId"], "v7")
+
+    def test_without_one_nothing_extra_is_sent(self):
+        client = FakeS3Client(get_object_resp={
+            "Body": io.BytesIO(b"hello"), "ContentLength": 5})
+        m = make_model(bucket="bkt")
+        m._client = client
+        m.get_object_preview("a.txt", 1024)
+        self.assertNotIn("VersionId", client.calls_of("get_object")[0])
+
+
+class SavedSearchTests(unittest.TestCase):
+    """With results driving the queue, a recurring cleanup is worth one click
+    rather than a re-typed form."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self, profile="prod"):
+        settings = QSettings("s3duck-tests-saved", "s3duck-tests-saved")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, profile, "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        win.data_model.bucket = "bkt"
+        return win
+
+    def _dialog(self, win):
+        dlg = main_window.SearchDialog(win, win, win.data_model, "logs/")
+        self.addCleanup(dlg.close)
+        return dlg
+
+    def test_nothing_is_saved_to_begin_with(self):
+        win = self._window()
+        self.assertEqual(win.load_saved_searches(), [])
+
+    def test_a_corrupt_store_costs_the_list_not_the_dialog(self):
+        win = self._window()
+        win.settings.beginGroup("common")
+        win.settings.setValue("searches/prod", "{nope")
+        win.settings.endGroup()
+        self.assertEqual(win.load_saved_searches(), [])
+
+    def test_the_form_round_trips_through_a_config(self):
+        win = self._window()
+        dlg = self._dialog(win)
+        dlg._query.setText("*.tmp")
+        dlg._regex.setChecked(True)
+        dlg._case.setChecked(True)
+        dlg._exts.setText("log, tmp")
+        dlg._min_size.setText("5")
+        dlg._size_unit.setCurrentIndex(2)
+        dlg._use_after.setChecked(True)
+        config = dlg.search_config()
+
+        other = self._dialog(win)
+        other.apply_search_config(config)
+        self.assertEqual(other.search_config(), config)
+
+    def test_saving_then_choosing_restores_the_filters(self):
+        win = self._window()
+        dlg = self._dialog(win)
+        dlg._query.setText("old")
+        dlg._exts.setText("log")
+        with patch.object(main_window.QInputDialog, "getText",
+                          lambda *a, **kw: ("nightly", True)):
+            dlg._save_search()
+        self.assertEqual(
+            [e["name"] for e in win.load_saved_searches()], ["nightly"])
+
+        fresh = self._dialog(win)
+        self.assertEqual(fresh._saved.count(), 2)   # "(none)" plus the saved
+        with patch.object(main_window.SearchDialog, "_run_search",
+                          lambda _s: None):
+            fresh._saved.setCurrentIndex(1)
+        self.assertEqual(fresh._query.text(), "old")
+        self.assertEqual(fresh._exts.text(), "log")
+
+    def test_saving_the_same_name_twice_replaces_it(self):
+        win = self._window()
+        dlg = self._dialog(win)
+        with patch.object(main_window.QInputDialog, "getText",
+                          lambda *a, **kw: ("nightly", True)):
+            dlg._query.setText("first")
+            dlg._save_search()
+            dlg._query.setText("second")
+            dlg._save_search()
+        entries = win.load_saved_searches()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["filters"]["query"], "second")
+
+    def test_cancelling_the_name_prompt_saves_nothing(self):
+        win = self._window()
+        dlg = self._dialog(win)
+        with patch.object(main_window.QInputDialog, "getText",
+                          lambda *a, **kw: ("", False)):
+            dlg._save_search()
+        self.assertEqual(win.load_saved_searches(), [])
+
+    def test_deleting_removes_only_that_one(self):
+        win = self._window()
+        win.store_saved_searches([{"name": "a", "filters": {}},
+                                  {"name": "b", "filters": {}}])
+        dlg = self._dialog(win)
+        with patch.object(main_window.SearchDialog, "_run_search",
+                          lambda _s: None):
+            dlg._saved.setCurrentIndex(1)   # "a"
+            dlg._delete_search()
+        self.assertEqual([e["name"] for e in win.load_saved_searches()], ["b"])
+
+    def test_searches_are_per_profile(self):
+        win = self._window("prod")
+        win.store_saved_searches([{"name": "prod-only", "filters": {}}])
+        win.profile_name = "dev"
+        self.assertEqual(win.load_saved_searches(), [])
+
+
+class TransientErrorTests(unittest.TestCase):
+    """botocore already retries inside one request; this is about the job
+    above it, which it gave up on."""
+
+    def _error(self, code="", status=None):
+        response = {"Error": {"Code": code, "Message": "x"},
+                    "ResponseMetadata": {}}
+        if status is not None:
+            response["ResponseMetadata"]["HTTPStatusCode"] = status
+        return botocore.exceptions.ClientError(response, "PutObject")
+
+    def test_the_services_own_try_again_answers_count(self):
+        for code in ("SlowDown", "InternalError", "ServiceUnavailable",
+                     "RequestTimeout", "ThrottlingException"):
+            with self.subTest(code=code):
+                self.assertTrue(utils.is_transient_error(self._error(code)))
+
+    def test_server_side_status_codes_count(self):
+        for status in (429, 500, 502, 503, 504):
+            with self.subTest(status=status):
+                self.assertTrue(
+                    utils.is_transient_error(self._error("Weird", status)))
+
+    def test_a_refusal_is_not_transient(self):
+        """An AccessDenied retried on a timer is just a slower AccessDenied."""
+        for code, status in (("AccessDenied", 403), ("NoSuchKey", 404),
+                             ("InvalidRequest", 400)):
+            with self.subTest(code=code):
+                self.assertFalse(
+                    utils.is_transient_error(self._error(code, status)))
+
+    def test_connection_failures_never_reached_the_service(self):
+        self.assertTrue(utils.is_transient_error(
+            botocore.exceptions.EndpointConnectionError(
+                endpoint_url="https://s3.example")))
+
+    def test_an_ordinary_exception_is_not_transient(self):
+        self.assertFalse(utils.is_transient_error(ValueError("nope")))
+
+
+class QueueRetryTests(unittest.TestCase):
+    """Retry-all, and one automatic retry for a failure the service asked us
+    to repeat."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self):
+        settings = QSettings("s3duck-tests-retry", "s3duck-tests-retry")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, "prod", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        return win
+
+    def _entry(self, win, entry_id, status, transient=False):
+        entry = main_window._QEntry(entry_id, "upload", [("k", "/tmp/f")],
+                                    label=f"job {entry_id}")
+        entry.status = status
+        entry.error_transient = transient
+        win._queue_entries[entry_id] = entry
+        return entry
+
+    def test_only_failed_jobs_are_collected(self):
+        win = self._window()
+        self._entry(win, 1, "done")
+        self._entry(win, 2, "error")
+        self._entry(win, 3, "cancelled")
+        self._entry(win, 4, "error")
+        self.assertEqual([e.entry_id for e in win.failed_entries()], [2, 4])
+
+    def test_retry_all_requeues_each_one(self):
+        win = self._window()
+        self._entry(win, 1, "error")
+        self._entry(win, 2, "error")
+        queued = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: queued.append(m)):
+            win.retry_failed_transfers()
+        self.assertEqual(queued, ["upload", "upload"])
+
+    def test_retry_all_with_nothing_failed_does_nothing(self):
+        win = self._window()
+        self._entry(win, 1, "done")
+        queued = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: queued.append(m)):
+            win.retry_failed_transfers()
+        self.assertEqual(queued, [])
+
+    def test_a_transient_failure_is_retried_once(self):
+        win = self._window()
+        entry = self._entry(win, 1, "error", transient=True)
+        self.assertTrue(win._maybe_auto_retry(entry))
+        self.assertEqual(entry.auto_retries, 1)
+        # and never again
+        self.assertFalse(win._maybe_auto_retry(entry))
+
+    def test_a_refusal_is_not_retried(self):
+        win = self._window()
+        entry = self._entry(win, 1, "error", transient=False)
+        self.assertFalse(win._maybe_auto_retry(entry))
+        self.assertEqual(entry.auto_retries, 0)
+
+    def test_the_setting_switches_it_off(self):
+        win = self._window()
+        win.settings.beginGroup("common")
+        win.settings.setValue("auto_retry", "false")
+        win.settings.endGroup()
+        entry = self._entry(win, 1, "error", transient=True)
+        self.assertFalse(win._maybe_auto_retry(entry))
+
+    def test_it_is_on_by_default(self):
+        self.assertTrue(self._window().auto_retry_enabled())
+
+    def test_the_retry_carries_the_cross_profile_models(self):
+        """Dropping them re-queued a job the worker could only refuse."""
+        win = self._window()
+        entry = self._entry(win, 1, "error")
+        entry.source_bucket = "other"
+        entry.dest_model = object()
+        entry.source_model = object()
+        seen = {}
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: seen.update(kw)):
+            win._requeue(entry)
+        self.assertEqual(seen["source_bucket"], "other")
+        self.assertIs(seen["dest_model"], entry.dest_model)
+        self.assertIs(seen["source_model"], entry.source_model)
+
+
+class PrefixTreeTests(unittest.TestCase):
+    """The usage pie says what kind of files; this says which folder, which
+    is what a bill is made of."""
+
+    ENTRIES = [("a/b/one.txt", 10), ("a/b/two.txt", 20),
+               ("a/c/three.txt", 5), ("top.txt", 1)]
+
+    def test_sizes_roll_up_to_every_level(self):
+        tree = main_window.build_prefix_tree(self.ENTRIES)
+        self.assertEqual(tree["size"], 36)
+        self.assertEqual(tree["count"], 4)
+        self.assertEqual(tree["children"]["a"]["size"], 35)
+        self.assertEqual(
+            main_window.node_at_path(tree, ["a", "b"])["size"], 30)
+        self.assertEqual(
+            main_window.node_at_path(tree, ["a", "c"])["count"], 1)
+
+    def test_folder_markers_are_not_objects(self):
+        tree = main_window.build_prefix_tree([("a/", 0), ("a/x", 5)])
+        self.assertEqual(tree["count"], 1)
+        self.assertEqual(tree["size"], 5)
+
+    def test_a_missing_path_is_empty_not_an_error(self):
+        tree = main_window.build_prefix_tree(self.ENTRIES)
+        self.assertEqual(main_window.node_at_path(tree, ["nope", "deep"]), {})
+
+    def test_children_come_back_biggest_first(self):
+        tree = main_window.build_prefix_tree(self.ENTRIES)
+        rows = main_window.treemap_children(tree)
+        self.assertEqual([name for name, _s, _g in rows], ["a", "top.txt"])
+
+    def test_zero_sized_entries_are_dropped(self):
+        tree = main_window.build_prefix_tree([("a", 0), ("b", 5)])
+        self.assertEqual([n for n, _s, _g in main_window.treemap_children(tree)],
+                         ["b"])
+
+    def test_a_long_tail_is_folded_into_one_tile(self):
+        """A thousand slivers is not a picture of anything."""
+        tree = main_window.build_prefix_tree(
+            [(f"f{i}.txt", 100 - i) for i in range(50)])
+        rows = main_window.treemap_children(tree, limit=10)
+        self.assertEqual(len(rows), 11)
+        self.assertTrue(rows[-1][2])            # marked as a group
+        self.assertIn("40 more", rows[-1][0])
+        self.assertEqual(sum(size for _n, size, _g in rows), tree["size"])
+
+
+class SquarifyTests(unittest.TestCase):
+    """Area is the whole point: if it does not add up, the picture lies."""
+
+    def test_the_rectangles_fill_the_box(self):
+        rects = main_window.squarify([50, 25, 15, 10], 0, 0, 200, 100)
+        self.assertEqual(len(rects), 4)
+        area = sum(w * h for _x, _y, w, h in rects)
+        self.assertAlmostEqual(area, 200 * 100, places=3)
+
+    def test_area_is_proportional_to_value(self):
+        rects = main_window.squarify([75, 25], 0, 0, 100, 100)
+        first = rects[0][2] * rects[0][3]
+        second = rects[1][2] * rects[1][3]
+        self.assertAlmostEqual(first / second, 3.0, places=3)
+
+    def test_every_rectangle_stays_inside_the_box(self):
+        rects = main_window.squarify([5, 4, 3, 2, 1], 0, 0, 300, 120)
+        for x, y, width, height in rects:
+            self.assertGreaterEqual(round(x, 6), 0)
+            self.assertGreaterEqual(round(y, 6), 0)
+            self.assertLessEqual(round(x + width, 6), 300)
+            self.assertLessEqual(round(y + height, 6), 120)
+
+    def test_degenerate_input_produces_nothing(self):
+        self.assertEqual(main_window.squarify([], 0, 0, 10, 10), [])
+        self.assertEqual(main_window.squarify([0, 0], 0, 0, 10, 10), [])
+        self.assertEqual(main_window.squarify([1], 0, 0, 0, 10), [])
+
+    def test_a_single_value_takes_the_whole_box(self):
+        rects = main_window.squarify([1], 0, 0, 40, 20)
+        self.assertEqual(len(rects), 1)
+        self.assertAlmostEqual(rects[0][2] * rects[0][3], 800, places=3)
+
+    def test_many_values_do_not_recurse_into_a_stack_overflow(self):
+        rects = main_window.squarify(list(range(1, 800)), 0, 0, 900, 600)
+        self.assertEqual(len(rects), 799)
+
+
+class TreemapWidgetTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _widget(self):
+        widget = main_window.TreemapWidget()
+        self.addCleanup(widget.deleteLater)
+        widget.resize(400, 200)
+        return widget
+
+    def test_rows_become_rectangles(self):
+        widget = self._widget()
+        widget.set_rows([("a", 60, False), ("b", 40, False)])
+        self.assertEqual(len(widget._rects), 2)
+
+    def test_clicking_a_tile_asks_to_drill(self):
+        widget = self._widget()
+        widget.set_rows([("a", 100, False)])
+        seen = []
+        widget.drilled.connect(seen.append)
+        widget.mouseReleaseEvent(QMouseEvent(
+            QEvent.Type.MouseButtonRelease, QPointF(10, 10), QPointF(10, 10),
+            Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier))
+        self.assertEqual(seen, ["a"])
+
+    def test_the_folded_group_is_not_drillable(self):
+        widget = self._widget()
+        widget.set_rows([("… 40 more", 100, True)])
+        seen = []
+        widget.drilled.connect(seen.append)
+        widget.mouseReleaseEvent(QMouseEvent(
+            QEvent.Type.MouseButtonRelease, QPointF(10, 10), QPointF(10, 10),
+            Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier))
+        self.assertEqual(seen, [])
+
+    def test_painting_a_full_map_does_not_raise(self):
+        """A Python error inside paint() aborts the process, so it is only
+        ever caught by actually painting."""
+        widget = self._widget()
+        widget.set_rows([(f"prefix-{i}", 100 - i, False) for i in range(40)])
+        pixmap = QPixmap(400, 200)
+        widget.render(pixmap)
+
+
+class ManifestTests(unittest.TestCase):
+    """An integrity record nobody can afford to take is not taken, so this
+    one costs exactly one listing."""
+
+    ENTRIES = [
+        ("logs/b.txt", 20, "etag-b", "2026-01-02"),
+        ("logs/a.txt", 10, "etag-a", "2026-01-01"),
+    ]
+
+    def test_a_manifest_round_trips(self):
+        text = main_window.build_manifest(
+            self.ENTRIES, "bkt", "logs/", "2026-09-02T10:00:00Z")
+        meta, records = main_window.parse_manifest(text)
+        self.assertEqual(meta["bucket"], "bkt")
+        self.assertEqual(meta["prefix"], "logs/")
+        self.assertEqual(meta["taken"], "2026-09-02T10:00:00Z")
+        self.assertEqual(records, {"logs/a.txt": (10, "etag-a"),
+                                   "logs/b.txt": (20, "etag-b")})
+
+    def test_entries_are_written_in_key_order(self):
+        text = main_window.build_manifest(self.ENTRIES)
+        body = [line for line in text.splitlines() if line.startswith("logs/")]
+        self.assertEqual([line.split(",")[0] for line in body],
+                         ["logs/a.txt", "logs/b.txt"])
+
+    def test_a_foreign_csv_is_refused(self):
+        """Verifying against an arbitrary CSV would report every object as
+        changed."""
+        with self.assertRaises(ValueError):
+            main_window.parse_manifest("key,size\na,1\n")
+
+    def test_a_truncated_manifest_is_refused(self):
+        with self.assertRaises(ValueError):
+            main_window.parse_manifest(main_window.MANIFEST_HEADER + "\n")
+
+    def test_unparseable_rows_are_skipped_not_fatal(self):
+        text = (main_window.build_manifest(self.ENTRIES)
+                + "broken,notanumber,x,y\n,,,\n")
+        _meta, records = main_window.parse_manifest(text)
+        self.assertEqual(len(records), 2)
+
+    def test_an_unchanged_prefix_reports_nothing(self):
+        stored = {"a": (1, "e1"), "b": (2, "e2")}
+        result = main_window.compare_manifest(stored, dict(stored))
+        self.assertEqual(result["same"], 2)
+        self.assertEqual(result["missing"], [])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["changed"], [])
+
+    def test_every_kind_of_drift_is_named(self):
+        stored = {"gone": (1, "e"), "same": (1, "e"),
+                  "grew": (1, "e"), "rewritten": (1, "e1")}
+        current = {"same": (1, "e"), "grew": (9, "e"),
+                   "rewritten": (1, "e2"), "new": (1, "e")}
+        result = main_window.compare_manifest(stored, current)
+        self.assertEqual(result["missing"], ["gone"])
+        self.assertEqual(result["added"], ["new"])
+        self.assertEqual(result["same"], 1)
+        reasons = dict(result["changed"])
+        self.assertIn("size 1 → 9", reasons["grew"])
+        self.assertIn("different content", reasons["rewritten"])
+
+    def test_a_blank_etag_never_claims_a_change(self):
+        """Some backends omit the ETag; absent is not different."""
+        result = main_window.compare_manifest({"a": (1, "")}, {"a": (1, "e")})
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["same"], 1)
+
+    def test_an_empty_manifest_against_a_full_prefix(self):
+        result = main_window.compare_manifest({}, {"a": (1, "e")})
+        self.assertEqual(result["added"], ["a"])
+
+
+class CliParsingTests(unittest.TestCase):
+    """`s3duck s3://bucket/prefix` from a terminal, a chat link or a file
+    manager — not a second CLI to learn."""
+
+    parse = staticmethod(s3duck.parse_cli)
+
+    def test_no_arguments_is_a_plain_launch(self):
+        self.assertEqual(self.parse([]),
+                         {"profile": "", "location": "", "help": False,
+                          "unknown": []})
+
+    def test_a_bare_location(self):
+        self.assertEqual(self.parse(["s3://bkt/logs/"])["location"],
+                         "s3://bkt/logs/")
+
+    def test_a_profile_in_both_spellings(self):
+        self.assertEqual(self.parse(["-p", "prod"])["profile"], "prod")
+        self.assertEqual(self.parse(["--profile", "prod"])["profile"], "prod")
+        self.assertEqual(self.parse(["--profile=prod"])["profile"], "prod")
+
+    def test_a_profile_and_a_location_together(self):
+        args = self.parse(["--profile=prod", "s3://bkt/x/"])
+        self.assertEqual((args["profile"], args["location"]),
+                         ("prod", "s3://bkt/x/"))
+
+    def test_help_is_recognised(self):
+        self.assertTrue(self.parse(["--help"])["help"])
+        self.assertTrue(self.parse(["-h"])["help"])
+
+    def test_a_dangling_profile_flag_does_not_crash(self):
+        self.assertEqual(self.parse(["--profile"])["profile"], "")
+
+    def test_extra_arguments_are_reported_not_guessed_at(self):
+        args = self.parse(["one", "two", "--nope"])
+        self.assertEqual(args["location"], "one")
+        self.assertEqual(sorted(args["unknown"]), ["--nope", "two"])
+
+
+class InstanceHandoverTests(unittest.TestCase):
+    """A location handed to a running window opens there; a bare launch still
+    gets its own window."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def test_a_message_reaches_the_listener(self):
+        server = utils.InstanceServer()
+        name = utils.instance_socket_name("s3duck-test-handover")
+        self.assertTrue(server.start(name))
+        self.addCleanup(server.stop)
+        received = []
+        server.received.connect(received.append)
+        self.assertTrue(
+            utils.send_to_running_instance("s3://bkt/logs/", name))
+        deadline = time.monotonic() + 3
+        while not received and time.monotonic() < deadline:
+            self._app.processEvents()
+        self.assertEqual(received, ["s3://bkt/logs/"])
+
+    def test_sending_with_nobody_listening_fails_cleanly(self):
+        self.assertFalse(utils.send_to_running_instance(
+            "s3://bkt/", utils.instance_socket_name("s3duck-test-nobody"),
+            timeout_ms=100))
+
+    def test_a_stale_socket_does_not_block_the_next_listener(self):
+        """A crash leaves the socket behind; without removeServer the next
+        run could never listen again."""
+        name = utils.instance_socket_name("s3duck-test-stale")
+        first = utils.InstanceServer()
+        self.assertTrue(first.start(name))
+        second = utils.InstanceServer()
+        self.assertTrue(second.start(name))
+        self.addCleanup(second.stop)
+        first.stop()
+
+    def test_the_socket_name_is_per_user(self):
+        self.assertNotEqual(utils.instance_socket_name("a"),
+                            utils.instance_socket_name("b"))
+        self.assertIn("a", utils.instance_socket_name("a"))
+
+
+class DesktopEntryTests(unittest.TestCase):
+    """The URL handler only works if the desktop entry claims the scheme."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _entry(self):
+        with open(os.path.join(self.ROOT, "resources", "s3duck.desktop")) as f:
+            return f.read()
+
+    def test_the_s3_scheme_is_claimed(self):
+        self.assertIn("MimeType=x-scheme-handler/s3;", self._entry())
+
+    def test_the_exec_line_takes_the_url(self):
+        self.assertIn("%U", self._entry())
+
+    def test_the_package_refreshes_the_mime_cache(self):
+        """Claiming the scheme does nothing until the cache knows."""
+        with open(os.path.join(self.ROOT, "DEBIAN", "postinst")) as handle:
+            self.assertIn("update-desktop-database", handle.read())
+
+
+class UploadRuleTests(unittest.TestCase):
+    """"Anything under archive/ goes to Glacier" is a policy; applying it by
+    hand on every upload is how it stops being one."""
+
+    def test_a_rule_line_is_parsed(self):
+        rules = Model.parse_upload_rules(
+            "archive/* -> class=GLACIER, tag:team=infra")
+        self.assertEqual(rules, [{
+            "pattern": "archive/*", "storage_class": "GLACIER",
+            "tags": {"team": "infra"}}])
+
+    def test_junk_and_actionless_lines_are_dropped(self):
+        rules = Model.parse_upload_rules("\n".join([
+            "# a comment", "no arrow here", "-> class=GLACIER",
+            "empty/* ->", "good/* -> class=STANDARD_IA"]))
+        self.assertEqual([r["pattern"] for r in rules], ["good/*"])
+
+    def test_rules_round_trip_through_text(self):
+        text = "archive/* -> class=GLACIER, tag:a=1, tag:b=2"
+        self.assertEqual(
+            Model.format_upload_rules(Model.parse_upload_rules(text)), text)
+
+    def test_first_match_wins(self):
+        """A table where two rules half-apply is one nobody can predict."""
+        m = make_model()
+        m.set_upload_rules([
+            {"pattern": "logs/2026/*", "storage_class": "STANDARD_IA"},
+            {"pattern": "logs/*", "storage_class": "GLACIER"},
+        ])
+        self.assertEqual(m.rule_for_key("logs/2026/a.log")["storage_class"],
+                         "STANDARD_IA")
+        self.assertEqual(m.rule_for_key("logs/2025/a.log")["storage_class"],
+                         "GLACIER")
+
+    def test_a_bare_prefix_means_everything_under_it(self):
+        m = make_model()
+        m.set_upload_rules([{"pattern": "archive/", "storage_class": "GLACIER"}])
+        self.assertIsNotNone(m.rule_for_key("archive/deep/a.txt"))
+        self.assertIsNone(m.rule_for_key("archives/a.txt"))
+
+    def test_no_match_means_no_rule(self):
+        m = make_model()
+        m.set_upload_rules([{"pattern": "a/*", "storage_class": "GLACIER"}])
+        self.assertIsNone(m.rule_for_key("b/x.txt"))
+        self.assertIsNone(m.rule_for_key(""))
+
+    def test_a_rule_sets_the_storage_class_and_tags(self):
+        m = make_model()
+        m.set_upload_rules([{"pattern": "archive/*",
+                             "storage_class": "GLACIER",
+                             "tags": {"team": "infra", "keep": "yes"}}])
+        args = m.upload_args_for("/tmp/a.txt", "archive/a.txt")
+        self.assertEqual(args["StorageClass"], "GLACIER")
+        self.assertEqual(args["Tagging"], "keep=yes&team=infra")
+
+    def test_a_rule_overrides_the_global_storage_class(self):
+        m = make_model()
+        m.set_upload_options(storage_class="STANDARD_IA")
+        m.set_upload_rules([{"pattern": "archive/*",
+                             "storage_class": "DEEP_ARCHIVE"}])
+        self.assertEqual(
+            m.upload_args_for("/tmp/a", "archive/a")["StorageClass"],
+            "DEEP_ARCHIVE")
+        self.assertEqual(
+            m.upload_args_for("/tmp/a", "other/a")["StorageClass"],
+            "STANDARD_IA")
+
+    def test_the_content_type_still_applies_alongside(self):
+        m = make_model()
+        m.set_upload_rules([{"pattern": "site/*", "storage_class": "GLACIER"}])
+        args = m.upload_args_for("/tmp/index.html", "site/index.html")
+        self.assertEqual(args["ContentType"], "text/html")
+        self.assertEqual(args["StorageClass"], "GLACIER")
+
+    def test_the_rule_reaches_a_real_upload(self):
+        client = FakeS3Client()
+        m = make_model(bucket="bkt")
+        m._client = client
+        m.set_upload_rules([{"pattern": "archive/*",
+                             "storage_class": "GLACIER"}])
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        path = os.path.join(directory, "a.txt")
+        with open(path, "w") as handle:
+            handle.write("x")
+        m.upload_file(path, "archive/a.txt")
+        extra = client.calls_of("upload_file")[0]["kwargs"]["ExtraArgs"]
+        self.assertEqual(extra["StorageClass"], "GLACIER")
+
+    def test_a_worker_clone_carries_the_rules_by_value(self):
+        m = make_model()
+        m.set_upload_rules([{"pattern": "a/*", "storage_class": "GLACIER"}])
+        clone = m.clone_for_worker()
+        clone.upload_rules[0]["storage_class"] = "CHANGED"
+        self.assertEqual(m.upload_rules[0]["storage_class"], "GLACIER")
+
+    def test_setting_rules_drops_nameless_ones(self):
+        m = make_model()
+        self.assertEqual(
+            m.set_upload_rules([{"pattern": "  ", "storage_class": "X"}]), [])
+
+
+class LogFileTests(unittest.TestCase):
+    """The log view is capped and dies with the window, which is fine until
+    someone needs to say what happened an hour ago."""
+
+    def _path(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        return os.path.join(directory, "deep", "s3duck.log")
+
+    def test_lines_are_written_and_read_back(self):
+        log = utils.LogFile(self._path())
+        log.write("first")
+        log.write("second")
+        self.assertEqual(log.tail().splitlines(), ["first", "second"])
+
+    def test_the_directory_is_created(self):
+        path = self._path()
+        utils.LogFile(path).write("x")
+        self.assertTrue(os.path.isfile(path))
+
+    def test_an_empty_path_disables_it(self):
+        log = utils.LogFile("")
+        self.assertFalse(log.enabled)
+        self.assertFalse(log.write("x"))
+        self.assertEqual(log.tail(), "")
+
+    def test_the_file_rotates_once_at_the_cap(self):
+        path = self._path()
+        log = utils.LogFile(path, max_bytes=200)
+        for index in range(200):
+            log.write(f"line {index}")
+        self.assertTrue(os.path.exists(path + ".1"))
+        self.assertLess(os.path.getsize(path), 400)
+
+    def test_rotation_keeps_only_one_backup(self):
+        path = self._path()
+        log = utils.LogFile(path, max_bytes=100)
+        for index in range(300):
+            log.write(f"line {index}")
+        self.assertFalse(os.path.exists(path + ".2"))
+
+    def test_an_unwritable_path_disables_rather_than_raising(self):
+        """A full disk must not take the app down with it."""
+        log = utils.LogFile(os.path.join(os.sep, "proc", "nope", "x.log"))
+        self.assertFalse(log.write("x"))
+        self.assertFalse(log.enabled)
+
+    def test_tail_returns_only_the_last_lines(self):
+        log = utils.LogFile(self._path())
+        for index in range(50):
+            log.write(f"line {index}")
+        self.assertEqual(len(log.tail(10).splitlines()), 10)
+
+    def test_tail_of_a_missing_file_is_empty(self):
+        self.assertEqual(utils.LogFile(self._path()).tail(), "")
+
+
+class ProblemReportTests(unittest.TestCase):
+    """Nobody reconstructs a Qt plugin list and the last failure's request id
+    from memory."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self):
+        settings = QSettings("s3duck-tests-report", "s3duck-tests-report")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, "prod", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        # Never touch the real log file from a test.
+        win.log_file = utils.LogFile("")
+        return win
+
+    def test_the_report_carries_diagnostics_and_the_log(self):
+        win = self._window()
+        win.log("something happened")
+        text = win.build_problem_report()
+        self.assertIn("SVG icons render", text)
+        self.assertIn("something happened", text)
+        self.assertIn("Log (last", text)
+
+    def test_the_last_failure_is_included(self):
+        win = self._window()
+        entry = main_window._QEntry(3, "upload", [], label="logs/a.txt")
+        entry.status = "error"
+        entry.error_details = "Code: AccessDenied\nRequest id: REQ9"
+        win._queue_entries[3] = entry
+        text = win.build_problem_report()
+        self.assertIn("Last failure", text)
+        self.assertIn("REQ9", text)
+
+    def test_a_clean_session_has_no_failure_section(self):
+        win = self._window()
+        self.assertNotIn("Last failure", win.build_problem_report())
+
+    def test_the_report_never_carries_the_secret_key(self):
+        win = self._window()
+        win.data_model.secret_key = "SUPERSECRET"
+        self.assertNotIn("SUPERSECRET", win.build_problem_report())
+
+    def test_the_log_file_receives_what_the_view_shows(self):
+        win = self._window()
+        path = os.path.join(tempfile.mkdtemp(), "s.log")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path),
+                        ignore_errors=True)
+        win.log_file = utils.LogFile(path)
+        win.log("written to both")
+        self.assertIn("written to both", win.logview.toPlainText())
+        self.assertIn("written to both", win.log_file.tail())
+        # and it says which profile the line came from
+        self.assertIn("[prod]", win.log_file.tail())
+
+
+class AutoRetryLifetimeTests(unittest.TestCase):
+    """REGRESSION (abort at exit): the automatic retry used
+    QTimer.singleShot, which keeps firing after the window is gone — five
+    seconds later it started a transfer against a torn-down model. The suite
+    caught it as an intermittent core dump long after every test had passed."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self):
+        settings = QSettings("s3duck-tests-retrylife", "s3duck-tests-retrylife")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = main_window.MainWindow(settings=(
+                self.ROOT, settings, "prod", "https://s3.amazonaws.com",
+                "us-east-1", "", "AK", "SK", False, False,
+            ))
+        self.addCleanup(win.close)
+        return win
+
+    def _failed(self, win, entry_id=1):
+        entry = main_window._QEntry(entry_id, "upload", [("k", "/tmp/f")],
+                                    label="job")
+        entry.status = "error"
+        entry.error_transient = True
+        win._queue_entries[entry_id] = entry
+        return entry
+
+    def test_the_retry_timer_belongs_to_the_window(self):
+        """A parented timer is destroyed with it; a static one is not."""
+        win = self._window()
+        self.assertIs(win._retry_timer.parent(), win)
+        self.assertTrue(win._retry_timer.isSingleShot())
+
+    def test_scheduling_arms_the_timer_and_holds_the_entry(self):
+        win = self._window()
+        entry = self._failed(win)
+        self.assertTrue(win._maybe_auto_retry(entry))
+        self.assertTrue(win._retry_timer.isActive())
+        self.assertEqual(win._pending_retries, [entry])
+
+    def test_firing_requeues_what_was_held(self):
+        win = self._window()
+        entry = self._failed(win)
+        win._maybe_auto_retry(entry)
+        queued = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: queued.append(m)):
+            win._run_pending_retries()
+        self.assertEqual(queued, ["upload"])
+        self.assertEqual(win._pending_retries, [])
+
+    def test_a_closing_window_starts_nothing(self):
+        win = self._window()
+        entry = self._failed(win)
+        win._maybe_auto_retry(entry)
+        win._shutdown_threads()
+        queued = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: queued.append(m)):
+            win._run_pending_retries()
+        self.assertEqual(queued, [])
+
+    def test_shutdown_disarms_the_timer(self):
+        win = self._window()
+        win._maybe_auto_retry(self._failed(win))
+        win._shutdown_threads()
+        self.assertFalse(win._retry_timer.isActive())
+        self.assertEqual(win._pending_retries, [])

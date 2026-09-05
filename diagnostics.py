@@ -155,8 +155,16 @@ def collect(root, *, version="", model=None, profile_name="") -> list:
             ("Region", str(getattr(model, "region_name", "") or "(unset)")),
             ("Bucket", str(getattr(model, "bucket", "") or "(bucket list)")),
             ("Read-only", _yes_no(getattr(model, "read_only", False))),
+            ("Requester pays", _yes_no(
+                getattr(model, "requester_pays", False))),
+            ("Public base URL",
+             str(getattr(model, "public_base_url", "") or "(endpoint)")),
             ("TLS verification", _yes_no(
                 not getattr(model, "no_ssl_check", False))),
+            ("CA bundle",
+             str(getattr(model, "ca_bundle", "") or "(system trust store)")),
+            ("HTTP proxy",
+             str(getattr(model, "proxy_url", "") or "(direct)")),
             ("Path-style addressing", _yes_no(getattr(model, "use_path", False))),
         ]))
         sections.append(("Transfers", [
@@ -173,6 +181,10 @@ def collect(root, *, version="", model=None, profile_name="") -> list:
              _yes_no(getattr(model, "verify_downloads", False))),
             ("Upload checksum",
              str(getattr(model, "checksum_algorithm", "") or "none")),
+            ("Detect Content-Type",
+             _yes_no(getattr(model, "detect_content_type", False))),
+            ("Content-Type overrides",
+             str(len(getattr(model, "content_type_overrides", {}) or {}))),
             ("Bandwidth limit",
              "unlimited" if getattr(model, "rate_limiter", None) is None
              else f"{int(model.rate_limiter.rate_bps) // 1024} KB/s"),

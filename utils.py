@@ -4,8 +4,13 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
+import subprocess
 import tempfile
+import threading
+import time
+from datetime import datetime, timezone
 
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
@@ -17,11 +22,43 @@ try:
     from PyQt6 import sip
 except ImportError:
     sip = None
-from PyQt6.QtGui import QCursor, QIcon
+try:
+    from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+except ImportError:
+    # Debian splits some Qt modules out; without this one the app still runs,
+    # it just cannot hand a location to an already-running window.
+    QLocalServer = None
+    QLocalSocket = None
+try:
+    import keyring
+except Exception:
+    # Any failure here — not installed, or installed but unable to find a
+    # backend — means the same thing to us: the OS store is not usable.
+    keyring = None
+from PyQt6.QtGui import QCursor, QIcon, QTransform
 from PyQt6.QtWidgets import QApplication, QProgressDialog
 
 PROFILE_BUNDLE_VERSION = 1
 PROFILE_BUNDLE_ITERATIONS = 480000
+
+# Where an expiry hides in ~/.aws/credentials. There is no standard key: the
+# CLI's own SSO cache uses none of these, while aws-vault, awsume, saml2aws and
+# gimme-aws-creds each picked a different one.
+AWS_EXPIRY_KEYS = (
+    "aws_session_expiration",
+    "x_security_token_expires",
+    "aws_credential_expiration",
+    "aws_expiration",
+    "expiration",
+)
+
+# Credentials with less than this left are reported as expiring soon, which is
+# roughly the window in which starting a long transfer is a bad idea.
+EXPIRY_WARN_SECONDS = 15 * 60
+
+
+class CredentialProcessError(Exception):
+    """Raised when a profile's credential_process cannot produce keys."""
 
 
 class BundleError(Exception):
@@ -179,6 +216,237 @@ def import_profile_bundle(blob, passphrase: str) -> list:
     return profiles
 
 
+# Where the credential key lives. "local" is the historical behaviour and
+# stays the default: the key sits in the same QSettings file as the ciphertext,
+# which protects against a casual reader and nothing else.
+CREDENTIAL_STORE_LOCAL = "local"
+CREDENTIAL_STORE_KEYRING = "keyring"
+CREDENTIAL_STORE_PASSPHRASE = "passphrase"
+CREDENTIAL_STORES = (
+    CREDENTIAL_STORE_LOCAL,
+    CREDENTIAL_STORE_KEYRING,
+    CREDENTIAL_STORE_PASSPHRASE,
+)
+
+KEYRING_SERVICE = "s3duck"
+KEYRING_ENTRY = "credential-key"
+
+# The unlocked key for this process. The launcher unlocks once; the profile
+# switcher and the main window read it from here rather than prompting again.
+_SESSION_KEY = {"value": ""}
+
+
+def session_key() -> str:
+    return _SESSION_KEY["value"]
+
+
+def set_session_key(value):
+    _SESSION_KEY["value"] = str(value or "")
+
+
+def keyring_available() -> bool:
+    """Whether an OS secret store is present AND actually usable."""
+    if keyring is None:
+        return False
+    try:
+        backend = keyring.get_keyring()
+    except Exception:
+        return False
+    # keyring always returns *a* backend; the fail/null ones raise on write,
+    # which would lose the key rather than store it.
+    name = type(backend).__name__.lower()
+    return "fail" not in name and "null" not in name
+
+
+def wrap_key(key: str, passphrase: str) -> str:
+    """Seal the credential key under a passphrase, as a storable string."""
+    if not passphrase:
+        raise CredentialError("A passphrase is required.")
+    salt = secrets.token_bytes(16)
+    token = Fernet(_bundle_key(passphrase, salt)).encrypt(
+        str(key or "").encode())
+    return json.dumps({
+        "salt": base64.b64encode(salt).decode(),
+        "data": token.decode(),
+    })
+
+
+def unwrap_key(blob, passphrase: str) -> str:
+    """Reverse wrap_key. Raises CredentialError on a wrong passphrase."""
+    try:
+        document = json.loads(
+            blob.decode() if isinstance(blob, (bytes, bytearray)) else str(blob))
+        salt = base64.b64decode(document["salt"])
+        data = document["data"].encode()
+    except Exception as exc:
+        raise CredentialError(
+            "The passphrase-protected key is corrupt.") from exc
+    try:
+        return Fernet(_bundle_key(passphrase, salt)).decrypt(data).decode()
+    except InvalidToken as exc:
+        raise CredentialError("Wrong passphrase.") from exc
+    except Exception as exc:
+        raise CredentialError(f"Could not unlock the key: {exc}") from exc
+
+
+class CredentialStore:
+    """
+    Where the Fernet key protecting stored credentials is kept.
+
+    The default keeps it beside the ciphertext, which is obfuscation rather
+    than encryption; the other two modes hand it to the OS secret store or
+    seal it under a passphrase the user types once per launch. Switching modes
+    re-homes the same key, so the stored profiles stay readable.
+    """
+
+    def __init__(self, settings, ask_passphrase=None):
+        self.settings = settings
+        # Called as ask_passphrase(prompt) -> str or None. Supplied by the UI
+        # so this class never depends on a particular dialog.
+        self.ask_passphrase = ask_passphrase
+
+    def _get(self, name, default=""):
+        self.settings.beginGroup("common")
+        value = self.settings.value(name, default)
+        self.settings.endGroup()
+        return value
+
+    def _set(self, name, value):
+        self.settings.beginGroup("common")
+        if value is None:
+            self.settings.remove(name)
+        else:
+            self.settings.setValue(name, value)
+        self.settings.endGroup()
+
+    def mode(self) -> str:
+        stored = str(self._get("credential_store", CREDENTIAL_STORE_LOCAL) or "")
+        return stored if stored in CREDENTIAL_STORES else CREDENTIAL_STORE_LOCAL
+
+    def describe(self) -> str:
+        return {
+            CREDENTIAL_STORE_LOCAL:
+                "In the settings file, next to the credentials",
+            CREDENTIAL_STORE_KEYRING:
+                "In the operating system's secret store",
+            CREDENTIAL_STORE_PASSPHRASE:
+                "Sealed under a passphrase, entered once per launch",
+        }[self.mode()]
+
+    def load_key(self, passphrase=None) -> str:
+        """
+        The credential key, unlocking it if the mode requires that.
+
+        Returns "" when there is nothing stored yet (a first run), and raises
+        CredentialError when there is something stored that cannot be read.
+        """
+        cached = session_key()
+        if cached:
+            return cached
+        mode = self.mode()
+        if mode == CREDENTIAL_STORE_KEYRING:
+            if keyring is None:
+                raise CredentialError(
+                    "This installation is set to keep the credential key in "
+                    "the OS secret store, but the 'keyring' package is not "
+                    "installed.")
+            try:
+                key = keyring.get_password(KEYRING_SERVICE, KEYRING_ENTRY) or ""
+            except Exception as exc:
+                raise CredentialError(
+                    f"The OS secret store could not be read: {exc}") from exc
+        elif mode == CREDENTIAL_STORE_PASSPHRASE:
+            blob = self._get("key_wrapped", "")
+            if not blob:
+                return ""
+            if passphrase is None and self.ask_passphrase is not None:
+                passphrase = self.ask_passphrase(
+                    "Passphrase for the stored credentials:")
+            if not passphrase:
+                raise CredentialError("No passphrase was entered.")
+            key = unwrap_key(blob, passphrase)
+        else:
+            key = str(self._get("key", "") or "")
+        # Only the modes that cannot be re-read for free are cached: the local
+        # key is in the settings file, and caching it process-wide would let
+        # one settings scope answer for another.
+        if key and mode != CREDENTIAL_STORE_LOCAL:
+            set_session_key(key)
+        return key
+
+    def ensure_key(self) -> str:
+        """The credential key, creating one on a first run."""
+        key = self.load_key()
+        if key:
+            return key
+        key = Crypto.generate_key()
+        mode = self.mode()
+        self._store_key(key, mode)
+        if mode != CREDENTIAL_STORE_LOCAL:
+            set_session_key(key)
+        return key
+
+    def _store_key(self, key, mode, passphrase=None):
+        if mode == CREDENTIAL_STORE_KEYRING:
+            if not keyring_available():
+                raise CredentialError(
+                    "No usable OS secret store was found.")
+            keyring.set_password(KEYRING_SERVICE, KEYRING_ENTRY, key)
+        elif mode == CREDENTIAL_STORE_PASSPHRASE:
+            if not passphrase:
+                raise CredentialError("A passphrase is required.")
+            self._set("key_wrapped", wrap_key(key, passphrase))
+        else:
+            self._set("key", key)
+
+    def _clear_key(self, mode):
+        if mode == CREDENTIAL_STORE_KEYRING:
+            if keyring is not None:
+                try:
+                    keyring.delete_password(KEYRING_SERVICE, KEYRING_ENTRY)
+                except Exception:
+                    # Nothing stored, or a store that refuses deletes. The key
+                    # is already somewhere else by now, so this is cosmetic.
+                    pass
+        elif mode == CREDENTIAL_STORE_PASSPHRASE:
+            self._set("key_wrapped", None)
+        else:
+            self._set("key", None)
+
+    def set_mode(self, mode, passphrase=None):
+        """
+        Move the existing key to another home.
+
+        The new home is written before the old one is cleared: a failure
+        halfway through must never leave the key nowhere.
+        """
+        if mode not in CREDENTIAL_STORES:
+            raise CredentialError(f"Unknown credential store: {mode}")
+        previous = self.mode()
+        key = self.load_key() or Crypto.generate_key()
+        self._store_key(key, mode, passphrase=passphrase)
+        self._set("credential_store", mode)
+        if previous != mode:
+            self._clear_key(previous)
+        set_session_key("" if mode == CREDENTIAL_STORE_LOCAL else key)
+        return mode
+
+
+def resolve_credential_key(settings) -> str:
+    """
+    The credential key for this process.
+
+    The settings file wins when it holds one, so a component reading a
+    different settings scope is never handed another one's key; the unlocked
+    session key is the fallback, which is what the keyring and passphrase
+    modes leave behind (they store nothing in the settings file at all).
+    """
+    settings.beginGroup("common")
+    key = settings.value("key", "")
+    settings.endGroup()
+    return str(key or "") or session_key()
+
+
 # Preset accents offered per profile. Named rather than free-form so the
 # colours stay distinguishable and consistent between the launcher and the
 # main window.
@@ -278,6 +546,235 @@ def themed_icon(name, fallback_path="", probe_size: int = ICON_PROBE_SIZE):
         icon = bundled_icon(fallback_path, probe_size)
     _icon_cache[key] = icon
     return icon
+
+
+# Failures that are the service asking for patience rather than saying no.
+TRANSIENT_ERROR_CODES = frozenset({
+    "InternalError", "InternalServerError", "ServiceUnavailable", "SlowDown",
+    "RequestTimeout", "RequestTimeoutException", "RequestTimeTooSkewed",
+    "ThrottlingException", "Throttling", "TooManyRequests",
+    "OperationAborted", "PriorRequestNotComplete", "BandwidthLimitExceeded",
+    "503 SlowDown",
+})
+TRANSIENT_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+def is_transient_error(exc) -> bool:
+    """
+    Whether a failure is worth retrying on its own.
+
+    botocore already retries inside one request; this is about the job above
+    it, which it gave up on. Only the service's own "try again" answers count
+    — an AccessDenied retried on a timer is just a slower AccessDenied.
+    """
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        code = str((response.get("Error") or {}).get("Code") or "")
+        if code in TRANSIENT_ERROR_CODES:
+            return True
+        status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+        try:
+            if int(status) in TRANSIENT_HTTP_STATUS:
+                return True
+        except (TypeError, ValueError):
+            pass
+        return False
+    # Connection-level failures never reached the service at all.
+    name = type(exc).__name__
+    return name in ("EndpointConnectionError", "ConnectionClosedError",
+                    "ConnectTimeoutError", "ReadTimeoutError",
+                    "IncompleteReadError", "ConnectionError")
+
+
+def describe_client_error(exc) -> str:
+    """
+    Everything a provider's support desk asks for about one failure.
+
+    botocore carries the request id, the extended (host) id and the HTTP
+    status in the exception's response, and none of it survives ``str(exc)``
+    — which is all the log used to keep, so a report of "it failed" could
+    never be traced to a request.
+    """
+    lines = [f"Error: {exc}", f"Type: {type(exc).__name__}"]
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error = response.get("Error") or {}
+        metadata = response.get("ResponseMetadata") or {}
+        for label, value in (
+            ("Code", error.get("Code")),
+            ("Message", error.get("Message")),
+            ("HTTP status", metadata.get("HTTPStatusCode")),
+            ("Request id", metadata.get("RequestId")),
+            ("Host id", metadata.get("HostId")),
+            ("Retries", (metadata.get("RetryAttempts")
+                         if metadata.get("RetryAttempts") else None)),
+        ):
+            if value not in (None, ""):
+                lines.append(f"{label}: {value}")
+        headers = metadata.get("HTTPHeaders") or {}
+        for header in ("x-amz-request-id", "x-amz-id-2", "x-amz-bucket-region"):
+            if headers.get(header):
+                lines.append(f"{header}: {headers[header]}")
+    operation = getattr(exc, "operation_name", "")
+    if operation:
+        lines.insert(1, f"Operation: {operation}")
+    return "\n".join(lines)
+
+
+def mirrored_icon(icon, probe_size: int = ICON_PROBE_SIZE):
+    """
+    A horizontally flipped copy of an icon.
+
+    Forward is Back pointing the other way, and mirroring the bundled arrow
+    keeps the pair consistent without a second asset — which also means no
+    second PNG twin to keep in step for the no-SVG builds.
+    """
+    if icon is None:
+        return QIcon()
+    pixmap = icon.pixmap(probe_size, probe_size)
+    if pixmap.isNull():
+        return icon
+    return QIcon(pixmap.transformed(QTransform().scale(-1, 1)))
+
+
+def forward_icon(back, probe_size: int = ICON_PROBE_SIZE):
+    """The theme's "go-next" when it paints something, else a mirrored Back."""
+    themed = QIcon.fromTheme("go-next")
+    if icon_is_visible(themed, probe_size):
+        return themed
+    return mirrored_icon(back, probe_size)
+
+
+# One socket per user, so two logins on one machine do not talk to each other.
+INSTANCE_SOCKET = "s3duck-ipc"
+
+
+def instance_socket_name(base=INSTANCE_SOCKET) -> str:
+    try:
+        return f"{base}-{os.getuid()}"
+    except AttributeError:      # Windows
+        return f"{base}-{os.environ.get('USERNAME', 'user')}"
+
+
+def send_to_running_instance(payload, name="", timeout_ms=400) -> bool:
+    """
+    Hand a location to an already-running window; True when it took it.
+
+    Only used when the command line names a location — a bare launch still
+    opens its own window, because two profiles side by side is a thing people
+    legitimately want.
+    """
+    if QLocalSocket is None:
+        return False
+    socket = QLocalSocket()
+    socket.connectToServer(name or instance_socket_name())
+    if not socket.waitForConnected(timeout_ms):
+        return False
+    socket.write(str(payload or "").encode("utf-8"))
+    socket.flush()
+    socket.waitForBytesWritten(timeout_ms)
+    socket.disconnectFromServer()
+    return True
+
+
+class InstanceServer(QObject):
+    """Listens for locations handed over by a second launch."""
+
+    received = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._server = None
+
+    def start(self, name="") -> bool:
+        if QLocalServer is None:
+            return False
+        name = name or instance_socket_name()
+        self._server = QLocalServer(self)
+        # A crash leaves the socket file behind; without this the second run
+        # can never listen again.
+        QLocalServer.removeServer(name)
+        if not self._server.listen(name):
+            self._server = None
+            return False
+        self._server.newConnection.connect(self._on_connection)
+        return True
+
+    def _on_connection(self):
+        socket = self._server.nextPendingConnection()
+        if socket is None:
+            return
+        if socket.waitForReadyRead(400):
+            payload = bytes(socket.readAll()).decode("utf-8", "replace")
+            if payload.strip():
+                self.received.emit(payload.strip())
+        socket.disconnectFromServer()
+
+    def stop(self):
+        if self._server is not None:
+            self._server.close()
+            self._server = None
+
+
+class LogFile:
+    """
+    A single rotating log file for the session log.
+
+    The log view is capped at a few thousand lines and dies with the window,
+    which is fine until someone needs to say what happened an hour ago. Every
+    write is best-effort: a full disk must not take the app down with it.
+    """
+
+    MAX_BYTES = 2 * 1024 * 1024
+
+    def __init__(self, path="", max_bytes=MAX_BYTES):
+        self.path = str(path or "")
+        self.max_bytes = int(max_bytes)
+        self.enabled = bool(self.path)
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def default_path() -> str:
+        return os.path.join(
+            os.path.expanduser("~"), ".config", "s3duck", "s3duck.log")
+
+    def write(self, line):
+        if not self.enabled or not self.path:
+            return False
+        try:
+            with self._lock:
+                self._rotate_if_needed()
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                with open(self.path, "a", encoding="utf-8") as handle:
+                    handle.write(str(line).rstrip("\n") + "\n")
+            return True
+        except OSError:
+            # One failed write disables the file rather than repeating the
+            # error for every subsequent line.
+            self.enabled = False
+            return False
+
+    def _rotate_if_needed(self):
+        try:
+            if os.path.getsize(self.path) < self.max_bytes:
+                return
+        except OSError:
+            return
+        backup = self.path + ".1"
+        try:
+            if os.path.exists(backup):
+                os.remove(backup)
+            os.replace(self.path, backup)
+        except OSError:
+            pass
+
+    def tail(self, lines=200) -> str:
+        """The last *lines* of the log, or "" when there is no file."""
+        try:
+            with open(self.path, encoding="utf-8", errors="replace") as handle:
+                return "".join(handle.readlines()[-int(lines):])
+        except OSError:
+            return ""
 
 
 TEMP_PREFIX = "s3duck_"
@@ -579,15 +1076,144 @@ def scan_local_tree(root) -> dict:
     return out
 
 
+def parse_expiry(value) -> float:
+    """
+    Read a credential expiry into epoch seconds; 0 when there is not one.
+
+    Accepts what the various credential helpers actually write: RFC 3339 with
+    a ``Z`` or an offset, a naive local timestamp, or a bare epoch. Anything
+    unparseable is treated as absent — a profile must not become unusable
+    because a helper invented a new format.
+    """
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value) if value > 0 else 0.0
+    text = str(value).strip()
+    if not text:
+        return 0.0
+    try:
+        number = float(text)
+    except ValueError:
+        pass
+    else:
+        return number if number > 0 else 0.0
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return float(parsed.timestamp())
+
+
+def format_duration(seconds) -> str:
+    """A short human span: 2d, 3h 20m, 14m, 45s."""
+    total = int(max(0, seconds))
+    if total >= 86400:
+        days, rest = divmod(total, 86400)
+        hours = rest // 3600
+        return f"{days}d {hours}h" if hours else f"{days}d"
+    if total >= 3600:
+        hours, rest = divmod(total, 3600)
+        minutes = rest // 60
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    if total >= 60:
+        return f"{total // 60}m"
+    return f"{total}s"
+
+
+def expiry_state(expires_at, now=None, warn_within=EXPIRY_WARN_SECONDS) -> tuple:
+    """
+    Classify a credential expiry as ``(state, label)``.
+
+    States are "none" (nothing to say), "ok", "soon" and "expired". The label
+    is what a badge or a status line shows; it is empty for "none" so a caller
+    can render it unconditionally.
+    """
+    moment = parse_expiry(expires_at)
+    if moment <= 0:
+        return "none", ""
+    remaining = moment - (time.time() if now is None else float(now))
+    if remaining <= 0:
+        return "expired", "expired"
+    if remaining <= float(warn_within):
+        return "soon", f"expires in {format_duration(remaining)}"
+    return "ok", f"expires in {format_duration(remaining)}"
+
+
+def run_credential_process(command, timeout=60) -> dict:
+    """
+    Mint credentials by running the profile's ``credential_process``.
+
+    This is the AWS SDKs' own refresh mechanism, which is the only practical
+    way to keep an SSO or assume-role session alive: the command prints a JSON
+    document with AccessKeyId / SecretAccessKey / SessionToken / Expiration.
+
+    The command is split with shlex and run WITHOUT a shell, so a stored
+    profile cannot smuggle in a pipeline or a redirect.
+    """
+    text = str(command or "").strip()
+    if not text:
+        raise CredentialProcessError("No credential process is configured.")
+    try:
+        argv = shlex.split(text)
+    except ValueError as exc:
+        raise CredentialProcessError(f"Unparseable command: {exc}") from exc
+    if not argv:
+        raise CredentialProcessError("No credential process is configured.")
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, timeout=timeout, check=False)
+    except FileNotFoundError as exc:
+        raise CredentialProcessError(f"{argv[0]}: not found") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise CredentialProcessError(
+            f"{argv[0]}: timed out after {timeout}s") from exc
+    except OSError as exc:
+        raise CredentialProcessError(f"{argv[0]}: {exc}") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or b"").decode(
+            "utf-8", "replace").strip().splitlines()
+        raise CredentialProcessError(
+            f"{argv[0]} exited {completed.returncode}"
+            + (f": {detail[-1]}" if detail else ""))
+    try:
+        payload = json.loads((completed.stdout or b"").decode("utf-8", "replace"))
+    except ValueError as exc:
+        raise CredentialProcessError(
+            f"{argv[0]} did not print JSON credentials") from exc
+    if not isinstance(payload, dict):
+        raise CredentialProcessError(
+            f"{argv[0]} did not print a JSON object")
+    access = str(payload.get("AccessKeyId") or "").strip()
+    secret = str(payload.get("SecretAccessKey") or "").strip()
+    if not access or not secret:
+        raise CredentialProcessError(
+            f"{argv[0]} printed no AccessKeyId/SecretAccessKey")
+    return {
+        "access_key": access,
+        "secret_key": secret,
+        "session_token": str(payload.get("SessionToken") or "").strip(),
+        "expires": str(payload.get("Expiration") or "").strip(),
+    }
+
+
 def load_aws_profiles(credentials_path=None, config_path=None) -> dict:
     """
     Parse the AWS shared credentials/config files into
-    ``{profile_name: {access_key, secret_key, session_token, region, endpoint_url}}``.
+    ``{profile_name: {access_key, secret_key, session_token, region,
+    endpoint_url, expires, credential_process}}``.
 
     Both files are optional and parse errors are swallowed — this only ever
     pre-fills a form. ``~/.aws/config`` names profiles ``[profile foo]`` (except
     ``[default]``), and supplies region/endpoint for a credentials-file profile
     of the same name.
+
+    A profile whose credentials come from a ``credential_process`` has no keys
+    in the file at all, so it is kept even with an empty access key: the
+    command is what makes it usable.
     """
     home = os.path.expanduser("~")
     credentials_path = credentials_path or os.path.join(home, ".aws", "credentials")
@@ -601,13 +1227,22 @@ def load_aws_profiles(credentials_path=None, config_path=None) -> dict:
             return configparser.RawConfigParser()
         return parser
 
+    def _expiry_of(parser, section):
+        for key in AWS_EXPIRY_KEYS:
+            value = (parser.get(section, key, fallback="") or "").strip()
+            if value:
+                return value
+        return ""
+
     profiles = {}
 
     creds = _read(credentials_path)
     for section in creds.sections():
         access = creds.get(section, "aws_access_key_id", fallback="") or ""
         secret = creds.get(section, "aws_secret_access_key", fallback="") or ""
-        if not access and not secret:
+        process = (
+            creds.get(section, "credential_process", fallback="") or "").strip()
+        if not access and not secret and not process:
             continue
         profiles[section] = {
             "access_key": access.strip(),
@@ -619,6 +1254,8 @@ def load_aws_profiles(credentials_path=None, config_path=None) -> dict:
             "endpoint_url": (
                 creds.get(section, "endpoint_url", fallback="") or ""
             ).strip(),
+            "expires": _expiry_of(creds, section),
+            "credential_process": process,
         }
 
     cfg = _read(config_path)
@@ -626,15 +1263,21 @@ def load_aws_profiles(credentials_path=None, config_path=None) -> dict:
         name = section[len("profile "):] if section.startswith("profile ") else section
         entry = profiles.setdefault(name, {
             "access_key": "", "secret_key": "", "session_token": "",
-            "region": "", "endpoint_url": "",
+            "region": "", "endpoint_url": "", "expires": "",
+            "credential_process": "",
         })
-        for key, field in (("region", "region"), ("endpoint_url", "endpoint_url")):
+        for key, field in (("region", "region"),
+                           ("endpoint_url", "endpoint_url"),
+                           ("credential_process", "credential_process")):
             value = (cfg.get(section, key, fallback="") or "").strip()
             if value and not entry.get(field):
                 entry[field] = value
+        if not entry.get("expires"):
+            entry["expires"] = _expiry_of(cfg, section)
 
-    # Drop config-only profiles that carry no usable credentials.
-    return {n: v for n, v in profiles.items() if v.get("access_key")}
+    # Drop config-only profiles that can produce neither keys nor a command.
+    return {n: v for n, v in profiles.items()
+            if v.get("access_key") or v.get("credential_process")}
 
 
 def center_on_screen(widget):

@@ -3,10 +3,12 @@ from datetime import timezone
 from enum import Enum
 from typing import NamedTuple
 import base64
+import fnmatch
 import hashlib
 import struct
 import zlib
 import json
+import mimetypes
 import platform
 import re
 import time
@@ -15,7 +17,7 @@ import os
 import boto3
 import botocore
 import threading
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from boto3.s3.transfer import TransferConfig
 
@@ -93,6 +95,53 @@ def as_epoch(value) -> float:
 # deliberately absent: it needs a third-party module, and an algorithm we
 # cannot verify would pass every download unchecked.
 CHECKSUM_ALGORITHMS = ("CRC32", "SHA1", "SHA256")
+
+# What an object gets when nothing better is known. S3's own default for a
+# body uploaded without a Content-Type.
+FALLBACK_CONTENT_TYPE = "binary/octet-stream"
+
+# Extensions the stdlib table either misses entirely or answers differently
+# depending on the platform's /etc/mime.types. Applied before mimetypes so the
+# result does not depend on the machine doing the upload.
+BUILTIN_CONTENT_TYPES = {
+    "md": "text/markdown",
+    "markdown": "text/markdown",
+    "yml": "application/yaml",
+    "yaml": "application/yaml",
+    "toml": "application/toml",
+    "wasm": "application/wasm",
+    "webmanifest": "application/manifest+json",
+    "avif": "image/avif",
+    "webp": "image/webp",
+    "heic": "image/heic",
+    "jxl": "image/jxl",
+    "opus": "audio/opus",
+    "flac": "audio/flac",
+    "mkv": "video/x-matroska",
+    # .ts is deliberately absent: an HLS segment and a TypeScript source
+    # share it, and guessing wrong breaks video playback. The stdlib answer
+    # (video/mp2t) stands unless the user overrides it.
+    "tsx": "application/typescript",
+    "jsx": "text/javascript",
+    "mjs": "text/javascript",
+    "cjs": "text/javascript",
+    "map": "application/json",
+    "lock": "text/plain",
+    "log": "text/plain",
+    "env": "text/plain",
+    "sql": "application/sql",
+    "epub": "application/epub+zip",
+    "zst": "application/zstd",
+    "7z": "application/x-7z-compressed",
+    "apk": "application/vnd.android.package-archive",
+    "deb": "application/vnd.debian.binary-package",
+    "rpm": "application/x-rpm",
+    "dmg": "application/x-apple-diskimage",
+    "iso": "application/x-iso9660-image",
+    "parquet": "application/vnd.apache.parquet",
+    "ndjson": "application/x-ndjson",
+    "jsonl": "application/x-ndjson",
+}
 
 
 def prefix_of(key) -> str:
@@ -256,6 +305,19 @@ class Model:
 
     # Multipart tuning. Non-AWS backends often want a different part size, and
     # the part size also decides how a resumable upload is chunked.
+    # S3 operations that accept RequestPayer. Bucket-level calls (ListBuckets,
+    # GetBucketVersioning, …) do not, and sending it there is a hard
+    # ParamValidationError rather than something the service ignores.
+    REQUESTER_PAYS_OPERATIONS = (
+        "GetObject", "HeadObject", "PutObject", "DeleteObject",
+        "DeleteObjects", "CopyObject", "ListObjects", "ListObjectsV2",
+        "ListObjectVersions", "ListMultipartUploads", "ListParts",
+        "CreateMultipartUpload", "UploadPart", "UploadPartCopy",
+        "CompleteMultipartUpload", "AbortMultipartUpload", "RestoreObject",
+        "GetObjectTagging", "PutObjectTagging", "DeleteObjectTagging",
+        "GetObjectAcl", "PutObjectAcl", "GetObjectAttributes",
+    )
+
     DEFAULT_MULTIPART_THRESHOLD_MB = 16
     DEFAULT_MULTIPART_CHUNKSIZE_MB = 8
     MIN_MULTIPART_CHUNKSIZE_MB = 5      # S3's own floor for a non-final part
@@ -278,6 +340,10 @@ class Model:
         session_token=None,
         parallel_files=None,
         read_only=False,
+        requester_pays=False,
+        public_base_url="",
+        proxy_url="",
+        ca_bundle="",
     ):
         self.session = boto3.session.Session()
         self._client = None
@@ -320,11 +386,40 @@ class Model:
         # Extra args applied to every upload (storage class, encryption).
         self.upload_extra_args = {}
 
+        # boto3 never guesses a content type, so without this every uploaded
+        # object is stored as binary/octet-stream and a browser opening its
+        # public URL downloads it instead of rendering it.
+        self.detect_content_type = True
+        # extension (no dot, lower-case) -> content type; beats the tables.
+        self.content_type_overrides = {}
+
+        # Per-destination upload rules: [{pattern, storage_class, tags}].
+        # "Anything under archive/ goes to Glacier" is a policy, and applying
+        # it by hand on every upload is how it stops being one.
+        self.upload_rules = []
+
         # Writes are refused entirely when the profile is read-only.
         self.read_only = bool(read_only)
 
+        # Requester-pays buckets refuse every read that does not opt in to
+        # being billed for it, so without this such a bucket is unusable.
+        self.requester_pays = bool(requester_pays)
+
+        # A CDN or custom domain in front of this bucket. Public and presigned
+        # links are shown against it instead of the raw endpoint.
+        self.public_base_url = str(public_base_url or "").rstrip("/")
+
+        # An outbound HTTP proxy, and a CA bundle to trust. The bundle is the
+        # right answer to a corporate MITM certificate or a self-signed MinIO
+        # one; no_ssl_check turns verification off entirely and is not.
+        self.proxy_url = str(proxy_url or "").strip()
+        self.ca_bundle = str(ca_bundle or "").strip()
+
         # Shared across all transfers so the cap is a total, not per file.
         self.rate_limiter = None
+
+        # Set by list() when a cap stopped the walk before the end.
+        self.last_listing_truncated = False
 
         # Compare the downloaded bytes against the object's ETag afterwards.
         self.verify_downloads = False
@@ -480,6 +575,178 @@ class Model:
         self.upload_extra_args = args
         return args
 
+    def set_content_type_options(self, detect=None, overrides=None):
+        """
+        Configure the per-file Content-Type sent with every upload.
+
+        ``overrides`` maps a bare extension to a type and wins over both the
+        built-in table and the platform's mimetypes database.
+        """
+        if detect is not None:
+            self.detect_content_type = bool(detect)
+        if overrides is not None:
+            self.content_type_overrides = {
+                str(ext).strip().lstrip("*").lstrip(".").lower():
+                    str(value).strip()
+                for ext, value in dict(overrides).items()
+                if str(ext).strip().lstrip("*").lstrip(".") and str(value).strip()
+            }
+        return self.content_type_overrides
+
+    @staticmethod
+    def parse_content_type_overrides(text) -> dict:
+        """
+        Read the user's ``ext = type`` lines into a mapping.
+
+        Unparseable lines are dropped rather than raising: this is edited in a
+        free-text box, and a half-typed line must not cost the whole table.
+        """
+        overrides = {}
+        for line in str(text or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            separator = "=" if "=" in line else (":" if ":" in line else "")
+            if not separator:
+                continue
+            ext, _, value = line.partition(separator)
+            ext = ext.strip().lstrip("*").lstrip(".").lower()
+            value = value.strip()
+            if ext and value:
+                overrides[ext] = value
+        return overrides
+
+    @staticmethod
+    def format_content_type_overrides(overrides) -> str:
+        return "\n".join(
+            f"{ext} = {value}"
+            for ext, value in sorted(dict(overrides or {}).items()))
+
+    def guess_content_type(self, name) -> str:
+        """
+        The Content-Type for a local path or key, or "" when nothing is known.
+
+        Empty rather than a fallback on purpose: the caller must be able to
+        tell "no idea" from "deliberately binary/octet-stream".
+        """
+        base = os.path.basename(str(name or ""))
+        if "." not in base:
+            return ""
+        ext = base.rsplit(".", 1)[-1].lower()
+        if ext in self.content_type_overrides:
+            return self.content_type_overrides[ext]
+        if ext in BUILTIN_CONTENT_TYPES:
+            return BUILTIN_CONTENT_TYPES[ext]
+        guessed, encoding = mimetypes.guess_type(base)
+        # A .tar.gz is not "a gzip": the transfer encoding would make the
+        # object undownloadable in a browser that silently decompresses it.
+        if encoding:
+            return ""
+        return guessed or ""
+
+    def set_upload_rules(self, rules):
+        """Replace the per-destination upload rules."""
+        cleaned = []
+        for rule in list(rules or []):
+            pattern = str(rule.get("pattern") or "").strip()
+            if not pattern:
+                continue
+            cleaned.append({
+                "pattern": pattern,
+                "storage_class": str(rule.get("storage_class") or "").strip(),
+                "tags": {str(k): str(v)
+                         for k, v in dict(rule.get("tags") or {}).items()},
+            })
+        self.upload_rules = cleaned
+        return cleaned
+
+    @staticmethod
+    def parse_upload_rules(text) -> list:
+        """
+        Read ``glob -> class=X, tag:k=v`` lines into rules.
+
+        Unparseable lines are dropped rather than raising: this is edited in a
+        free-text box, and a half-typed rule must not cost the whole table.
+        """
+        rules = []
+        for line in str(text or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "->" not in line:
+                continue
+            pattern, _, rest = line.partition("->")
+            pattern = pattern.strip()
+            if not pattern:
+                continue
+            rule = {"pattern": pattern, "storage_class": "", "tags": {}}
+            for part in rest.split(","):
+                name, _, value = part.strip().partition("=")
+                name = name.strip().lower()
+                value = value.strip()
+                if not value:
+                    continue
+                if name == "class":
+                    rule["storage_class"] = value.upper()
+                elif name.startswith("tag:"):
+                    tag = name[4:].strip()
+                    if tag:
+                        rule["tags"][tag] = value
+            if rule["storage_class"] or rule["tags"]:
+                rules.append(rule)
+        return rules
+
+    @staticmethod
+    def format_upload_rules(rules) -> str:
+        lines = []
+        for rule in list(rules or []):
+            parts = []
+            if rule.get("storage_class"):
+                parts.append(f"class={rule['storage_class']}")
+            for key, value in sorted(dict(rule.get("tags") or {}).items()):
+                parts.append(f"tag:{key}={value}")
+            if parts:
+                lines.append(f"{rule.get('pattern', '')} -> "
+                             + ", ".join(parts))
+        return "\n".join(lines)
+
+    def rule_for_key(self, key):
+        """
+        The first upload rule whose glob matches this destination key.
+
+        First match wins rather than merging: a table where two rules
+        half-apply is one nobody can predict.
+        """
+        target = str(key or "").lstrip("/")
+        if not target:
+            return None
+        for rule in self.upload_rules:
+            pattern = rule.get("pattern") or ""
+            if fnmatch.fnmatchcase(target, pattern):
+                return rule
+            # A bare prefix is the obvious way to write "everything under
+            # here", so accept it without demanding a trailing glob.
+            if pattern.endswith("/") and target.startswith(pattern):
+                return rule
+        return None
+
+    def upload_args_for(self, local_file, key="") -> dict:
+        """
+        The ExtraArgs for one upload: the shared options, this file's type,
+        and whatever an upload rule says about its destination.
+        """
+        args = dict(self.upload_extra_args)
+        if self.detect_content_type and local_file and "ContentType" not in args:
+            content_type = self.guess_content_type(local_file)
+            if content_type:
+                args["ContentType"] = content_type
+        rule = self.rule_for_key(key)
+        if rule:
+            if rule.get("storage_class"):
+                args["StorageClass"] = rule["storage_class"]
+            if rule.get("tags"):
+                # S3 wants the tag set as a url-encoded query string here.
+                args["Tagging"] = urlencode(sorted(rule["tags"].items()))
+        return args
+
     def clone_for_worker(self):
         """
         Build a lightweight copy of this model that owns its own boto3 session
@@ -504,6 +771,10 @@ class Model:
         m.secret_key = self.secret_key
         m.session_token = self.session_token
         m.read_only = self.read_only
+        m.requester_pays = self.requester_pays
+        m.public_base_url = self.public_base_url
+        m.proxy_url = self.proxy_url
+        m.ca_bundle = self.ca_bundle
         m.parallel_files = self.parallel_files
         m.rate_limiter = self.rate_limiter
         m.verify_downloads = self.verify_downloads
@@ -520,7 +791,11 @@ class Model:
         # Shared by reference on purpose: a binding a worker discovers is worth
         # keeping for the whole app.
         m.binding_cache = self.binding_cache
+        m.last_listing_truncated = False
         m.upload_extra_args = dict(self.upload_extra_args)
+        m.detect_content_type = self.detect_content_type
+        m.content_type_overrides = dict(self.content_type_overrides)
+        m.upload_rules = [dict(rule) for rule in self.upload_rules]
         m.no_ssl_check = self.no_ssl_check
         m.use_path = self.use_path
         m.timeout = self.timeout
@@ -530,6 +805,34 @@ class Model:
         m.transfer_cfg_download = self.transfer_cfg_download
         m.transfer_cfg_upload = self.transfer_cfg_upload
         return m
+
+    def proxy_settings(self) -> dict:
+        """
+        The profile's proxy as botocore expects it, or {} when unset.
+
+        One URL covers both schemes: a proxy configured for an S3 endpoint is
+        the way out of the network, not a per-scheme choice.
+        """
+        url = str(self.proxy_url or "").strip()
+        if not url:
+            return {}
+        if "://" not in url:
+            url = "http://" + url
+        return {"http": url, "https": url}
+
+    def check_tls_settings(self) -> str:
+        """
+        A human-readable problem with the TLS settings, or "".
+
+        A CA bundle that is not there produces an SSLError deep inside the
+        first request, which reads like the server is broken.
+        """
+        if self.no_ssl_check and self.ca_bundle:
+            return ("Certificate verification is switched off, so the CA "
+                    "bundle is ignored.")
+        if self.ca_bundle and not os.path.isfile(self.ca_bundle):
+            return f"CA bundle not found: {self.ca_bundle}"
+        return ""
 
     @staticmethod
     def get_os_family():
@@ -566,21 +869,44 @@ class Model:
         )
         if self.no_ssl_check:
             params.update({"verify": False})
+        elif self.ca_bundle:
+            # A path, not a boolean: trusting one extra CA is not the same as
+            # trusting anything that answers.
+            params.update({"verify": self.ca_bundle})
 
-        params.update(
-            {
-                "config": botocore.config.Config(
-                    s3=s3_config,
-                    connect_timeout=self.timeout,
-                    read_timeout=self.read_timeout,
-                    retries={
-                        "max_attempts": self.retries,
-                        "mode": "standard",
-                    },
-                ),
-            }
-        )
-        return self.session.client("s3", **params)
+        config_args = {
+            "s3": s3_config,
+            "connect_timeout": self.timeout,
+            "read_timeout": self.read_timeout,
+            "retries": {"max_attempts": self.retries, "mode": "standard"},
+        }
+        proxies = self.proxy_settings()
+        if proxies:
+            config_args["proxies"] = proxies
+        params.update({"config": botocore.config.Config(**config_args)})
+        client = self.session.client("s3", **params)
+        if self.requester_pays:
+            self._register_requester_pays(client)
+        return client
+
+    def _register_requester_pays(self, client):
+        """
+        Add ``RequestPayer=requester`` to every call that accepts it.
+
+        Threading the argument through forty call sites would mean forgetting
+        one, and the symptom of forgetting is a bare AccessDenied on a bucket
+        that looked fine a moment ago. botocore's parameter hook covers the
+        managed transfer paths too, which never see our keyword arguments at
+        all.
+        """
+        def _add(params, **_kwargs):
+            if isinstance(params, dict):
+                params.setdefault("RequestPayer", "requester")
+
+        for operation in self.REQUESTER_PAYS_OPERATIONS:
+            client.meta.events.register(
+                f"provide-client-params.s3.{operation}", _add)
+        return client
 
     @property
     def client(self):
@@ -1145,16 +1471,22 @@ class Model:
 
         bucket_client.delete_bucket(Bucket=bucket_name)
 
-    def _list_bucket_once(self, client_obj, bucket_name, prefix):
+    def _list_bucket_once(self, client_obj, bucket_name, prefix,
+                          page_cb=None, max_items=0):
         """
         Try to list 'prefix' in 'bucket_name' using client_obj once.
 
-        Returns tuple: (ok, items, expecting_region, fatal_exc)
+        Returns tuple: (ok, items, expecting_region, fatal_exc, truncated)
 
         ok=True  -> listing succeeded
         items    -> list[Item] if ok
         expecting_region -> str or None; if not None, server hinted "use this region instead"
         fatal_exc -> Exception or None if this attempt should be considered a hard failure
+        truncated -> True when max_items stopped the walk early
+
+        ``page_cb(count)`` is called after every page so a caller can show
+        progress: a prefix with a hundred thousand direct children used to
+        take a long, completely silent minute.
         """
         paginator = client_obj.get_paginator("list_objects_v2")
         try:
@@ -1177,21 +1509,23 @@ class Model:
                     endq = rest.find("'")
                     if endq != -1:
                         expecting_region = rest[:endq].strip()
-                return False, [], expecting_region, None
+                return False, [], expecting_region, None, False
 
             # Access/NoSuchKey/etc: treat as **fatal** now (surface real boto3 message)
             if err_code in ("NoSuchKey", "AccessDenied", "AllAccessDisabled"):
-                return False, [], None, exc
+                return False, [], None, exc, False
 
             # other real failure
-            return False, [], None, exc
+            return False, [], None, exc, False
 
         except Exception as exc:
             # unknown non-ClientError; treat as fatal
-            return False, [], None, exc
+            return False, [], None, exc, False
 
         # We got a paginator successfully. Now accumulate.
         items = []
+        truncated = False
+        limit = int(max_items or 0)
         try:
             for page in pages:
                 folders = [fld2["Prefix"] for fld2 in page.get("CommonPrefixes", [])]
@@ -1220,17 +1554,26 @@ class Model:
                             etag=(obj.get("ETag") or "").replace('"', ""),
                         )
                     )
+
+                if page_cb is not None:
+                    page_cb(len(items))
+                if limit and len(items) >= limit:
+                    # Stop rather than build a model the view cannot render;
+                    # the caller says so instead of pretending this is all.
+                    del items[limit:]
+                    truncated = True
+                    break
         except botocore.exceptions.ClientError as exc:
             err_code = exc.response.get("Error", {}).get("Code", "")
             if err_code in ("NoSuchKey", "AccessDenied", "AllAccessDisabled"):
-                return False, [], None, exc
-            return False, [], None, exc
+                return False, [], None, exc, False
+            return False, [], None, exc, False
         except Exception as exc:
-            return False, [], None, exc
+            return False, [], None, exc, False
 
-        return True, items, None, None
+        return True, items, None, None, truncated
 
-    def list(self, fld):
+    def list(self, fld, page_cb=None, max_items=0):
         """
         List objects/prefixes in the currently selected bucket under prefix 'fld'.
 
@@ -1242,12 +1585,15 @@ class Model:
           our active client for this bucket so the rest of the UI keeps working.
         """
         prefix = fld or ""
+        self.last_listing_truncated = False
 
         # 1. Try with the current live client
-        ok, items, expecting_region, fatal_exc = self._list_bucket_once(
-            self.client, self.bucket, prefix
+        ok, items, expecting_region, fatal_exc, cut = self._list_bucket_once(
+            self.client, self.bucket, prefix, page_cb=page_cb,
+            max_items=max_items
         )
         if ok:
+            self.last_listing_truncated = cut
             return items
         if fatal_exc:
             # true fatal -> raise original error with details
@@ -1256,13 +1602,16 @@ class Model:
         # 2. If server told us a better region, try that region
         if expecting_region:
             tmp_client = self._make_client(region=expecting_region)
-            ok2, items2, expecting_region2, fatal_exc2 = self._list_bucket_once(
-                tmp_client, self.bucket, prefix
+            (ok2, items2, expecting_region2,
+             fatal_exc2, cut2) = self._list_bucket_once(
+                tmp_client, self.bucket, prefix, page_cb=page_cb,
+                max_items=max_items
             )
             if ok2:
                 # success in new region -> adopt it permanently for this bucket
                 self.region_name = expecting_region
                 self._client = tmp_client
+                self.last_listing_truncated = cut2
                 return items2
             if fatal_exc2:
                 raise fatal_exc2
@@ -1380,7 +1729,7 @@ class Model:
 
         if self.verify_downloads and (etag or head):
             if not self.verify_download(local_name, etag, head=head,
-                                        log_fn=log_fn):
+                                        log_fn=log_fn, key=key):
                 raise Exception(
                     f"Checksum mismatch after downloading '{key}'; the local "
                     "file does not match the object's stored digest"
@@ -1432,6 +1781,184 @@ class Model:
                 digest.update(block)
         return base64.b64encode(digest.digest()).decode()
 
+    def get_object_parts(self, key: str, version_id: str = "") -> list:
+        """
+        The part boundaries and per-part checksums of a multipart object.
+
+        This is the piece that makes a multipart object verifiable at all: an
+        ETag or a composite checksum cannot be reproduced without knowing how
+        the object was split. Returns [] when the backend does not implement
+        GetObjectAttributes (most S3-compatible ones do not) or when the
+        object is not multipart, so callers degrade to "not comparable"
+        rather than failing a transfer.
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        parts = []
+        marker = 0
+        while True:
+            params = {
+                "Bucket": self.bucket,
+                "Key": key,
+                "ObjectAttributes": ["ObjectParts"],
+                "MaxParts": 1000,
+            }
+            if version_id:
+                params["VersionId"] = version_id
+            if marker:
+                params["PartNumberMarker"] = marker
+            try:
+                resp = self.client.get_object_attributes(**params)
+            except botocore.exceptions.ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in ("NotImplemented", "InvalidRequest",
+                            "MethodNotAllowed", "AccessDenied",
+                            "InvalidArgument", "UnsupportedOperation"):
+                    return []
+                raise
+            except botocore.exceptions.ParamValidationError:
+                # An older botocore without the operation at all.
+                return []
+            node = resp.get("ObjectParts") or {}
+            for part in node.get("Parts") or []:
+                entry = {"PartNumber": int(part.get("PartNumber") or 0),
+                         "Size": int(part.get("Size") or 0)}
+                for field, value in part.items():
+                    if field.startswith("Checksum"):
+                        entry[field] = value
+                parts.append(entry)
+            if not node.get("IsTruncated"):
+                break
+            try:
+                following = int(node.get("NextPartNumberMarker") or 0)
+            except (TypeError, ValueError):
+                break
+            # Same guard as _uploaded_parts: a marker that does not advance
+            # would spin this thread forever.
+            if following <= marker:
+                break
+            marker = following
+        parts.sort(key=lambda entry: entry["PartNumber"])
+        return parts
+
+    @staticmethod
+    def _digest_range(handle, length, algorithm) -> tuple:
+        """
+        Digest ``length`` bytes from the open handle.
+
+        Returns ``(base64_checksum, md5_bytes)`` — the caller needs the raw
+        MD5 to rebuild a composite ETag and the base64 form to compare an S3
+        checksum, and reading the range twice for that would double the I/O.
+        """
+        name = str(algorithm or "").upper()
+        md5 = hashlib.md5()
+        crc = 0
+        digest = None
+        if name in ("SHA1", "SHA256"):
+            digest = hashlib.new("sha1" if name == "SHA1" else "sha256")
+        remaining = int(length)
+        while remaining > 0:
+            block = handle.read(min(1024 * 1024, remaining))
+            if not block:
+                break
+            remaining -= len(block)
+            md5.update(block)
+            if name == "CRC32":
+                crc = zlib.crc32(block, crc)
+            elif digest is not None:
+                digest.update(block)
+        if name == "CRC32":
+            checksum = base64.b64encode(
+                struct.pack(">I", crc & 0xFFFFFFFF)).decode()
+        elif digest is not None:
+            checksum = base64.b64encode(digest.digest()).decode()
+        else:
+            checksum = ""
+        return checksum, md5.digest()
+
+    @classmethod
+    def file_part_digests(cls, path, sizes, algorithm="") -> tuple:
+        """
+        Per-part digests of a local file, split at the given part sizes.
+
+        Returns ``(checksums, md5_digests)``. Raises ValueError when the sizes
+        do not add up to the file: a mismatch there means the parts describe a
+        different object, and comparing anyway would report a false pass.
+        """
+        total = sum(int(size) for size in sizes)
+        actual = os.path.getsize(path)
+        if total != actual:
+            raise ValueError(
+                f"part sizes total {total} bytes but the file is {actual}")
+        checksums = []
+        md5s = []
+        with open(path, "rb") as handle:
+            for size in sizes:
+                checksum, md5 = cls._digest_range(handle, int(size), algorithm)
+                checksums.append(checksum)
+                md5s.append(md5)
+        return checksums, md5s
+
+    @staticmethod
+    def composite_etag(md5_digests) -> str:
+        """
+        Rebuild a multipart ETag: MD5 over the concatenated part MD5s, then
+        "-<count>". This is how S3 forms one, so it is how it is checked.
+        """
+        digests = list(md5_digests)
+        if not digests:
+            return ""
+        combined = hashlib.md5(b"".join(digests)).hexdigest()
+        return f"{combined}-{len(digests)}"
+
+    def verify_parts(self, path, parts, etag="", algorithm="", log_fn=None):
+        """
+        Check a downloaded file against a multipart object's real parts.
+
+        Returns True (verified), False (mismatch) or None (nothing to compare
+        with — no parts, or no per-part digest to check them against).
+        """
+        parts = list(parts or [])
+        if not parts:
+            return None
+        sizes = [int(part.get("Size") or 0) for part in parts]
+        if any(size <= 0 for size in sizes):
+            return None
+        field = f"Checksum{str(algorithm or '').upper()}"
+        expected = [part.get(field) for part in parts]
+        have_checksums = bool(algorithm) and all(expected)
+        try:
+            checksums, md5s = self.file_part_digests(
+                path, sizes, algorithm if have_checksums else "")
+        except (ValueError, OSError) as exc:
+            if log_fn:
+                log_fn(f"part verification skipped ({exc}): {path}")
+            return None
+
+        if have_checksums:
+            for number, (actual, wanted) in enumerate(
+                    zip(checksums, expected), start=1):
+                if actual != wanted:
+                    if log_fn:
+                        log_fn(f"CHECKSUM MISMATCH in part {number} of {path}: "
+                               f"{algorithm} {actual} != {wanted}")
+                    return False
+            if log_fn:
+                log_fn(f"checksum ok ({algorithm}, {len(parts)} parts): {path}")
+            return True
+
+        wanted = self.normalize_etag(etag)
+        if not wanted or "-" not in wanted:
+            return None
+        actual = self.composite_etag(md5s)
+        if actual != wanted:
+            if log_fn:
+                log_fn(f"CHECKSUM MISMATCH for {path}: {actual} != {wanted}")
+            return False
+        if log_fn:
+            log_fn(f"checksum ok (multipart ETag, {len(parts)} parts): {path}")
+        return True
+
     def head_with_checksum(self, key) -> dict:
         """
         head_object asking for the stored checksum.
@@ -1472,18 +1999,24 @@ class Model:
                 return name, str(value)
         return "", ""
 
-    def verify_download(self, path, etag, head=None, log_fn=None) -> bool:
+    def verify_download(self, path, etag, head=None, log_fn=None,
+                        key="") -> bool:
         """
         Check a downloaded file against the object's stored digest.
 
         Prefers an additional checksum, which — unlike an ETag — stays
-        comparable for multipart objects when it is a full-object one. Falls
-        back to the ETag when the object carries no checksum, and reports
-        "not comparable" only when neither can settle it.
+        comparable for multipart objects when it is a full-object one. A
+        per-part checksum or a multipart ETag is settled by asking the service
+        for the object's real part boundaries; only when that is unavailable
+        too does this report "not comparable" and pass.
         """
         algorithm, expected = self.stored_checksum(head)
         if algorithm and expected:
             if self.checksum_is_composite(expected):
+                verdict = self._verify_by_parts(
+                    path, key, etag, algorithm, log_fn=log_fn)
+                if verdict is not None:
+                    return verdict
                 if log_fn:
                     log_fn(f"checksum skipped (per-part {algorithm}): {path}")
             else:
@@ -1498,6 +2031,9 @@ class Model:
                 return True
 
         if not self.etag_is_md5(etag):
+            verdict = self._verify_by_parts(path, key, etag, "", log_fn=log_fn)
+            if verdict is not None:
+                return verdict
             if log_fn:
                 log_fn(f"checksum skipped (multipart ETag): {path}")
             return True
@@ -1510,6 +2046,24 @@ class Model:
         if log_fn:
             log_fn(f"checksum ok: {path}")
         return True
+
+    def _verify_by_parts(self, path, key, etag, algorithm, log_fn=None):
+        """
+        Settle a multipart digest using the object's real part boundaries.
+
+        Returns True/False, or None when the backend cannot supply them — in
+        which case the caller falls back to reporting "not comparable".
+        """
+        if not key:
+            return None
+        try:
+            parts = self.get_object_parts(key)
+        except Exception as exc:
+            if log_fn:
+                log_fn(f"could not read the parts of '{key}': {exc}")
+            return None
+        return self.verify_parts(
+            path, parts, etag=etag, algorithm=algorithm, log_fn=log_fn)
 
     def _resume_paths(self, out_path):
         part = out_path + self.PART_SUFFIX
@@ -1603,7 +2157,7 @@ class Model:
             os.remove(meta_path)
 
         if self.verify_downloads and not self.verify_download(
-                out_path, etag, log_fn=log_fn):
+                out_path, etag, log_fn=log_fn, key=key):
             raise Exception(
                 f"Checksum mismatch after downloading '{key}'; the local file "
                 "does not match the object's ETag"
@@ -2131,7 +2685,7 @@ class Model:
         total_parts = max(1, (int(size) + chunk - 1) // chunk)
         mtime = os.path.getmtime(local_file)
         state_path = self._upload_state_path(key, local_file)
-        extra = dict(self.upload_extra_args)
+        extra = self.upload_args_for(local_file, key)
 
         upload_id = self._read_upload_state(
             state_path, key, size, mtime, chunk)
@@ -2257,7 +2811,7 @@ class Model:
                 _do_resumable()
             return
 
-        extra_args = dict(self.upload_extra_args) or None
+        extra_args = self.upload_args_for(local_file, key) or None
 
         def _do_upload():
             self.client.upload_file(
@@ -2438,8 +2992,13 @@ class Model:
         """
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
-        ep = self.endpoint_url.rstrip("/")
         key = (key or "").lstrip("/")
+        # A CDN or custom domain is mapped at the bucket root, so the bucket
+        # name is never part of the path there. Presigned links deliberately
+        # do NOT go through this: their signature covers the host.
+        if self.public_base_url:
+            return f"{self.public_base_url}/{key}"
+        ep = self.endpoint_url.rstrip("/")
         if self._endpoint_has_bucket(ep, self.bucket):
             # virtual-host style: bucket already in the hostname
             return f"{ep}/{key}"
@@ -2467,6 +3026,554 @@ class Model:
             raise ValueError("Bucket is empty")
 
         return self.client.head_object(Bucket=self.bucket, Key=key)
+
+    def get_bucket_lifecycle(self) -> list:
+        """
+        The bucket's lifecycle rules, or [] when it has none.
+
+        A bucket with no configuration answers with an error rather than an
+        empty document, which is not a failure worth showing.
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        try:
+            resp = self.client.get_bucket_lifecycle_configuration(
+                Bucket=self.bucket)
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchLifecycleConfiguration",
+                        "NoSuchLifecycleConfigurationError"):
+                return []
+            raise
+        return list(resp.get("Rules") or [])
+
+    def put_bucket_lifecycle(self, rules, log_fn=None):
+        """Replace the bucket's lifecycle rules; an empty list removes them."""
+        self._guard_write()
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        if not rules:
+            self.client.delete_bucket_lifecycle(Bucket=self.bucket)
+            if log_fn:
+                log_fn(f"removed the lifecycle configuration of {self.bucket}")
+            return
+        self.client.put_bucket_lifecycle_configuration(
+            Bucket=self.bucket,
+            LifecycleConfiguration={"Rules": list(rules)})
+        if log_fn:
+            log_fn(f"wrote {len(rules)} lifecycle rule(s) to {self.bucket}")
+
+    @staticmethod
+    def lifecycle_rule_scope(rule) -> str:
+        """The prefix a rule applies to, across both filter shapes."""
+        if "Prefix" in rule and rule.get("Prefix") is not None:
+            return str(rule.get("Prefix") or "")
+        node = rule.get("Filter") or {}
+        if "Prefix" in node:
+            return str(node.get("Prefix") or "")
+        combined = node.get("And") or {}
+        return str(combined.get("Prefix") or "")
+
+    @staticmethod
+    def lifecycle_rule_extras(rule) -> dict:
+        """
+        The parts of a filter that are NOT a prefix: tags and size bounds.
+
+        Returns ``{"tags": [(key, value)], "min_size": int|None,
+        "max_size": int|None}``. These narrow which objects a rule touches, so
+        a summary that omits them describes a rule that deletes far more than
+        the real one does.
+        """
+        node = dict((rule or {}).get("Filter") or {})
+        combined = dict(node.get("And") or {})
+        tags = list(combined.get("Tags") or [])
+        if node.get("Tag"):
+            tags = [node["Tag"]] + tags
+        pairs = [(str(tag.get("Key") or ""), str(tag.get("Value") or ""))
+                 for tag in tags if isinstance(tag, dict)]
+        minimum = node.get("ObjectSizeGreaterThan",
+                           combined.get("ObjectSizeGreaterThan"))
+        maximum = node.get("ObjectSizeLessThan",
+                           combined.get("ObjectSizeLessThan"))
+        return {
+            "tags": pairs,
+            "min_size": None if minimum is None else int(minimum),
+            "max_size": None if maximum is None else int(maximum),
+        }
+
+    @classmethod
+    def lifecycle_filter_is_simple(cls, rule) -> bool:
+        """
+        Whether the prefix editor can represent this rule's filter without
+        losing part of it.
+
+        A rule filtered by tag or size that is rebuilt from a prefix form comes
+        back matching every object under that prefix — which for an expiration
+        rule means deleting things it never used to touch.
+        """
+        extras = cls.lifecycle_rule_extras(rule)
+        return not (extras["tags"] or extras["min_size"] is not None
+                    or extras["max_size"] is not None)
+
+    @classmethod
+    def summarize_lifecycle_rule(cls, rule) -> str:
+        """One readable line for a rule, for a list the user can scan."""
+        rule = dict(rule or {})
+        parts = []
+        scope = cls.lifecycle_rule_scope(rule)
+        parts.append(f"prefix '{scope}'" if scope else "whole bucket")
+        extras = cls.lifecycle_rule_extras(rule)
+        for key, value in extras["tags"]:
+            parts.append(f"tagged {key}={value}" if value else f"tagged {key}")
+        if extras["min_size"] is not None:
+            parts.append(f"larger than {extras['min_size']} B")
+        if extras["max_size"] is not None:
+            parts.append(f"smaller than {extras['max_size']} B")
+        for transition in rule.get("Transitions") or []:
+            days = transition.get("Days")
+            target = transition.get("StorageClass") or "?"
+            if days is not None:
+                parts.append(f"to {target} after {days}d")
+            else:
+                parts.append(f"to {target} on {transition.get('Date')}")
+        expiration = rule.get("Expiration") or {}
+        if expiration.get("Days") is not None:
+            parts.append(f"delete after {expiration['Days']}d")
+        elif expiration.get("Date"):
+            parts.append(f"delete on {expiration['Date']}")
+        if expiration.get("ExpiredObjectDeleteMarker"):
+            parts.append("clean up delete markers")
+        noncurrent = rule.get("NoncurrentVersionExpiration") or {}
+        if noncurrent.get("NoncurrentDays") is not None:
+            parts.append(
+                f"delete old versions after {noncurrent['NoncurrentDays']}d")
+        for transition in rule.get("NoncurrentVersionTransitions") or []:
+            parts.append(
+                f"old versions to {transition.get('StorageClass')} after "
+                f"{transition.get('NoncurrentDays')}d")
+        abort = rule.get("AbortIncompleteMultipartUpload") or {}
+        if abort.get("DaysAfterInitiation") is not None:
+            parts.append(
+                "abort incomplete uploads after "
+                f"{abort['DaysAfterInitiation']}d")
+        if len(parts) == 1:
+            parts.append("does nothing")
+        return " · ".join(parts)
+
+    @staticmethod
+    def build_lifecycle_rule(rule_id, *, prefix="", enabled=True,
+                             transition_days=None, transition_class="",
+                             expire_days=None, noncurrent_days=None,
+                             abort_days=None, expire_delete_markers=False):
+        """
+        Assemble a rule document from the fields the editor collects.
+
+        Raises ValueError when the result would do nothing: S3 accepts such a
+        rule and then silently never fires it.
+        """
+        rule = {
+            "ID": str(rule_id or "").strip() or "rule",
+            "Status": "Enabled" if enabled else "Disabled",
+            # The modern shape. A bare "Prefix" is the deprecated one and is
+            # rejected outright when mixed with Filter.
+            "Filter": {"Prefix": str(prefix or "")},
+        }
+        if transition_days is not None and transition_class:
+            rule["Transitions"] = [{"Days": int(transition_days),
+                                    "StorageClass": str(transition_class)}]
+        if expire_days is not None:
+            rule["Expiration"] = {"Days": int(expire_days)}
+        elif expire_delete_markers:
+            rule["Expiration"] = {"ExpiredObjectDeleteMarker": True}
+        if noncurrent_days is not None:
+            rule["NoncurrentVersionExpiration"] = {
+                "NoncurrentDays": int(noncurrent_days)}
+        if abort_days is not None:
+            rule["AbortIncompleteMultipartUpload"] = {
+                "DaysAfterInitiation": int(abort_days)}
+        if not any(key in rule for key in (
+                "Transitions", "Expiration", "NoncurrentVersionExpiration",
+                "AbortIncompleteMultipartUpload")):
+            raise ValueError(
+                "A lifecycle rule needs at least one action, or it will never "
+                "do anything.")
+        return rule
+
+    def get_bucket_cors(self) -> list:
+        """The bucket's CORS rules, or [] when it has none."""
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        try:
+            resp = self.client.get_bucket_cors(Bucket=self.bucket)
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchCORSConfiguration", "NoSuchCORSConfigurationError"):
+                return []
+            raise
+        return list(resp.get("CORSRules") or [])
+
+    def put_bucket_cors(self, rules, log_fn=None):
+        """Replace the CORS document; an empty list removes it."""
+        self._guard_write()
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        if not rules:
+            self.client.delete_bucket_cors(Bucket=self.bucket)
+            if log_fn:
+                log_fn(f"removed the CORS configuration of {self.bucket}")
+            return
+        self.client.put_bucket_cors(
+            Bucket=self.bucket, CORSConfiguration={"CORSRules": list(rules)})
+        if log_fn:
+            log_fn(f"wrote {len(rules)} CORS rule(s) to {self.bucket}")
+
+    def get_bucket_policy(self) -> str:
+        """The bucket policy as JSON text, or "" when there is none."""
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        try:
+            resp = self.client.get_bucket_policy(Bucket=self.bucket)
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("NoSuchBucketPolicy", "NoSuchBucketPolicyError"):
+                return ""
+            raise
+        return str(resp.get("Policy") or "")
+
+    def put_bucket_policy(self, policy, log_fn=None):
+        """
+        Replace the bucket policy; an empty document removes it.
+
+        The JSON is parsed here rather than at the server: a policy that fails
+        to apply because of a typo is a confusing round trip, and a malformed
+        one that DID apply would be worse.
+        """
+        self._guard_write()
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        text = str(policy or "").strip()
+        if not text:
+            self.client.delete_bucket_policy(Bucket=self.bucket)
+            if log_fn:
+                log_fn(f"removed the bucket policy of {self.bucket}")
+            return
+        try:
+            parsed = json.loads(text)
+        except ValueError as exc:
+            raise ValueError(f"The policy is not valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict) or "Statement" not in parsed:
+            raise ValueError(
+                "A bucket policy must be a JSON object with a Statement list.")
+        self.client.put_bucket_policy(Bucket=self.bucket, Policy=text)
+        if log_fn:
+            log_fn(f"wrote a bucket policy to {self.bucket}")
+
+    def get_bucket_policy_status(self) -> str:
+        """"public", "not public", or "" when the server will not say."""
+        if not self.bucket:
+            return ""
+        try:
+            resp = self.client.get_bucket_policy_status(Bucket=self.bucket)
+        except Exception:
+            return ""
+        status = (resp.get("PolicyStatus") or {}).get("IsPublic")
+        if status is None:
+            return ""
+        return "public" if status else "not public"
+
+    # Codes a backend returns for a bucket document that simply is not set.
+    ABSENT_DOCUMENT_CODES = (
+        "NoSuchLifecycleConfiguration", "NoSuchCORSConfiguration",
+        "NoSuchBucketPolicy", "NoSuchTagSet", "NoSuchTagSetError",
+        "NoSuchWebsiteConfiguration", "NoSuchConfiguration",
+        "ServerSideEncryptionConfigurationNotFoundError",
+        "ObjectLockConfigurationNotFoundError", "NotImplemented",
+        "MethodNotAllowed", "InvalidRequest", "UnsupportedOperation",
+    )
+
+    def _optional_document(self, call, **kwargs):
+        """
+        Read a bucket document that may simply not be set.
+
+        Every one of these answers with an error rather than an empty
+        document, and on an S3-compatible backend the same call may not exist
+        at all — neither is a failure worth showing.
+        """
+        try:
+            return call(Bucket=self.bucket, **kwargs)
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in self.ABSENT_DOCUMENT_CODES:
+                return None
+            raise
+        except botocore.exceptions.ParamValidationError:
+            return None
+        except AttributeError:
+            # An older botocore without the operation.
+            return None
+
+    def get_bucket_encryption(self) -> dict:
+        """
+        The bucket's default encryption, or {} when it has none.
+
+        Returns ``{"sse": "AES256"|"aws:kms", "kms_key": str,
+        "bucket_key": bool}``.
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        resp = self._optional_document(self.client.get_bucket_encryption)
+        if not resp:
+            return {}
+        rules = ((resp.get("ServerSideEncryptionConfiguration") or {})
+                 .get("Rules") or [])
+        for rule in rules:
+            default = rule.get("ApplyServerSideEncryptionByDefault") or {}
+            algorithm = default.get("SSEAlgorithm")
+            if algorithm:
+                return {
+                    "sse": str(algorithm),
+                    "kms_key": str(default.get("KMSMasterKeyID") or ""),
+                    "bucket_key": bool(rule.get("BucketKeyEnabled")),
+                }
+        return {}
+
+    def put_bucket_encryption(self, sse="", kms_key="", bucket_key=False,
+                              log_fn=None):
+        """Set or remove the bucket's default encryption."""
+        self._guard_write()
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        if not sse:
+            self.client.delete_bucket_encryption(Bucket=self.bucket)
+            if log_fn:
+                log_fn(f"removed default encryption from {self.bucket}")
+            return
+        if sse not in self.SSE_MODES or sse == "":
+            raise ValueError(f"unsupported encryption mode: {sse}")
+        default = {"SSEAlgorithm": sse}
+        if sse == "aws:kms" and kms_key:
+            default["KMSMasterKeyID"] = kms_key
+        rule = {"ApplyServerSideEncryptionByDefault": default}
+        if bucket_key:
+            rule["BucketKeyEnabled"] = True
+        self.client.put_bucket_encryption(
+            Bucket=self.bucket,
+            ServerSideEncryptionConfiguration={"Rules": [rule]})
+        if log_fn:
+            log_fn(f"default encryption on {self.bucket}: {sse}")
+
+    def get_bucket_tags(self) -> dict:
+        """The bucket's own tags (not an object's), or {}."""
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        resp = self._optional_document(self.client.get_bucket_tagging)
+        if not resp:
+            return {}
+        return {str(tag.get("Key") or ""): str(tag.get("Value") or "")
+                for tag in resp.get("TagSet") or [] if tag.get("Key")}
+
+    def put_bucket_tags(self, tags, log_fn=None):
+        """Replace the bucket's tag set; an empty mapping removes it."""
+        self._guard_write()
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        tags = {str(k).strip(): str(v).strip()
+                for k, v in dict(tags or {}).items() if str(k).strip()}
+        if not tags:
+            self.client.delete_bucket_tagging(Bucket=self.bucket)
+            if log_fn:
+                log_fn(f"removed the tags from {self.bucket}")
+            return
+        self.client.put_bucket_tagging(
+            Bucket=self.bucket,
+            Tagging={"TagSet": [{"Key": k, "Value": v}
+                                for k, v in sorted(tags.items())]})
+        if log_fn:
+            log_fn(f"wrote {len(tags)} tag(s) to {self.bucket}")
+
+    def get_bucket_website(self) -> dict:
+        """
+        The static-website configuration, or {}.
+
+        Returns ``{"index": str, "error": str, "redirect": str}``.
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        resp = self._optional_document(self.client.get_bucket_website)
+        if not resp:
+            return {}
+        redirect = resp.get("RedirectAllRequestsTo") or {}
+        return {
+            "index": str((resp.get("IndexDocument") or {}).get("Suffix") or ""),
+            "error": str((resp.get("ErrorDocument") or {}).get("Key") or ""),
+            "redirect": str(redirect.get("HostName") or ""),
+        }
+
+    def put_bucket_website(self, index="", error="", redirect="", log_fn=None):
+        """
+        Configure static-website hosting; everything blank removes it.
+
+        A redirect-everything host and an index document are mutually
+        exclusive in the API, so the redirect wins when both are given rather
+        than sending a document the service rejects.
+        """
+        self._guard_write()
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        index = str(index or "").strip()
+        error = str(error or "").strip()
+        redirect = str(redirect or "").strip()
+        if not index and not redirect:
+            self.client.delete_bucket_website(Bucket=self.bucket)
+            if log_fn:
+                log_fn(f"removed website hosting from {self.bucket}")
+            return
+        if redirect:
+            config = {"RedirectAllRequestsTo": {"HostName": redirect}}
+        else:
+            config = {"IndexDocument": {"Suffix": index}}
+            if error:
+                config["ErrorDocument"] = {"Key": error}
+        self.client.put_bucket_website(
+            Bucket=self.bucket, WebsiteConfiguration=config)
+        if log_fn:
+            log_fn(f"website hosting configured on {self.bucket}")
+
+    def get_bucket_notifications(self) -> list:
+        """
+        Event notifications as ``[(kind, target, events)]``, or [].
+
+        Read-only on purpose: a notification points at a queue, topic or
+        function whose ARN this app has no way to validate, and a wrong one
+        silently stops every event.
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        resp = self._optional_document(
+            self.client.get_bucket_notification_configuration)
+        if not resp:
+            return []
+        out = []
+        for field, kind, arn_field in (
+            ("TopicConfigurations", "SNS topic", "TopicArn"),
+            ("QueueConfigurations", "SQS queue", "QueueArn"),
+            ("LambdaFunctionConfigurations", "Lambda", "LambdaFunctionArn"),
+            ("EventBridgeConfiguration", "EventBridge", ""),
+        ):
+            node = resp.get(field)
+            if not node:
+                continue
+            if not arn_field:
+                out.append((kind, "(enabled)", []))
+                continue
+            for entry in node:
+                out.append((kind, str(entry.get(arn_field) or ""),
+                            list(entry.get("Events") or [])))
+        return out
+
+    def get_bucket_acceleration(self) -> str:
+        """"Enabled", "Suspended", or "" when the bucket has no setting."""
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        resp = self._optional_document(
+            self.client.get_bucket_accelerate_configuration)
+        if not resp:
+            return ""
+        return str(resp.get("Status") or "")
+
+    def set_bucket_acceleration(self, enabled, log_fn=None):
+        """Turn transfer acceleration on or off."""
+        self._guard_write()
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        status = "Enabled" if enabled else "Suspended"
+        self.client.put_bucket_accelerate_configuration(
+            Bucket=self.bucket,
+            AccelerateConfiguration={"Status": status})
+        if log_fn:
+            log_fn(f"transfer acceleration {status.lower()} on {self.bucket}")
+
+    def get_object_lock_configuration(self) -> dict:
+        """
+        The bucket's Object Lock defaults, or {} when it is not enabled.
+
+        Returns ``{"enabled": bool, "mode": str, "days": int, "years": int}``.
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        try:
+            resp = self.client.get_object_lock_configuration(
+                Bucket=self.bucket)
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("ObjectLockConfigurationNotFoundError",
+                        "ObjectLockConfigurationNotFound",
+                        "NotImplemented", "InvalidRequest"):
+                return {}
+            raise
+        config = resp.get("ObjectLockConfiguration") or {}
+        rule = (config.get("Rule") or {}).get("DefaultRetention") or {}
+        return {
+            "enabled": config.get("ObjectLockEnabled") == "Enabled",
+            "mode": str(rule.get("Mode") or ""),
+            "days": int(rule.get("Days") or 0),
+            "years": int(rule.get("Years") or 0),
+        }
+
+    def get_object_lock_state(self, key: str, version_id: str = "") -> dict:
+        """
+        Retention and legal-hold state for one object.
+
+        Returns ``{"mode", "retain_until", "legal_hold", "supported"}``;
+        supported is False on a bucket (or backend) without Object Lock, which
+        is the common case and not an error.
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        state = {"mode": "", "retain_until": "", "legal_hold": "",
+                 "supported": True}
+        params = {"Bucket": self.bucket, "Key": key}
+        if version_id:
+            params["VersionId"] = version_id
+        try:
+            retention = self.client.get_object_retention(**params)
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("InvalidRequest", "NotImplemented",
+                        "ObjectLockConfigurationNotFoundError"):
+                state["supported"] = False
+                return state
+            if code not in ("NoSuchObjectLockConfiguration",
+                            "NoSuchObjectLockConfigurationError"):
+                raise
+            retention = {}
+        node = (retention or {}).get("Retention") or {}
+        state["mode"] = str(node.get("Mode") or "")
+        retain = node.get("RetainUntilDate")
+        state["retain_until"] = "" if retain is None else str(retain)
+        try:
+            hold = self.client.get_object_legal_hold(**params)
+            state["legal_hold"] = str(
+                (hold.get("LegalHold") or {}).get("Status") or "")
+        except botocore.exceptions.ClientError:
+            # A bucket with retention but no hold set answers with an error;
+            # an absent hold is simply OFF.
+            state["legal_hold"] = state["legal_hold"] or ""
+        return state
+
+    def set_object_legal_hold(self, key: str, on: bool, version_id: str = "",
+                              log_fn=None):
+        """Place or clear a legal hold on one object."""
+        self._guard_write()
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        params = {"Bucket": self.bucket, "Key": key,
+                  "LegalHold": {"Status": "ON" if on else "OFF"}}
+        if version_id:
+            params["VersionId"] = version_id
+        self.client.put_object_legal_hold(**params)
+        if log_fn:
+            log_fn(f"legal hold {'ON' if on else 'OFF'}: {key}")
 
     def get_bucket_hints(self, bucket_name: str):
         """
@@ -2874,6 +3981,85 @@ class Model:
     # Storage classes whose objects must be restored before they can be read.
     ARCHIVE_STORAGE_CLASSES = ("GLACIER", "DEEP_ARCHIVE")
 
+    # Indicative us-east-1 list price in USD per GiB-month, storage only. A
+    # bundled table can never be a bill: prices change, every region differs,
+    # and the real invoice also carries requests, retrieval and transfer. It
+    # is enough to answer "is this bucket costing me pennies or hundreds",
+    # which is the question a size figure alone cannot.
+    STORAGE_PRICES_USD = {
+        "STANDARD": 0.023,
+        "REDUCED_REDUNDANCY": 0.024,
+        "INTELLIGENT_TIERING": 0.023,
+        "STANDARD_IA": 0.0125,
+        "ONEZONE_IA": 0.01,
+        "GLACIER_IR": 0.004,
+        "GLACIER": 0.0036,
+        "DEEP_ARCHIVE": 0.00099,
+    }
+    # Classes worth suggesting for bytes that are sitting in STANDARD, with
+    # the catch that makes each one a real decision rather than free money.
+    COLDER_CLASSES = (
+        ("STANDARD_IA", "30-day minimum, per-GB retrieval fee"),
+        ("GLACIER_IR", "90-day minimum, per-GB retrieval fee"),
+        ("DEEP_ARCHIVE", "180-day minimum, restore takes hours"),
+    )
+    PRICING_BASE = 1024 ** 3
+
+    def is_aws_endpoint(self) -> bool:
+        """
+        Whether this profile talks to AWS itself.
+
+        The bundled prices are AWS list prices, so quoting them at a MinIO or
+        Ceph endpoint would be inventing a number.
+        """
+        try:
+            host = (urlparse(self.endpoint_url).hostname or "").lower()
+        except Exception:
+            return False
+        return host.endswith("amazonaws.com")
+
+    @classmethod
+    def estimate_storage_cost(cls, by_class) -> dict:
+        """
+        Monthly storage cost for a ``{storage_class: bytes}`` breakdown.
+
+        Returns ``{"total": usd, "by_class": {cls: usd}, "unpriced": [cls]}``.
+        A class with no price is reported rather than silently costed at zero.
+        """
+        priced = {}
+        unpriced = []
+        total = 0.0
+        for name, size in (by_class or {}).items():
+            key = str(name or "STANDARD").upper()
+            price = cls.STORAGE_PRICES_USD.get(key)
+            if price is None:
+                unpriced.append(key)
+                continue
+            cost = (int(size or 0) / cls.PRICING_BASE) * price
+            priced[key] = cost
+            total += cost
+        return {"total": total, "by_class": priced,
+                "unpriced": sorted(set(unpriced))}
+
+    @classmethod
+    def colder_class_options(cls, by_class) -> list:
+        """
+        What the STANDARD bytes would cost in a colder class.
+
+        Returns ``[(class, monthly_usd, monthly_saving, caveat)]``, empty when
+        there is nothing in STANDARD to move.
+        """
+        hot = int((by_class or {}).get("STANDARD", 0) or 0)
+        if hot <= 0:
+            return []
+        gib = hot / cls.PRICING_BASE
+        current = gib * cls.STORAGE_PRICES_USD["STANDARD"]
+        options = []
+        for name, caveat in cls.COLDER_CLASSES:
+            cost = gib * cls.STORAGE_PRICES_USD[name]
+            options.append((name, cost, current - cost, caveat))
+        return options
+
     @staticmethod
     def parse_restore_status(restore_header: str) -> str:
         """
@@ -3019,6 +4205,34 @@ class Model:
                 log_fn(f"Region error setting metadata of '{key}': {exc}")
             self.rebind_bucket(log_fn=log_fn)
             _do()
+
+    def retype_object(self, key: str, log_fn=None):
+        """
+        Re-stamp one existing object's Content-Type from its key.
+
+        Returns ``(changed, content_type)``. A key the tables cannot name is
+        left alone rather than stamped with the fallback: rewriting every
+        extensionless object to binary/octet-stream costs a copy and changes
+        nothing.
+        """
+        self._guard_write()
+        guessed = self.guess_content_type(key)
+        if not guessed:
+            return False, ""
+        current = self.get_object_metadata(key)
+        if (current.get("content_type") or "") == guessed:
+            return False, guessed
+        self.set_object_metadata(
+            key,
+            content_type=guessed,
+            cache_control=current.get("cache_control"),
+            content_disposition=current.get("content_disposition"),
+            content_encoding=current.get("content_encoding"),
+            metadata=current.get("metadata"),
+            storage_class=current.get("storage_class"),
+            log_fn=log_fn,
+        )
+        return True, guessed
 
     @staticmethod
     def build_search_matcher(query: str = "", *, regex: bool = False,
@@ -3166,6 +4380,86 @@ class Model:
             self.rebind_bucket(log_fn=log_fn)
             return _fetch()
 
+    def object_fingerprint(self, key: str, version_id: str = "") -> tuple:
+        """
+        A content fingerprint built from metadata alone, as ``(kind, value)``.
+
+        kind "full"  — a whole-object digest: equal means the same bytes, and
+                       different means different bytes.
+        kind "parts" — per-part digests: equal still means the same bytes, but
+                       different is inconclusive, since identical content split
+                       at other boundaries digests differently.
+        kind ""      — the service will not answer without the bytes.
+
+        This is what lets the duplicate finder settle a "same size, ETags
+        cannot compare" candidate without downloading either copy.
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        params = {
+            "Bucket": self.bucket,
+            "Key": key,
+            "ObjectAttributes": ["ETag", "Checksum", "ObjectParts"],
+            "MaxParts": 1000,
+        }
+        if version_id:
+            params["VersionId"] = version_id
+        try:
+            resp = self.client.get_object_attributes(**params)
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("NotImplemented", "InvalidRequest", "MethodNotAllowed",
+                        "AccessDenied", "InvalidArgument",
+                        "UnsupportedOperation"):
+                return "", ""
+            raise
+        except botocore.exceptions.ParamValidationError:
+            return "", ""
+
+        checksum = resp.get("Checksum") or {}
+        for name in CHECKSUM_ALGORITHMS:
+            value = checksum.get(f"Checksum{name}")
+            if value and not self.checksum_is_composite(value):
+                return "full", f"{name}:{value}"
+
+        etag = self.normalize_etag(resp.get("ETag"))
+        if etag and self.etag_is_md5(etag):
+            # A single-part object's ETag is the MD5 of its bytes.
+            return "full", f"MD5:{etag}"
+
+        node = resp.get("ObjectParts") or {}
+        parts = []
+        for part in node.get("Parts") or []:
+            digest = ""
+            for name in CHECKSUM_ALGORITHMS:
+                if part.get(f"Checksum{name}"):
+                    digest = f"{name}:{part[f'Checksum{name}']}"
+                    break
+            if not digest:
+                return "", ""
+            parts.append(f"{int(part.get('Size') or 0)}:{digest}")
+        if parts and not node.get("IsTruncated"):
+            return "parts", "|".join(parts)
+        return "", ""
+
+    @staticmethod
+    def compare_fingerprints(fingerprints) -> str:
+        """
+        "same", "different" or "unknown" for a group of ``(kind, value)``.
+
+        Only a whole-object digest can prove two objects differ; per-part
+        digests can prove they match but never that they do not.
+        """
+        entries = list(fingerprints or [])
+        if len(entries) < 2 or any(not kind for kind, _v in entries):
+            return "unknown"
+        values = {value for _kind, value in entries}
+        if len(values) == 1:
+            return "same"
+        if all(kind == "full" for kind, _v in entries):
+            return "different"
+        return "unknown"
+
     def list_tree(self, prefix: str = "", cancel_event=None, log_fn=None) -> dict:
         """
         Map every object under 'prefix' to ``{relative_path: (size, mtime)}``
@@ -3207,7 +4501,8 @@ class Model:
             self.rebind_bucket(log_fn=log_fn)
             return _fetch()
 
-    def get_object_preview(self, key: str, max_bytes: int = 1024 * 1024) -> dict:
+    def get_object_preview(self, key: str, max_bytes: int = 1024 * 1024,
+                           version_id: str = "") -> dict:
         """
         Fetch up to max_bytes of an object for in-app preview.
 
@@ -3220,6 +4515,8 @@ class Model:
 
         def _do():
             kwargs = {"Bucket": self.bucket, "Key": key}
+            if version_id:
+                kwargs["VersionId"] = version_id
             if max_bytes and max_bytes > 0:
                 kwargs["Range"] = f"bytes=0-{int(max_bytes) - 1}"
             try:
@@ -3253,6 +4550,10 @@ class Model:
                 "size": total,
                 "data": body,
                 "truncated": bool(truncated),
+                # Carried so an edit can be written back conditionally: the
+                # body the user is looking at is only safe to replace while
+                # the object still has this ETag.
+                "etag": self.normalize_etag(resp.get("ETag")),
             }
 
         try:
@@ -3262,6 +4563,80 @@ class Model:
                 raise
             self.rebind_bucket()
             return _do()
+
+    # Codes an S3-compatible backend returns for a conditional PUT it does
+    # not implement. On these the write is retried unconditionally, after the
+    # ETag has been re-checked by hand.
+    PRECONDITION_UNSUPPORTED_CODES = (
+        "NotImplemented", "InvalidRequest", "InvalidArgument",
+        "BadRequest", "MethodNotAllowed",
+    )
+
+    class PreconditionFailed(Exception):
+        """The object changed since it was read, so the write was refused."""
+
+    def put_object_body(self, key: str, data: bytes, *, if_match="",
+                        content_type="", log_fn=None) -> str:
+        """
+        Replace an object's body, refusing when it changed since it was read.
+
+        Returns the new ETag. The precondition is what makes in-app editing
+        safe; a backend without conditional writes falls back to comparing the
+        ETag first, which is racy but still catches the case that happens in
+        practice — someone saved while the editor was open.
+        """
+        self._guard_write()
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        expected = self.normalize_etag(if_match)
+        params = dict(self.upload_extra_args)
+        params.pop("ChecksumAlgorithm", None)
+        params.pop("ChecksumType", None)
+        guessed = content_type or self.guess_content_type(key)
+        if guessed:
+            params["ContentType"] = guessed
+
+        def _put(conditional):
+            kwargs = dict(Bucket=self.bucket, Key=key, Body=data, **params)
+            if conditional and expected:
+                kwargs["IfMatch"] = expected
+            return self.client.put_object(**kwargs)
+
+        def _verify_by_hand():
+            if not expected:
+                return
+            head = self.client.head_object(Bucket=self.bucket, Key=key)
+            if self.normalize_etag(head.get("ETag")) != expected:
+                raise self.PreconditionFailed(
+                    "The object changed on the server since it was opened.")
+
+        try:
+            resp = _put(bool(expected))
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            status = exc.response.get(
+                "ResponseMetadata", {}).get("HTTPStatusCode")
+            if code in ("PreconditionFailed", "412") or status == 412:
+                raise self.PreconditionFailed(
+                    "The object changed on the server since it was opened."
+                ) from exc
+            if expected and (code in self.PRECONDITION_UNSUPPORTED_CODES
+                             or status == 501):
+                if log_fn:
+                    log_fn(f"conditional write unsupported ({code}); "
+                           "checking the ETag by hand")
+                _verify_by_hand()
+                resp = _put(False)
+            elif self._is_region_error(exc):
+                if log_fn:
+                    log_fn(f"Region error writing '{key}': {exc}")
+                self.rebind_bucket(log_fn=log_fn)
+                resp = _put(bool(expected))
+            else:
+                raise
+        if log_fn:
+            log_fn(f"saved {key} ({len(data)} bytes)")
+        return self.normalize_etag(resp.get("ETag"))
 
     def build_region_swapped_endpoint(self, base_endpoint: str,
                                       new_region: str) -> str:

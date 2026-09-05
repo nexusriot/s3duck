@@ -7,7 +7,10 @@ from PyQt6.QtWidgets import (
     QMessageBox, QLabel
 )
 
-from utils import str_to_bool, Crypto, decrypt_optional, normalize_accent
+from utils import (
+    str_to_bool, Crypto, decrypt_optional, normalize_accent,
+    resolve_credential_key,
+)
 
 
 @dataclass
@@ -23,6 +26,13 @@ class Profile:
     session_token: str = ""
     read_only: bool = False
     color: str = ""
+    session_expires: str = ""
+    aws_profile: str = ""
+    credential_process: str = ""
+    public_base_url: str = ""
+    requester_pays: bool = False
+    proxy_url: str = ""
+    ca_bundle: str = ""
 
 
 def load_profiles(settings: QSettings) -> List[dict]:
@@ -43,6 +53,13 @@ def load_profiles(settings: QSettings) -> List[dict]:
             "session_token": settings.value("session_token", ""),
             "read_only": settings.value("read_only", "false"),
             "color": settings.value("color", ""),
+            "session_expires": settings.value("session_expires", ""),
+            "aws_profile": settings.value("aws_profile", ""),
+            "credential_process": settings.value("credential_process", ""),
+            "public_base_url": settings.value("public_base_url", ""),
+            "requester_pays": settings.value("requester_pays", "false"),
+            "proxy_url": settings.value("proxy_url", ""),
+            "ca_bundle": settings.value("ca_bundle", ""),
         })
     settings.endArray()
     settings.endGroup()
@@ -50,11 +67,10 @@ def load_profiles(settings: QSettings) -> List[dict]:
 
 
 def decrypt_profile(settings: QSettings, raw: dict) -> Profile:
-    settings.beginGroup("common")
-    key = settings.value("key", "")
-    settings.endGroup()
-
-    crypto = Crypto(key)
+    # Not settings["common/key"] directly: under the keyring and passphrase
+    # modes there is no key in the settings file at all, only the one the
+    # launcher unlocked for this process.
+    crypto = Crypto(resolve_credential_key(settings))
     return Profile(
         name=str(raw.get("name") or ""),
         url=str(raw.get("url") or ""),
@@ -67,6 +83,13 @@ def decrypt_profile(settings: QSettings, raw: dict) -> Profile:
         session_token=decrypt_optional(crypto, raw.get("session_token")),
         read_only=str_to_bool(raw.get("read_only", "false")),
         color=normalize_accent(raw.get("color", "")),
+        session_expires=str(raw.get("session_expires") or ""),
+        aws_profile=str(raw.get("aws_profile") or ""),
+        credential_process=str(raw.get("credential_process") or ""),
+        public_base_url=str(raw.get("public_base_url") or ""),
+        requester_pays=str_to_bool(raw.get("requester_pays", "false")),
+        proxy_url=str(raw.get("proxy_url") or ""),
+        ca_bundle=str(raw.get("ca_bundle") or ""),
     )
 
 

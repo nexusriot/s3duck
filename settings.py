@@ -5,10 +5,11 @@ from PyQt6.QtGui import *
 
 from utils import (
     str_to_bool, center_on_screen, load_aws_profiles, PROFILE_ACCENTS,
-    normalize_accent,
+    normalize_accent, expiry_state,
 )
 
-EMPTY_SETTINGS = ("", "", "", "", "", "", "false", "true", "", "false", "")
+EMPTY_SETTINGS = ("", "", "", "", "", "", "false", "true", "", "false", "",
+                  "", "", "", "", "false", "", "")
 
 
 class SettingsWindow(QDialog):
@@ -29,9 +30,16 @@ class SettingsWindow(QDialog):
             session_token,
             read_only,
             color,
+            session_expires,
+            aws_profile,
+            credential_process,
+            public_base_url,
+            requester_pays,
+            proxy_url,
+            ca_bundle,
         ) = settings
         self.setWindowTitle("Profile settings")
-        self.resize(600, 250)
+        self.resize(640, 320)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
 
         self.formGroupBox = QGroupBox("Connection settings")
@@ -42,9 +50,21 @@ class SettingsWindow(QDialog):
         self.accessKeyEdit = QLineEdit()
         self.secretKeyEdit = QLineEdit()
         self.sessionTokenEdit = QLineEdit()
+        self.sessionExpiresEdit = QLineEdit()
+        self.credentialProcessEdit = QLineEdit()
+        self.publicBaseUrlEdit = QLineEdit()
+        self.proxyEdit = QLineEdit()
+        self.caBundleEdit = QLineEdit()
+        self.caBundleButton = QPushButton("Browse…")
+        self.expiryLabel = QLabel()
         self.noSslCheck = QCheckBox()
         self.usePath = QCheckBox()
         self.readOnly = QCheckBox()
+        self.requesterPays = QCheckBox()
+        # Which ~/.aws profile this was imported from. Carried rather than
+        # shown: it is only ever set by the import button, and it is what
+        # "Refresh credentials" re-reads.
+        self.aws_profile = str(aws_profile or "")
         self.accent = QComboBox()
         for label, value in PROFILE_ACCENTS:
             self.accent.addItem(label, value)
@@ -87,9 +107,31 @@ class SettingsWindow(QDialog):
         self.secretKeyEdit.setEchoMode(QLineEdit.EchoMode.Password)
         self.sessionTokenEdit.setText(session_token)
         self.sessionTokenEdit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.sessionExpiresEdit.setText(str(session_expires or ""))
+        self.sessionExpiresEdit.setPlaceholderText(
+            "2026-09-02T18:30:00Z — blank for permanent keys")
+        self.sessionExpiresEdit.textChanged.connect(self._sync_expiry_label)
+        self.credentialProcessEdit.setText(str(credential_process or ""))
+        self.credentialProcessEdit.setPlaceholderText(
+            "aws configure export-credentials --profile prod --format process")
+        self.credentialProcessEdit.textChanged.connect(self.on_text_changed)
+        self.publicBaseUrlEdit.setText(str(public_base_url or ""))
+        self.publicBaseUrlEdit.setPlaceholderText(
+            "https://cdn.example.com — blank uses the endpoint")
+        self.proxyEdit.setText(str(proxy_url or ""))
+        self.proxyEdit.setPlaceholderText(
+            "http://proxy.corp:3128 — blank connects directly")
+        self.caBundleEdit.setText(str(ca_bundle or ""))
+        self.caBundleEdit.setPlaceholderText(
+            "PEM file to trust — the right answer to a private CA")
+        self.caBundleButton.clicked.connect(self.browse_ca_bundle)
+        self.noSslCheck.toggled.connect(self._sync_tls_fields)
+        self._sync_tls_fields()
         self.noSslCheck.setChecked(str_to_bool(no_ssl_check))
         self.usePath.setChecked(str_to_bool(use_path))
         self.readOnly.setChecked(str_to_bool(read_only))
+        self.requesterPays.setChecked(str_to_bool(requester_pays))
+        self._sync_expiry_label()
 
     def import_from_aws(self):
         profiles = load_aws_profiles()
@@ -110,6 +152,12 @@ class SettingsWindow(QDialog):
         self.accessKeyEdit.setText(entry.get("access_key", ""))
         self.secretKeyEdit.setText(entry.get("secret_key", ""))
         self.sessionTokenEdit.setText(entry.get("session_token", ""))
+        self.sessionExpiresEdit.setText(entry.get("expires", ""))
+        if entry.get("credential_process"):
+            self.credentialProcessEdit.setText(entry["credential_process"])
+        # Remembered so "Refresh credentials" knows which profile to re-read
+        # when this one's temporary keys lapse.
+        self.aws_profile = chosen
         if entry.get("region"):
             self.regionEdit.setText(entry["region"])
         if entry.get("endpoint_url"):
@@ -125,14 +173,40 @@ class SettingsWindow(QDialog):
         super().showEvent(event)
         center_on_screen(self)
 
+    def browse_ca_bundle(self):
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "CA bundle", self.caBundleEdit.text().strip() or "",
+            "Certificates (*.pem *.crt *.cer);;All files (*)")
+        if path:
+            self.caBundleEdit.setText(path)
+
+    def _sync_tls_fields(self):
+        """A CA bundle is meaningless while verification is switched off."""
+        enabled = not self.noSslCheck.isChecked()
+        self.caBundleEdit.setEnabled(enabled)
+        self.caBundleButton.setEnabled(enabled)
+
+    def _sync_expiry_label(self):
+        state, label = expiry_state(self.sessionExpiresEdit.text())
+        if state == "none":
+            self.expiryLabel.setText("")
+            return
+        colour = {"expired": "#c62828", "soon": "#b26a00"}.get(state, "")
+        text = "expired" if state == "expired" else label
+        self.expiryLabel.setText(
+            f"<span style='color:{colour}'>{text}</span>" if colour else text)
+
     @QtCore.pyqtSlot()
     def on_text_changed(self):
         btn_apply = self.buttonBox.button(QDialogButtonBox.StandardButton.Ok)
+        # A credential_process profile has no keys of its own: the command is
+        # what produces them, so requiring both would make it unsaveable.
+        has_keys = bool(self.accessKeyEdit.text()) and bool(
+            self.secretKeyEdit.text())
         btn_apply.setEnabled(
             bool(self.nameLineEdit.text())
             and bool(self.urlLineEdit.text())
-            and bool(self.accessKeyEdit.text())
-            and bool(self.secretKeyEdit.text())
+            and (has_keys or bool(self.credentialProcessEdit.text().strip()))
         )
 
     def setRetVal(self):
@@ -148,6 +222,13 @@ class SettingsWindow(QDialog):
             self.sessionTokenEdit.text(),
             self.readOnly.isChecked(),
             self.accent.currentData() or "",
+            self.sessionExpiresEdit.text().strip(),
+            self.aws_profile,
+            self.credentialProcessEdit.text().strip(),
+            self.publicBaseUrlEdit.text().strip(),
+            self.requesterPays.isChecked(),
+            self.proxyEdit.text().strip(),
+            self.caBundleEdit.text().strip(),
         )
         self.close()
 
@@ -165,6 +246,25 @@ class SettingsWindow(QDialog):
         layout.addRow(QLabel("Secret key"), self.secretKeyEdit)
         layout.addRow(
             QLabel("Session token (temporary credentials)"), self.sessionTokenEdit
+        )
+        layout.addRow(QLabel("Session expires"), self.sessionExpiresEdit)
+        layout.addRow(QLabel(""), self.expiryLabel)
+        layout.addRow(
+            QLabel("Credential process (refreshes SSO / assumed-role keys)"),
+            self.credentialProcessEdit,
+        )
+        layout.addRow(
+            QLabel("Public base URL (CDN or custom domain for links)"),
+            self.publicBaseUrlEdit,
+        )
+        layout.addRow(QLabel("HTTP proxy"), self.proxyEdit)
+        caRow = QHBoxLayout()
+        caRow.addWidget(self.caBundleEdit, 1)
+        caRow.addWidget(self.caBundleButton)
+        layout.addRow(QLabel("CA bundle (trust a private certificate)"), caRow)
+        layout.addRow(
+            QLabel("Requester pays (bill reads to this account)"),
+            self.requesterPays,
         )
         layout.addRow(
             QLabel("No SSL check (self-signed certificate support)"), self.noSslCheck
