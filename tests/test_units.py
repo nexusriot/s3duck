@@ -34,7 +34,7 @@ from unittest.mock import patch
 import botocore.exceptions
 from PyQt6 import sip
 from PyQt6.QtCore import (
-    QByteArray, QEvent, QPointF, QRect, QSettings, Qt, QThread, QUrl,
+    QByteArray, QEvent, QObject, QPointF, QRect, QSettings, Qt, QThread, QUrl,
 )
 from PyQt6.QtGui import (
     QAction, QColor, QFont, QFontMetrics, QIcon, QIconEngine, QKeyEvent,
@@ -4468,6 +4468,59 @@ class WorkerLifetimeTests(unittest.TestCase):
         # that must fall through to isFinished, not blow up the sweep.
         self.assertFalse(utils._thread_finished(_Busy()))
         self.assertTrue(utils._thread_finished(_Gone()))
+
+    def test_a_thread_that_will_not_stop_is_cut_loose_from_its_parent(self):
+        """quit() only asks an event loop to stop; a worker parked in a
+        request ignores it. Leaving that thread parented to a dialog on its
+        way out is the "QThread: Destroyed while thread is still running"
+        abort the parenting was supposed to prevent."""
+        parent = QObject()
+        gate = threading.Event()
+        th = QThread(parent)
+        wk = utils.FuncWorker(lambda _w: gate.wait(5))
+        wk.moveToThread(th)
+        th.started.connect(wk.run)
+        wk.done.connect(th.quit, Qt.ConnectionType.DirectConnection)
+        utils.release_worker_on_finish(th, wk)
+        th.start()
+        deadline = time.monotonic() + 5.0
+        while not th.isRunning() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        try:
+            utils.join_qthread(th, timeout_ms=50)
+            self.assertIsNone(th.parent())
+            # Unparenting hands ownership to Python, so something must hold it
+            # or the next collection runs the destructor on a running thread.
+            self.assertIn(th, utils._DETACHED_THREADS)
+        finally:
+            gate.set()
+        self._drain(th)
+
+        utils.reap_finished_workers()
+        self.assertNotIn(th, utils._DETACHED_THREADS)
+        self.assertNotIn(id(wk), utils._LIVE_WORKERS)
+
+    def test_a_thread_that_stops_in_time_keeps_its_parent(self):
+        parent = QObject()
+        th = QThread(parent)
+        wk = utils.FuncWorker(lambda _w: None)
+        wk.moveToThread(th)
+        th.started.connect(wk.run)
+        wk.done.connect(th.quit)
+        utils.release_worker_on_finish(th, wk)
+        th.start()
+        self._drain(th)
+
+        utils.join_qthread(th)
+        self.assertIs(th.parent(), parent)
+        self.assertNotIn(th, utils._DETACHED_THREADS)
+
+    def test_detaching_a_dead_wrapper_is_not_an_error(self):
+        dead = QThread()
+        sip.delete(dead)
+        utils.detach_running_thread(dead)   # close paths race Qt's own delete
+        self.assertNotIn(dead, utils._DETACHED_THREADS)
 
     def test_join_qthread_tolerates_none_and_running(self):
         utils.join_qthread(None)   # close paths pass whatever they have
@@ -10128,27 +10181,52 @@ class CredentialStoreTests(unittest.TestCase):
             with self.assertRaises(CredentialError):
                 store.set_mode(utils.CREDENTIAL_STORE_KEYRING)
 
-    def test_keyring_availability_rejects_the_null_backend(self):
-        class _NullBackend:
-            pass
+    @staticmethod
+    def _backend(module_name, class_name="Keyring", base=object):
+        """A stand-in shaped like a real keyring backend: every one of them
+        is a class called "Keyring", told apart only by its module."""
+        cls = type(class_name, (base,), {})
+        cls.__module__ = module_name
+        return cls
 
-        class _FailBackend:
-            pass
-
-        _NullBackend.__name__ = "NullKeyring"
-        _FailBackend.__name__ = "FailKeyring"
-
+    def _with_backend(self, cls):
         class _Stub:
-            backend = None
+            @staticmethod
+            def get_keyring():
+                return cls()
 
-            @classmethod
-            def get_keyring(cls):
-                return cls.backend()
+        return patch.object(utils, "keyring", _Stub)
 
-        for backend in (_NullBackend, _FailBackend):
-            _Stub.backend = backend
-            with patch.object(utils, "keyring", _Stub):
-                self.assertFalse(utils.keyring_available())
+    def test_keyring_availability_rejects_the_null_backend(self):
+        """keyring.backends.fail.Keyring and keyring.backends.null.Keyring are
+        both named plain "Keyring" — exactly like the backends that work — so
+        only the module tells them apart."""
+        for module in ("keyring.backends.fail", "keyring.backends.null"):
+            with self.subTest(module=module):
+                with self._with_backend(self._backend(module)):
+                    self.assertFalse(utils.keyring_available())
+
+    def test_a_subclass_of_the_fail_backend_is_rejected_too(self):
+        base = self._backend("keyring.backends.fail")
+        with self._with_backend(self._backend("somewhere.else", base=base)):
+            self.assertFalse(utils.keyring_available())
+
+    def test_a_real_backend_is_accepted(self):
+        for module in ("keyring.backends.SecretService", "keyring.backends.macOS",
+                       "keyring.backends.Windows", "keyring.backends.kwallet",
+                       "keyring.backends.chainer"):
+            with self.subTest(module=module):
+                with self._with_backend(self._backend(module)):
+                    self.assertTrue(utils.keyring_available())
+
+    def test_a_backend_that_cannot_even_be_asked_is_unavailable(self):
+        class _Stub:
+            @staticmethod
+            def get_keyring():
+                raise RuntimeError("no backend")
+
+        with patch.object(utils, "keyring", _Stub):
+            self.assertFalse(utils.keyring_available())
 
     def test_wrap_is_salted_so_two_seals_differ(self):
         key = utils.Crypto.generate_key()
@@ -10217,6 +10295,47 @@ class PublicBaseUrlTests(unittest.TestCase):
         m = make_model(bucket="assets", public_base_url="https://cdn.example.com")
         self.assertEqual(m.clone_for_worker().public_base_url,
                          "https://cdn.example.com")
+
+    def test_a_hash_in_the_key_does_not_become_a_fragment(self):
+        """"notes#2.txt" pasted raw addresses the object "notes"."""
+        m = make_model(bucket="assets", public_base_url="https://cdn.example.com")
+        self.assertEqual(m.direct_object_url("notes#2.txt"),
+                         "https://cdn.example.com/notes%232.txt")
+
+    def test_a_question_mark_does_not_become_a_query(self):
+        m = make_model(bucket="assets", public_base_url="https://cdn.example.com")
+        self.assertEqual(m.direct_object_url("what?.txt"),
+                         "https://cdn.example.com/what%3F.txt")
+
+    def test_spaces_and_percent_signs_are_encoded(self):
+        m = make_model(bucket="assets", public_base_url="https://cdn.example.com")
+        self.assertEqual(m.direct_object_url("a b/100% done.txt"),
+                         "https://cdn.example.com/a%20b/100%25%20done.txt")
+
+    def test_slashes_stay_slashes(self):
+        """They are the path separators the object hierarchy is built from."""
+        m = make_model(bucket="assets", public_base_url="https://cdn.example.com")
+        self.assertEqual(m.direct_object_url("a/b/c.png"),
+                         "https://cdn.example.com/a/b/c.png")
+
+    def test_the_endpoint_form_is_encoded_the_same_way(self):
+        m = make_model(bucket="assets")
+        self.assertEqual(m.direct_object_url("notes#2.txt"),
+                         "https://s3.amazonaws.com/assets/notes%232.txt")
+
+    def test_an_ordinary_key_is_untouched(self):
+        m = make_model(bucket="assets", public_base_url="https://cdn.example.com")
+        self.assertEqual(m.direct_object_url("img/logo-1.0_final~2.png"),
+                         "https://cdn.example.com/img/logo-1.0_final~2.png")
+
+    def test_the_direct_url_encodes_a_key_exactly_as_botocore_does(self):
+        """The two links have to address the same object: a presigned URL is
+        built by botocore, a direct one by us, and users compare them."""
+        key = "notes#2 (final)~x/a b%c.txt"
+        m = make_model(bucket="assets", use_path=True)
+        signed = m.client.generate_presigned_url(
+            "get_object", Params={"Bucket": "assets", "Key": key}, ExpiresIn=60)
+        self.assertEqual(m.direct_object_url(key), signed.split("?")[0])
 
 
 class StorageCostTests(unittest.TestCase):
@@ -10660,6 +10779,22 @@ class RequesterPaysTests(unittest.TestCase):
         self.assertTrue(clone.requester_pays)
         self.assertEqual(self._emit(clone.client, "GetObject"),
                          {"RequestPayer": "requester"})
+
+    def test_every_listed_operation_really_accepts_the_parameter(self):
+        """The hook injects RequestPayer unconditionally, so an operation
+        listed here that does not take it turns into a ParamValidationError
+        the moment a requester-pays profile reaches it. DeleteObjectTagging
+        was on the list and is one of those — it takes Bucket, Key, VersionId
+        and ExpectedBucketOwner only."""
+        service = make_model(bucket="b").client.meta.service_model
+        for operation in Model.REQUESTER_PAYS_OPERATIONS:
+            with self.subTest(operation=operation):
+                shape = service.operation_model(operation).input_shape
+                self.assertIn("RequestPayer", (shape.members if shape else {}))
+
+    def test_delete_object_tagging_is_not_on_the_list(self):
+        self.assertNotIn("DeleteObjectTagging",
+                         Model.REQUESTER_PAYS_OPERATIONS)
 
 
 class _BucketAdminClient(FakeS3Client):
@@ -11530,6 +11665,91 @@ class DiagnosticsSettingsTests(unittest.TestCase):
             diagnostics.collect(self.ROOT, version="9.9.9", model=model))
         self.assertIn("(endpoint)", text)
 
+    def test_a_proxy_password_never_reaches_the_report(self):
+        """The report is written to be pasted into a bug tracker, and a
+        corporate proxy is routinely http://user:password@proxy:3128."""
+        model = make_model(bucket="bkt",
+                           proxy_url="http://alice:s3cr3t@proxy.corp:3128")
+        text = diagnostics.format_report(
+            diagnostics.collect(self.ROOT, version="9.9.9", model=model))
+        self.assertNotIn("s3cr3t", text)
+        self.assertNotIn("alice", text)
+        self.assertIn("proxy.corp:3128", text)
+
+    def test_a_proxy_without_credentials_is_shown_as_configured(self):
+        model = make_model(bucket="bkt", proxy_url="http://proxy.corp:3128")
+        text = diagnostics.format_report(
+            diagnostics.collect(self.ROOT, version="9.9.9", model=model))
+        self.assertIn("http://proxy.corp:3128", text)
+
+    def test_no_proxy_still_reads_as_direct(self):
+        model = make_model(bucket="bkt")
+        text = diagnostics.format_report(
+            diagnostics.collect(self.ROOT, version="9.9.9", model=model))
+        self.assertIn("(direct)", text)
+
+
+class RedactUrlCredentialsTests(unittest.TestCase):
+    """Everything that can appear in a proxy field, sanitised."""
+
+    def test_nothing_to_redact_is_left_exactly_alone(self):
+        for url in ("http://proxy.corp:3128", "proxy.corp:3128",
+                    "https://proxy.corp", "http://[2001:db8::1]:3128"):
+            with self.subTest(url=url):
+                self.assertEqual(
+                    diagnostics.redact_url_credentials(url), url)
+
+    def test_empty_values_stay_empty(self):
+        for value in ("", None, "   "):
+            self.assertEqual(diagnostics.redact_url_credentials(value), "")
+
+    def test_a_password_is_replaced(self):
+        self.assertEqual(
+            diagnostics.redact_url_credentials(
+                "http://alice:s3cr3t@proxy.corp:3128"),
+            "http://***@proxy.corp:3128")
+
+    def test_a_bare_username_goes_too(self):
+        self.assertEqual(
+            diagnostics.redact_url_credentials("http://alice@proxy.corp"),
+            "http://***@proxy.corp")
+
+    def test_credentials_without_a_scheme_are_still_caught(self):
+        self.assertEqual(
+            diagnostics.redact_url_credentials("alice:s3cr3t@proxy.corp:3128"),
+            "***@proxy.corp:3128")
+
+    def test_an_at_sign_inside_the_password_does_not_shift_the_host(self):
+        self.assertEqual(
+            diagnostics.redact_url_credentials(
+                "http://alice:p@ss@proxy.corp:3128"),
+            "http://***@proxy.corp:3128")
+
+    def test_an_ipv6_host_survives_intact(self):
+        self.assertEqual(
+            diagnostics.redact_url_credentials(
+                "http://alice:pw@[2001:db8::1]:3128"),
+            "http://***@[2001:db8::1]:3128")
+
+    def test_an_at_sign_in_the_path_is_not_mistaken_for_credentials(self):
+        for url in ("http://proxy.corp/go@home", "http://proxy.corp?to=a@b",
+                    "http://proxy.corp#a@b"):
+            with self.subTest(url=url):
+                self.assertEqual(
+                    diagnostics.redact_url_credentials(url), url)
+
+    def test_the_path_is_kept_when_there_are_credentials(self):
+        self.assertEqual(
+            diagnostics.redact_url_credentials("http://a:b@proxy.corp/pac?x=1"),
+            "http://***@proxy.corp/pac?x=1")
+
+    def test_a_malformed_value_leaks_nothing(self):
+        """Half a URL is still half a password."""
+        for url in ("http://alice:s3cr3t@", "alice:s3cr3t@", "@", "://"):
+            with self.subTest(url=url):
+                self.assertNotIn(
+                    "s3cr3t", diagnostics.redact_url_credentials(url))
+
 
 class DocumentationAccuracyTests(unittest.TestCase):
     """The README is the feature list users read before the app. A menu entry
@@ -11896,30 +12116,59 @@ class ObjectFingerprintTests(unittest.TestCase):
 
     def test_equal_full_fingerprints_are_the_same_object(self):
         self.assertEqual(
-            Model.compare_fingerprints([("full", "A"), ("full", "A")]), "same")
+            Model.compare_fingerprints(
+                [("full", "MD5:aaa"), ("full", "MD5:aaa")]), "same")
 
     def test_different_full_fingerprints_rule_the_group_out(self):
         self.assertEqual(
-            Model.compare_fingerprints([("full", "A"), ("full", "B")]),
+            Model.compare_fingerprints(
+                [("full", "MD5:aaa"), ("full", "MD5:bbb")]),
             "different")
+
+    def test_two_algorithms_cannot_rule_anything_out(self):
+        """A CRC32 and an ETag-derived MD5 of the very same bytes are two
+        different strings, so the group is unknown, not different."""
+        self.assertEqual(
+            Model.compare_fingerprints(
+                [("full", "CRC32:aaa"), ("full", "MD5:bbb")]),
+            "unknown")
+
+    def test_a_mixed_group_where_one_pair_matches_is_still_unknown(self):
+        self.assertEqual(
+            Model.compare_fingerprints(
+                [("full", "SHA256:aa"), ("full", "SHA256:aa"),
+                 ("full", "MD5:bb")]),
+            "unknown")
+
+    def test_identical_values_are_the_same_whatever_the_algorithm_column(self):
+        """Equality needs no algorithm agreement: the strings carry it."""
+        self.assertEqual(
+            Model.compare_fingerprints(
+                [("full", "SHA1:aa"), ("full", "SHA1:aa"),
+                 ("full", "SHA1:aa")]),
+            "same")
 
     def test_equal_part_fingerprints_still_prove_a_match(self):
         self.assertEqual(
-            Model.compare_fingerprints([("parts", "A"), ("parts", "A")]),
+            Model.compare_fingerprints(
+                [("parts", "8:MD5:aa"), ("parts", "8:MD5:aa")]),
             "same")
 
     def test_different_part_fingerprints_prove_nothing(self):
         """The same bytes split at other boundaries digest differently."""
         self.assertEqual(
-            Model.compare_fingerprints([("parts", "A"), ("parts", "B")]),
+            Model.compare_fingerprints(
+                [("parts", "8:MD5:aa"), ("parts", "4:MD5:bb")]),
             "unknown")
 
     def test_one_silent_member_makes_the_whole_group_unknown(self):
         self.assertEqual(
-            Model.compare_fingerprints([("full", "A"), ("", "")]), "unknown")
+            Model.compare_fingerprints([("full", "MD5:aa"), ("", "")]),
+            "unknown")
 
     def test_a_single_member_is_never_a_verdict(self):
-        self.assertEqual(Model.compare_fingerprints([("full", "A")]), "unknown")
+        self.assertEqual(
+            Model.compare_fingerprints([("full", "MD5:aa")]), "unknown")
 
 
 class DuplicateConfirmationTests(unittest.TestCase):
@@ -11945,7 +12194,7 @@ class DuplicateConfirmationTests(unittest.TestCase):
                 "count": len(keys), "wasted": 10}
 
     def test_matching_digests_confirm_a_candidate(self):
-        model = self._Model({"a": ("full", "X"), "b": ("full", "X")})
+        model = self._Model({"a": ("full", "MD5:aa"), "b": ("full", "MD5:aa")})
         self.assertEqual(
             main_window.DuplicateFinderDialog.confirm_groups(
                 model, [self._group("a", "b")]),
@@ -11953,34 +12202,44 @@ class DuplicateConfirmationTests(unittest.TestCase):
         self.assertEqual(model.asked, ["a", "b"])
 
     def test_differing_whole_object_digests_rule_it_out(self):
-        model = self._Model({"a": ("full", "X"), "b": ("full", "Y")})
+        model = self._Model({"a": ("full", "MD5:aa"), "b": ("full", "MD5:bb")})
         self.assertEqual(
             main_window.DuplicateFinderDialog.confirm_groups(
                 model, [self._group("a", "b")]),
             ["different"])
 
     def test_a_silent_backend_leaves_it_undecided(self):
-        model = self._Model({"a": ("", ""), "b": ("full", "X")})
+        model = self._Model({"a": ("", ""), "b": ("full", "MD5:aa")})
         self.assertEqual(
             main_window.DuplicateFinderDialog.confirm_groups(
                 model, [self._group("a", "b")]),
             ["unknown"])
 
     def test_a_failing_member_does_not_abort_the_pass(self):
-        model = self._Model({"a": RuntimeError("denied"), "b": ("full", "X")})
+        model = self._Model({"a": RuntimeError("denied"), "b": ("full", "MD5:aa")})
         self.assertEqual(
             main_window.DuplicateFinderDialog.confirm_groups(
                 model, [self._group("a", "b")]),
             ["unknown"])
 
     def test_cancellation_stops_between_groups(self):
-        model = self._Model({"a": ("full", "X"), "b": ("full", "X")})
+        model = self._Model({"a": ("full", "MD5:aa"), "b": ("full", "MD5:aa")})
         cancel = threading.Event()
         cancel.set()
         with self.assertRaises(TransferCancelled):
             main_window.DuplicateFinderDialog.confirm_groups(
                 model, [self._group("a", "b")], cancel_event=cancel)
         self.assertEqual(model.asked, [])
+
+    def test_two_checksum_algorithms_do_not_rule_a_candidate_out(self):
+        """Same size, same-looking pair, but one object was uploaded with a
+        CRC32 and the other only has an ETag. Reading that as "different"
+        threw away a real duplicate."""
+        model = self._Model({"a": ("full", "CRC32:aa"), "b": ("full", "MD5:bb")})
+        self.assertEqual(
+            main_window.DuplicateFinderDialog.confirm_groups(
+                model, [self._group("a", "b")]),
+            ["unknown"])
 
 
 class NavigationHistoryTests(unittest.TestCase):
@@ -13427,6 +13686,16 @@ class DesktopEntryTests(unittest.TestCase):
 
     def test_the_exec_line_takes_the_url(self):
         self.assertIn("%U", self._entry())
+
+    def test_every_value_is_free_of_trailing_whitespace(self):
+        """desktop-file-validate rejects "true " as a boolean, and the entry
+        is installed unchecked by the postinst."""
+        for line in self._entry().splitlines():
+            with self.subTest(line=line):
+                self.assertEqual(line, line.rstrip())
+
+    def test_startup_notify_is_an_exact_boolean(self):
+        self.assertIn("\nStartupNotify=true\n", "\n" + self._entry() + "\n")
 
     def test_the_package_refreshes_the_mime_cache(self):
         """Claiming the scheme does nothing until the cache knows."""

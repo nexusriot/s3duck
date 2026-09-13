@@ -356,7 +356,8 @@ context menu (Credential storage…):
 local        QSettings "common/key" — the default, and the historical
              behaviour: the key sits beside the ciphertext, which protects
              against a casual reader and nothing else
-keyring      the OS secret store (needs the `keyring` package)
+keyring      the OS secret store (needs the `keyring` package *and* a
+             backend it can reach — a headless box often has neither)
 passphrase   sealed with PBKDF2 under a passphrase entered once per launch,
              stored as "common/key_wrapped"
 ```

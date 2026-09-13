@@ -8,4 +8,4 @@ Type=Application
 Categories=Application;Network;
 Comment=S3Duck S3 browser
 MimeType=x-scheme-handler/s3;
-StartupNotify=true 
+StartupNotify=true

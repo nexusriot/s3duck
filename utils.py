@@ -252,10 +252,18 @@ def keyring_available() -> bool:
         backend = keyring.get_keyring()
     except Exception:
         return False
-    # keyring always returns *a* backend; the fail/null ones raise on write,
-    # which would lose the key rather than store it.
-    name = type(backend).__name__.lower()
-    return "fail" not in name and "null" not in name
+    # keyring always returns *a* backend; the fail/null ones raise on write or
+    # swallow the secret, either of which loses the key rather than stores it.
+    # They are identified by the module they come from, not by the class name:
+    # keyring.backends.fail.Keyring and keyring.backends.null.Keyring are both
+    # called plain "Keyring", exactly like SecretService's and macOS's, so a
+    # name test called every one of them usable. The whole MRO is checked so a
+    # backend deriving from one of them is caught too.
+    return not any(
+        getattr(cls, "__module__", "").rsplit(".", 1)[-1].lower()
+        in ("fail", "null")
+        for cls in type(backend).__mro__
+    )
 
 
 def wrap_key(key: str, passphrase: str) -> str:
@@ -877,16 +885,49 @@ def join_qthread(th, timeout_ms: int = 2000):
     thread is still running"). Callers join in the done handler (the work is
     over by then, so this returns immediately) and again on close, which covers
     a dialog dismissed mid-load.
+
+    The join is bounded because it runs on the GUI thread, and a worker parked
+    in a request cannot be interrupted: ``quit`` only asks an event loop to
+    stop, and the S3 call it is blocked in will return when the socket says so
+    and not before. Giving up used to leave exactly the thing the parenting was
+    meant to prevent — a running thread still attached to a dialog about to be
+    destroyed — so a thread that outlasts the wait is cut loose instead.
     """
     if th is None:
         return
     try:
         if th.isRunning():
             th.quit()
-            th.wait(timeout_ms)
+            if not th.wait(timeout_ms):
+                detach_running_thread(th)
     except RuntimeError:
         pass  # already deleted by Qt
     reap_finished_workers()
+
+
+_DETACHED_THREADS = []
+
+
+def detach_running_thread(th):
+    """Unparent a thread that would not stop, and hold it until it does.
+
+    Reparenting to None hands ownership back to Python, so the reference has
+    to be parked somewhere or the very next collection would run the QThread
+    destructor on a running thread — the abort this is here to avoid. The
+    sweep below releases it once it has finished, by which time destroying it
+    is safe and its own ``finished`` handler has usually deleted it already.
+    """
+    try:
+        th.setParent(None)
+    except RuntimeError:
+        return  # already deleted by Qt; nothing left to detach
+    _DETACHED_THREADS.append(th)
+
+
+def _release_finished_detached_threads():
+    for th in list(_DETACHED_THREADS):
+        if _thread_finished(th):
+            _DETACHED_THREADS.remove(th)
 
 
 _LIVE_WORKERS = {}
@@ -951,6 +992,7 @@ def reap_finished_workers():
         if _thread_finished(entry[1]):
             del _LIVE_WORKERS[key]
             _reaper().bury(entry)
+    _release_finished_detached_threads()
 
 
 def release_worker_on_finish(thread, worker):

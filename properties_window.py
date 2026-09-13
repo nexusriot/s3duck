@@ -2,7 +2,7 @@ from PyQt6.QtCore import *
 from PyQt6.QtWidgets import *
 from PyQt6.QtGui import *
 
-from utils import center_on_screen, release_worker_on_finish
+from utils import center_on_screen, join_qthread, release_worker_on_finish
 
 
 class _SizeWorker(QObject):
@@ -201,29 +201,17 @@ class PropertiesWindow(QDialog):
     def _stop_lock_thread(self):
         thread, self._lock_thread = self._lock_thread, None
         self._lock_worker = None
-        if thread is None:
-            return
-        try:
-            if thread.isRunning():
-                thread.quit()
-                thread.wait(2000)
-        except RuntimeError:
-            pass
+        join_qthread(thread)
 
     def _stop_size_thread(self):
         th, self._size_thread, self._size_worker = self._size_thread, None, None
-        if th is None:
-            return
-        try:
-            if th.isRunning():
-                th.quit()
-                th.wait(2000)
-        except RuntimeError:
-            pass
+        join_qthread(th)
 
     def closeEvent(self, event):
         # The worker thread is parented to this dialog; closing while it runs
-        # would destroy a running QThread and abort the process.
+        # would destroy a running QThread and abort the process. A probe still
+        # stuck in its request when the join gives up is detached there rather
+        # than left attached to a dialog on its way out.
         self._stop_size_thread()
         self._stop_lock_thread()
         super().closeEvent(event)

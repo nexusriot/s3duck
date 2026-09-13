@@ -515,8 +515,11 @@ class Profiles(QDialog):
              "Settings file (default) — readable by anything that can read "
              "your config"),
             (CREDENTIAL_STORE_KEYRING,
+             # Unavailable covers both "the package is missing" and "it is
+             # installed but found no backend to talk to", which is the usual
+             # answer on a headless Linux box.
              "OS secret store" + ("" if keyring_available()
-                                  else " — unavailable: install 'keyring'")),
+                                  else " — unavailable here")),
             (CREDENTIAL_STORE_PASSPHRASE,
              "Passphrase — asked once each time s3duck starts"),
         ]

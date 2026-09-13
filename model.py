@@ -17,7 +17,7 @@ import os
 import boto3
 import botocore
 import threading
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from boto3.s3.transfer import TransferConfig
 
@@ -308,13 +308,15 @@ class Model:
     # S3 operations that accept RequestPayer. Bucket-level calls (ListBuckets,
     # GetBucketVersioning, …) do not, and sending it there is a hard
     # ParamValidationError rather than something the service ignores.
+    # DeleteObjectTagging is the odd one out among the object calls: it takes
+    # Bucket, Key, VersionId and ExpectedBucketOwner and nothing else.
     REQUESTER_PAYS_OPERATIONS = (
         "GetObject", "HeadObject", "PutObject", "DeleteObject",
         "DeleteObjects", "CopyObject", "ListObjects", "ListObjectsV2",
         "ListObjectVersions", "ListMultipartUploads", "ListParts",
         "CreateMultipartUpload", "UploadPart", "UploadPartCopy",
         "CompleteMultipartUpload", "AbortMultipartUpload", "RestoreObject",
-        "GetObjectTagging", "PutObjectTagging", "DeleteObjectTagging",
+        "GetObjectTagging", "PutObjectTagging",
         "GetObjectAcl", "PutObjectAcl", "GetObjectAttributes",
     )
 
@@ -2989,10 +2991,16 @@ class Model:
         (e.g. https://mybucket.s3.region.amazonaws.com) — in that case the
         bucket name is already part of the host, so we must NOT add it again
         as a path segment (that produced .../mybucket/mybucket/key).
+
+        The key is percent-encoded on the way in. It is an arbitrary byte
+        string, and pasting one containing "#" or "?" straight into a URL
+        truncates the link at that character: "notes#2.txt" addressed the
+        object "notes" with a fragment. Slashes stay literal — they are the
+        path separators the object hierarchy is built from.
         """
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
-        key = (key or "").lstrip("/")
+        key = quote((key or "").lstrip("/"), safe="/")
         # A CDN or custom domain is mapped at the bucket root, so the bucket
         # name is never part of the path there. Presigned links deliberately
         # do NOT go through this: their signature covers the host.
@@ -4449,6 +4457,13 @@ class Model:
 
         Only a whole-object digest can prove two objects differ; per-part
         digests can prove they match but never that they do not.
+
+        Even then the digests have to be comparable. Every value carries the
+        algorithm that produced it ("CRC32:…", "MD5:…"), and objects uploaded
+        under different client settings routinely end up with different ones —
+        a CRC32 next to an ETag-derived MD5. Those two strings differ for
+        identical bytes, so a mixed group is "unknown", not "different";
+        calling it "different" quietly ruled real duplicates out.
         """
         entries = list(fingerprints or [])
         if len(entries) < 2 or any(not kind for kind, _v in entries):
@@ -4456,7 +4471,8 @@ class Model:
         values = {value for _kind, value in entries}
         if len(values) == 1:
             return "same"
-        if all(kind == "full" for kind, _v in entries):
+        algorithms = {value.split(":", 1)[0] for _kind, value in entries}
+        if all(kind == "full" for kind, _v in entries) and len(algorithms) == 1:
             return "different"
         return "unknown"
 
