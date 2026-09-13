@@ -2,7 +2,10 @@ from PyQt6.QtCore import *
 from PyQt6.QtWidgets import *
 from PyQt6.QtGui import *
 
-from utils import center_on_screen, join_qthread, release_worker_on_finish
+from utils import (
+    center_on_screen, DialogDismissMixin, join_qthread,
+    release_worker_on_finish,
+)
 
 
 class _SizeWorker(QObject):
@@ -41,7 +44,7 @@ class _LockWorker(QObject):
             self.done.emit(None, exc)
 
 
-class PropertiesWindow(QDialog):
+class PropertiesWindow(DialogDismissMixin, QDialog):
     def __init__(self, *args, **kwargs):
         settings = kwargs.pop("settings")
         super().__init__(*args, **kwargs)
@@ -207,14 +210,14 @@ class PropertiesWindow(QDialog):
         th, self._size_thread, self._size_worker = self._size_thread, None, None
         join_qthread(th)
 
-    def closeEvent(self, event):
-        # The worker thread is parented to this dialog; closing while it runs
-        # would destroy a running QThread and abort the process. A probe still
-        # stuck in its request when the join gives up is detached there rather
-        # than left attached to a dialog on its way out.
+    def stop_threads(self):
+        # Both probes are parented to this dialog, so one still running when
+        # the dialog is destroyed aborts the process. The mixin calls this
+        # from every way out — Escape included, which used to skip it. A probe
+        # still stuck in its request when the join gives up is detached there
+        # rather than left attached to a dialog on its way out.
         self._stop_size_thread()
         self._stop_lock_thread()
-        super().closeEvent(event)
 
     def showEvent(self, event):
         super().showEvent(event)

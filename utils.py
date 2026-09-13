@@ -16,7 +16,8 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from PyQt6.QtCore import (
-    QEventLoop, QMetaObject, QObject, QThread, Qt, pyqtSignal, pyqtSlot,
+    QEventLoop, QMetaObject, QObject, QThread, QTimer, Qt, pyqtSignal,
+    pyqtSlot,
 )
 try:
     from PyQt6 import sip
@@ -877,6 +878,61 @@ class TempWorkspace:
         return removed
 
 
+class DialogDismissMixin:
+    """Runs a dialog's cleanup on EVERY way out, not just the X button.
+
+    A QDialog leaves by two doors that do not meet. ``close()`` and the
+    window's close button send a QCloseEvent, so ``closeEvent`` runs. Escape,
+    ``reject()`` and ``accept()`` go straight to ``done()`` and raise no close
+    event at all — which meant every dialog here, all of which join their
+    worker threads in ``closeEvent``, skipped the join entirely when the user
+    pressed Escape. The thread kept running, still parented to a dialog that
+    outlives it only until its parent window goes: "QThread: Destroyed while
+    thread is still running", at exit, blamed on whatever ran last.
+
+    Subclasses put their teardown in ``stop_threads`` and any "are you sure"
+    in ``confirm_dismiss``; both are reached from both doors, exactly once.
+    Refusing in ``confirm_dismiss`` now also refuses Escape, which is the
+    other half of the same bug: the unsaved-work prompt could be walked past
+    with one keystroke.
+
+    Mix in BEFORE QDialog, so these overrides win:
+    ``class Foo(DialogDismissMixin, QDialog)``.
+    """
+
+    # Latched on the way out so re-entry cannot ask twice: Qt's own
+    # QDialog.closeEvent calls reject(), which comes straight back through
+    # done() while the first pass is still on the stack.
+    _dismissing = False
+
+    def confirm_dismiss(self) -> bool:
+        """False to refuse the dismissal. Override for unsaved work."""
+        return True
+
+    def stop_threads(self):
+        """Join whatever this dialog started. Must be idempotent."""
+
+    def _prepare_dismiss(self) -> bool:
+        if self._dismissing:
+            return True
+        if not self.confirm_dismiss():
+            return False
+        self._dismissing = True
+        self.stop_threads()
+        return True
+
+    def closeEvent(self, event):
+        if not self._prepare_dismiss():
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def done(self, result):
+        if not self._prepare_dismiss():
+            return
+        super().done(result)
+
+
 def join_qthread(th, timeout_ms: int = 2000):
     """Quit and join a worker QThread.
 
@@ -907,21 +963,37 @@ def join_qthread(th, timeout_ms: int = 2000):
 
 _DETACHED_THREADS = []
 
+# How often to look again at a thread that would not stop. It only runs while
+# one is outstanding, which is already the degraded case, so a slow poll is
+# enough — the point is that the release happens on its own.
+DETACHED_SWEEP_MS = 1000
+
 
 def detach_running_thread(th):
     """Unparent a thread that would not stop, and hold it until it does.
 
     Reparenting to None hands ownership back to Python, so the reference has
     to be parked somewhere or the very next collection would run the QThread
-    destructor on a running thread — the abort this is here to avoid. The
-    sweep below releases it once it has finished, by which time destroying it
-    is safe and its own ``finished`` handler has usually deleted it already.
+    destructor on a running thread — the abort this is here to avoid.
+
+    Releasing it again cannot wait for the next ``join_qthread`` the way a
+    pinned worker does: the dialog that owned this thread is on its way out,
+    and if nothing else in the session ever starts a worker, no sweep is ever
+    called and the wrapper (plus the C++ QThread, for callers that do not wire
+    ``finished`` to ``deleteLater``) is pinned for the life of the process.
+    So detaching also starts a periodic sweep on the GUI thread, which stops
+    itself as soon as the last detached thread has been released.
+
+    Runs on the GUI thread — every caller reaches it through ``join_qthread``
+    from a dialog handler, which is the same thread the reaper's timer lives
+    on.
     """
     try:
         th.setParent(None)
     except RuntimeError:
         return  # already deleted by Qt; nothing left to detach
     _DETACHED_THREADS.append(th)
+    _reaper().watch_detached()
 
 
 def _release_finished_detached_threads():
@@ -965,6 +1037,10 @@ class _WorkerReaper(QObject):
     def __init__(self):
         super().__init__()
         self._graveyard = []
+        # Parented to the reaper, so it lives and ticks on the GUI thread.
+        self._sweeper = QTimer(self)
+        self._sweeper.setInterval(DETACHED_SWEEP_MS)
+        self._sweeper.timeout.connect(self._sweep)
 
     def bury(self, entry):
         self._graveyard.append(entry)
@@ -974,6 +1050,17 @@ class _WorkerReaper(QObject):
     @pyqtSlot()
     def flush(self):
         self._graveyard.clear()
+
+    def watch_detached(self):
+        """Poll until every detached thread has been released."""
+        if not self._sweeper.isActive():
+            self._sweeper.start()
+
+    @pyqtSlot()
+    def _sweep(self):
+        reap_finished_workers()
+        if not _DETACHED_THREADS:
+            self._sweeper.stop()
 
 
 _REAPER = None

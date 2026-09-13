@@ -41,7 +41,8 @@ from model import TransferCancelled
 from model import run_parallel
 from model import CHECKSUM_ALGORITHMS, plan_prefix_download, prefix_of
 from utils import (
-    CredentialError, CredentialProcessError, FuncWorker, TempWorkspace,
+    CredentialError, CredentialProcessError, DialogDismissMixin, FuncWorker,
+    TempWorkspace,
     expiry_state, join_qthread, load_aws_profiles, normalize_accent,
     reap_finished_workers, release_worker_on_finish, require_crypto,
     describe_client_error, forward_icon, is_transient_error, LogFile,
@@ -2667,7 +2668,7 @@ class TreemapWidget(QWidget):
         super().mouseReleaseEvent(event)
 
 
-class SizeExplorerDialog(QDialog):
+class SizeExplorerDialog(DialogDismissMixin, QDialog):
     """Drill into a bucket by prefix, sized by what it actually holds."""
 
     def __init__(self, parent, main_window, model, prefix):
@@ -2714,12 +2715,11 @@ class SizeExplorerDialog(QDialog):
         layout.addLayout(row)
         self._scan()
 
-    def closeEvent(self, event):
+    def stop_threads(self):
         if self._cancel is not None:
             self._cancel.set()
         thread, self._thread, self._worker = self._thread, None, None
         join_qthread(thread)
-        super().closeEvent(event)
 
     def _scan(self):
         if self._thread is not None:
@@ -3643,7 +3643,7 @@ class BucketSettingsDialog(QDialog):
         self.reload()
 
 
-class CopyMoveDialog(QDialog):
+class CopyMoveDialog(DialogDismissMixin, QDialog):
     def __init__(self, parent, model, item_count: int, current_prefix: str):
         super().__init__(parent)
         self.setWindowTitle("Copy / Move")
@@ -3722,9 +3722,8 @@ class CopyMoveDialog(QDialog):
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
-    def closeEvent(self, event):
+    def stop_threads(self):
         self._stop_loader()
-        super().closeEvent(event)
 
     def _stop_loader(self):
         th, self._thread, self._worker = self._thread, None, None
@@ -4707,7 +4706,7 @@ class SecondPane(QWidget):
         join_qthread(thread)
 
 
-class PaneCompareDialog(QDialog):
+class PaneCompareDialog(DialogDismissMixin, QDialog):
     """
     What differs between the two panes, and a way to copy it either way.
 
@@ -4831,6 +4830,10 @@ class PaneCompareDialog(QDialog):
         release_worker_on_finish(self._thread, self._worker)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
+
+    def stop_threads(self):
+        th, self._thread, self._worker = self._thread, None, None
+        join_qthread(th)
 
     def _on_compared(self, result, exc):
         thread, self._thread, self._worker = self._thread, None, None
@@ -5015,7 +5018,7 @@ class WatchFolderDialog(QDialog):
         }
 
 
-class SyncDialog(QDialog):
+class SyncDialog(DialogDismissMixin, QDialog):
     """Compare a local folder with the current prefix, show a dry-run plan,
     then execute it through the transfer queue."""
 
@@ -5096,13 +5099,12 @@ class SyncDialog(QDialog):
         lay.addWidget(self._table, 1)
         lay.addLayout(row)
 
-    def closeEvent(self, event):
+    def stop_threads(self):
         if self._cancel is not None:
             self._cancel.set()
         th, self._thread, self._worker = self._thread, None, None
         self._cancel = None
         join_qthread(th)
-        super().closeEvent(event)
 
     def _browse(self):
         path = QFileDialog.getExistingDirectory(self, "Select local folder")
@@ -5294,7 +5296,7 @@ class BulkTagsDialog(QDialog):
             and not self.replace_all()
 
 
-class DuplicateFinderDialog(QDialog):
+class DuplicateFinderDialog(DialogDismissMixin, QDialog):
     """
     Find objects holding the same content and delete the redundant copies.
 
@@ -5386,13 +5388,12 @@ class DuplicateFinderDialog(QDialog):
 
         self._update_buttons()
 
-    def closeEvent(self, event):
+    def stop_threads(self):
         if self._cancel is not None:
             self._cancel.set()
         th, self._thread, self._worker = self._thread, None, None
         self._cancel = None
         join_qthread(th)
-        super().closeEvent(event)
 
     def unconfirmed_groups(self) -> list:
         return [group for group in self._groups if not group.get("confirmed")]
@@ -5992,7 +5993,7 @@ class TagsDialog(QDialog):
 
 
 
-class PreviewDialog(QDialog):
+class PreviewDialog(DialogDismissMixin, QDialog):
     """Inline preview for a single object: images and text render in-app;
     anything else can be opened with the OS default application."""
 
@@ -6132,20 +6133,23 @@ class PreviewDialog(QDialog):
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
-    def closeEvent(self, event):
+    def confirm_dismiss(self) -> bool:
+        # Escape reaches this now too. It used to walk straight past the
+        # prompt and throw the edits away without asking.
         if self._editing and self._text.document().isModified():
             answer = QMessageBox.question(
                 self, "Preview",
                 "Discard the unsaved changes to this object?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if answer != QMessageBox.StandardButton.Yes:
-                event.ignore()
-                return
+                return False
+        return True
+
+    def stop_threads(self):
         self._stop_load_thread()
         join_qthread(self._save_thread)
         self._save_thread = None
         self._save_worker = None
-        super().closeEvent(event)
 
     def _stop_load_thread(self):
         th, self._thread, self._worker = self._thread, None, None
@@ -6338,7 +6342,7 @@ class PreviewDialog(QDialog):
         prog.show()
 
 
-class VersionDiffDialog(QDialog):
+class VersionDiffDialog(DialogDismissMixin, QDialog):
     """
     A unified diff between two versions of one object.
 
@@ -6458,10 +6462,9 @@ class VersionDiffDialog(QDialog):
     def _copy(self):
         QApplication.clipboard().setText(self._text.toPlainText())
 
-    def closeEvent(self, event):
+    def stop_threads(self):
         thread, self._thread, self._worker = self._thread, None, None
         join_qthread(thread)
-        super().closeEvent(event)
 
 
 class DiffHighlighter(QSyntaxHighlighter):
@@ -6485,7 +6488,7 @@ class DiffHighlighter(QSyntaxHighlighter):
             self.setFormat(0, len(text), self._removed)
 
 
-class VersionsDialog(QDialog):
+class VersionsDialog(DialogDismissMixin, QDialog):
     """List, download, restore, and delete individual object versions."""
 
     def __init__(self, parent, main_window, model, key):
@@ -6553,9 +6556,8 @@ class VersionsDialog(QDialog):
 
         self._reload()
 
-    def closeEvent(self, event):
+    def stop_threads(self):
         self._stop_list_thread()
-        super().closeEvent(event)
 
     def _stop_list_thread(self):
         th, self._list_thread, self._list_worker = self._list_thread, None, None
@@ -6779,7 +6781,7 @@ class VersionsDialog(QDialog):
         prog.show()
 
 
-class IncompleteUploadsDialog(QDialog):
+class IncompleteUploadsDialog(DialogDismissMixin, QDialog):
     """List and abort in-flight multipart uploads.
 
     Orphaned uploads (from a cancelled or crashed transfer) keep their already
@@ -6848,9 +6850,8 @@ class IncompleteUploadsDialog(QDialog):
 
         self._reload()
 
-    def closeEvent(self, event):
+    def stop_threads(self):
         self._stop_thread(cancel=True)
-        super().closeEvent(event)
 
     def _stop_thread(self, cancel: bool = False):
         # Sizing every upload costs one ListParts call, so a scan can run for
@@ -7142,7 +7143,7 @@ class MetadataDialog(QDialog):
         self.accept()
 
 
-class SearchDialog(QDialog):
+class SearchDialog(DialogDismissMixin, QDialog):
     """Recursively search the current bucket/prefix by key substring."""
 
     MAX_RESULTS = 1000
@@ -7548,11 +7549,10 @@ class SearchDialog(QDialog):
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
-    def closeEvent(self, event):
+    def stop_threads(self):
         if self._cancel is not None:
             self._cancel.set()
         self._stop_search_thread()
-        super().closeEvent(event)
 
     def _stop_search_thread(self):
         th, self._thread, self._worker = self._thread, None, None

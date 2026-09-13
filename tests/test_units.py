@@ -2776,6 +2776,27 @@ class PropertiesWindowTests(unittest.TestCase):
         self.assertEqual(model.size_calls, [])  # no extra recursive listing
         self.assertEqual(dlg.eTag.text(), "abc")
 
+    def test_escape_joins_the_probes_the_way_closing_does(self):
+        """FINDING: the joins lived in closeEvent, which Escape never fires,
+        so one keystroke left both probe threads running and still parented to
+        the dialog — destroyed with the parent, which aborts the process."""
+        model = _FakePropsModel(size=1234)
+        dlg = self._dlg(model, "a/dir/")
+        self.assertIsNotNone(dlg._size_thread)
+        QApplication.sendEvent(dlg, QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Escape,
+            Qt.KeyboardModifier.NoModifier))
+        self._app.processEvents()
+        self.assertIsNone(dlg._size_thread)
+        self.assertIsNone(dlg._lock_thread)
+
+    def test_rejecting_joins_them_too(self):
+        model = _FakePropsModel(size=1234)
+        dlg = self._dlg(model, "a/dir/")
+        dlg.reject()
+        self._app.processEvents()
+        self.assertIsNone(dlg._size_thread)
+
     def test_folder_size_is_computed_off_the_main_thread(self):
         model = _FakePropsModel(size=1234)
         dlg = self._dlg(model, "a/dir/")
@@ -4363,6 +4384,160 @@ class DebianPackagingTests(unittest.TestCase):
             self.assertIn(f"s/{token}/", script, f"{token} never substituted")
 
 
+class DialogDismissTests(unittest.TestCase):
+    """FINDING (crash + data loss): every dialog here joined its worker
+    threads in closeEvent, and Escape/reject()/accept() never raise a close
+    event — so one keystroke skipped the join and left a running QThread
+    parented to a dialog, and walked straight past PreviewDialog's
+    unsaved-changes prompt."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    class _Dlg(utils.DialogDismissMixin, QDialog):
+        def __init__(self, veto=False):
+            super().__init__()
+            self.veto = veto
+            self.stops = 0
+            self.asked = 0
+            self.finished_count = 0
+            self.finished.connect(self._count)
+
+        def _count(self, _result):
+            self.finished_count += 1
+
+        def confirm_dismiss(self):
+            self.asked += 1
+            return not self.veto
+
+        def stop_threads(self):
+            self.stops += 1
+
+    @staticmethod
+    def _escape(dlg):
+        QApplication.sendEvent(dlg, QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Escape,
+            Qt.KeyboardModifier.NoModifier))
+
+    def _routes(self):
+        return (("close", lambda d: d.close()),
+                ("reject", lambda d: d.reject()),
+                ("accept", lambda d: d.accept()),
+                ("escape", self._escape))
+
+    def test_every_way_out_runs_the_cleanup_exactly_once(self):
+        for name, dismiss in self._routes():
+            with self.subTest(route=name):
+                dlg = self._Dlg()
+                self.addCleanup(dlg.close)
+                dlg.show()
+                dismiss(dlg)
+                self._app.processEvents()
+                self.assertEqual(dlg.stops, 1)
+                self.assertFalse(dlg.isVisible())
+
+    def test_no_way_out_emits_finished_twice(self):
+        """Cleanup must not be bought by firing the dialog's own signal
+        again — callers connect to finished."""
+        for name, dismiss in self._routes():
+            with self.subTest(route=name):
+                dlg = self._Dlg()
+                self.addCleanup(dlg.close)
+                dlg.show()
+                dismiss(dlg)
+                self._app.processEvents()
+                self.assertEqual(dlg.finished_count, 1)
+
+    def test_refusing_blocks_every_way_out(self):
+        """The unsaved-work prompt was escapable; now it is not."""
+        for name, dismiss in self._routes():
+            with self.subTest(route=name):
+                dlg = self._Dlg(veto=True)
+                dlg.show()
+                dismiss(dlg)
+                self._app.processEvents()
+                self.assertEqual(dlg.stops, 0)
+                self.assertTrue(dlg.isVisible())
+                dlg.veto = False
+                dlg.close()
+
+    def test_the_question_is_asked_once_per_dismissal(self):
+        """Qt's own QDialog.closeEvent calls reject(), which re-enters done()
+        while the first pass is still on the stack — an unguarded hook would
+        prompt twice."""
+        for name, dismiss in self._routes():
+            with self.subTest(route=name):
+                dlg = self._Dlg()
+                self.addCleanup(dlg.close)
+                dlg.show()
+                dismiss(dlg)
+                self._app.processEvents()
+                self.assertEqual(dlg.asked, 1)
+
+    def test_accepting_still_reports_its_result(self):
+        dlg = self._Dlg()
+        self.addCleanup(dlg.close)
+        dlg.show()
+        dlg.accept()
+        self.assertEqual(dlg.result(), QDialog.DialogCode.Accepted)
+
+
+class DialogThreadCleanupContractTests(unittest.TestCase):
+    """A new dialog must not be able to reintroduce the Escape hole."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    SOURCES = ("main_window.py", "properties_window.py", "settings.py",
+               "profile_switcher.py")
+
+    def _dialogs_that_join(self):
+        found = []
+        for name in self.SOURCES:
+            with open(os.path.join(self.ROOT, name)) as handle:
+                tree = ast.parse(handle.read())
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                bases = [ast.unparse(base) for base in node.bases]
+                source = ast.unparse(node)
+                if "QDialog" in bases and "join_qthread" in source:
+                    found.append((name, node, bases))
+        return found
+
+    def test_the_audit_finds_the_dialogs_it_is_meant_to_guard(self):
+        """A scan that silently matches nothing proves nothing."""
+        names = {node.name for _f, node, _b in self._dialogs_that_join()}
+        self.assertIn("PropertiesWindow", names)
+        self.assertIn("PreviewDialog", names)
+        self.assertGreaterEqual(len(names), 10)
+
+    def test_every_thread_joining_dialog_cleans_up_on_every_exit(self):
+        for filename, node, bases in self._dialogs_that_join():
+            with self.subTest(dialog=node.name):
+                methods = {m.name for m in node.body
+                           if isinstance(m, ast.FunctionDef)}
+                self.assertIn(
+                    "DialogDismissMixin", bases,
+                    f"{filename}:{node.name} joins worker threads but does "
+                    "not mix in DialogDismissMixin, so Escape skips the join")
+                self.assertIn(
+                    "stop_threads", methods,
+                    f"{filename}:{node.name} mixes the guard in but never "
+                    "overrides stop_threads, so it cleans up nothing")
+
+    def test_none_of_them_hide_the_cleanup_in_close_event(self):
+        """closeEvent is the door Escape does not use."""
+        for filename, node, _bases in self._dialogs_that_join():
+            for member in node.body:
+                if (isinstance(member, ast.FunctionDef)
+                        and member.name == "closeEvent"):
+                    with self.subTest(dialog=node.name):
+                        self.assertNotIn(
+                            "join_qthread", ast.unparse(member),
+                            f"{filename}:{node.name} joins in closeEvent, "
+                            "which Escape never reaches")
+
+
 class WorkerLifetimeTests(unittest.TestCase):
     """release_worker_on_finish — the fix for the intermittent whole-suite
     freeze: a worker deleteLater'd via its own signal is destroyed on the
@@ -4500,6 +4675,95 @@ class WorkerLifetimeTests(unittest.TestCase):
         utils.reap_finished_workers()
         self.assertNotIn(th, utils._DETACHED_THREADS)
         self.assertNotIn(id(wk), utils._LIVE_WORKERS)
+
+    def test_a_detached_thread_is_released_without_any_later_join(self):
+        """FINDING (leak): the only sweep ran from join_qthread/
+        release_worker_on_finish, so a detached thread's wrapper — and the
+        C++ QThread, for callers that do not wire finished to deleteLater —
+        stayed pinned for the life of the process if nothing else in the
+        session ever started a worker. Detaching now drives its own sweep."""
+        gate = threading.Event()
+        parent = QObject()
+        th = QThread(parent)
+        wk = utils.FuncWorker(lambda _w: gate.wait(5))
+        wk.moveToThread(th)
+        th.started.connect(wk.run)
+        wk.done.connect(th.quit, Qt.ConnectionType.DirectConnection)
+        utils.release_worker_on_finish(th, wk)
+        th.start()
+        deadline = time.monotonic() + 5.0
+        while not th.isRunning() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        try:
+            utils.join_qthread(th, timeout_ms=50)
+            self.assertIn(th, utils._DETACHED_THREADS)
+            self.assertTrue(utils._reaper()._sweeper.isActive(),
+                            "nothing will ever look at this thread again")
+        finally:
+            gate.set()
+        self._drain(th)
+
+        # No join_qthread, no release_worker_on_finish — only the sweep.
+        utils._reaper()._sweep()
+        self.assertNotIn(th, utils._DETACHED_THREADS)
+        self.assertNotIn(id(wk), utils._LIVE_WORKERS)
+        self.assertFalse(utils._reaper()._sweeper.isActive(),
+                         "the poll must stop once there is nothing to watch")
+
+    def test_the_sweep_keeps_polling_while_a_thread_is_still_running(self):
+        gate = threading.Event()
+        parent = QObject()          # must outlive the thread it parents
+        th = QThread(parent)
+        wk = utils.FuncWorker(lambda _w: gate.wait(5))
+        wk.moveToThread(th)
+        th.started.connect(wk.run)
+        wk.done.connect(th.quit, Qt.ConnectionType.DirectConnection)
+        utils.release_worker_on_finish(th, wk)
+        th.start()
+        deadline = time.monotonic() + 5.0
+        while not th.isRunning() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        try:
+            utils.join_qthread(th, timeout_ms=50)
+            utils._reaper()._sweep()
+            self.assertIn(th, utils._DETACHED_THREADS)
+            self.assertTrue(utils._reaper()._sweeper.isActive())
+        finally:
+            gate.set()
+        self._drain(th)
+        utils._reaper()._sweep()
+        self.assertNotIn(th, utils._DETACHED_THREADS)
+
+    def test_the_sweep_really_fires_on_its_own_timer(self):
+        """The wiring, not just the slot: a real event loop must reach it."""
+        gate = threading.Event()
+        parent = QObject()          # must outlive the thread it parents
+        th = QThread(parent)
+        wk = utils.FuncWorker(lambda _w: gate.wait(5))
+        wk.moveToThread(th)
+        th.started.connect(wk.run)
+        wk.done.connect(th.quit, Qt.ConnectionType.DirectConnection)
+        utils.release_worker_on_finish(th, wk)
+        th.start()
+        deadline = time.monotonic() + 5.0
+        while not th.isRunning() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        with patch.object(utils, "DETACHED_SWEEP_MS", 10):
+            utils._reaper()._sweeper.setInterval(10)
+            try:
+                utils.join_qthread(th, timeout_ms=50)
+            finally:
+                gate.set()
+            th.wait(5000)
+            deadline = time.monotonic() + 5.0
+            while (th in utils._DETACHED_THREADS
+                   and time.monotonic() < deadline):
+                self._app.processEvents()
+        utils._reaper()._sweeper.setInterval(utils.DETACHED_SWEEP_MS)
+        self.assertNotIn(th, utils._DETACHED_THREADS)
 
     def test_a_thread_that_stops_in_time_keeps_its_parent(self):
         parent = QObject()
@@ -8630,6 +8894,38 @@ class PreviewRenderTests(unittest.TestCase):
                         "size": 5, "truncated": False}, None)
         self.assertEqual(dlg._stack.currentIndex(), 3)   # hex page
         self.assertIn("|..ABC|", dlg._hex.toPlainText())
+
+    def test_escape_cannot_walk_past_the_unsaved_changes_prompt(self):
+        """FINDING (data loss): the prompt lived in closeEvent, so Escape
+        threw the edits away without asking."""
+        dlg = self._dlg("notes.txt")
+        # Registered after the helper's dlg.close(), so it runs BEFORE it:
+        # a cleanup that trips the prompt would block on a modal box forever.
+        self.addCleanup(setattr, dlg, "_editing", False)
+        dlg.show()
+        dlg._on_loaded({"data": b"hello", "content_type": "text/plain",
+                        "size": 5, "truncated": False}, None)
+        dlg._editing = True
+        dlg._text.setPlainText("edited")
+        # setPlainText clears the flag; typing is what would set it.
+        dlg._text.document().setModified(True)
+
+        asked = []
+        with patch.object(main_window.QMessageBox, "question",
+                          lambda *a, **k: asked.append(1)
+                          or QMessageBox.StandardButton.No):
+            QApplication.sendEvent(dlg, QKeyEvent(
+                QEvent.Type.KeyPress, Qt.Key.Key_Escape,
+                Qt.KeyboardModifier.NoModifier))
+            self._app.processEvents()
+        self.assertTrue(asked, "Escape discarded the edits without asking")
+        self.assertTrue(dlg.isVisible())
+
+        with patch.object(main_window.QMessageBox, "question",
+                          lambda *a, **k: QMessageBox.StandardButton.Yes):
+            dlg.reject()
+            self._app.processEvents()
+        self.assertFalse(dlg.isVisible())
 
     def test_code_gets_a_highlighter(self):
         dlg = self._dlg("script.py")
