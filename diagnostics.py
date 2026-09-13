@@ -155,8 +155,17 @@ def collect(root, *, version="", model=None, profile_name="") -> list:
             ("Region", str(getattr(model, "region_name", "") or "(unset)")),
             ("Bucket", str(getattr(model, "bucket", "") or "(bucket list)")),
             ("Read-only", _yes_no(getattr(model, "read_only", False))),
+            ("Requester pays", _yes_no(
+                getattr(model, "requester_pays", False))),
+            ("Public base URL",
+             str(getattr(model, "public_base_url", "") or "(endpoint)")),
             ("TLS verification", _yes_no(
                 not getattr(model, "no_ssl_check", False))),
+            ("CA bundle",
+             str(getattr(model, "ca_bundle", "") or "(system trust store)")),
+            ("HTTP proxy",
+             redact_url_credentials(getattr(model, "proxy_url", "")) or
+             "(direct)"),
             ("Path-style addressing", _yes_no(getattr(model, "use_path", False))),
         ]))
         sections.append(("Transfers", [
@@ -173,6 +182,10 @@ def collect(root, *, version="", model=None, profile_name="") -> list:
              _yes_no(getattr(model, "verify_downloads", False))),
             ("Upload checksum",
              str(getattr(model, "checksum_algorithm", "") or "none")),
+            ("Detect Content-Type",
+             _yes_no(getattr(model, "detect_content_type", False))),
+            ("Content-Type overrides",
+             str(len(getattr(model, "content_type_overrides", {}) or {}))),
             ("Bandwidth limit",
              "unlimited" if getattr(model, "rate_limiter", None) is None
              else f"{int(model.rate_limiter.rate_bps) // 1024} KB/s"),
@@ -184,6 +197,40 @@ def collect(root, *, version="", model=None, profile_name="") -> list:
 
 def _yes_no(value) -> str:
     return "yes" if value else "no"
+
+
+def redact_url_credentials(value) -> str:
+    """
+    A URL with any inline ``user:password@`` replaced by ``***``.
+
+    This report exists to be pasted into a bug report, and a corporate proxy
+    is routinely configured as http://user:password@proxy.corp:3128 — which
+    would put the password in every issue the user ever files.
+
+    The whole userinfo goes, not just the password: a login name is no more
+    pastable than the secret next to it, and dropping both keeps the malformed
+    cases (no host, no scheme, an "@" and nothing else) from leaking a half.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    scheme, sep, rest = text.partition("://")
+    if not sep:
+        scheme, rest = "", text
+    # Credentials can only live in the authority, which ends at the first
+    # "/", "?" or "#". A path or query is free to hold an "@" of its own.
+    end = len(rest)
+    for mark in "/?#":
+        found = rest.find(mark)
+        if found != -1:
+            end = min(end, found)
+    authority, tail = rest[:end], rest[end:]
+    if "@" not in authority:
+        return text
+    # Last "@" wins: a password may contain one, a host may not. Whatever is
+    # left is the host — brackets and port included, so IPv6 survives intact.
+    host = authority.rpartition("@")[2]
+    return f"{scheme}{sep}***@{host}{tail}"
 
 
 def format_report(sections) -> str:

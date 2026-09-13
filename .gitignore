@@ -2,7 +2,20 @@
 .vscode/
 .idea/
 __pycache__/
+.pytest_cache/
 build/
 dist/
 
+# Written by PyInstaller, not by hand
 s3duck.spec
+
+# Things the app itself writes, in case it is run against this checkout:
+# interrupted downloads, an exported manifest, a saved problem report and the
+# session log.
+*.s3duckpart
+*.s3duckpart.meta
+*-manifest.csv
+s3duck-report.txt
+s3duck-log-*.txt
+s3duck.log
+s3duck.log.*

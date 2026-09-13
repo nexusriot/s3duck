@@ -6,6 +6,9 @@ Description:Simple Opensource cross-platform client for Simple Storage Service.
  Every entry in Depends is imported directly by the app, except
  python3-pyqt6.qtsvg, which Qt needs as an image plugin to render the bundled
  SVG icons at all: without it QIcon loads an .svg into a non-null icon that
- paints nothing, so toolbar buttons come out blank.
+ paints nothing, so toolbar buttons come out blank. python3-keyring is only
+ recommended: it is imported behind a guard and just one of the three places
+ the credential key can live.
 Installed-Size: _size_
 Depends: python3 (>=3.6), python3-boto3, python3-botocore, python3-cryptography, python3-urllib3, python3-pyqt6, python3-pyqt6.sip, python3-pyqt6.qtsvg, python3-pyqt6.qtpdf
+Recommends: python3-keyring

@@ -33,7 +33,10 @@ from utils import (
     str_to_bool, center_on_screen, export_profile_bundle,
     import_profile_bundle, BundleError, Crypto, CredentialError,
     require_crypto, decrypt_optional, run_with_progress,
-    normalize_accent, themed_icon,
+    normalize_accent, themed_icon, expiry_state, load_aws_profiles,
+    run_credential_process, CredentialStore, CREDENTIAL_STORE_LOCAL,
+    CREDENTIAL_STORE_KEYRING, CREDENTIAL_STORE_PASSPHRASE, keyring_available,
+    InstanceServer, send_to_running_instance,
 )
 from theme import apply_theme
 
@@ -70,6 +73,7 @@ def selected_row_index(row, item_count) -> int:
 
 READ_ONLY_BADGE = "read-only"
 INSECURE_BADGE = "TLS unverified"
+EXPIRED_BADGE = "expired"
 
 # Badges are colour-coded by what they mean for the user: amber for a mode
 # worth knowing about, red for an actual exposure. Fixed colours rather than
@@ -77,7 +81,23 @@ INSECURE_BADGE = "TLS unverified"
 BADGE_COLORS = {
     READ_ONLY_BADGE: QColor("#b26a00"),
     INSECURE_BADGE: QColor("#c62828"),
+    EXPIRED_BADGE: QColor("#c62828"),
 }
+
+
+def expiry_badge(item, now=None) -> str:
+    """
+    The credential-lifetime badge for a profile row, or "" when there is none.
+
+    Temporary keys used to look exactly like permanent ones, so a lapsed
+    session showed up as an unexplained authentication failure on connect.
+    """
+    state, label = expiry_state(getattr(item, "session_expires", ""), now=now)
+    if state == "expired":
+        return EXPIRED_BADGE
+    if state == "soon":
+        return label
+    return ""
 
 
 def preselect_row(items, last_name) -> int:
@@ -124,6 +144,9 @@ def profile_badges(item) -> list:
         badges.append(READ_ONLY_BADGE)
     if str_to_bool(item.no_ssl_check):
         badges.append(INSECURE_BADGE)
+    expiry = expiry_badge(item)
+    if expiry:
+        badges.append(expiry)
     return badges
 
 
@@ -132,7 +155,13 @@ def badge_color(name, palette, selected: bool) -> QColor:
     sit on the highlight brush and lose contrast."""
     if selected:
         return QColor(palette.highlightedText().color())
-    return QColor(BADGE_COLORS.get(name, palette.text().color()))
+    if name in BADGE_COLORS:
+        return QColor(BADGE_COLORS[name])
+    # "expires in 12m" is generated, not one of the fixed badges, and means
+    # the same thing as the amber ones: worth knowing, not yet broken.
+    if name.startswith("expires in "):
+        return QColor("#b26a00")
+    return QColor(palette.text().color())
 
 
 def _summary_font(base: QFont) -> QFont:
@@ -254,6 +283,13 @@ class SettingsItem:
         enc_session_token="",
         read_only="false",
         color="",
+        session_expires="",
+        aws_profile="",
+        credential_process="",
+        public_base_url="",
+        requester_pays="false",
+        proxy_url="",
+        ca_bundle="",
     ):
         self.name = name
         self.url = url
@@ -266,6 +302,17 @@ class SettingsItem:
         self.enc_session_token = enc_session_token
         self.read_only = read_only
         self.color = color
+        # Temporary credentials only: when they lapse, and how to mint new
+        # ones without going back to the AWS console.
+        self.session_expires = session_expires
+        self.aws_profile = aws_profile
+        self.credential_process = credential_process
+        self.public_base_url = public_base_url
+        self.requester_pays = requester_pays
+        # Network reachability, not identity: an outbound proxy and the CA
+        # bundle that makes a private certificate trustworthy.
+        self.proxy_url = proxy_url
+        self.ca_bundle = ca_bundle
 
 
 def get_current_dir():
@@ -286,11 +333,18 @@ class Profiles(QDialog):
         Qt.Key.Key_F2: "onEdit",
     }
 
-    def __init__(self):
+    def __init__(self, startup=None):
         super().__init__()
+        self.startup = dict(startup or {})
+        # Set when a location is waiting for the window that is about to open.
+        self.pending_location = ""
         self.current_dir = get_current_dir()
         # store settings in ~/.config/s3duck
         self.settings = QSettings("s3duck", "s3duck")
+        self.credential_store = CredentialStore(
+            self.settings,
+            ask_passphrase=lambda prompt: self._ask_passphrase(
+                "Unlock credentials", prompt))
         self.items = []
         vbox = QVBoxLayout(self)
         hbox = QHBoxLayout()
@@ -330,6 +384,7 @@ class Profiles(QDialog):
         self.listWidget.currentItemChanged.connect(self.on_elements_changed)
         self.listWidget.itemSelectionChanged.connect(self.on_elements_changed)
         self.listWidget.installEventFilter(self)
+        self.unlock_credentials()
         self.load()
         self.populate_list()
         self.settings.beginGroup("common")
@@ -340,7 +395,16 @@ class Profiles(QDialog):
             self.listWidget.setCurrentIndex(
                 self.listWidget.model().index(row, 0))
         self.listWidget.doubleClicked.connect(self.onStart)
+
+        # Listening is best-effort: when another window already holds the
+        # socket, this one simply cannot receive handovers.
+        self.instance_server = InstanceServer(self)
+        self.instance_server.received.connect(self.open_location_request)
+        self.instance_server.start()
+
         self.show()
+        if self.startup.get("location"):
+            QtCore.QTimer.singleShot(0, self._open_startup_location)
 
     def showEvent(self, event):
         # Center on the active screen once the frame geometry is known
@@ -349,11 +413,80 @@ class Profiles(QDialog):
         super().showEvent(event)
         center_on_screen(self)
 
+    def _open_startup_location(self):
+        """Open the location the command line named, once the UI is up."""
+        location = str(self.startup.get("location") or "")
+        if location:
+            self.open_location_request(location)
+
+    def profile_row_for(self, name) -> int:
+        """The row of a profile by name, or -1."""
+        wanted = str(name or "").strip()
+        for index, item in enumerate(self.items):
+            if str(item.name or "").strip() == wanted and wanted:
+                return index
+        return -1
+
+    def open_location_request(self, location):
+        """
+        Act on an `s3://bucket/prefix` handed in by a launch or a second run.
+
+        An open window takes it as a new tab; otherwise a profile is started
+        and asked to land there.
+        """
+        location = str(location or "").strip()
+        if not location:
+            return
+        window = getattr(self, "main_window", None)
+        if window is not None and window.isVisible():
+            bucket, prefix = window._parse_s3_location(location, "")
+            if not bucket:
+                return
+            window.open_in_new_tab(bucket, prefix)
+            window.raise_()
+            window.activateWindow()
+            return
+        wanted = str(self.startup.get("profile") or "")
+        row = self.profile_row_for(wanted)
+        if row < 0 and self.listWidget.count():
+            row = max(0, self.listWidget.currentRow())
+        if row < 0:
+            QMessageBox.information(
+                self, "Open location",
+                f"No profile is configured to open {location}.")
+            return
+        self.listWidget.setCurrentIndex(
+            self.listWidget.model().index(row, 0))
+        self.pending_location = location
+        self.onStart()
+
+    def unlock_credentials(self):
+        """
+        Make the credential key available for this run.
+
+        Only the passphrase mode can actually fail here, and a wrong one is
+        worth retrying rather than starting a session where every profile
+        reports the same decryption error.
+        """
+        for _attempt in range(3):
+            try:
+                self.credential_store.load_key()
+                return True
+            except CredentialError as exc:
+                answer = QMessageBox.question(
+                    self, "Unlock credentials",
+                    f"{exc}\n\nTry again?",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No)
+                if answer != QMessageBox.StandardButton.Yes:
+                    return False
+        return False
+
     def _stored_key(self):
-        self.settings.beginGroup("common")
-        key = self.settings.value("key")
-        self.settings.endGroup()
-        return key
+        try:
+            return self.credential_store.load_key()
+        except CredentialError:
+            return ""
 
     def _secrets_or_warn(self, item):
         """(access, secret, token) for a profile, or None after reporting."""
@@ -367,17 +500,60 @@ class Profiles(QDialog):
 
     def _crypto_or_warn(self):
         """A validated Crypto for write paths, or None after reporting."""
-        self.settings.beginGroup("common")
-        key = self.settings.value("key")
-        if not key:
-            key = Crypto.generate_key()
-            self.settings.setValue("key", key)
-        self.settings.endGroup()
         try:
-            return require_crypto(key)
+            return require_crypto(self.credential_store.ensure_key())
         except CredentialError as exc:
             QMessageBox.critical(self, "Credentials", str(exc))
             return None
+
+    def credential_storage(self):
+        """Choose where the key protecting stored credentials lives."""
+        store = self.credential_store
+        current = store.mode()
+        options = [
+            (CREDENTIAL_STORE_LOCAL,
+             "Settings file (default) — readable by anything that can read "
+             "your config"),
+            (CREDENTIAL_STORE_KEYRING,
+             # Unavailable covers both "the package is missing" and "it is
+             # installed but found no backend to talk to", which is the usual
+             # answer on a headless Linux box.
+             "OS secret store" + ("" if keyring_available()
+                                  else " — unavailable here")),
+            (CREDENTIAL_STORE_PASSPHRASE,
+             "Passphrase — asked once each time s3duck starts"),
+        ]
+        labels = [label for _mode, label in options]
+        index = [mode for mode, _label in options].index(current)
+        chosen, ok = QInputDialog.getItem(
+            self, "Credential storage",
+            "Where to keep the key that protects saved credentials:",
+            labels, index, False)
+        if not ok:
+            return
+        mode = options[labels.index(chosen)][0]
+        if mode == current:
+            return
+        passphrase = None
+        if mode == CREDENTIAL_STORE_PASSPHRASE:
+            passphrase = self._ask_passphrase(
+                "Credential storage", "New passphrase:")
+            if passphrase is None:
+                return
+            again = self._ask_passphrase(
+                "Credential storage", "Repeat the passphrase:")
+            if again != passphrase:
+                QMessageBox.warning(
+                    self, "Credential storage", "The passphrases differ.")
+                return
+        try:
+            store.set_mode(mode, passphrase=passphrase)
+        except CredentialError as exc:
+            QMessageBox.critical(self, "Credential storage", str(exc))
+            return
+        QMessageBox.information(
+            self, "Credential storage",
+            f"The credential key now lives here:\n\n{store.describe()}")
 
     def _current_item_index(self) -> int:
         model = self.listWidget.selectionModel()
@@ -400,6 +576,87 @@ class Profiles(QDialog):
         self.save_settings()
         self.populate_list()
         self.select_last()
+
+    def _store_refreshed(self, item, minted) -> tuple:
+        """Encrypt freshly minted credentials back onto a profile row."""
+        crypto = self._crypto_or_warn()
+        if crypto is None:
+            return None
+        item.enc_access_key = crypto.encrypt(minted["access_key"])
+        item.enc_secret_key = crypto.encrypt(minted["secret_key"])
+        item.enc_session_token = crypto.encrypt(minted.get("session_token", ""))
+        item.session_expires = minted.get("expires", "")
+        self.save_settings()
+        self.populate_list()
+        return (minted["access_key"], minted["secret_key"],
+                minted.get("session_token", ""))
+
+    def _refresh_from_process(self, item):
+        """
+        Mint new credentials by running the profile's credential_process.
+
+        This is how an SSO or assumed-role session stays usable: the stored
+        keys are a snapshot that lapses, the command is the thing that can
+        produce another one.
+        """
+        def _mint(_worker):
+            return run_credential_process(item.credential_process)
+
+        minted, exc = run_with_progress(
+            self, "Refreshing credentials for %s…" % item.name, _mint)
+        if minted is None and exc is None:
+            return None  # cancelled
+        if exc is not None:
+            QMessageBox.critical(self, "Refresh credentials", str(exc))
+            return None
+        return self._store_refreshed(item, minted)
+
+    def _refresh_from_aws_file(self, item):
+        """Re-read the ~/.aws profile this one was imported from."""
+        entry = load_aws_profiles().get(item.aws_profile)
+        if not entry:
+            QMessageBox.warning(
+                self, "Refresh credentials",
+                "Profile '%s' is no longer in ~/.aws/credentials."
+                % item.aws_profile)
+            return None
+        if not entry.get("access_key"):
+            QMessageBox.warning(
+                self, "Refresh credentials",
+                "Profile '%s' in ~/.aws/credentials has no access key."
+                % item.aws_profile)
+            return None
+        return self._store_refreshed(item, {
+            "access_key": entry.get("access_key", ""),
+            "secret_key": entry.get("secret_key", ""),
+            "session_token": entry.get("session_token", ""),
+            "expires": entry.get("expires", ""),
+        })
+
+    def refresh_credentials(self, item=None, quiet=False):
+        """
+        Replace a profile's temporary credentials with fresh ones.
+
+        Prefers the credential process, because it can mint a session without
+        anything else having run first; falls back to re-reading the ~/.aws
+        profile the keys were imported from.
+        """
+        if item is None:
+            elem = self._current_item_index()
+            if elem < 0:
+                return None
+            item = self.items[elem]
+        if item.credential_process:
+            return self._refresh_from_process(item)
+        if item.aws_profile:
+            return self._refresh_from_aws_file(item)
+        if not quiet:
+            QMessageBox.information(
+                self, "Refresh credentials",
+                "This profile has no credential process and was not imported "
+                "from ~/.aws, so there is nothing to refresh from. Edit it and "
+                "either import the profile again or set a credential process.")
+        return None
 
     def check_profile(self):
         """
@@ -424,6 +681,9 @@ class Profiles(QDialog):
             str_to_bool(item.use_path),
             session_token=session_token,
             read_only=str_to_bool(item.read_only),
+            requester_pays=str_to_bool(item.requester_pays),
+            proxy_url=item.proxy_url,
+            ca_bundle=item.ca_bundle,
         )
         # Same reasoning as onStart: this reaches the network (and may create
         # and delete a probe key), so it cannot run on the GUI thread.
@@ -462,6 +722,7 @@ class Profiles(QDialog):
             delete_action = None
             edit_profile_action = None
             check_action = None
+            refresh_action = None
             menu = QMenu()
             ixs = self.listWidget.selectedIndexes()
             add_profile_action = QAction(
@@ -471,6 +732,11 @@ class Profiles(QDialog):
                 "Add profile",
             )
             menu.addAction(add_profile_action)
+            storage_action = QAction(
+                themed_icon("dialog-password", os.path.join(
+                    self.current_dir, "icons", "settings_24px.svg")),
+                "Credential storage…")
+            menu.addAction(storage_action)
             import_action = QAction(
                 themed_icon("document-open", os.path.join(self.current_dir, "icons", "folder_24px.svg")), "Import profiles…")
             export_action = QAction(
@@ -497,6 +763,12 @@ class Profiles(QDialog):
                             )),
                     "Check profile",
                 )
+                refresh_action = QAction(
+                    themed_icon("view-refresh", os.path.join(
+                                self.current_dir, "icons", "refresh_24px.svg"
+                            )),
+                    "Refresh credentials",
+                )
                 delete_action = QAction(
                     themed_icon("edit-delete", os.path.join(
                                 self.current_dir,
@@ -508,6 +780,7 @@ class Profiles(QDialog):
                 menu.addAction(copy_profile_action)
                 menu.addAction(edit_profile_action)
                 menu.addAction(check_action)
+                menu.addAction(refresh_action)
                 menu.addAction(delete_action)
 
             clk = menu.exec(event.globalPos())
@@ -521,8 +794,13 @@ class Profiles(QDialog):
                 self.onDelete()
             if clk == check_action:
                 self.check_profile()
+            if refresh_action is not None and clk == refresh_action:
+                self.refresh_credentials()
             if clk == add_profile_action:
                 self.onAdd()
+                return True
+            if clk == storage_action:
+                self.credential_storage()
                 return True
             if clk == import_action:
                 self.onImport()
@@ -549,6 +827,13 @@ class Profiles(QDialog):
                     self.settings.value("session_token", ""),
                     self.settings.value("read_only", "false"),
                     self.settings.value("color", ""),
+                    self.settings.value("session_expires", ""),
+                    self.settings.value("aws_profile", ""),
+                    self.settings.value("credential_process", ""),
+                    self.settings.value("public_base_url", ""),
+                    self.settings.value("requester_pays", "false"),
+                    self.settings.value("proxy_url", ""),
+                    self.settings.value("ca_bundle", ""),
                 )
             )
         self.settings.endArray()
@@ -563,6 +848,26 @@ class Profiles(QDialog):
         if secrets is None:
             return
         acc_key, secret_key, session_token = secrets
+        # Temporary credentials that have lapsed (or are about to) would fail
+        # the connect probe with an opaque auth error, so mint a session first
+        # when the profile knows how.
+        state, _label = expiry_state(item.session_expires)
+        if state in ("expired", "soon") or not acc_key:
+            if item.credential_process or item.aws_profile:
+                refreshed = self.refresh_credentials(item, quiet=True)
+                if refreshed is not None:
+                    acc_key, secret_key, session_token = refreshed
+                elif state == "expired":
+                    return
+            elif state == "expired":
+                if QMessageBox.question(
+                    self, "Expired credentials",
+                    "This profile's temporary credentials expired. Connect "
+                    "anyway?",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                ) != QMessageBox.StandardButton.Yes:
+                    return
         no_ssl_check = str_to_bool(item.no_ssl_check)
         use_path = str_to_bool(item.use_path)
         read_only = str_to_bool(item.read_only)
@@ -578,7 +883,16 @@ class Profiles(QDialog):
             use_path,
             session_token=session_token,
             read_only=read_only,
+            requester_pays=str_to_bool(item.requester_pays),
+            proxy_url=item.proxy_url,
+            ca_bundle=item.ca_bundle,
         )
+
+        # A CA bundle that is not there surfaces as an SSLError deep inside
+        # the first request, which reads like the server is broken.
+        tls_problem = dm.check_tls_settings()
+        if tls_problem:
+            QMessageBox.warning(self, "Profile", tls_problem)
 
         # Sanity check creds: try to list buckets. Off the GUI thread, because
         # an unreachable endpoint blocks for the full botocore connect timeout
@@ -610,6 +924,13 @@ class Profiles(QDialog):
                 session_token,
                 read_only,
                 item.color,
+                item.session_expires,
+                item.aws_profile,
+                item.credential_process,
+                item.public_base_url,
+                str_to_bool(item.requester_pays),
+                item.proxy_url,
+                item.ca_bundle,
             )
             self.settings.beginGroup("common")
             self.settings.setValue("last_profile", item.name)
@@ -618,6 +939,13 @@ class Profiles(QDialog):
             self.main_window = MainWindow(settings=self.main_settings)
             self.main_window.show()
             self.hide()
+            pending = getattr(self, "pending_location", "")
+            if pending:
+                self.pending_location = ""
+                bucket, prefix = self.main_window._parse_s3_location(
+                    pending, "")
+                if bucket:
+                    self.main_window.open_location(bucket, prefix)
         else:
             msgBox = QMessageBox()
             msgBox.setWindowTitle("Profile check")
@@ -673,6 +1001,13 @@ class Profiles(QDialog):
                 "use_path": str(item.use_path),
                 "read_only": str(item.read_only),
                 "color": str(item.color or ""),
+                "session_expires": str(item.session_expires or ""),
+                "aws_profile": str(item.aws_profile or ""),
+                "credential_process": str(item.credential_process or ""),
+                "public_base_url": str(item.public_base_url or ""),
+                "requester_pays": str(item.requester_pays or "false"),
+                "proxy_url": str(item.proxy_url or ""),
+                "ca_bundle": str(item.ca_bundle or ""),
             })
         try:
             blob = export_profile_bundle(payload, passphrase)
@@ -729,6 +1064,13 @@ class Profiles(QDialog):
                     crypto.encrypt(str(entry.get("session_token") or "")),
                     str(entry.get("read_only", "false")).lower(),
                     normalize_accent(entry.get("color", "")),
+                    str(entry.get("session_expires") or ""),
+                    str(entry.get("aws_profile") or ""),
+                    str(entry.get("credential_process") or ""),
+                    str(entry.get("public_base_url") or ""),
+                    str(entry.get("requester_pays", "false")).lower(),
+                    str(entry.get("proxy_url") or ""),
+                    str(entry.get("ca_bundle") or ""),
                 )
             )
             added += 1
@@ -758,6 +1100,14 @@ class Profiles(QDialog):
             self.settings.setValue("session_token", item.enc_session_token)
             self.settings.setValue("read_only", item.read_only)
             self.settings.setValue("color", item.color)
+            self.settings.setValue("session_expires", item.session_expires)
+            self.settings.setValue("aws_profile", item.aws_profile)
+            self.settings.setValue(
+                "credential_process", item.credential_process)
+            self.settings.setValue("public_base_url", item.public_base_url)
+            self.settings.setValue("requester_pays", item.requester_pays)
+            self.settings.setValue("proxy_url", item.proxy_url)
+            self.settings.setValue("ca_bundle", item.ca_bundle)
         self.settings.endArray()
         self.settings.endGroup()
 
@@ -792,6 +1142,13 @@ class Profiles(QDialog):
                 session_token,
                 read_only,
                 color,
+                session_expires,
+                aws_profile,
+                credential_process,
+                public_base_url,
+                requester_pays,
+                proxy_url,
+                ca_bundle,
             ) = value
             enc_access_key = crypto.encrypt(access_key)
             enc_secret_key = crypto.encrypt(secret_key)
@@ -809,6 +1166,13 @@ class Profiles(QDialog):
                     enc_session_token,
                     str(bool(read_only)).lower(),
                     normalize_accent(color),
+                    session_expires,
+                    aws_profile,
+                    credential_process,
+                    public_base_url,
+                    str(bool(requester_pays)).lower(),
+                    proxy_url,
+                    ca_bundle,
                 )
             )
             self.save_settings()
@@ -840,6 +1204,13 @@ class Profiles(QDialog):
             session_token,
             item.read_only,
             item.color,
+            item.session_expires,
+            item.aws_profile,
+            item.credential_process,
+            item.public_base_url,
+            item.requester_pays,
+            item.proxy_url,
+            item.ca_bundle,
         )
         settings = SettingsWindow(self, settings=settings)
         value = settings.exec()
@@ -856,6 +1227,13 @@ class Profiles(QDialog):
                 session_token,
                 read_only,
                 color,
+                session_expires,
+                aws_profile,
+                credential_process,
+                public_base_url,
+                requester_pays,
+                proxy_url,
+                ca_bundle,
             ) = value
             enc_access_key = crypto.encrypt(access_key)
             enc_secret_key = crypto.encrypt(secret_key)
@@ -872,6 +1250,13 @@ class Profiles(QDialog):
                 enc_session_token,
                 str(bool(read_only)).lower(),
                 normalize_accent(color),
+                session_expires,
+                aws_profile,
+                credential_process,
+                public_base_url,
+                str(bool(requester_pays)).lower(),
+                proxy_url,
+                ca_bundle,
             )
             self.save_settings()
             self.populate_list()
@@ -909,7 +1294,55 @@ class Profiles(QDialog):
         )
 
 
+def parse_cli(argv) -> dict:
+    """
+    Read the command line: an optional profile and a location to open.
+
+    Kept tiny and pure — the point is `s3duck s3://bucket/prefix` from a
+    terminal, a chat link or a file manager, not a second CLI to learn.
+    """
+    out = {"profile": "", "location": "", "help": False, "unknown": []}
+    items = list(argv or [])
+    index = 0
+    while index < len(items):
+        item = str(items[index])
+        if item in ("-h", "--help"):
+            out["help"] = True
+        elif item in ("-p", "--profile"):
+            index += 1
+            if index < len(items):
+                out["profile"] = str(items[index])
+        elif item.startswith("--profile="):
+            out["profile"] = item.split("=", 1)[1]
+        elif item.startswith("-"):
+            out["unknown"].append(item)
+        elif not out["location"]:
+            out["location"] = item
+        else:
+            out["unknown"].append(item)
+        index += 1
+    return out
+
+
+CLI_USAGE = """s3duck — GUI client for S3-compatible storage
+
+  s3duck                          open the profile launcher
+  s3duck s3://bucket/prefix/      open that location
+  s3duck -p NAME s3://bucket/     open it with a named profile
+
+A location handed to an already-running window opens there in a new tab."""
+
+
 def main():
+    args = parse_cli(sys.argv[1:])
+    if args["help"]:
+        print(CLI_USAGE)
+        return
+    # Only a location is handed over: a bare launch still opens its own
+    # window, because two profiles side by side is a thing people want.
+    if args["location"] and send_to_running_instance(args["location"]):
+        return
+
     app = QApplication(sys.argv)
     # Cross-platform font with emoji fallback
     font = QFont()
@@ -930,7 +1363,7 @@ def main():
     _settings.endGroup()
     apply_theme(app, _saved_theme)
 
-    profiles = Profiles()
+    profiles = Profiles(startup=args)
     sys.exit(app.exec())
 
 

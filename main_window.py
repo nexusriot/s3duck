@@ -1,4 +1,7 @@
+import csv
+import difflib
 import fnmatch
+import io
 import json
 import os
 import re
@@ -28,7 +31,7 @@ from PyQt6 import QtWidgets
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
 from PyQt6.QtGui import QIcon, QStandardItemModel, QStandardItem, QAction
-from PyQt6.QtGui import QFontDatabase, QShortcut, QKeySequence, QPainter, QPen, QColor, QFont, QPalette
+from PyQt6.QtGui import QFontDatabase, QShortcut, QKeySequence, QPainter, QPen, QColor, QFont, QFontMetrics, QPalette
 from PyQt6.QtGui import QDesktopServices, QPixmap, QActionGroup
 from PyQt6.QtGui import QDrag, QSyntaxHighlighter, QTextCharFormat
 from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QMimeData, QRectF, QUrl
@@ -38,8 +41,12 @@ from model import TransferCancelled
 from model import run_parallel
 from model import CHECKSUM_ALGORITHMS, plan_prefix_download, prefix_of
 from utils import (
-    FuncWorker, TempWorkspace, join_qthread, normalize_accent,
-    reap_finished_workers, release_worker_on_finish, run_with_progress,
+    CredentialError, CredentialProcessError, DialogDismissMixin, FuncWorker,
+    TempWorkspace,
+    expiry_state, join_qthread, load_aws_profiles, normalize_accent,
+    reap_finished_workers, release_worker_on_finish, require_crypto,
+    describe_client_error, forward_icon, is_transient_error, LogFile,
+    resolve_credential_key, run_credential_process, run_with_progress,
     scan_local_tree, themed_icon,
 )
 from properties_window import PropertiesWindow
@@ -49,7 +56,7 @@ from theme import apply_theme, THEMES
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.17.1"
+__VERSION__ = "0.20.2"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -62,15 +69,28 @@ LIST_OPTIONAL_COLUMNS = (3, 4)
 PROGRESS_EMIT_INTERVAL_SEC = 0.6   # ~1.6 updates/sec
 PROGRESS_MIN_BYTE_DELTA = 1 * 1024 * 1024  # also emit if at least 1MB progressed
 TICK_INTERVAL_MS = 600             # UI tick
+# How often the credential countdown is refreshed. A minute is fine: the
+# warning window is fifteen.
+CREDENTIAL_CHECK_INTERVAL_MS = 60 * 1000
+# How long to wait before re-queueing a job the service asked us to retry.
+AUTO_RETRY_DELAY_MS = 5000
+# How often a long listing reports its running count.
+LISTING_COUNT_INTERVAL_SEC = 0.4
+# Entries fetched for one listing before it stops and says so. A prefix that
+# large is not browsable anyway; Search is the tool for it.
+DEFAULT_LISTING_LIMIT = 50000
 EMA_ALPHA = 0.15                   # smoother rate
 RATE_WINDOW_SEC = 2.0              # window for instantaneous rate
 
 
 class NavigationWorker(QObject):
     finished = pyqtSignal(int, object, str)  # seq, payload, err_str
+    counted = pyqtSignal(int, int)           # seq, entries so far
 
-    def __init__(self, data_model_clone, seq: int, bucket: str, prefix: str):
+    def __init__(self, data_model_clone, seq: int, bucket: str, prefix: str,
+                 max_items: int = 0):
         super().__init__()
+        self._max_items = int(max_items or 0)
         # Private model clone — the worker owns its own boto3 client so it
         # cannot race the main thread or other navigation workers on shared
         # client/region/endpoint state.
@@ -97,12 +117,25 @@ class NavigationWorker(QObject):
                     "promoted": self._capture_state(),
                 }
             else:
-                items = self._dm.list(self._prefix)
+                # Emitted per page: a prefix with tens of thousands of direct
+                # children used to spend a silent minute here.
+                last = [0.0]
+
+                def _page(count):
+                    now = time.monotonic()
+                    if count and (now - last[0]) >= LISTING_COUNT_INTERVAL_SEC:
+                        last[0] = now
+                        self.counted.emit(self._seq, int(count))
+
+                items = self._dm.list(
+                    self._prefix, page_cb=_page, max_items=self._max_items)
                 payload = {
                     "mode": "bucket_items",
                     "items": items,
                     "bucket": self._bucket,
                     "prefix": self._prefix,
+                    "truncated": bool(
+                        getattr(self._dm, "last_listing_truncated", False)),
                     "promoted": self._capture_state(),
                 }
             self.finished.emit(self._seq, payload, "")
@@ -603,7 +636,13 @@ def build_exclude_matcher(patterns):
     name, so `*.tmp` works at any depth. A pattern ending in `/` (or naming a
     directory) excludes everything beneath it, which is what `node_modules/`
     is expected to do.
+
+    A single string is split here rather than being iterated character by
+    character — passing the raw text from an input box is the obvious mistake,
+    and its symptom is the lone "*" excluding absolutely everything.
     """
+    if isinstance(patterns, str):
+        patterns = re.split(r"[,\s]+", patterns)
     cleaned = [p.strip() for p in (patterns or []) if p and p.strip()]
     if not cleaned:
         return lambda _rel: False
@@ -694,6 +733,274 @@ def build_sync_plan(local_entries, remote_entries, *, direction,
     return actions
 
 
+MANIFEST_HEADER = "# s3duck-manifest v1"
+MANIFEST_COLUMNS = ("key", "size", "etag", "modified")
+
+
+def build_manifest(entries, bucket="", prefix="", stamp="") -> str:
+    """
+    A CSV record of what a prefix held, from one listing.
+
+    Size and ETag come back with ListObjectsV2, so a manifest of a million
+    objects costs no more than browsing them — which is the point: an
+    integrity record nobody can afford to take is not taken.
+    """
+    buffer = io.StringIO()
+    buffer.write(f"{MANIFEST_HEADER}\n")
+    buffer.write(f"# bucket: {bucket}\n")
+    buffer.write(f"# prefix: {prefix}\n")
+    buffer.write(f"# taken: {stamp}\n")
+    writer = csv.writer(buffer)
+    writer.writerow(MANIFEST_COLUMNS)
+    for entry in sorted(entries or [], key=lambda row: str(row[0])):
+        key, size, etag, modified = (list(entry) + [None] * 4)[:4]
+        writer.writerow([str(key), int(size or 0), str(etag or ""),
+                         "" if modified is None else str(modified)])
+    return buffer.getvalue()
+
+
+def parse_manifest(text) -> tuple:
+    """
+    Read a manifest back as ``(meta, {key: (size, etag)})``.
+
+    Raises ValueError on anything that is not one of ours — verifying against
+    an arbitrary CSV would report every object as changed.
+    """
+    lines = str(text or "").splitlines()
+    if not lines or not lines[0].startswith(MANIFEST_HEADER):
+        raise ValueError("This is not an s3duck manifest.")
+    meta = {}
+    body = []
+    for line in lines[1:]:
+        if line.startswith("#"):
+            label, _, value = line[1:].partition(":")
+            meta[label.strip()] = value.strip()
+        else:
+            body.append(line)
+    if not body:
+        raise ValueError("The manifest has no entries.")
+    reader = csv.reader(body)
+    header = next(reader, [])
+    if [column.strip() for column in header] != list(MANIFEST_COLUMNS):
+        raise ValueError("The manifest columns are not the expected ones.")
+    records = {}
+    for row in reader:
+        if len(row) < 3 or not row[0]:
+            continue
+        try:
+            size = int(row[1])
+        except (TypeError, ValueError):
+            continue
+        records[row[0]] = (size, str(row[2] or ""))
+    return meta, records
+
+
+def compare_manifest(stored, current) -> dict:
+    """
+    Diff a manifest against a fresh listing.
+
+    Returns ``{"missing", "added", "changed", "same"}`` — changed carries
+    ``(key, reason)`` so "the size is the same but the content is not" reads
+    differently from "it grew".
+    """
+    stored = dict(stored or {})
+    current = dict(current or {})
+    missing = sorted(set(stored) - set(current))
+    added = sorted(set(current) - set(stored))
+    changed = []
+    same = 0
+    for key in sorted(set(stored) & set(current)):
+        was_size, was_etag = stored[key]
+        now_size, now_etag = current[key]
+        if int(was_size) != int(now_size):
+            changed.append((key, f"size {was_size} → {now_size}"))
+        elif was_etag and now_etag and was_etag != now_etag:
+            changed.append((key, "same size, different content"))
+        else:
+            same += 1
+    return {"missing": missing, "added": added, "changed": changed,
+            "same": same}
+
+
+def build_prefix_tree(entries, separator="/") -> dict:
+    """
+    Nest ``(key, size)`` pairs into ``{name: {size, count, children}}``.
+
+    The usage pie answers "what kind of files"; this answers "which folder",
+    which is the one a bill is actually made of.
+    """
+    root = {"size": 0, "count": 0, "children": {}}
+    for key, size in entries or []:
+        text = str(key or "")
+        if not text or text.endswith(separator):
+            continue
+        size = int(size or 0)
+        node = root
+        node["size"] += size
+        node["count"] += 1
+        parts = [part for part in text.split(separator) if part]
+        for part in parts[:-1]:
+            node = node["children"].setdefault(
+                part, {"size": 0, "count": 0, "children": {}})
+            node["size"] += size
+            node["count"] += 1
+        if parts:
+            leaf = node["children"].setdefault(
+                parts[-1], {"size": 0, "count": 0, "children": {}})
+            leaf["size"] += size
+            leaf["count"] += 1
+    return root
+
+
+def node_at_path(root, path) -> dict:
+    """Walk a prefix tree to ``path`` (a list of names), or {} if it is gone."""
+    node = root or {}
+    for part in path or []:
+        node = (node.get("children") or {}).get(part)
+        if node is None:
+            return {}
+    return node
+
+
+def treemap_children(node, limit=80) -> list:
+    """
+    ``[(name, size, is_group)]`` for one level, biggest first.
+
+    Everything past the limit is folded into one "other" tile: a thousand
+    slivers is not a picture of anything.
+    """
+    rows = sorted(((name, child["size"])
+                   for name, child in (node.get("children") or {}).items()),
+                  key=lambda row: row[1], reverse=True)
+    rows = [row for row in rows if row[1] > 0]
+    if len(rows) <= limit:
+        return [(name, size, False) for name, size in rows]
+    head = [(name, size, False) for name, size in rows[:limit]]
+    rest = sum(size for _name, size in rows[limit:])
+    if rest:
+        head.append((f"… {len(rows) - limit} more", rest, True))
+    return head
+
+
+def _treemap_row(sizes, x, y, dx, dy) -> list:
+    """Lay one run of areas along the shorter side of the box."""
+    covered = sum(sizes)
+    rects = []
+    if covered <= 0:
+        return rects
+    if dx >= dy:
+        width = covered / dy if dy else 0
+        for size in sizes:
+            height = size / width if width else 0
+            rects.append((x, y, width, height))
+            y += height
+    else:
+        height = covered / dx if dx else 0
+        for size in sizes:
+            width = size / height if height else 0
+            rects.append((x, y, width, height))
+            x += width
+    return rects
+
+
+def _treemap_worst(sizes, dx, dy) -> float:
+    """The worst aspect ratio a run would produce; lower is squarer."""
+    rects = _treemap_row(sizes, 0, 0, dx, dy)
+    worst = 0.0
+    for _x, _y, width, height in rects:
+        if width <= 0 or height <= 0:
+            return float("inf")
+        worst = max(worst, width / height, height / width)
+    return worst
+
+
+def squarify(values, x=0.0, y=0.0, width=1.0, height=1.0) -> list:
+    """
+    Squarified treemap rectangles for *values*, in the same order.
+
+    Iterative rather than recursive: a bucket with thousands of prefixes would
+    otherwise recurse once per row.
+    """
+    values = [float(value) for value in values or []]
+    if not values or width <= 0 or height <= 0:
+        return []
+    total = sum(values)
+    if total <= 0:
+        return []
+    scale = (width * height) / total
+    areas = [value * scale for value in values]
+
+    rects = []
+    index = 0
+    while index < len(areas):
+        run = 1
+        while (index + run < len(areas)
+               and _treemap_worst(areas[index:index + run], width, height)
+               >= _treemap_worst(areas[index:index + run + 1], width, height)):
+            run += 1
+        current = areas[index:index + run]
+        rects.extend(_treemap_row(current, x, y, width, height))
+        covered = sum(current)
+        if width >= height:
+            used = covered / height if height else 0
+            x += used
+            width -= used
+        else:
+            used = covered / width if width else 0
+            y += used
+            height -= used
+        index += run
+        if width <= 0 or height <= 0:
+            break
+    return rects
+
+
+def build_compare_plan(left, right, *, tolerance=SYNC_MTIME_TOLERANCE_SEC,
+                       exclude=None) -> list:
+    """
+    Diff two ``{rel_path: (size, mtime)}`` maps without picking a direction.
+
+    Returns ``[{rel, status, left_size, right_size}]`` where status is
+    "only_left", "only_right", "differs" or "same". Direction-free on purpose:
+    the same comparison drives a copy either way, and calling one side "the
+    source" before the user has said so is how a compare turns into a sync
+    nobody asked for.
+    """
+    is_excluded = exclude if callable(exclude) else build_exclude_matcher(exclude)
+    rows = []
+    for rel in sorted(set(left or {}) | set(right or {})):
+        if is_excluded(rel):
+            continue
+        here = (left or {}).get(rel)
+        there = (right or {}).get(rel)
+        if here is None:
+            rows.append({"rel": rel, "status": "only_right",
+                         "left_size": None, "right_size": int(there[0])})
+            continue
+        if there is None:
+            rows.append({"rel": rel, "status": "only_left",
+                         "left_size": int(here[0]), "right_size": None})
+            continue
+        same_size = int(here[0]) == int(there[0])
+        close_enough = abs(float(here[1]) - float(there[1])) <= tolerance
+        rows.append({
+            "rel": rel,
+            "status": "same" if (same_size and close_enough) else "differs",
+            "left_size": int(here[0]),
+            "right_size": int(there[0]),
+        })
+    return rows
+
+
+def summarize_compare_plan(rows) -> dict:
+    """Count a compare plan by status."""
+    counts = {"only_left": 0, "only_right": 0, "differs": 0, "same": 0}
+    for row in rows or []:
+        status = row.get("status", "same")
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
 def summarize_sync_plan(actions) -> dict:
     """Count actions by kind and total the bytes that would move."""
     counts = {}
@@ -722,6 +1029,12 @@ LISTVIEW_KEY_HELP = (
     ("Ctrl+V", "Paste clipboard into this folder"),
     ("Ctrl+B", "Bookmark the current location"),
     ("Ctrl+Shift+D", "Find duplicate objects"),
+    ("Ctrl+T", "Open another tab on this location"),
+    ("Ctrl+W", "Close the current tab"),
+    ("Ctrl+Tab", "Next tab (Ctrl+Shift+Tab for the previous one)"),
+    ("F3", "Show or hide the second pane"),
+    ("F5", "Dual pane: copy to the other pane — otherwise Refresh"),
+    ("F6", "Dual pane: move to the other pane"),
     ("Enter", "Open the selected bucket / folder / file"),
     ("Backspace", "Go up one level"),
     ("Del", "Delete selection"),
@@ -1314,10 +1627,24 @@ class UpTopProxyModel(QSortFilterProxyModel):
         self.up_label = up_label
         self._order = Qt.SortOrder.AscendingOrder  # remember current sort order
         self._filter_text = ""
+        self._glob = False
 
     def set_filter_text(self, text):
         self._filter_text = (text or "").strip().lower()
+        # Only * and ? switch on glob matching. A bare "[" is far more often
+        # part of a file name than the start of a character class, and
+        # treating it as one silently anchors the pattern.
+        self._glob = any(ch in self._filter_text for ch in "*?")
         self.invalidateFilter()
+
+    def matches(self, name) -> bool:
+        """Whether one row name passes the current filter."""
+        if not self._filter_text:
+            return True
+        lowered = str(name or "").lower()
+        if self._glob:
+            return fnmatch.fnmatchcase(lowered, self._filter_text)
+        return self._filter_text in lowered
 
     def filterAcceptsRow(self, source_row, source_parent):
         if not self._filter_text:
@@ -1328,7 +1655,7 @@ class UpTopProxyModel(QSortFilterProxyModel):
         # Always keep the "[..]" up-entry visible while filtering.
         if name == self.up_label:
             return True
-        return self._filter_text in name.lower()
+        return self.matches(name)
 
     def sort(self, column, order=Qt.SortOrder.AscendingOrder):
         self._order = order
@@ -1407,6 +1734,10 @@ class Worker(QObject):
     batch_progress = pyqtSignal(object, object)
 
     error = pyqtSignal(str)
+    # The same failure with its request id and HTTP status attached — what a
+    # provider's support desk asks for, and what str(exc) throws away — plus
+    # whether the service was asking for patience rather than saying no.
+    details = pyqtSignal(str, bool)
 
     def __init__(self, data_model, job, dest_model=None):
         super().__init__()
@@ -1510,6 +1841,7 @@ class Worker(QObject):
                 cancelled = True
             else:
                 self.progress.emit(f"download failed: {msg}")
+                self.details.emit(describe_client_error(exc), is_transient_error(exc))
                 self.error.emit(msg)
 
         finally:
@@ -1530,6 +1862,7 @@ class Worker(QObject):
                 cancelled = True
             else:
                 self.progress.emit(f"delete failed: {msg}")
+                self.details.emit(describe_client_error(exc), is_transient_error(exc))
                 self.error.emit(msg)
         finally:
             self.finished.emit(cancelled)
@@ -1614,6 +1947,7 @@ class Worker(QObject):
                 cancelled = True
             else:
                 self.progress.emit(f"upload failed: {msg}")
+                self.details.emit(describe_client_error(exc), is_transient_error(exc))
                 self.error.emit(msg)
 
         finally:
@@ -1647,6 +1981,7 @@ class Worker(QObject):
                 cancelled = True
             else:
                 self.progress.emit(f"sync to profile failed: {msg}")
+                self.details.emit(describe_client_error(exc), is_transient_error(exc))
                 self.error.emit(msg)
         finally:
             self.finished.emit(cancelled)
@@ -1680,6 +2015,7 @@ class Worker(QObject):
                 cancelled = True
             else:
                 self.progress.emit(f"copy to profile failed: {msg}")
+                self.details.emit(describe_client_error(exc), is_transient_error(exc))
                 self.error.emit(msg)
         finally:
             self.finished.emit(cancelled)
@@ -1711,6 +2047,7 @@ class Worker(QObject):
                 cancelled = True
             else:
                 self.progress.emit(f"copy failed: {msg}")
+                self.details.emit(describe_client_error(exc), is_transient_error(exc))
                 self.error.emit(msg)
         finally:
             self.finished.emit(cancelled)
@@ -1749,6 +2086,7 @@ class Worker(QObject):
                 cancelled = True
             else:
                 self.progress.emit(f"move failed: {msg}")
+                self.details.emit(describe_client_error(exc), is_transient_error(exc))
                 self.error.emit(msg)
         finally:
             self.finished.emit(cancelled)
@@ -1789,6 +2127,7 @@ class Worker(QObject):
                 cancelled = True
             else:
                 self.progress.emit(f"bucket delete failed: {msg}")
+                self.details.emit(describe_client_error(exc), is_transient_error(exc))
                 self.error.emit(msg)
         finally:
             self.finished.emit(cancelled)
@@ -1875,6 +2214,7 @@ class Worker(QObject):
                 cancelled = True
             else:
                 self.progress.emit(f"sync failed: {msg}")
+                self.details.emit(describe_client_error(exc), is_transient_error(exc))
                 self.error.emit(msg)
         finally:
             self.finished.emit(cancelled)
@@ -1899,6 +2239,7 @@ class Worker(QObject):
                 cancelled = True
             else:
                 self.progress.emit(f"tagging failed: {msg}")
+                self.details.emit(describe_client_error(exc), is_transient_error(exc))
                 self.error.emit(msg)
         finally:
             self.finished.emit(cancelled)
@@ -1968,6 +2309,7 @@ class Worker(QObject):
                 cancelled = True
             else:
                 self.progress.emit(f"zip download failed: {msg}")
+                self.details.emit(describe_client_error(exc), is_transient_error(exc))
                 self.error.emit(msg)
         finally:
             if archive is not None:
@@ -2006,6 +2348,7 @@ class Worker(QObject):
                 cancelled = True
             else:
                 self.progress.emit(f"undo failed: {msg}")
+                self.details.emit(describe_client_error(exc), is_transient_error(exc))
                 self.error.emit(msg)
         finally:
             self.finished.emit(cancelled)
@@ -2041,6 +2384,7 @@ class Worker(QObject):
                 cancelled = True
             else:
                 self.progress.emit(f"empty bucket failed: {msg}")
+                self.details.emit(describe_client_error(exc), is_transient_error(exc))
                 self.error.emit(msg)
         finally:
             self.finished.emit(cancelled)
@@ -2074,6 +2418,37 @@ class Worker(QObject):
                 cancelled = True
             else:
                 self.progress.emit(f"storage-class change failed: {msg}")
+                self.details.emit(describe_client_error(exc), is_transient_error(exc))
+                self.error.emit(msg)
+        finally:
+            self.finished.emit(cancelled)
+
+    def set_content_type(self):
+        # job = [(key, is_folder)]
+        cancelled = False
+        fixed = 0
+        skipped = 0
+        try:
+            for key, is_folder in self.job:
+                if self._cancel_event.is_set():
+                    raise TransferCancelled("cancelled")
+                for k in self._iter_object_keys(key, is_folder):
+                    changed, content_type = self.data_model.retype_object(
+                        k, log_fn=self.progress.emit)
+                    if changed:
+                        fixed += 1
+                        self.progress.emit(f"content-type {content_type}: {k}")
+                    else:
+                        skipped += 1
+            self.progress.emit(
+                f"content-type done: {fixed} updated, {skipped} unchanged")
+        except Exception as exc:
+            msg = str(exc) or exc.__class__.__name__
+            if "cancelled" in msg.lower():
+                cancelled = True
+            else:
+                self.progress.emit(f"content-type fix failed: {msg}")
+                self.details.emit(describe_client_error(exc), is_transient_error(exc))
                 self.error.emit(msg)
         finally:
             self.finished.emit(cancelled)
@@ -2106,6 +2481,7 @@ class Worker(QObject):
                 cancelled = True
             else:
                 self.progress.emit(f"restore failed: {msg}")
+                self.details.emit(describe_client_error(exc), is_transient_error(exc))
                 self.error.emit(msg)
         finally:
             self.finished.emit(cancelled)
@@ -2164,6 +2540,10 @@ class UsageWorker(QObject):
                 "total": total, "count": count, "by_cat": by_cat,
                 "by_top": by_top, "by_class": by_class,
                 "largest": largest[:10],
+                "cost": (DataModel.estimate_storage_cost(by_class)
+                         if self.data_model.is_aws_endpoint() else None),
+                "colder": (DataModel.colder_class_options(by_class)
+                           if self.data_model.is_aws_endpoint() else []),
             })
         except Exception as exc:
             self.finished.emit(self.bucket_name, self.prefix, exc)
@@ -2207,6 +2587,213 @@ class PieWidget(QWidget):
             start += span
 
 
+class TreemapWidget(QWidget):
+    """
+    One level of a prefix tree as proportional rectangles.
+
+    A pie by file category cannot answer "which folder is the bill"; area is
+    the only encoding that makes a 400 GB prefix look like one.
+    """
+
+    drilled = pyqtSignal(str)
+
+    PALETTE = ("#4e79a7", "#f28e2b", "#59a14f", "#e15759", "#76b7b2",
+               "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows = []
+        self._rects = []
+        self.setMinimumHeight(260)
+        self.setMouseTracking(True)
+
+    def set_rows(self, rows):
+        self._rows = list(rows or [])
+        self._layout()
+        self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout()
+
+    def _layout(self):
+        self._rects = squarify(
+            [row[1] for row in self._rows], 0, 0,
+            max(1, self.width()), max(1, self.height()))
+
+    def _row_at(self, point):
+        for row, (x, y, width, height) in zip(self._rows, self._rects):
+            if (x <= point.x() <= x + width) and (y <= point.y() <= y + height):
+                return row
+        return None
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        metrics = QFontMetrics(self.font())
+        for index, (row, rect) in enumerate(zip(self._rows, self._rects)):
+            name, size, is_group = row
+            x, y, width, height = (int(v) for v in rect)
+            if width <= 0 or height <= 0:
+                continue
+            colour = QColor(self.PALETTE[index % len(self.PALETTE)])
+            if is_group:
+                colour = QColor("#9e9e9e")
+            painter.fillRect(x, y, width, height, colour)
+            painter.setPen(QPen(QColor(0, 0, 0, 60)))
+            painter.drawRect(x, y, width, height)
+            # A label only where it fits; a clipped one is worse than none.
+            if width < 48 or height < metrics.height() + 4:
+                continue
+            painter.setPen(QPen(QColor("#101010")))
+            label = metrics.elidedText(
+                name, Qt.TextElideMode.ElideMiddle, width - 8)
+            painter.drawText(x + 4, y + metrics.ascent() + 3, label)
+            if height >= metrics.height() * 2 + 6:
+                painter.drawText(
+                    x + 4, y + metrics.height() + metrics.ascent() + 3,
+                    _human_bytes(size))
+        painter.end()
+
+    def mouseMoveEvent(self, event):
+        row = self._row_at(event.position().toPoint())
+        self.setToolTip(
+            f"{row[0]} — {_human_bytes(row[1])}" if row else "")
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        row = self._row_at(event.position().toPoint())
+        if row and not row[2]:
+            self.drilled.emit(row[0])
+        super().mouseReleaseEvent(event)
+
+
+class SizeExplorerDialog(DialogDismissMixin, QDialog):
+    """Drill into a bucket by prefix, sized by what it actually holds."""
+
+    def __init__(self, parent, main_window, model, prefix):
+        super().__init__(parent)
+        self._mw = main_window
+        self._model = model
+        self._prefix = prefix or ""
+        self._root = {}
+        self._path = []
+        self._thread = None
+        self._worker = None
+        self._cancel = None
+
+        self.setWindowTitle(f"Size explorer — {model.bucket}/{self._prefix}")
+        self.resize(880, 620)
+
+        self._breadcrumb = QLabel("")
+        self._breadcrumb.setWordWrap(True)
+        self._up = QPushButton("Up")
+        self._up.clicked.connect(self.go_up)
+        self._rescan = QPushButton("Rescan")
+        self._rescan.clicked.connect(self._scan)
+
+        top = QHBoxLayout()
+        top.addWidget(self._up)
+        top.addWidget(self._breadcrumb, 1)
+        top.addWidget(self._rescan)
+
+        self._map = TreemapWidget()
+        self._map.drilled.connect(self.drill)
+        self._info = QLabel("Scanning…")
+        self._info.setWordWrap(True)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(close_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(top)
+        layout.addWidget(self._map, 1)
+        layout.addWidget(self._info)
+        layout.addLayout(row)
+        self._scan()
+
+    def stop_threads(self):
+        if self._cancel is not None:
+            self._cancel.set()
+        thread, self._thread, self._worker = self._thread, None, None
+        join_qthread(thread)
+
+    def _scan(self):
+        if self._thread is not None:
+            return
+        clone = self._model.clone_for_worker()
+        bucket = self._model.bucket
+        prefix = self._prefix
+        cancel = threading.Event()
+        self._cancel = cancel
+        self._info.setText("Scanning…")
+        self._rescan.setEnabled(False)
+
+        def _run(_worker):
+            entries = []
+            for key, size, _storage in clone.get_keys_for_bucket(
+                    bucket, prefix):
+                if cancel.is_set():
+                    raise TransferCancelled("cancelled")
+                relative = key[len(prefix):] if key.startswith(prefix) else key
+                entries.append((relative, size))
+            return build_prefix_tree(entries)
+
+        self._thread = QThread(self)
+        self._worker = FuncWorker(_run)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.done.connect(self._on_scanned)
+        self._worker.done.connect(self._thread.quit)
+        release_worker_on_finish(self._thread, self._worker)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.start()
+
+    def _on_scanned(self, result, exc):
+        thread, self._thread, self._worker = self._thread, None, None
+        self._cancel = None
+        join_qthread(thread)
+        self._rescan.setEnabled(True)
+        if exc is not None:
+            self._info.setText(f"Scan failed: {exc}")
+            return
+        self._root = result or {}
+        self._path = []
+        self._render()
+
+    def current_node(self) -> dict:
+        return node_at_path(self._root, self._path)
+
+    def drill(self, name):
+        node = node_at_path(self._root, self._path + [name])
+        if not node or not node.get("children"):
+            return   # a leaf object, not a prefix
+        self._path.append(name)
+        self._render()
+
+    def go_up(self):
+        if self._path:
+            self._path.pop()
+            self._render()
+
+    def _render(self):
+        node = self.current_node()
+        rows = treemap_children(node)
+        self._map.set_rows(rows)
+        where = "/".join(self._path)
+        self._breadcrumb.setText(
+            f"{self._model.bucket}/{self._prefix}{where}"
+            + ("/" if where else ""))
+        self._up.setEnabled(bool(self._path))
+        self._info.setText(
+            f"{_human_bytes(node.get('size', 0))} in "
+            f"{node.get('count', 0)} object(s) · {len(rows)} entries here"
+            + ("  ·  click a tile to go deeper" if rows else ""))
+
+
 class BucketUsageDialog(QDialog):
 
     def __init__(self, bucket_name: str, prefix: str = "", parent=None):
@@ -2235,6 +2822,12 @@ class BucketUsageDialog(QDialog):
 
         self.by_class = QLabel("<b>Storage classes</b><br><pre>Calculating…</pre>")
         self.by_class.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        # Only ever filled for an AWS endpoint: the bundled prices are AWS
+        # list prices, and quoting them at a MinIO endpoint invents a number.
+        self.cost = QLabel("")
+        self.cost.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.cost.hide()
         self.largest = QLabel("<b>Largest objects</b><br><pre>Calculating…</pre>")
         self.largest.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
@@ -2251,6 +2844,7 @@ class BucketUsageDialog(QDialog):
         layout.addLayout(top)
         layout.addWidget(self.top_groups)
         layout.addWidget(self.by_class)
+        layout.addWidget(self.cost)
         layout.addWidget(self.largest)
         layout.addWidget(btn)
         self.setLayout(layout)
@@ -2271,6 +2865,7 @@ class BucketUsageDialog(QDialog):
             self.legend_labels[k].setText(f"{k}: Calculating…")
         self.top_groups.setText("<b>Top groups</b><br><pre>Calculating…</pre>")
         self.by_class.setText("<b>Storage classes</b><br><pre>Calculating…</pre>")
+        self.cost.hide()
         self.largest.setText("<b>Largest objects</b><br><pre>Calculating…</pre>")
 
     def set_error(self, bucket_name: str, prefix: str, err: Exception):
@@ -2283,11 +2878,36 @@ class BucketUsageDialog(QDialog):
             self.legend_labels[k].setText(f"{k}: n/a")
         self.top_groups.setText(f"<b>Top groups</b><br><pre>n/a\n{err}</pre>")
         self.by_class.setText("<b>Storage classes</b><br><pre>n/a</pre>")
+        self.cost.hide()
         self.largest.setText("<b>Largest objects</b><br><pre>n/a</pre>")
+
+    @staticmethod
+    def cost_html(cost, colder) -> str:
+        """The estimated-cost panel, or "" when there is nothing to show."""
+        if not cost:
+            return ""
+        lines = [f"{'Storage (estimated)':22s}  ${cost['total']:,.2f} / month"]
+        for name, amount in sorted(cost.get("by_class", {}).items(),
+                                   key=lambda kv: kv[1], reverse=True):
+            if amount:
+                lines.append(f"  {name:20s}  ${amount:,.2f}")
+        if cost.get("unpriced"):
+            lines.append("  not priced: " + ", ".join(cost["unpriced"]))
+        if colder:
+            lines.append("")
+            lines.append("If the STANDARD bytes moved:")
+            for name, amount, saving, caveat in colder:
+                lines.append(
+                    f"  {name:20s}  ${amount:,.2f}  "
+                    f"(saves ${saving:,.2f})  — {caveat}")
+        return ("<b>Estimated cost</b> "
+                "<span style='color:#666;'>us-east-1 list price, storage "
+                "only — requests, retrieval and transfer are not "
+                "included</span><br><pre>" + "\n".join(lines) + "</pre>")
 
     def set_result(self, bucket_name: str, prefix: str, total: int, by_cat: dict,
                    by_top: dict, count: int = 0, by_class: dict = None,
-                   largest=None):
+                   largest=None, cost=None, colder=None):
         self._bucket = bucket_name
         title = f"<b>{bucket_name}</b>" + (f"<br><span style='color:#666'>/{prefix}</span>" if prefix else "")
         self.title.setText(title)
@@ -2321,6 +2941,10 @@ class BucketUsageDialog(QDialog):
         self.by_class.setText(
             "<b>Storage classes</b><br><pre>" + "\n".join(class_lines) + "</pre>")
 
+        html = self.cost_html(cost, colder or [])
+        self.cost.setText(html)
+        self.cost.setVisible(bool(html))
+
         big_lines = [
             f"{_human_bytes(int(size or 0)):>10s}  {name}"
             for size, name in (largest or [])
@@ -2329,7 +2953,697 @@ class BucketUsageDialog(QDialog):
             "<b>Largest objects</b><br><pre>" + "\n".join(big_lines) + "</pre>")
 
 
-class CopyMoveDialog(QDialog):
+class LifecycleRuleDialog(QDialog):
+    """One lifecycle rule: what it covers and what it does."""
+
+    def __init__(self, parent, rule=None):
+        super().__init__(parent)
+        self.setWindowTitle("Lifecycle rule")
+        self.setMinimumWidth(460)
+        rule = dict(rule or {})
+
+        self._id = QLineEdit(str(rule.get("ID") or ""))
+        self._id.setPlaceholderText("expire-logs")
+        self._prefix = QLineEdit(DataModel.lifecycle_rule_scope(rule))
+        self._prefix.setPlaceholderText("logs/  (blank = the whole bucket)")
+        self._enabled = QCheckBox("Enabled")
+        self._enabled.setChecked(rule.get("Status", "Enabled") == "Enabled")
+
+        transitions = (rule.get("Transitions") or [{}])[0]
+        self._transition = QCheckBox("Move to another storage class after")
+        self._transition_days = QSpinBox()
+        self._transition_days.setRange(1, 36500)
+        self._transition_days.setSuffix(" days")
+        self._transition_days.setValue(int(transitions.get("Days") or 30))
+        self._transition_class = QComboBox()
+        for name in ("STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING",
+                     "GLACIER_IR", "GLACIER", "DEEP_ARCHIVE"):
+            self._transition_class.addItem(name, name)
+        index = self._transition_class.findData(
+            transitions.get("StorageClass") or "STANDARD_IA")
+        self._transition_class.setCurrentIndex(max(index, 0))
+        self._transition.setChecked(bool(transitions.get("Days")))
+
+        expiration = rule.get("Expiration") or {}
+        self._expire = QCheckBox("Delete objects after")
+        self._expire_days = QSpinBox()
+        self._expire_days.setRange(1, 36500)
+        self._expire_days.setSuffix(" days")
+        self._expire_days.setValue(int(expiration.get("Days") or 365))
+        self._expire.setChecked(expiration.get("Days") is not None)
+
+        noncurrent = rule.get("NoncurrentVersionExpiration") or {}
+        self._noncurrent = QCheckBox("Delete noncurrent versions after")
+        self._noncurrent_days = QSpinBox()
+        self._noncurrent_days.setRange(1, 36500)
+        self._noncurrent_days.setSuffix(" days")
+        self._noncurrent_days.setValue(
+            int(noncurrent.get("NoncurrentDays") or 30))
+        self._noncurrent.setChecked(
+            noncurrent.get("NoncurrentDays") is not None)
+
+        abort = rule.get("AbortIncompleteMultipartUpload") or {}
+        self._abort = QCheckBox("Abort incomplete multipart uploads after")
+        self._abort_days = QSpinBox()
+        self._abort_days.setRange(1, 3650)
+        self._abort_days.setSuffix(" days")
+        self._abort_days.setValue(
+            int(abort.get("DaysAfterInitiation") or 7))
+        self._abort.setChecked(abort.get("DaysAfterInitiation") is not None)
+
+        self._markers = QCheckBox("Clean up expired delete markers")
+        self._markers.setChecked(
+            bool(expiration.get("ExpiredObjectDeleteMarker")))
+
+        form = QFormLayout()
+        form.addRow(QLabel("Rule name"), self._id)
+        form.addRow(QLabel("Applies to prefix"), self._prefix)
+        form.addRow(self._enabled)
+        for check, spin in ((self._transition, self._transition_days),
+                            (self._expire, self._expire_days),
+                            (self._noncurrent, self._noncurrent_days),
+                            (self._abort, self._abort_days)):
+            row = QHBoxLayout()
+            row.addWidget(check)
+            row.addWidget(spin)
+            row.addStretch(1)
+            check.toggled.connect(spin.setEnabled)
+            spin.setEnabled(check.isChecked())
+            form.addRow(row)
+        transition_row = QHBoxLayout()
+        transition_row.addWidget(QLabel("Storage class"))
+        transition_row.addWidget(self._transition_class)
+        transition_row.addStretch(1)
+        form.addRow(transition_row)
+        form.addRow(self._markers)
+
+        note = QLabel(
+            "Lifecycle actions are executed by the storage service, not by "
+            "this app, and deletions they make are permanent.")
+        note.setWordWrap(True)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(note)
+        layout.addWidget(buttons)
+        self._rule = None
+
+    def _accept(self):
+        try:
+            self._rule = self.rule()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Lifecycle rule", str(exc))
+            return
+        self.accept()
+
+    def rule(self) -> dict:
+        return DataModel.build_lifecycle_rule(
+            self._id.text(),
+            prefix=self._prefix.text().strip(),
+            enabled=self._enabled.isChecked(),
+            transition_days=(self._transition_days.value()
+                             if self._transition.isChecked() else None),
+            transition_class=(self._transition_class.currentData()
+                              if self._transition.isChecked() else ""),
+            expire_days=(self._expire_days.value()
+                         if self._expire.isChecked() else None),
+            noncurrent_days=(self._noncurrent_days.value()
+                             if self._noncurrent.isChecked() else None),
+            abort_days=(self._abort_days.value()
+                        if self._abort.isChecked() else None),
+            expire_delete_markers=self._markers.isChecked(),
+        )
+
+    def result_rule(self):
+        return self._rule
+
+
+class BucketSettingsDialog(QDialog):
+    """
+    Lifecycle, CORS, policy and Object Lock for one bucket.
+
+    Four documents that all live on the bucket rather than on an object, kept
+    in one place so the toolbar does not grow four more entries.
+    """
+
+    def __init__(self, parent, main_window, model):
+        super().__init__(parent)
+        self._mw = main_window
+        self._model = model
+        self.setWindowTitle(f"Bucket settings — {model.bucket}")
+        self.resize(720, 520)
+        self._writable = not main_window.is_read_only()
+        self._acceleration_was = False
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_lifecycle(), "Lifecycle")
+        self.tabs.addTab(self._build_cors(), "CORS")
+        self.tabs.addTab(self._build_policy(), "Policy")
+        self.tabs.addTab(self._build_bucket(), "Encryption && tags")
+        self.tabs.addTab(self._build_website(), "Website")
+        self.tabs.addTab(self._build_events(), "Events")
+        self.tabs.addTab(self._build_lock(), "Object Lock")
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(close_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.tabs, 1)
+        layout.addLayout(row)
+        self.reload()
+
+    def _build_lifecycle(self):
+        page = QWidget()
+        self._rules = []
+        self._rules_list = QListWidget()
+        self._rules_list.itemDoubleClicked.connect(
+            lambda _i: self._edit_rule())
+        self._lifecycle_status = QLabel("")
+        self._lifecycle_status.setWordWrap(True)
+
+        self._btn_add = QPushButton("Add…")
+        self._btn_edit = QPushButton("Edit…")
+        self._btn_remove = QPushButton("Remove")
+        self._btn_save = QPushButton("Save to bucket")
+        self._btn_add.clicked.connect(self._add_rule)
+        self._btn_edit.clicked.connect(self._edit_rule)
+        self._btn_remove.clicked.connect(self._remove_rule)
+        self._btn_save.clicked.connect(self._save_lifecycle)
+        for button in (self._btn_add, self._btn_edit, self._btn_remove,
+                       self._btn_save):
+            button.setEnabled(self._writable)
+
+        buttons = QHBoxLayout()
+        for button in (self._btn_add, self._btn_edit, self._btn_remove):
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        buttons.addWidget(self._btn_save)
+
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel(
+            "Rules the storage service applies on its own schedule. "
+            "Transitions and expirations happen without this app running."))
+        layout.addWidget(self._rules_list, 1)
+        layout.addWidget(self._lifecycle_status)
+        layout.addLayout(buttons)
+        return page
+
+    def _build_cors(self):
+        page = QWidget()
+        self._cors_text = QPlainTextEdit()
+        self._cors_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._cors_text.setReadOnly(not self._writable)
+        self._cors_status = QLabel("")
+        self._cors_status.setWordWrap(True)
+        save = QPushButton("Save to bucket")
+        save.clicked.connect(self._save_cors)
+        save.setEnabled(self._writable)
+        self._btn_cors_save = save
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(save)
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel(
+            "The CORS rules as JSON — a list of rule objects. An empty "
+            "document removes the configuration."))
+        layout.addWidget(self._cors_text, 1)
+        layout.addWidget(self._cors_status)
+        layout.addLayout(row)
+        return page
+
+    def _build_policy(self):
+        page = QWidget()
+        self._policy_text = QPlainTextEdit()
+        self._policy_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._policy_text.setReadOnly(True)
+        self._policy_status = QLabel("")
+        self._policy_status.setWordWrap(True)
+        self._policy_edit = QCheckBox("Allow editing")
+        self._policy_edit.setEnabled(self._writable)
+        self._policy_edit.toggled.connect(self._toggle_policy_edit)
+        self._btn_policy_save = QPushButton("Save to bucket")
+        self._btn_policy_save.clicked.connect(self._save_policy)
+        self._btn_policy_save.setEnabled(False)
+        row = QHBoxLayout()
+        row.addWidget(self._policy_edit)
+        row.addStretch(1)
+        row.addWidget(self._btn_policy_save)
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel(
+            "The bucket policy decides who can reach this bucket. It opens "
+            "read-only on purpose: a wrong policy can expose every object in "
+            "it, or lock you out of your own bucket."))
+        layout.addWidget(self._policy_text, 1)
+        layout.addWidget(self._policy_status)
+        layout.addLayout(row)
+        return page
+
+    def _build_bucket(self):
+        """Default encryption, the bucket's own tags, and acceleration."""
+        page = QWidget()
+        self._sse = QComboBox()
+        self._sse.addItem("(none)", "")
+        for mode in DataModel.SSE_MODES:
+            if mode:
+                self._sse.addItem(mode, mode)
+        self._sse_key = QLineEdit()
+        self._sse_key.setPlaceholderText("KMS key id or ARN (aws:kms only)")
+        self._bucket_key = QCheckBox(
+            "Use an S3 Bucket Key (fewer KMS requests)")
+        self._sse.currentIndexChanged.connect(self._sync_sse_fields)
+
+        self._bucket_tags = QPlainTextEdit()
+        self._bucket_tags.setPlaceholderText("one per line:  key = value")
+        self._bucket_tags.setMaximumHeight(90)
+
+        self._acceleration = QCheckBox("Transfer acceleration")
+        self._bucket_status = QLabel("")
+        self._bucket_status.setWordWrap(True)
+
+        save = QPushButton("Save to bucket")
+        save.clicked.connect(self._save_bucket)
+        save.setEnabled(self._writable)
+        self._btn_bucket_save = save
+        for widget in (self._sse, self._sse_key, self._bucket_key,
+                       self._bucket_tags, self._acceleration):
+            widget.setEnabled(self._writable)
+
+        form = QFormLayout()
+        form.addRow(QLabel("Default encryption"), self._sse)
+        form.addRow(QLabel("KMS key"), self._sse_key)
+        form.addRow(self._bucket_key)
+        form.addRow(QLabel("Bucket tags"), self._bucket_tags)
+        form.addRow(self._acceleration)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(save)
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel(
+            "Default encryption applies to objects uploaded from anywhere, "
+            "not just this app. Bucket tags are the bucket's own, separate "
+            "from the tags on its objects."))
+        layout.addLayout(form)
+        layout.addWidget(self._bucket_status)
+        layout.addStretch(1)
+        layout.addLayout(row)
+        return page
+
+    def _build_website(self):
+        page = QWidget()
+        self._site_index = QLineEdit()
+        self._site_index.setPlaceholderText("index.html")
+        self._site_error = QLineEdit()
+        self._site_error.setPlaceholderText("error.html (optional)")
+        self._site_redirect = QLineEdit()
+        self._site_redirect.setPlaceholderText(
+            "example.com — redirects every request, instead of serving")
+        self._site_status = QLabel("")
+        self._site_status.setWordWrap(True)
+        save = QPushButton("Save to bucket")
+        save.clicked.connect(self._save_website)
+        save.setEnabled(self._writable)
+        self._btn_site_save = save
+        for widget in (self._site_index, self._site_error,
+                       self._site_redirect):
+            widget.setReadOnly(not self._writable)
+
+        form = QFormLayout()
+        form.addRow(QLabel("Index document"), self._site_index)
+        form.addRow(QLabel("Error document"), self._site_error)
+        form.addRow(QLabel("Redirect all requests to"), self._site_redirect)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(save)
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel(
+            "Static-website hosting serves this bucket over its website "
+            "endpoint. It does not make the objects public on its own — the "
+            "policy does that. Leaving everything blank removes the "
+            "configuration."))
+        layout.addLayout(form)
+        layout.addWidget(self._site_status)
+        layout.addStretch(1)
+        layout.addLayout(row)
+        return page
+
+    def _build_events(self):
+        page = QWidget()
+        self._events = QLabel("")
+        self._events.setWordWrap(True)
+        self._events.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel(
+            "Event notifications, read-only: a destination ARN cannot be "
+            "validated from here, and a wrong one silently stops every "
+            "event."))
+        layout.addWidget(self._events)
+        layout.addStretch(1)
+        return page
+
+    def _sync_sse_fields(self):
+        mode = self._sse.currentData() or ""
+        self._sse_key.setEnabled(self._writable and mode == "aws:kms")
+        self._bucket_key.setEnabled(self._writable and mode == "aws:kms")
+
+    def _save_bucket(self):
+        tags = DataModel.parse_content_type_overrides(
+            self._bucket_tags.toPlainText())
+        try:
+            self._model.put_bucket_encryption(
+                sse=self._sse.currentData() or "",
+                kms_key=self._sse_key.text().strip(),
+                bucket_key=self._bucket_key.isChecked(),
+                log_fn=self._mw.log)
+            self._model.put_bucket_tags(tags, log_fn=self._mw.log)
+            if self._acceleration.isChecked() != self._acceleration_was:
+                self._model.set_bucket_acceleration(
+                    self._acceleration.isChecked(), log_fn=self._mw.log)
+        except Exception as exc:
+            QMessageBox.critical(self, "Bucket settings", str(exc))
+            return
+        self._bucket_status.setText("Saved.")
+        self.reload()
+
+    def _save_website(self):
+        try:
+            self._model.put_bucket_website(
+                index=self._site_index.text(),
+                error=self._site_error.text(),
+                redirect=self._site_redirect.text(),
+                log_fn=self._mw.log)
+        except Exception as exc:
+            QMessageBox.critical(self, "Website hosting", str(exc))
+            return
+        self._site_status.setText("Saved.")
+        self.reload()
+
+    def _build_lock(self):
+        page = QWidget()
+        self._lock_status = QLabel("")
+        self._lock_status.setWordWrap(True)
+        self._lock_status.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout = QVBoxLayout(page)
+        layout.addWidget(self._lock_status)
+        layout.addStretch(1)
+        return page
+
+    @staticmethod
+    def read_documents(model) -> dict:
+        """
+        Fetch all four bucket documents, each failure kept beside its own key.
+
+        One dict rather than four calls from the UI thread: this is five round
+        trips, and a dialog that blocks for them is the thing every other
+        network path in this app already avoids.
+        """
+        out = {}
+        for name, fetch in (
+            ("lifecycle", model.get_bucket_lifecycle),
+            ("cors", model.get_bucket_cors),
+            ("policy", model.get_bucket_policy),
+            ("lock", model.get_object_lock_configuration),
+            ("encryption", model.get_bucket_encryption),
+            ("tags", model.get_bucket_tags),
+            ("website", model.get_bucket_website),
+            ("events", model.get_bucket_notifications),
+            ("acceleration", model.get_bucket_acceleration),
+        ):
+            try:
+                out[name] = fetch()
+            except Exception as exc:
+                out[name] = None
+                out[name + "_error"] = str(exc)
+        try:
+            out["policy_status"] = model.get_bucket_policy_status()
+        except Exception:
+            out["policy_status"] = ""
+        return out
+
+    def reload(self):
+        """Read all four documents off the UI thread and render them."""
+        clone = self._model.clone_for_worker()
+
+        def _read(_worker):
+            return self.read_documents(clone)
+
+        payload, exc = run_with_progress(
+            self, f"Reading settings for {self._model.bucket}…", _read)
+        if payload is None and exc is None:
+            return  # cancelled
+        if exc is not None:
+            payload = {"lifecycle_error": str(exc), "cors_error": str(exc),
+                       "policy_error": str(exc), "lock_error": str(exc)}
+        self.apply_documents(payload)
+
+    def apply_documents(self, payload):
+        """Render what read_documents returned."""
+        payload = dict(payload or {})
+
+        if payload.get("lifecycle_error"):
+            self._rules = []
+            self._lifecycle_status.setText(
+                f"Could not read the rules: {payload['lifecycle_error']}")
+        else:
+            self._rules = list(payload.get("lifecycle") or [])
+            self._lifecycle_status.setText(
+                "" if self._rules else "No lifecycle rules on this bucket.")
+        self._refresh_rules()
+
+        if payload.get("cors_error"):
+            self._cors_status.setText(
+                f"Could not read CORS: {payload['cors_error']}")
+        else:
+            rules = list(payload.get("cors") or [])
+            self._cors_text.setPlainText(
+                json.dumps(rules, indent=2) if rules else "")
+            self._cors_status.setText(
+                "" if rules else "No CORS configuration on this bucket.")
+
+        if payload.get("policy_error"):
+            self._policy_status.setText(
+                f"Could not read the policy: {payload['policy_error']}")
+        else:
+            policy = str(payload.get("policy") or "")
+            if policy:
+                try:
+                    policy = json.dumps(json.loads(policy), indent=2)
+                except ValueError:
+                    pass
+            self._policy_text.setPlainText(policy)
+            status = payload.get("policy_status") or ""
+            self._policy_status.setText(
+                (f"This bucket is {status}." if status else "")
+                + ("" if policy else " No bucket policy is set."))
+
+        self._apply_bucket_documents(payload)
+
+        if payload.get("lock_error"):
+            self._lock_status.setText(
+                f"Could not read Object Lock: {payload['lock_error']}")
+            return
+        config = dict(payload.get("lock") or {})
+        if not config.get("enabled"):
+            self._lock_status.setText(
+                "Object Lock is not enabled on this bucket.\n\n"
+                "It can only be turned on when a bucket is created, and it "
+                "makes objects undeletable for the retention period — "
+                "including by you.")
+            return
+        retention = config.get("mode") or "none"
+        window = ""
+        if config.get("days"):
+            window = f"{config['days']} day(s)"
+        elif config.get("years"):
+            window = f"{config['years']} year(s)"
+        self._lock_status.setText(
+            "Object Lock is <b>enabled</b> on this bucket.<br><br>"
+            f"Default retention mode: {retention}<br>"
+            f"Default retention period: {window or 'not set'}<br><br>"
+            "Per-object retention and legal holds are shown in Properties, "
+            "and a legal hold can be placed from the object's context menu.")
+
+    def _apply_bucket_documents(self, payload):
+        """Render the encryption / tags / website / events tabs."""
+        encryption = dict(payload.get("encryption") or {})
+        index = self._sse.findData(encryption.get("sse", ""))
+        self._sse.setCurrentIndex(max(index, 0))
+        self._sse_key.setText(encryption.get("kms_key", ""))
+        self._bucket_key.setChecked(bool(encryption.get("bucket_key")))
+        self._sync_sse_fields()
+
+        tags = dict(payload.get("tags") or {})
+        self._bucket_tags.setPlainText(
+            "\n".join(f"{key} = {value}" for key, value in sorted(tags.items())))
+
+        status = str(payload.get("acceleration") or "")
+        self._acceleration_was = status == "Enabled"
+        self._acceleration.setChecked(self._acceleration_was)
+        self._acceleration.setEnabled(self._writable and bool(status is not None))
+
+        problems = [payload[name] for name in
+                    ("encryption_error", "tags_error", "acceleration_error")
+                    if payload.get(name)]
+        self._bucket_status.setText(
+            "  ".join(problems) if problems else "")
+
+        website = dict(payload.get("website") or {})
+        self._site_index.setText(website.get("index", ""))
+        self._site_error.setText(website.get("error", ""))
+        self._site_redirect.setText(website.get("redirect", ""))
+        if payload.get("website_error"):
+            self._site_status.setText(
+                f"Could not read it: {payload['website_error']}")
+        else:
+            self._site_status.setText(
+                "" if website else "Website hosting is not configured.")
+
+        if payload.get("events_error"):
+            self._events.setText(
+                f"Could not read them: {payload['events_error']}")
+            return
+        events = list(payload.get("events") or [])
+        if not events:
+            self._events.setText("No event notifications are configured.")
+            return
+        lines = []
+        for kind, target, names in events:
+            lines.append(
+                f"<b>{kind}</b> → {target}"
+                + (f"<br>&nbsp;&nbsp;{', '.join(names)}" if names else ""))
+        self._events.setText("<br>".join(lines))
+
+    def _refresh_rules(self):
+        self._rules_list.clear()
+        for rule in self._rules:
+            name = str(rule.get("ID") or "(unnamed)")
+            state = "" if rule.get("Status") == "Enabled" else "  [disabled]"
+            item = QListWidgetItem(
+                f"{name}{state}\n    "
+                f"{DataModel.summarize_lifecycle_rule(rule)}")
+            self._rules_list.addItem(item)
+
+    def _selected_rule_index(self) -> int:
+        return self._rules_list.currentRow()
+
+    def _add_rule(self):
+        dlg = LifecycleRuleDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._rules.append(dlg.result_rule())
+        self._refresh_rules()
+        self._lifecycle_status.setText("Not saved yet.")
+
+    def _edit_rule(self):
+        index = self._selected_rule_index()
+        if not (0 <= index < len(self._rules)):
+            return
+        if not DataModel.lifecycle_filter_is_simple(self._rules[index]):
+            # Rebuilding it from the prefix form would drop the tag or size
+            # filter, quietly widening the rule to every object under the
+            # prefix — for an expiration rule, that deletes more than before.
+            QMessageBox.information(
+                self, "Lifecycle rule",
+                "This rule is filtered by tag or object size, which this "
+                "editor cannot represent. It can be removed here, but editing "
+                "it would silently widen it to the whole prefix — change it "
+                "in the provider's own console instead.")
+            return
+        dlg = LifecycleRuleDialog(self, self._rules[index])
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._rules[index] = dlg.result_rule()
+        self._refresh_rules()
+        self._lifecycle_status.setText("Not saved yet.")
+
+    def _remove_rule(self):
+        index = self._selected_rule_index()
+        if not (0 <= index < len(self._rules)):
+            return
+        del self._rules[index]
+        self._refresh_rules()
+        self._lifecycle_status.setText("Not saved yet.")
+
+    def _save_lifecycle(self):
+        summary = "\n".join(
+            f"• {rule.get('ID')}: {DataModel.summarize_lifecycle_rule(rule)}"
+            for rule in self._rules
+        ) or "(no rules — the configuration will be removed)"
+        answer = QMessageBox.question(
+            self, "Lifecycle rules",
+            "Write these rules to "
+            f"{self._model.bucket}?\n\n{summary}\n\n"
+            "The service will apply them on its own schedule, and "
+            "expirations delete objects permanently.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._model.put_bucket_lifecycle(
+                self._rules, log_fn=self._mw.log)
+        except Exception as exc:
+            QMessageBox.critical(self, "Lifecycle rules", str(exc))
+            return
+        self._lifecycle_status.setText("Saved.")
+        self.reload()
+
+    def _save_cors(self):
+        text = self._cors_text.toPlainText().strip()
+        rules = []
+        if text:
+            try:
+                rules = json.loads(text)
+            except ValueError as exc:
+                QMessageBox.warning(self, "CORS", f"Not valid JSON: {exc}")
+                return
+            if not isinstance(rules, list):
+                QMessageBox.warning(
+                    self, "CORS", "The document must be a list of rules.")
+                return
+        try:
+            self._model.put_bucket_cors(rules, log_fn=self._mw.log)
+        except Exception as exc:
+            QMessageBox.critical(self, "CORS", str(exc))
+            return
+        self._cors_status.setText("Saved.")
+        self.reload()
+
+    def _toggle_policy_edit(self, enabled):
+        self._policy_text.setReadOnly(not enabled)
+        self._btn_policy_save.setEnabled(bool(enabled))
+
+    def _save_policy(self):
+        text = self._policy_text.toPlainText().strip()
+        answer = QMessageBox.question(
+            self, "Bucket policy",
+            ("Remove the bucket policy?" if not text else
+             "Replace the policy on "
+             f"{self._model.bucket}?\n\nA policy decides who can reach "
+             "every object in this bucket."),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._model.put_bucket_policy(text, log_fn=self._mw.log)
+        except Exception as exc:
+            QMessageBox.critical(self, "Bucket policy", str(exc))
+            return
+        self._policy_status.setText("Saved.")
+        self.reload()
+
+
+class CopyMoveDialog(DialogDismissMixin, QDialog):
     def __init__(self, parent, model, item_count: int, current_prefix: str):
         super().__init__(parent)
         self.setWindowTitle("Copy / Move")
@@ -2408,9 +3722,8 @@ class CopyMoveDialog(QDialog):
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
-    def closeEvent(self, event):
+    def stop_threads(self):
         self._stop_loader()
-        super().closeEvent(event)
 
     def _stop_loader(self):
         th, self._thread, self._worker = self._thread, None, None
@@ -2457,7 +3770,10 @@ class TransferSettingsDialog(QDialog):
                  notify=True, parallel_files=4, max_parallel_files=32,
                  verify_downloads=False, rate_limit_kbps=0,
                  checksum_algorithm="", multipart_threshold_mb=16,
-                 multipart_chunksize_mb=8, resumable_uploads=True):
+                 multipart_chunksize_mb=8, resumable_uploads=True,
+                 detect_content_type=True, content_type_overrides=None,
+                 listing_limit=DEFAULT_LISTING_LIMIT, auto_retry=True,
+                 upload_rules=None, log_to_file=True):
         super().__init__(parent)
         self.setWindowTitle("Transfer settings")
         self.setMinimumWidth(460)
@@ -2522,6 +3838,40 @@ class TransferSettingsDialog(QDialog):
         index = self._checksum.findData(str(checksum_algorithm or "").upper())
         self._checksum.setCurrentIndex(max(index, 0))
 
+        self._listing_limit = QSpinBox()
+        self._listing_limit.setRange(0, 5_000_000)
+        self._listing_limit.setSingleStep(1000)
+        self._listing_limit.setSpecialValueText("no limit")
+        self._listing_limit.setValue(int(listing_limit or 0))
+
+        self._log_to_file = QCheckBox(
+            "Write the session log to ~/.config/s3duck/s3duck.log")
+        self._log_to_file.setChecked(bool(log_to_file))
+
+        self._auto_retry = QCheckBox(
+            "Retry a job once when the service asks for it "
+            "(throttling, 5xx, dropped connection)")
+        self._auto_retry.setChecked(bool(auto_retry))
+
+        self._detect_type = QCheckBox(
+            "Set Content-Type from the file extension when uploading")
+        self._detect_type.setChecked(bool(detect_content_type))
+
+        self._type_overrides = QPlainTextEdit(
+            DataModel.format_content_type_overrides(content_type_overrides))
+        self._type_overrides.setPlaceholderText(
+            "one per line:  ext = type\nmd = text/markdown")
+        self._type_overrides.setMaximumHeight(72)
+
+        self._upload_rules = QPlainTextEdit(
+            DataModel.format_upload_rules(upload_rules))
+        self._upload_rules.setPlaceholderText(
+            "archive/* -> class=GLACIER\n"
+            "logs/ -> class=STANDARD_IA, tag:team=infra")
+        self._upload_rules.setMaximumHeight(72)
+        self._detect_type.toggled.connect(self._type_overrides.setEnabled)
+        self._type_overrides.setEnabled(self._detect_type.isChecked())
+
         form = QFormLayout()
         form.addRow(QLabel("Files transferred at once"), self._parallel_files)
         form.addRow(QLabel("Connections per file (multipart)"), self._concurrency)
@@ -2532,14 +3882,22 @@ class TransferSettingsDialog(QDialog):
         form.addRow(QLabel("Upload encryption"), self._sse)
         form.addRow(QLabel("KMS key"), self._kms)
         form.addRow(QLabel("Upload checksum"), self._checksum)
+        form.addRow(QLabel("Entries loaded per listing"), self._listing_limit)
+        form.addRow(self._detect_type)
+        form.addRow(QLabel("Content-Type overrides"), self._type_overrides)
+        form.addRow(QLabel("Upload rules by destination"), self._upload_rules)
         form.addRow(self._resumable)
+        form.addRow(self._auto_retry)
+        form.addRow(self._log_to_file)
         form.addRow(self._verify)
         form.addRow(self._notify)
 
         note = QLabel(
             "Total connections is roughly files × connections-per-file. "
             "Storage class and encryption apply to new uploads; existing "
-            "objects are unaffected, use \"Change storage class…\" for those."
+            "objects are unaffected, use \"Change storage class…\" for those. "
+            "Without a detected Content-Type an object is stored as "
+            "binary/octet-stream, which a browser downloads instead of showing."
         )
         note.setWordWrap(True)
 
@@ -2600,6 +3958,25 @@ class TransferSettingsDialog(QDialog):
     def rate_limit_kbps(self) -> int:
         return self._rate_limit.value()
 
+    def listing_limit(self) -> int:
+        return self._listing_limit.value()
+
+    def auto_retry(self) -> bool:
+        return self._auto_retry.isChecked()
+
+    def upload_rules(self) -> list:
+        return DataModel.parse_upload_rules(self._upload_rules.toPlainText())
+
+    def log_to_file(self) -> bool:
+        return self._log_to_file.isChecked()
+
+    def detect_content_type(self) -> bool:
+        return self._detect_type.isChecked()
+
+    def content_type_overrides(self) -> dict:
+        return DataModel.parse_content_type_overrides(
+            self._type_overrides.toPlainText())
+
 
 def build_profile_model(profile, bucket=""):
     """A DataModel for another profile's credentials and endpoint."""
@@ -2613,6 +3990,10 @@ def build_profile_model(profile, bucket=""):
         profile.use_path,
         session_token=profile.session_token,
         read_only=profile.read_only,
+        requester_pays=getattr(profile, "requester_pays", False),
+        public_base_url=getattr(profile, "public_base_url", ""),
+        proxy_url=getattr(profile, "proxy_url", ""),
+        ca_bundle=getattr(profile, "ca_bundle", ""),
     )
 
 
@@ -3084,7 +4465,560 @@ class BulkRenameDialog(QDialog):
         return list(self._plan)
 
 
-class SyncDialog(QDialog):
+class SecondPane(QWidget):
+    """
+    The other half of a two-pane view: a local folder or a remote prefix.
+
+    Deliberately its own small model rather than a second MainWindow: only
+    listing and selection are needed here, because every operation the pane
+    takes part in is executed by the window's existing transfer queue.
+    """
+
+    LOCAL = "local"
+    REMOTE = "remote"
+    COLUMNS = ("Name", "Size", "Modified")
+
+    def __init__(self, parent, main_window, model):
+        super().__init__(parent)
+        self._mw = main_window
+        self._model = model
+        self._thread = None
+        self._worker = None
+        self._entries = []
+        self._bucket = model.bucket or ""
+        self._prefix = model.current_folder or ""
+        self._local_dir = os.path.expanduser("~")
+
+        self.mode = QComboBox()
+        self.mode.addItem("Local folder", self.LOCAL)
+        self.mode.addItem("Remote prefix", self.REMOTE)
+        self.mode.currentIndexChanged.connect(lambda _i: self.refresh())
+
+        self.path = QLineEdit(self._local_dir)
+        self.path.returnPressed.connect(self._go_typed)
+        self.up_btn = QPushButton("↑")
+        self.up_btn.setFixedWidth(28)
+        self.up_btn.setToolTip("Up one level")
+        self.up_btn.clicked.connect(self.go_up)
+        self.browse_btn = QPushButton("…")
+        self.browse_btn.setFixedWidth(28)
+        self.browse_btn.clicked.connect(self._browse)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.addWidget(self.mode)
+        top.addWidget(self.up_btn)
+        top.addWidget(self.path, 1)
+        top.addWidget(self.browse_btn)
+
+        self.view = QTreeView()
+        self.view.setRootIsDecorated(False)
+        self.view.setUniformRowHeights(True)
+        self.view.setSortingEnabled(False)
+        self.view.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.view.doubleClicked.connect(self._on_activated)
+        self.model = QStandardItemModel()
+        self.model.setHorizontalHeaderLabels(list(self.COLUMNS))
+        self.view.setModel(self.model)
+
+        self.status = QLabel("")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addLayout(top)
+        layout.addWidget(self.view, 1)
+        layout.addWidget(self.status)
+
+    def current_mode(self) -> str:
+        return self.mode.currentData() or self.LOCAL
+
+    def location(self) -> str:
+        if self.current_mode() == self.LOCAL:
+            return self._local_dir
+        return f"s3://{self._bucket}/{self._prefix}"
+
+    def set_remote(self, bucket, prefix):
+        """Point the pane at a remote prefix and show it."""
+        self._bucket = bucket or ""
+        self._prefix = prefix or ""
+        index = self.mode.findData(self.REMOTE)
+        if self.mode.currentIndex() != index:
+            self.mode.setCurrentIndex(index)   # triggers refresh
+        else:
+            self.refresh()
+
+    def set_local(self, path):
+        self._local_dir = os.path.abspath(path or os.path.expanduser("~"))
+        index = self.mode.findData(self.LOCAL)
+        if self.mode.currentIndex() != index:
+            self.mode.setCurrentIndex(index)
+        else:
+            self.refresh()
+
+    def remote_target(self) -> tuple:
+        return self._bucket, self._prefix
+
+    def local_target(self) -> str:
+        return self._local_dir
+
+    def entries(self) -> list:
+        """``[(name, is_dir, size)]`` for what is currently listed."""
+        return list(self._entries)
+
+    def selected(self) -> list:
+        """The selected rows as ``(name, is_dir, size)``."""
+        rows = sorted({index.row()
+                       for index in self.view.selectionModel().selectedIndexes()})
+        return [self._entries[row] for row in rows
+                if 0 <= row < len(self._entries)]
+
+    def _browse(self):
+        if self.current_mode() == self.LOCAL:
+            path = QFileDialog.getExistingDirectory(
+                self, "Folder", self._local_dir)
+            if path:
+                self.set_local(path)
+            return
+        text, ok = QInputDialog.getText(
+            self, "Remote prefix", "s3://bucket/prefix:",
+            text=f"s3://{self._bucket}/{self._prefix}")
+        if not ok:
+            return
+        bucket, prefix = MainWindow._parse_s3_location(text, "")
+        if bucket:
+            self.set_remote(bucket, prefix)
+
+    def _go_typed(self):
+        text = self.path.text().strip()
+        if self.current_mode() == self.LOCAL:
+            if os.path.isdir(text):
+                self.set_local(text)
+            return
+        bucket, prefix = MainWindow._parse_s3_location(text, self._bucket)
+        if bucket:
+            self.set_remote(bucket, prefix)
+
+    def go_up(self):
+        if self.current_mode() == self.LOCAL:
+            parent = os.path.dirname(self._local_dir.rstrip(os.sep))
+            if parent and parent != self._local_dir:
+                self.set_local(parent)
+            return
+        if not self._prefix:
+            return
+        trimmed = self._prefix.rstrip("/")
+        parent = trimmed.rsplit("/", 1)[0] + "/" if "/" in trimmed else ""
+        self.set_remote(self._bucket, parent)
+
+    def _on_activated(self, index):
+        row = index.row()
+        if not (0 <= row < len(self._entries)):
+            return
+        name, is_dir, _size = self._entries[row]
+        if not is_dir:
+            return
+        if self.current_mode() == self.LOCAL:
+            self.set_local(os.path.join(self._local_dir, name))
+        else:
+            self.set_remote(self._bucket, (self._prefix or "") + name + "/")
+
+    def refresh(self):
+        self.path.setText(
+            self._local_dir if self.current_mode() == self.LOCAL
+            else f"s3://{self._bucket}/{self._prefix}")
+        if self.current_mode() == self.LOCAL:
+            self._show(self._scan_local())
+            return
+        if not self._bucket:
+            self._show([])
+            self.status.setText("No bucket selected")
+            return
+        if self._thread is not None:
+            return
+        clone = self._model.clone_for_worker()
+        clone.bucket = self._bucket
+        prefix = self._prefix
+
+        def _list(_w):
+            return clone.list(prefix)
+
+        self.status.setText("Loading…")
+        self._thread = QThread(self)
+        self._worker = FuncWorker(_list)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.done.connect(self._on_listed)
+        self._worker.done.connect(self._thread.quit)
+        release_worker_on_finish(self._thread, self._worker)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.start()
+
+    def _scan_local(self):
+        rows = []
+        try:
+            names = sorted(os.listdir(self._local_dir))
+        except OSError as exc:
+            self.status.setText(str(exc))
+            return []
+        for name in names:
+            full = os.path.join(self._local_dir, name)
+            try:
+                is_dir = os.path.isdir(full)
+                size = 0 if is_dir else os.path.getsize(full)
+            except OSError:
+                continue
+            rows.append((name, is_dir, size))
+        rows.sort(key=lambda row: (not row[1], row[0].lower()))
+        return rows
+
+    def _on_listed(self, result, exc):
+        thread, self._thread, self._worker = self._thread, None, None
+        join_qthread(thread)
+        if exc is not None:
+            self.status.setText(f"Could not list: {exc}")
+            self._show([])
+            return
+        rows = [(item.name, item.t == FSObjectType.FOLDER, int(item.size or 0))
+                for item in (result or [])]
+        rows.sort(key=lambda row: (not row[1], row[0].lower()))
+        self._show(rows)
+
+    def _show(self, rows):
+        self._entries = list(rows)
+        self.model.removeRows(0, self.model.rowCount())
+        for name, is_dir, size in self._entries:
+            cells = [
+                QStandardItem(name),
+                QStandardItem("" if is_dir else _human_bytes(size)),
+                QStandardItem(""),
+            ]
+            for cell in cells:
+                cell.setEditable(False)
+            self.model.appendRow(cells)
+        folders = sum(1 for _n, is_dir, _s in self._entries if is_dir)
+        self.status.setText(
+            f"{folders} folder(s), {len(self._entries) - folders} file(s)")
+
+    def shutdown(self):
+        thread, self._thread, self._worker = self._thread, None, None
+        join_qthread(thread)
+
+
+class PaneCompareDialog(DialogDismissMixin, QDialog):
+    """
+    What differs between the two panes, and a way to copy it either way.
+
+    Both sides are walked recursively, so this also answers "are these two
+    prefixes the same" for two locations in one account — which the sync
+    dialog could only do by way of a local folder.
+    """
+
+    STATUS_LABELS = {
+        "only_left": "only on the left",
+        "only_right": "only on the right",
+        "differs": "differs",
+        "same": "same",
+    }
+
+    def __init__(self, parent, main_window, left, right):
+        super().__init__(parent)
+        self._mw = main_window
+        # Each side is ("local", path) or ("remote", bucket, prefix).
+        self._left = left
+        self._right = right
+        self._rows = []
+        self._thread = None
+        self._worker = None
+        self._cancel = None
+
+        self.setWindowTitle("Compare panes")
+        self.resize(860, 560)
+
+        self._info = QLabel(
+            f"{self.describe(left)}   ⟷   {self.describe(right)}")
+        self._info.setWordWrap(True)
+
+        self._hide_same = QCheckBox("Hide identical files")
+        self._hide_same.setChecked(True)
+        self._hide_same.toggled.connect(self._render)
+
+        self._exclude = QLineEdit()
+        self._exclude.setPlaceholderText("Exclude, e.g.  *.tmp  .git/")
+
+        self._btn_compare = QPushButton("Compare")
+        self._btn_compare.clicked.connect(self._compare)
+
+        top = QHBoxLayout()
+        top.addWidget(self._hide_same)
+        top.addWidget(QLabel("Exclude"))
+        top.addWidget(self._exclude, 1)
+        top.addWidget(self._btn_compare)
+
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(
+            ["Path", "Left", "Right", "Status"])
+        self._table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.verticalHeader().setVisible(False)
+        self._table.horizontalHeader().setStretchLastSection(True)
+
+        self._summary = QLabel("Press Compare.")
+        self._summary.setWordWrap(True)
+
+        self._btn_to_right = QPushButton("Copy selected  →")
+        self._btn_to_left = QPushButton("←  Copy selected")
+        self._btn_to_right.clicked.connect(lambda: self._copy("right"))
+        self._btn_to_left.clicked.connect(lambda: self._copy("left"))
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+        self._table.itemSelectionChanged.connect(self._update_buttons)
+
+        row = QHBoxLayout()
+        row.addWidget(self._btn_to_left)
+        row.addWidget(self._btn_to_right)
+        row.addStretch(1)
+        row.addWidget(close_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._info)
+        layout.addLayout(top)
+        layout.addWidget(self._table, 1)
+        layout.addWidget(self._summary)
+        layout.addLayout(row)
+        self._update_buttons()
+
+    @staticmethod
+    def describe(side) -> str:
+        if side[0] == "local":
+            return side[1]
+        return f"s3://{side[1]}/{side[2]}"
+
+    @staticmethod
+    def read_side(side, model):
+        """``{rel: (size, mtime)}`` for one side of the comparison."""
+        if side[0] == "local":
+            return scan_local_tree(side[1])
+        clone = model.clone_for_worker()
+        clone.bucket = side[1]
+        return clone.list_tree(side[2])
+
+    def _compare(self):
+        if self._thread is not None:
+            return
+        left, right = self._left, self._right
+        model = self._mw.data_model
+        exclude = self._exclude.text()
+        self._summary.setText("Comparing…")
+        self._btn_compare.setEnabled(False)
+
+        def _run(_worker):
+            return build_compare_plan(
+                self.read_side(left, model), self.read_side(right, model),
+                exclude=exclude)
+
+        self._thread = QThread(self)
+        self._worker = FuncWorker(_run)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.done.connect(self._on_compared)
+        self._worker.done.connect(self._thread.quit)
+        release_worker_on_finish(self._thread, self._worker)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.start()
+
+    def stop_threads(self):
+        th, self._thread, self._worker = self._thread, None, None
+        join_qthread(th)
+
+    def _on_compared(self, result, exc):
+        thread, self._thread, self._worker = self._thread, None, None
+        join_qthread(thread)
+        self._btn_compare.setEnabled(True)
+        if exc is not None:
+            self._summary.setText(f"Could not compare: {exc}")
+            return
+        self._rows = list(result or [])
+        self._render()
+
+    def visible_rows(self) -> list:
+        if self._hide_same.isChecked():
+            return [row for row in self._rows if row["status"] != "same"]
+        return list(self._rows)
+
+    def _render(self):
+        rows = self.visible_rows()
+        self._table.setRowCount(0)
+        for row in rows:
+            index = self._table.rowCount()
+            self._table.insertRow(index)
+            cells = (
+                row["rel"],
+                "—" if row["left_size"] is None else _human_bytes(row["left_size"]),
+                "—" if row["right_size"] is None else _human_bytes(row["right_size"]),
+                self.STATUS_LABELS.get(row["status"], row["status"]),
+            )
+            for column, text in enumerate(cells):
+                self._table.setItem(index, column, QTableWidgetItem(text))
+        counts = summarize_compare_plan(self._rows)
+        self._summary.setText(
+            f"{counts['only_left']} only on the left, "
+            f"{counts['only_right']} only on the right, "
+            f"{counts['differs']} differ, {counts['same']} identical")
+        self._update_buttons()
+
+    def selected_rows(self) -> list:
+        rows = self.visible_rows()
+        indexes = sorted({index.row()
+                          for index in self._table.selectedIndexes()})
+        return [rows[index] for index in indexes if 0 <= index < len(rows)]
+
+    def _update_buttons(self):
+        selected = self.selected_rows()
+        writable = not self._mw.is_read_only()
+        # A row that exists only on one side can only travel away from it.
+        to_right = [r for r in selected if r["status"] != "only_right"]
+        to_left = [r for r in selected if r["status"] != "only_left"]
+        self._btn_to_right.setEnabled(
+            bool(to_right) and (self._right[0] == "local" or writable))
+        self._btn_to_left.setEnabled(
+            bool(to_left) and (self._left[0] == "local" or writable))
+
+    def _copy(self, towards):
+        source = self._left if towards == "right" else self._right
+        target = self._right if towards == "right" else self._left
+        skip = "only_right" if towards == "right" else "only_left"
+        rows = [row for row in self.selected_rows() if row["status"] != skip]
+        if not rows:
+            return
+        job, method, kwargs = self.build_job(source, target,
+                                             [row["rel"] for row in rows])
+        if not job:
+            self._summary.setText("Nothing that can be copied that way.")
+            return
+        self.accept()
+        self._mw.assign_thread_operation(method, job, **kwargs)
+        self._mw.statusBar().showMessage(
+            f"Copying {len(job)} item(s) {towards}…", 4000)
+
+    @staticmethod
+    def build_job(source, target, rels):
+        """
+        Turn a set of relative paths into a queue job for this pair of sides.
+
+        Returns ``(job, method, kwargs)``. Which operation it is depends
+        entirely on the pair, which is why the panes do not decide it.
+        """
+        rels = [rel for rel in rels if rel]
+        if not rels:
+            return [], "", {}
+        if source[0] == "local" and target[0] == "remote":
+            prefix = target[2] or ""
+            return ([(prefix + rel,
+                      os.path.join(source[1], rel.replace("/", os.sep)))
+                     for rel in rels], "upload", {})
+        if source[0] == "remote" and target[0] == "local":
+            prefix = source[2] or ""
+            job = []
+            for rel in rels:
+                local = os.path.join(target[1], rel.replace("/", os.sep))
+                job.append((prefix + rel, local, None, target[1]))
+            return job, "download", {"need_refresh": False}
+        if source[0] == "remote" and target[0] == "remote":
+            src_prefix, dst_prefix = source[2] or "", target[2] or ""
+            cross = source[1] != target[1]
+            job = [(src_prefix + rel, dst_prefix + rel, False,
+                    target[1] if cross else None) for rel in rels]
+            return job, "copy", {
+                "source_bucket": source[1] if cross else ""}
+        # local -> local is not this app's job.
+        return [], "", {}
+
+
+class WatchFolderDialog(QDialog):
+    """Configure the folder that is mirrored up on an interval."""
+
+    INTERVALS = ((30, "30 seconds"), (60, "1 minute"), (300, "5 minutes"),
+                 (900, "15 minutes"), (3600, "1 hour"))
+
+    def __init__(self, parent, bucket, prefix, config=None):
+        super().__init__(parent)
+        config = dict(config or {})
+        self.setWindowTitle("Watch a folder")
+        self.setMinimumWidth(520)
+
+        self._local = QLineEdit(str(config.get("local") or ""))
+        self._local.setPlaceholderText("local folder to mirror upwards…")
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse)
+        local_row = QHBoxLayout()
+        local_row.addWidget(self._local, 1)
+        local_row.addWidget(browse)
+
+        self._interval = QComboBox()
+        for seconds, label in self.INTERVALS:
+            self._interval.addItem(label, seconds)
+        index = self._interval.findData(int(config.get("interval") or 300))
+        self._interval.setCurrentIndex(max(index, 0))
+
+        self._exclude = QLineEdit(str(config.get("exclude") or ""))
+        self._exclude.setPlaceholderText("*.tmp  node_modules/  .git/")
+
+        self._delete_extra = QCheckBox(
+            "Delete objects that no longer exist locally")
+        self._delete_extra.setChecked(bool(config.get("delete_extra")))
+
+        form = QFormLayout()
+        form.addRow(QLabel("Local folder"), local_row)
+        form.addRow(QLabel("Destination"),
+                    QLabel(f"s3://{bucket}/{prefix}"))
+        form.addRow(QLabel("Check every"), self._interval)
+        form.addRow(QLabel("Exclude"), self._exclude)
+        form.addRow(self._delete_extra)
+
+        note = QLabel(
+            "Each check compares the folder with the prefix and queues only "
+            "what differs. Watching stops when this window closes, and is "
+            "never resumed on its own at startup.")
+        note.setWordWrap(True)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(note)
+        layout.addWidget(buttons)
+
+    def _browse(self):
+        path = QFileDialog.getExistingDirectory(self, "Folder to watch")
+        if path:
+            self._local.setText(path)
+
+    def _accept(self):
+        if not os.path.isdir(self._local.text().strip()):
+            QMessageBox.warning(
+                self, "Watch a folder", "Choose an existing local folder.")
+            return
+        self.accept()
+
+    def config(self) -> dict:
+        return {
+            "local": self._local.text().strip(),
+            "interval": int(self._interval.currentData() or 300),
+            "exclude": self._exclude.text().strip(),
+            "delete_extra": self._delete_extra.isChecked(),
+        }
+
+
+class SyncDialog(DialogDismissMixin, QDialog):
     """Compare a local folder with the current prefix, show a dry-run plan,
     then execute it through the transfer queue."""
 
@@ -3165,13 +5099,12 @@ class SyncDialog(QDialog):
         lay.addWidget(self._table, 1)
         lay.addLayout(row)
 
-    def closeEvent(self, event):
+    def stop_threads(self):
         if self._cancel is not None:
             self._cancel.set()
         th, self._thread, self._worker = self._thread, None, None
         self._cancel = None
         join_qthread(th)
-        super().closeEvent(event)
 
     def _browse(self):
         path = QFileDialog.getExistingDirectory(self, "Select local folder")
@@ -3363,7 +5296,7 @@ class BulkTagsDialog(QDialog):
             and not self.replace_all()
 
 
-class DuplicateFinderDialog(QDialog):
+class DuplicateFinderDialog(DialogDismissMixin, QDialog):
     """
     Find objects holding the same content and delete the redundant copies.
 
@@ -3420,6 +5353,12 @@ class DuplicateFinderDialog(QDialog):
 
         self._btn_keep_newest = QPushButton("Select all but newest")
         self._btn_keep_oldest = QPushButton("Select all but oldest")
+        self._btn_confirm = QPushButton("Confirm candidates")
+        self._btn_confirm.setToolTip(
+            "Ask the service for each candidate's stored digest — settles a "
+            "group without downloading either copy, where the backend "
+            "supports it")
+        self._btn_confirm.clicked.connect(self._confirm_candidates)
         self._btn_clear = QPushButton("Clear selection")
         self._btn_delete = QPushButton("Delete selected…")
         close_btn = QPushButton("Close")
@@ -3434,6 +5373,7 @@ class DuplicateFinderDialog(QDialog):
         row = QHBoxLayout()
         row.addWidget(self._btn_keep_newest)
         row.addWidget(self._btn_keep_oldest)
+        row.addWidget(self._btn_confirm)
         row.addWidget(self._btn_clear)
         row.addStretch(1)
         row.addWidget(self._btn_delete)
@@ -3448,13 +5388,94 @@ class DuplicateFinderDialog(QDialog):
 
         self._update_buttons()
 
-    def closeEvent(self, event):
+    def stop_threads(self):
         if self._cancel is not None:
             self._cancel.set()
         th, self._thread, self._worker = self._thread, None, None
         self._cancel = None
         join_qthread(th)
-        super().closeEvent(event)
+
+    def unconfirmed_groups(self) -> list:
+        return [group for group in self._groups if not group.get("confirmed")]
+
+    @staticmethod
+    def confirm_groups(model, groups, cancel_event=None) -> list:
+        """
+        Settle each candidate group from stored digests alone.
+
+        Returns the verdicts in the same order: "same" (a real duplicate),
+        "different" (ruled out) or "unknown" (the backend cannot say without
+        the bytes). Run off the UI thread — it is one request per member.
+        """
+        verdicts = []
+        for group in groups or []:
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+            fingerprints = []
+            for key, _modified in group.get("members") or []:
+                try:
+                    fingerprints.append(model.object_fingerprint(key))
+                except Exception:
+                    fingerprints.append(("", ""))
+            verdicts.append(DataModel.compare_fingerprints(fingerprints))
+        return verdicts
+
+    def _confirm_candidates(self):
+        if self._thread is not None:
+            return
+        pending = self.unconfirmed_groups()
+        if not pending:
+            return
+        clone = self._model.clone_for_worker()
+        cancel = threading.Event()
+        self._cancel = cancel
+        self._info.setText(
+            f"Confirming {len(pending)} candidate group(s) from stored "
+            "digests…")
+        self._btn_scan.setEnabled(False)
+        self._btn_confirm.setEnabled(False)
+
+        def _run(_w):
+            return self.confirm_groups(clone, pending, cancel_event=cancel)
+
+        self._thread = QThread(self)
+        self._worker = FuncWorker(_run)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.done.connect(
+            lambda result, exc: self._on_confirmed(pending, result, exc))
+        self._worker.done.connect(self._thread.quit)
+        release_worker_on_finish(self._thread, self._worker)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.start()
+
+    def _on_confirmed(self, pending, verdicts, exc):
+        th, self._thread, self._worker = self._thread, None, None
+        self._cancel = None
+        join_qthread(th)
+        self._btn_scan.setEnabled(True)
+        if exc is not None:
+            self._info.setText(f"Could not confirm: {exc}")
+            self._update_buttons()
+            return
+        confirmed = 0
+        ruled_out = 0
+        for group, verdict in zip(pending, list(verdicts or [])):
+            if verdict == "same":
+                group["confirmed"] = True
+                confirmed += 1
+            elif verdict == "different":
+                group["ruled_out"] = True
+                ruled_out += 1
+        if ruled_out:
+            # A group proven to hold different bytes is not a finding.
+            self._groups = [group for group in self._groups
+                            if not group.get("ruled_out")]
+        self._render()
+        still = len(self.unconfirmed_groups())
+        self._info.setText(
+            f"{self._info.text()}  —  confirmed {confirmed}, ruled out "
+            f"{ruled_out}, still undecidable {still}")
 
     def min_size_bytes(self) -> int:
         raw = (self._min_size.text() or "").strip()
@@ -3600,6 +5621,8 @@ class DuplicateFinderDialog(QDialog):
         self._btn_keep_newest.setEnabled(has_groups and not busy)
         self._btn_keep_oldest.setEnabled(has_groups and not busy)
         self._btn_clear.setEnabled(has_groups and not busy)
+        self._btn_confirm.setEnabled(
+            bool(self.unconfirmed_groups()) and not busy)
         self._btn_delete.setEnabled(
             bool(self.selected_keys()) and not busy and writable)
 
@@ -3970,7 +5993,7 @@ class TagsDialog(QDialog):
 
 
 
-class PreviewDialog(QDialog):
+class PreviewDialog(DialogDismissMixin, QDialog):
     """Inline preview for a single object: images and text render in-app;
     anything else can be opened with the OS default application."""
 
@@ -3993,12 +6016,20 @@ class PreviewDialog(QDialog):
 
     def __init__(self, parent, model, key):
         super().__init__(parent)
+        # _open_external stages the download in the window's temp workspace;
+        # without this it raised AttributeError from inside a Qt slot.
+        self._mw = parent
         self._model = model
         self._key = key
         self._thread = None
         self._worker = None
         self._dl_thread = None
         self._dl_worker = None
+        self._save_thread = None
+        self._save_worker = None
+        self._etag = ""
+        self._editable = False
+        self._editing = False
 
         base = key.rstrip("/").split("/")[-1] or key
         self.setWindowTitle(f"Preview — {base}")
@@ -4052,11 +6083,19 @@ class PreviewDialog(QDialog):
 
         self._open_btn = QPushButton("Open with default app")
         self._open_btn.clicked.connect(self._open_external)
+        self._edit_btn = QPushButton("Edit")
+        self._edit_btn.clicked.connect(self._toggle_edit)
+        self._edit_btn.hide()
+        self._save_btn = QPushButton("Save")
+        self._save_btn.clicked.connect(self._save)
+        self._save_btn.hide()
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.reject)
 
         btns = QHBoxLayout()
         btns.addWidget(self._open_btn)
+        btns.addWidget(self._edit_btn)
+        btns.addWidget(self._save_btn)
         btns.addStretch(1)
         btns.addWidget(close_btn)
 
@@ -4094,9 +6133,23 @@ class PreviewDialog(QDialog):
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
-    def closeEvent(self, event):
+    def confirm_dismiss(self) -> bool:
+        # Escape reaches this now too. It used to walk straight past the
+        # prompt and throw the edits away without asking.
+        if self._editing and self._text.document().isModified():
+            answer = QMessageBox.question(
+                self, "Preview",
+                "Discard the unsaved changes to this object?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+        return True
+
+    def stop_threads(self):
         self._stop_load_thread()
-        super().closeEvent(event)
+        join_qthread(self._save_thread)
+        self._save_thread = None
+        self._save_worker = None
 
     def _stop_load_thread(self):
         th, self._thread, self._worker = self._thread, None, None
@@ -4112,6 +6165,7 @@ class PreviewDialog(QDialog):
         data = result.get("data") or b""
         ctype = (result.get("content_type") or "").lower()
         truncated = result.get("truncated")
+        self._etag = str(result.get("etag") or "")
         ext = self._ext()
 
         # Raster images render as a pixmap (SVG is XML, shown as text below).
@@ -4157,6 +6211,76 @@ class PreviewDialog(QDialog):
         if ext in self.CODE_EXTS and self._highlighter is None:
             self._highlighter = CodeHighlighter(self._text.document())
         self._stack.setCurrentIndex(2)
+        # Editing is offered only for text that arrived whole and decoded
+        # cleanly: saving a truncated body would silently delete the tail, and
+        # saving a replacement-charactered decode would corrupt the file.
+        self._editable = (
+            not truncated
+            and not getattr(self._model, "read_only", False)
+            and "\ufffd" not in text)
+        self._edit_btn.setVisible(self._editable)
+        if truncated:
+            self._edit_btn.setToolTip(
+                "Too large to edit in-app; the preview is truncated")
+        elif getattr(self._model, "read_only", False):
+            self._edit_btn.setToolTip("Profile is read-only")
+
+    def _toggle_edit(self):
+        if not self._editable:
+            return
+        self._editing = not self._editing
+        self._text.setReadOnly(not self._editing)
+        self._edit_btn.setText("Cancel edit" if self._editing else "Edit")
+        self._save_btn.setVisible(self._editing)
+        if self._editing:
+            self._text.setFocus(Qt.FocusReason.OtherFocusReason)
+        else:
+            # Cancelling reloads rather than keeping the edited buffer around
+            # looking authoritative.
+            self._start_load()
+
+    def _save(self):
+        if self._save_thread is not None:
+            return
+        payload = self._text.toPlainText().encode("utf-8")
+        key = self._key
+        etag = self._etag
+        clone = self._model.clone_for_worker()
+
+        def _write(_w):
+            return clone.put_object_body(key, payload, if_match=etag)
+
+        self._save_btn.setEnabled(False)
+        self._save_thread = QThread(self)
+        self._save_worker = FuncWorker(_write)
+        self._save_worker.moveToThread(self._save_thread)
+        self._save_thread.started.connect(self._save_worker.run)
+        self._save_worker.done.connect(self._on_saved)
+        self._save_worker.done.connect(self._save_thread.quit)
+        release_worker_on_finish(self._save_thread, self._save_worker)
+        self._save_thread.finished.connect(self._save_thread.deleteLater)
+        self._save_thread.start()
+
+    def _on_saved(self, result, exc):
+        th, self._save_thread, self._save_worker = self._save_thread, None, None
+        join_qthread(th)
+        self._save_btn.setEnabled(True)
+        if exc is not None:
+            if isinstance(exc, DataModel.PreconditionFailed):
+                QMessageBox.warning(
+                    self, "Save",
+                    f"{exc}\n\nNothing was written. Close and reopen the "
+                    "preview to see the current contents.")
+            else:
+                QMessageBox.warning(self, "Save", f"Could not save:\n{exc}")
+            return
+        self._etag = str(result or "")
+        self._editing = False
+        self._text.setReadOnly(True)
+        self._edit_btn.setText("Edit")
+        self._save_btn.hide()
+        if getattr(self._mw, "statusBar", None) is not None:
+            self._mw.statusBar().showMessage("Saved", 3000)
 
     def _open_external(self):
         if self._dl_thread is not None:
@@ -4218,7 +6342,153 @@ class PreviewDialog(QDialog):
         prog.show()
 
 
-class VersionsDialog(QDialog):
+class VersionDiffDialog(DialogDismissMixin, QDialog):
+    """
+    A unified diff between two versions of one object.
+
+    The versions list can already download any version; what it could not do
+    is answer the question anyone actually opens it with — what changed.
+    """
+
+    MAX_BYTES = 512 * 1024
+
+    def __init__(self, parent, model, key, older, newer):
+        super().__init__(parent)
+        self._model = model
+        self._key = key
+        self._older = older
+        self._newer = newer
+        self._thread = None
+        self._worker = None
+
+        base = key.rstrip("/").split("/")[-1] or key
+        self.setWindowTitle(f"Diff — {base}")
+        self.resize(880, 620)
+
+        self._info = QLabel("Loading both versions…")
+        self._info.setWordWrap(True)
+        self._text = QPlainTextEdit()
+        self._text.setReadOnly(True)
+        self._text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        try:
+            self._text.setFont(
+                QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        except Exception:
+            pass
+        self._highlighter = DiffHighlighter(self._text.document())
+
+        copy_btn = QPushButton("Copy diff")
+        copy_btn.clicked.connect(self._copy)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+        row = QHBoxLayout()
+        row.addWidget(copy_btn)
+        row.addStretch(1)
+        row.addWidget(close_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._info)
+        layout.addWidget(self._text, 1)
+        layout.addLayout(row)
+        self._load()
+
+    @staticmethod
+    def build_diff(older_bytes, newer_bytes, older_label, newer_label,
+                   truncated=False) -> tuple:
+        """
+        ``(text, problem)`` for two version bodies.
+
+        Binary content is refused rather than rendered as mojibake: a diff of
+        replacement characters looks like a change on every line.
+        """
+        for payload in (older_bytes, newer_bytes):
+            if b"\x00" in (payload or b"")[:8192]:
+                return "", "One of these versions is binary; there is nothing to diff."
+        older_text = (older_bytes or b"").decode("utf-8", errors="replace")
+        newer_text = (newer_bytes or b"").decode("utf-8", errors="replace")
+        if "\ufffd" in older_text or "\ufffd" in newer_text:
+            return "", "One of these versions is not UTF-8 text."
+        if older_text == newer_text:
+            note = " (within the part that was read)" if truncated else ""
+            return "", f"These two versions are identical{note}."
+        diff = difflib.unified_diff(
+            older_text.splitlines(), newer_text.splitlines(),
+            fromfile=older_label, tofile=newer_label, lineterm="")
+        return "\n".join(diff), ""
+
+    def _load(self):
+        model = self._model
+        key = self._key
+        older, newer = self._older, self._newer
+        limit = self.MAX_BYTES
+
+        def _fetch(_worker):
+            clone = model.clone_for_worker()
+            return (clone.get_object_preview(key, limit, version_id=older),
+                    clone.get_object_preview(key, limit, version_id=newer))
+
+        self._thread = QThread(self)
+        self._worker = FuncWorker(_fetch)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.done.connect(self._on_loaded)
+        self._worker.done.connect(self._thread.quit)
+        release_worker_on_finish(self._thread, self._worker)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.start()
+
+    def _on_loaded(self, result, exc):
+        thread, self._thread, self._worker = self._thread, None, None
+        join_qthread(thread)
+        if exc is not None:
+            self._info.setText(f"Could not read the versions: {exc}")
+            return
+        first, second = result
+        truncated = bool(first.get("truncated") or second.get("truncated"))
+        text, problem = self.build_diff(
+            first.get("data"), second.get("data"),
+            f"{self._key}@{self._older}", f"{self._key}@{self._newer}",
+            truncated=truncated)
+        if problem:
+            self._info.setText(problem)
+            self._text.setPlainText("")
+            return
+        self._info.setText(
+            "Only the first "
+            f"{_human_bytes(self.MAX_BYTES)} of each version was read."
+            if truncated else "")
+        self._text.setPlainText(text)
+
+    def _copy(self):
+        QApplication.clipboard().setText(self._text.toPlainText())
+
+    def stop_threads(self):
+        thread, self._thread, self._worker = self._thread, None, None
+        join_qthread(thread)
+
+
+class DiffHighlighter(QSyntaxHighlighter):
+    """Colours a unified diff: added, removed and hunk lines."""
+
+    def __init__(self, document):
+        super().__init__(document)
+        self._added = QTextCharFormat()
+        self._added.setForeground(QColor("#2e7d32"))
+        self._removed = QTextCharFormat()
+        self._removed.setForeground(QColor("#c62828"))
+        self._hunk = QTextCharFormat()
+        self._hunk.setForeground(QColor("#1565c0"))
+
+    def highlightBlock(self, text):
+        if text.startswith("@@"):
+            self.setFormat(0, len(text), self._hunk)
+        elif text.startswith("+") and not text.startswith("+++"):
+            self.setFormat(0, len(text), self._added)
+        elif text.startswith("-") and not text.startswith("---"):
+            self.setFormat(0, len(text), self._removed)
+
+
+class VersionsDialog(DialogDismissMixin, QDialog):
     """List, download, restore, and delete individual object versions."""
 
     def __init__(self, parent, main_window, model, key):
@@ -4246,8 +6516,10 @@ class VersionsDialog(QDialog):
         self._table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
+        # Extended so two rows can be picked for a diff; every other action
+        # still works on exactly one.
         self._table.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
+            QAbstractItemView.SelectionMode.ExtendedSelection
         )
         self._table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers
@@ -4256,6 +6528,10 @@ class VersionsDialog(QDialog):
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.itemSelectionChanged.connect(self._update_buttons)
 
+        self._btn_diff = QPushButton("Compare two…")
+        self._btn_diff.setToolTip(
+            "Select two versions to see what changed between them")
+        self._btn_diff.clicked.connect(self._diff_selected)
         self._btn_download = QPushButton("Download…")
         self._btn_current = QPushButton("Make current")
         self._btn_delete = QPushButton("Delete version")
@@ -4266,6 +6542,7 @@ class VersionsDialog(QDialog):
         close_btn.clicked.connect(self.reject)
 
         row = QHBoxLayout()
+        row.addWidget(self._btn_diff)
         row.addWidget(self._btn_download)
         row.addWidget(self._btn_current)
         row.addWidget(self._btn_delete)
@@ -4279,9 +6556,8 @@ class VersionsDialog(QDialog):
 
         self._reload()
 
-    def closeEvent(self, event):
+    def stop_threads(self):
         self._stop_list_thread()
-        super().closeEvent(event)
 
     def _stop_list_thread(self):
         th, self._list_thread, self._list_worker = self._list_thread, None, None
@@ -4360,12 +6636,35 @@ class VersionsDialog(QDialog):
 
     def _selected(self):
         rows = self._table.selectionModel().selectedRows()
-        if not rows:
+        if len(rows) != 1:
             return None
         idx = rows[0].row()
         if 0 <= idx < len(self._versions):
             return self._versions[idx]
         return None
+
+    def selected_versions(self) -> list:
+        """Every selected row, oldest first — the order a diff reads in."""
+        rows = sorted(index.row()
+                      for index in self._table.selectionModel().selectedRows())
+        picked = [self._versions[row] for row in rows
+                  if 0 <= row < len(self._versions)]
+        # The listing is newest first, so reverse into chronological order.
+        return list(reversed(picked))
+
+    def diffable_pair(self):
+        """The two versions to diff, or None when the selection is not two."""
+        picked = [v for v in self.selected_versions()
+                  if not v["is_delete_marker"]]
+        if len(picked) != 2:
+            return None
+        return picked[0]["version_id"], picked[1]["version_id"]
+
+    def _diff_selected(self):
+        pair = self.diffable_pair()
+        if pair is None:
+            return
+        VersionDiffDialog(self, self._model, self._key, *pair).exec()
 
     def _update_buttons(self):
         v = self._selected()
@@ -4374,6 +6673,7 @@ class VersionsDialog(QDialog):
         self._btn_download.setEnabled(has and not is_dm)
         self._btn_current.setEnabled(has and not is_dm and not v["is_latest"])
         self._btn_delete.setEnabled(has)
+        self._btn_diff.setEnabled(self.diffable_pair() is not None)
 
     def _make_current_selected(self):
         v = self._selected()
@@ -4481,7 +6781,7 @@ class VersionsDialog(QDialog):
         prog.show()
 
 
-class IncompleteUploadsDialog(QDialog):
+class IncompleteUploadsDialog(DialogDismissMixin, QDialog):
     """List and abort in-flight multipart uploads.
 
     Orphaned uploads (from a cancelled or crashed transfer) keep their already
@@ -4550,9 +6850,8 @@ class IncompleteUploadsDialog(QDialog):
 
         self._reload()
 
-    def closeEvent(self, event):
+    def stop_threads(self):
         self._stop_thread(cancel=True)
-        super().closeEvent(event)
 
     def _stop_thread(self, cancel: bool = False):
         # Sizing every upload costs one ListParts call, so a scan can run for
@@ -4844,7 +7143,7 @@ class MetadataDialog(QDialog):
         self.accept()
 
 
-class SearchDialog(QDialog):
+class SearchDialog(DialogDismissMixin, QDialog):
     """Recursively search the current bucket/prefix by key substring."""
 
     MAX_RESULTS = 1000
@@ -4871,6 +7170,22 @@ class SearchDialog(QDialog):
         top = QHBoxLayout()
         top.addWidget(self._query, 1)
         top.addWidget(self._btn_search)
+
+        # Saved searches: with results now driving the queue, a recurring
+        # cleanup is worth one click rather than a re-typed form.
+        self._saved = QComboBox()
+        self._saved.setMinimumWidth(180)
+        self._saved.currentIndexChanged.connect(self._on_saved_chosen)
+        self._btn_save_search = QPushButton("Save…")
+        self._btn_save_search.clicked.connect(self._save_search)
+        self._btn_delete_search = QPushButton("Delete")
+        self._btn_delete_search.clicked.connect(self._delete_search)
+        saved_row = QHBoxLayout()
+        saved_row.addWidget(QLabel("Saved"))
+        saved_row.addWidget(self._saved)
+        saved_row.addWidget(self._btn_save_search)
+        saved_row.addWidget(self._btn_delete_search)
+        saved_row.addStretch(1)
 
         self._regex = QCheckBox("Regex")
         self._case = QCheckBox("Case sensitive")
@@ -4937,42 +7252,142 @@ class SearchDialog(QDialog):
         self._table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
+        # Extended, not single: a search that cannot act on what it found is
+        # only half a tool — the queue can already delete, tag, re-type and
+        # download any list of keys.
         self._table.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
+            QAbstractItemView.SelectionMode.ExtendedSelection
         )
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.doubleClicked.connect(self._goto_selected)
+        self._table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._result_menu)
 
         self._btn_goto = QPushButton("Go to location")
-        self._btn_copy = QPushButton("Copy key")
+        self._btn_copy = QPushButton("Copy keys")
+        self._btn_actions = QToolButton()
+        self._btn_actions.setText("Actions")
+        self._btn_actions.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._btn_actions.setMenu(QMenu(self._btn_actions))
+        self._btn_select_all = QPushButton("Select all")
         close_btn = QPushButton("Close")
         self._btn_goto.clicked.connect(self._goto_selected)
         self._btn_copy.clicked.connect(self._copy_selected)
+        self._btn_select_all.clicked.connect(self._table.selectAll)
         close_btn.clicked.connect(self.reject)
         self._btn_goto.setEnabled(False)
         self._btn_copy.setEnabled(False)
+        self._btn_actions.setEnabled(False)
+        self._btn_select_all.setEnabled(False)
         self._table.itemSelectionChanged.connect(self._update_buttons)
         row = QHBoxLayout()
         row.addWidget(self._btn_goto)
         row.addWidget(self._btn_copy)
+        row.addWidget(self._btn_actions)
+        row.addWidget(self._btn_select_all)
         row.addStretch(1)
         row.addWidget(close_btn)
 
         lay = QVBoxLayout(self)
         lay.addLayout(top)
+        lay.addLayout(saved_row)
         lay.addWidget(filters)
         lay.addWidget(self._info)
         lay.addWidget(self._table, 1)
         lay.addLayout(row)
 
+        self._reload_saved()
         self._query.setFocus()
 
     def _update_buttons(self):
-        has = self._table.currentRow() >= 0 and bool(self._results)
-        self._btn_goto.setEnabled(has)
-        self._btn_copy.setEnabled(has)
+        selected = self.selected_keys()
+        self._btn_goto.setEnabled(len(selected) == 1)
+        self._btn_copy.setEnabled(bool(selected))
+        self._btn_actions.setEnabled(bool(selected))
+        self._btn_select_all.setEnabled(bool(self._results))
+        if selected:
+            self._build_actions_menu(self._btn_actions.menu(), selected)
+
+    def selected_keys(self) -> list:
+        """Every result row the user has selected, in listing order."""
+        rows = sorted({index.row()
+                       for index in self._table.selectedIndexes()})
+        return [self._results[row][0] for row in rows
+                if 0 <= row < len(self._results)]
+
+    def _build_actions_menu(self, menu, keys):
+        """
+        Fill *menu* with everything the queue can do to these keys.
+
+        Built on demand rather than once, because read-only state and the
+        selection size both change what belongs in it.
+        """
+        menu.clear()
+        count = len(keys)
+        targets = [(key.rsplit("/", 1)[-1], key, False) for key in keys]
+        writable = not self._mw.is_read_only()
+
+        act_download = menu.addAction(f"Download {count} object(s)…")
+        act_download.triggered.connect(
+            lambda: self._act(self._mw.download_keys, keys))
+        act_copy_uri = menu.addAction("Copy s3:// URIs")
+        act_copy_uri.triggered.connect(lambda: self._copy_uris(keys))
+        if not writable:
+            hint = menu.addAction("(read-only profile)")
+            hint.setEnabled(False)
+            return menu
+        menu.addSeparator()
+        act_tags = menu.addAction("Add / remove tags…")
+        act_tags.triggered.connect(
+            lambda: self._act(self._mw.bulk_tags, targets))
+        act_class = menu.addAction("Change storage class…")
+        act_class.triggered.connect(
+            lambda: self._act(self._mw.change_storage_class_ui, targets))
+        act_restore = menu.addAction("Restore from Glacier…")
+        act_restore.triggered.connect(
+            lambda: self._act(self._mw.restore_from_glacier, targets))
+        act_type = menu.addAction("Fix Content-Type from extension")
+        act_type.triggered.connect(
+            lambda: self._act(self._mw.fix_content_type_ui, targets))
+        menu.addSeparator()
+        act_delete = menu.addAction(f"Delete {count} object(s)…")
+        act_delete.triggered.connect(
+            lambda: self._act(self._mw.delete_keys, keys))
+        return menu
+
+    def _act(self, handler, payload):
+        """
+        Run a main-window action against the selection.
+
+        The dialog closes first: every one of these queues work that refreshes
+        the listing underneath, and a search whose results have just been
+        deleted is worse than no search at all.
+        """
+        self.accept()
+        handler(payload)
+
+    def _copy_uris(self, keys):
+        bucket = self._model.bucket
+        QtWidgets.QApplication.clipboard().setText(
+            "\n".join(f"s3://{bucket}/{key}" for key in keys))
+        self._mw.statusBar().showMessage(
+            f"{len(keys)} URI(s) copied", 2000)
+
+    def _result_menu(self, pos):
+        keys = self.selected_keys()
+        if not keys:
+            return
+        menu = QMenu(self)
+        if len(keys) == 1:
+            act_goto = menu.addAction("Go to location")
+            act_goto.triggered.connect(self._goto_selected)
+            menu.addSeparator()
+        self._build_actions_menu(menu, keys)
+        menu.exec(self._table.viewport().mapToGlobal(pos))
 
     @staticmethod
     def _parse_size(text, factor):
@@ -5003,6 +7418,90 @@ class SearchDialog(QDialog):
             kwargs["modified_before"] = datetime.combine(
                 self._before.date().toPyDate(), dtime.max, tzinfo=timezone.utc)
         return kwargs
+
+    def search_config(self) -> dict:
+        """Every filter widget's value, as something JSON can hold."""
+        return {
+            "query": self._query.text(),
+            "regex": self._regex.isChecked(),
+            "case": self._case.isChecked(),
+            "extensions": self._exts.text(),
+            "min_size": self._min_size.text(),
+            "max_size": self._max_size.text(),
+            "unit": int(self._size_unit.currentData() or 1),
+            "use_after": self._use_after.isChecked(),
+            "after": self._after.date().toString("yyyy-MM-dd"),
+            "use_before": self._use_before.isChecked(),
+            "before": self._before.date().toString("yyyy-MM-dd"),
+        }
+
+    def apply_search_config(self, config):
+        """Fill the form from a saved search."""
+        config = dict(config or {})
+        self._query.setText(str(config.get("query") or ""))
+        self._regex.setChecked(bool(config.get("regex")))
+        self._case.setChecked(bool(config.get("case")))
+        self._exts.setText(str(config.get("extensions") or ""))
+        self._min_size.setText(str(config.get("min_size") or ""))
+        self._max_size.setText(str(config.get("max_size") or ""))
+        index = self._size_unit.findData(int(config.get("unit") or 1))
+        self._size_unit.setCurrentIndex(max(index, 0))
+        self._use_after.setChecked(bool(config.get("use_after")))
+        self._use_before.setChecked(bool(config.get("use_before")))
+        for checked, widget, value in (
+            (config.get("use_after"), self._after, config.get("after")),
+            (config.get("use_before"), self._before, config.get("before")),
+        ):
+            if checked and value:
+                parsed = QDate.fromString(str(value), "yyyy-MM-dd")
+                if parsed.isValid():
+                    widget.setDate(parsed)
+
+    def _reload_saved(self, select=""):
+        entries = self._mw.load_saved_searches()
+        self._saved.blockSignals(True)
+        self._saved.clear()
+        self._saved.addItem("(none)", None)
+        for entry in entries:
+            self._saved.addItem(str(entry.get("name") or ""), entry)
+        index = self._saved.findText(select) if select else 0
+        self._saved.setCurrentIndex(max(index, 0))
+        self._saved.blockSignals(False)
+        self._btn_delete_search.setEnabled(self._saved.currentIndex() > 0)
+
+    def _on_saved_chosen(self, _index):
+        entry = self._saved.currentData()
+        self._btn_delete_search.setEnabled(entry is not None)
+        if entry is None:
+            return
+        self.apply_search_config(entry.get("filters") or {})
+        self._run_search()
+
+    def _save_search(self):
+        name, ok = QInputDialog.getText(
+            self, "Save search", "Name:",
+            text=self._saved.currentText()
+            if self._saved.currentIndex() > 0 else "")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        entries = [entry for entry in self._mw.load_saved_searches()
+                   if str(entry.get("name") or "") != name]
+        entries.append({"name": name, "filters": self.search_config()})
+        entries.sort(key=lambda entry: str(entry.get("name") or "").lower())
+        self._mw.store_saved_searches(entries)
+        self._reload_saved(select=name)
+        self._info.setText(f"Saved as '{name}'.")
+
+    def _delete_search(self):
+        entry = self._saved.currentData()
+        if entry is None:
+            return
+        name = str(entry.get("name") or "")
+        entries = [row for row in self._mw.load_saved_searches()
+                   if str(row.get("name") or "") != name]
+        self._mw.store_saved_searches(entries)
+        self._reload_saved()
 
     def _has_filters(self) -> bool:
         kwargs = self.filter_kwargs()
@@ -5050,11 +7549,10 @@ class SearchDialog(QDialog):
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
-    def closeEvent(self, event):
+    def stop_threads(self):
         if self._cancel is not None:
             self._cancel.set()
         self._stop_search_thread()
-        super().closeEvent(event)
 
     def _stop_search_thread(self):
         th, self._thread, self._worker = self._thread, None, None
@@ -5090,10 +7588,13 @@ class SearchDialog(QDialog):
         return None
 
     def _copy_selected(self):
-        key = self._selected_key()
-        if key:
-            QtWidgets.QApplication.clipboard().setText(key)
-            self._mw.statusBar().showMessage("Key copied", 2000)
+        keys = self.selected_keys()
+        if not keys:
+            return
+        QtWidgets.QApplication.clipboard().setText("\n".join(keys))
+        self._mw.statusBar().showMessage(
+            "Key copied" if len(keys) == 1 else f"{len(keys)} keys copied",
+            2000)
 
     def _goto_selected(self):
         key = self._selected_key()
@@ -5217,6 +7718,12 @@ class _QEntry:
         self.thread = None
         self.worker = None
         self.error = None
+        # The same failure with the request id and HTTP status attached, kept
+        # so a finished job can still be reported accurately hours later.
+        self.error_details = ""
+        self.error_transient = False
+        # How many times this job has been re-queued automatically.
+        self.auto_retries = 0
 
 
 def _scaled_bar_values(done, total, scale=1000):
@@ -5238,6 +7745,7 @@ def _scaled_bar_values(done, total, scale=1000):
 class _QueueRow(QWidget):
     cancel_requested = pyqtSignal(int)
     retry_requested = pyqtSignal(int)
+    details_requested = pyqtSignal(int)
 
     _OP_ICONS = {
         "upload": "⬆", "download": "⬇", "delete": "✕",
@@ -5283,12 +7791,22 @@ class _QueueRow(QWidget):
         self._retry_btn.clicked.connect(lambda: self.retry_requested.emit(self._entry_id))
         self._retry_btn.hide()
 
+        # Shown only on a failed row: what actually came back from the
+        # service, which is the thing a bug report needs.
+        self._details_btn = QPushButton("ℹ")
+        self._details_btn.setFixedSize(22, 22)
+        self._details_btn.setToolTip("Why it failed")
+        self._details_btn.clicked.connect(
+            lambda: self.details_requested.emit(self._entry_id))
+        self._details_btn.hide()
+
         row = QHBoxLayout(self)
         row.setContentsMargins(4, 2, 4, 2)
         row.addWidget(icon)
         row.addWidget(self._desc, 1)
         row.addWidget(self._status)
         row.addWidget(self._bar, 1)
+        row.addWidget(self._details_btn)
         row.addWidget(self._retry_btn)
         row.addWidget(self._cancel_btn)
 
@@ -5309,6 +7827,7 @@ class _QueueRow(QWidget):
             self._cancel_btn.setEnabled(False)
         # Only an unfinished job is worth re-running.
         self._retry_btn.setVisible(status in ("cancelled", "error"))
+        self._details_btn.setVisible(status == "error")
 
     def set_byte_progress(self, done: int, total: int):
         range_max, value = _scaled_bar_values(done, total)
@@ -5319,6 +7838,8 @@ class _QueueRow(QWidget):
 class TransferQueuePanel(QWidget):
     cancel_requested = pyqtSignal(int)
     retry_requested = pyqtSignal(int)
+    details_requested = pyqtSignal(int)
+    retry_all_requested = pyqtSignal()
     history_requested = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -5334,6 +7855,10 @@ class TransferQueuePanel(QWidget):
         clear_btn.setFlat(True)
         clear_btn.clicked.connect(self._clear_done)
 
+        retry_btn = QPushButton("Retry failed")
+        retry_btn.setFlat(True)
+        retry_btn.clicked.connect(self.retry_all_requested)
+
         history_btn = QPushButton("History")
         history_btn.setFlat(True)
         history_btn.clicked.connect(self.history_requested)
@@ -5342,6 +7867,7 @@ class TransferQueuePanel(QWidget):
         hdr_row.setContentsMargins(0, 0, 0, 0)
         hdr_row.setSpacing(0)
         hdr_row.addWidget(hdr, 1)
+        hdr_row.addWidget(retry_btn)
         hdr_row.addWidget(history_btn)
         hdr_row.addWidget(clear_btn)
 
@@ -5370,6 +7896,7 @@ class TransferQueuePanel(QWidget):
         row = _QueueRow(entry)
         row.cancel_requested.connect(self.cancel_requested)
         row.retry_requested.connect(self.retry_requested)
+        row.details_requested.connect(self.details_requested)
         self._rows[entry.entry_id] = row
         count = self._content_lay.count()
         self._content_lay.insertWidget(count - 1, row)
@@ -5479,7 +8006,7 @@ class MainWindow(QMainWindow):
 
         # Profiles created before session-token / read-only support pass fewer
         # fields; pad so old callers keep working.
-        settings = tuple(settings) + ("",) * (13 - len(tuple(settings)))
+        settings = tuple(settings) + ("",) * (20 - len(tuple(settings)))
         (
             current_dir,
             settings,
@@ -5494,7 +8021,19 @@ class MainWindow(QMainWindow):
             session_token,
             read_only,
             accent,
+            session_expires,
+            aws_profile,
+            credential_process,
+            public_base_url,
+            requester_pays,
+            proxy_url,
+            ca_bundle,
         ) = settings
+        # Credential lifetime is profile state, not model state: the model
+        # only ever sees the keys it was handed.
+        self.session_expires = str(session_expires or "")
+        self.aws_profile = str(aws_profile or "")
+        self.credential_process = str(credential_process or "")
         self.settings = settings
         self.current_dir = current_dir
         # Needed before the settings loaders below, which key off the profile.
@@ -5504,6 +8043,12 @@ class MainWindow(QMainWindow):
         # roots whose owning process is gone.
         self.temp_workspace = TempWorkspace()
         self.temp_workspace.sweep()
+        settings.beginGroup("common")
+        log_to_file = str(
+            settings.value("log_to_file", "true")).lower() in ("true", "1")
+        settings.endGroup()
+        self.log_file = LogFile(
+            LogFile.default_path() if log_to_file else "")
         settings.beginGroup("common")
         try:
             transfer_concurrency = int(settings.value(
@@ -5522,6 +8067,10 @@ class MainWindow(QMainWindow):
             session_token=session_token,
             parallel_files=parallel_files,
             read_only=bool(read_only),
+            requester_pays=bool(requester_pays),
+            public_base_url=public_base_url,
+            proxy_url=proxy_url,
+            ca_bundle=ca_bundle,
         )
         self._load_binding_cache()
         self._load_upload_options()
@@ -5577,22 +8126,76 @@ class MainWindow(QMainWindow):
         # Quick-find search bar (hidden until Ctrl+F). Filters the current
         # bucket/folder listing by name via the proxy model.
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Filter by name…  (just type, or Ctrl+F; Esc to close)")
+        self.search_edit.setPlaceholderText(
+            "Filter by name or glob (*.log)…  "
+            "(just type, or Ctrl+F; Esc to close)")
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.textChanged.connect(self._on_search_text_changed)
         self.search_edit.installEventFilter(self)
-        self.search_edit.hide()
+        # A filter that matches nothing looks exactly like an empty folder
+        # without this.
+        self.filter_status = QLabel("")
+        self.filter_status.hide()
+
+        self._filter_row = QWidget()
+        _filter_lay = QHBoxLayout(self._filter_row)
+        _filter_lay.setContentsMargins(0, 0, 0, 0)
+        _filter_lay.addWidget(self.search_edit, 1)
+        _filter_lay.addWidget(self.filter_status)
+        self._filter_row.hide()
+
+        # A capped listing must say so: silently showing the first N of a
+        # much larger prefix reads as "this is everything".
+        self.listing_notice = QLabel("")
+        self.listing_notice.setWordWrap(True)
+        self.listing_notice.setStyleSheet("color: #b26a00;")
+        self.listing_notice.hide()
+
+        # Location tabs. Each tab is a remembered (bucket, prefix) that the
+        # one listing view navigates to — not a second view: the queue, the
+        # log and the model are shared, and duplicating those to show two
+        # folders would buy nothing.
+        self.tabbar = QTabBar()
+        self.tabbar.setExpanding(False)
+        self.tabbar.setMovable(True)
+        self.tabbar.setTabsClosable(True)
+        self.tabbar.setDrawBase(False)
+        self.tabbar.setUsesScrollButtons(True)
+        self.tabbar.currentChanged.connect(self._on_tab_changed)
+        self.tabbar.tabCloseRequested.connect(self.close_tab)
+        self.tabbar.tabMoved.connect(self._on_tab_moved)
+        self.tabbar.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tabbar.customContextMenuRequested.connect(self._tab_menu)
+        self.tabbar.hide()
+        self._tabs = []
+        self._tab_switching = False
+        self._tab_restore_pending = False
+        # Set while a Back/Forward step is in flight, so the resulting
+        # navigation is not recorded as a new move.
+        self._history_navigating = False
 
         self._list_container = QWidget()
         _list_lay = QVBoxLayout(self._list_container)
         _list_lay.setContentsMargins(0, 0, 0, 0)
         _list_lay.setSpacing(2)
-        _list_lay.addWidget(self.search_edit)
+        _list_lay.addWidget(self.tabbar)
+        _list_lay.addWidget(self._filter_row)
+        _list_lay.addWidget(self.listing_notice)
         _list_lay.addWidget(self.listview)
+
+        # The second pane lives beside the listing; both sit above the log.
+        self.second_pane = SecondPane(self, self, self.data_model)
+        self.second_pane.hide()
+        self.panes = QSplitter(Qt.Orientation.Horizontal)
+        self.panes.addWidget(self._list_container)
+        self.panes.addWidget(self.second_pane)
+        self.panes.setStretchFactor(0, 1)
+        self.panes.setStretchFactor(1, 1)
 
         self.clip = QApplication.clipboard()
         self.splitter = QSplitter(Qt.Orientation.Vertical)
-        self.splitter.addWidget(self._list_container)
+        self.splitter.addWidget(self.panes)
         self.splitter.addWidget(self.logview)
         # ~75% top / ~25% bottom
         self.splitter.setStretchFactor(0, 3)
@@ -5607,6 +8210,9 @@ class MainWindow(QMainWindow):
         self._queue_panel = TransferQueuePanel(self)
         self._queue_panel.cancel_requested.connect(self._on_queue_cancel_requested)
         self._queue_panel.retry_requested.connect(self._on_queue_retry_requested)
+        self._queue_panel.details_requested.connect(self.show_failure_details)
+        self._queue_panel.retry_all_requested.connect(
+            self.retry_failed_transfers)
         self._queue_panel.history_requested.connect(self.show_transfer_history)
         self.accent_bar = QWidget()
         self.accent_bar.setFixedHeight(4)
@@ -5647,6 +8253,7 @@ class MainWindow(QMainWindow):
         self.tBar.addSeparator()
         self.tBar.addAction(self.btnHome)
         self.tBar.addAction(self.btnBack)
+        self.tBar.addAction(self.btnForward)
         self.tBar.addAction(self.btnUp)
         self.tBar.addAction(self.btnRefresh)
         self.tBar.addAction(self.btnBucketUsage)
@@ -5699,8 +8306,37 @@ class MainWindow(QMainWindow):
         self.pb.setMaximum(100)
         self.pb.hide()
         self.status_text = QLabel("")
+        # Temporary credentials used to lapse silently mid-session; the only
+        # symptom was an authentication error on the next operation.
+        self.credential_status = QLabel("")
+        self.credential_status.hide()
+        self.statusBar().addPermanentWidget(self.credential_status, 0)
         self.statusBar().addPermanentWidget(self.status_text, 2)
         self.statusBar().addPermanentWidget(self.pb, 1)
+        # Set once the window starts tearing down, so a timer that has
+        # already fired cannot start new work on the way out.
+        self._closing = False
+        self._pending_retries = []
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.timeout.connect(self._run_pending_retries)
+
+        # Interval folder mirror. Never started automatically; see
+        # _load_watch_config.
+        self._watch = None
+        self._watch_config = {}
+        self._watch_timer = None
+        self._watch_thread = None
+        self._watch_worker = None
+        self.watch_status = QLabel("")
+        self.watch_status.hide()
+        self.statusBar().addPermanentWidget(self.watch_status, 0)
+
+        self._credential_timer = QTimer(self)
+        self._credential_timer.setInterval(CREDENTIAL_CHECK_INTERVAL_MS)
+        self._credential_timer.timeout.connect(self._update_credential_status)
+        self._credential_timer.start()
+        self._update_credential_status()
 
         self._smooth_total = 1
         self._smooth_done = 0
@@ -5773,6 +8409,31 @@ class MainWindow(QMainWindow):
         self._bulk_rename_shortcut = QShortcut(QKeySequence("Shift+F2"), self)
         self._bulk_rename_shortcut.activated.connect(self.bulk_rename)
 
+        self._dual_pane_shortcut = QShortcut(QKeySequence("F3"), self)
+        self._dual_pane_shortcut.activated.connect(self.toggle_dual_pane)
+        # F5 is already Refresh, and two live bindings for one key make Qt
+        # treat both as ambiguous — neither fires. The commander keys are
+        # therefore only armed while the second pane is on screen, and
+        # Refresh keeps Ctrl+R throughout.
+        self._pane_copy_shortcut = QShortcut(QKeySequence("F5"), self)
+        self._pane_copy_shortcut.activated.connect(
+            lambda: self.pane_transfer(move=False))
+        self._pane_copy_shortcut.setEnabled(False)
+        self._pane_move_shortcut = QShortcut(QKeySequence("F6"), self)
+        self._pane_move_shortcut.activated.connect(
+            lambda: self.pane_transfer(move=True))
+        self._pane_move_shortcut.setEnabled(False)
+
+        self._new_tab_shortcut = QShortcut(QKeySequence("Ctrl+T"), self)
+        self._new_tab_shortcut.activated.connect(self.new_tab)
+        self._close_tab_shortcut = QShortcut(QKeySequence("Ctrl+W"), self)
+        self._close_tab_shortcut.activated.connect(lambda: self.close_tab())
+        self._next_tab_shortcut = QShortcut(QKeySequence("Ctrl+Tab"), self)
+        self._next_tab_shortcut.activated.connect(lambda: self.next_tab(1))
+        self._prev_tab_shortcut = QShortcut(
+            QKeySequence("Ctrl+Shift+Tab"), self)
+        self._prev_tab_shortcut.activated.connect(lambda: self.next_tab(-1))
+
         self.menu = QMenu()
         self.menu.setAttribute(Qt.WidgetAttribute.WA_NoMouseReplay, True)
 
@@ -5780,6 +8441,8 @@ class MainWindow(QMainWindow):
 
         self.restoreSettings()
         self.select_first()
+        self._load_watch_config()
+        self._load_tabs()
 
         self.navigate(show_loading=True)
         # After the first listing, so a failed reopen leaves a usable window
@@ -5865,7 +8528,11 @@ class MainWindow(QMainWindow):
 
     def log(self, message: str):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.logview.appendPlainText(f"[{ts}] {message}")
+        line = f"[{ts}] {message}"
+        self.logview.appendPlainText(line)
+        # The view is capped and dies with the window; the file is what is
+        # left to look at afterwards.
+        self.log_file.write(f"{line}  [{self.profile_name}]")
 
     def _begin_model_reset_ui(self):
         self.listview.setUpdatesEnabled(False)
@@ -6104,12 +8771,32 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         act_usage = menu.addAction("Bucket usage…")
         act_usage.triggered.connect(lambda: self.request_bucket_usage())
+        self.actSizeExplorer = menu.addAction("Size explorer…")
+        self.actSizeExplorer.triggered.connect(lambda: self.open_size_explorer())
+        self.actExportManifest = menu.addAction("Export manifest…")
+        self.actExportManifest.triggered.connect(lambda: self.export_manifest())
+        self.actVerifyManifest = menu.addAction("Verify against manifest…")
+        self.actVerifyManifest.triggered.connect(lambda: self.verify_manifest())
         act_incomplete = menu.addAction("Incomplete uploads…")
         act_incomplete.triggered.connect(lambda: self.show_incomplete_uploads())
         act_sync = menu.addAction("Sync with local folder…")
         act_sync.triggered.connect(lambda: self.open_sync())
         self.actSyncProfile = menu.addAction("Sync to another profile…")
         self.actSyncProfile.triggered.connect(lambda: self.sync_to_profile())
+        self.actDualPane = menu.addAction("Dual pane (F3)")
+        self.actDualPane.triggered.connect(lambda: self.toggle_dual_pane())
+        self.actComparePanes = menu.addAction("Compare panes…")
+        self.actComparePanes.triggered.connect(lambda: self.compare_panes())
+        self.actWatchFolder = menu.addAction("Watch folder…")
+        self.actWatchFolder.triggered.connect(lambda: self.open_watch())
+        self.actBucketSettings = menu.addAction("Bucket settings…")
+        self.actBucketSettings.triggered.connect(
+            lambda: self.bucket_settings())
+        menu.addSeparator()
+        self.actRefreshCredentials = menu.addAction("Refresh credentials")
+        self.actRefreshCredentials.triggered.connect(
+            lambda: self.refresh_credentials())
+        self.actRefreshCredentials.setEnabled(self.can_refresh_credentials())
         menu.addSeparator()
         act_settings = menu.addAction("Transfer settings…")
         act_settings.triggered.connect(lambda: self.transfer_settings())
@@ -6117,6 +8804,8 @@ class MainWindow(QMainWindow):
         # through findChildren and reach the command palette like the rest.
         self.actDiagnostics = menu.addAction("Diagnostics…")
         self.actDiagnostics.triggered.connect(lambda: self.show_diagnostics())
+        self.actReportProblem = menu.addAction("Report a problem…")
+        self.actReportProblem.triggered.connect(lambda: self.report_problem())
         self.toolsButton.setMenu(menu)
         self.tBar.addWidget(self.toolsButton)
 
@@ -6152,12 +8841,21 @@ class MainWindow(QMainWindow):
         checksum = self.settings.value("upload_checksum", "") or ""
         threshold_mb = self.settings.value("multipart_threshold_mb", None)
         chunk_mb = self.settings.value("multipart_chunksize_mb", None)
+        detect_type = str(self.settings.value(
+            "detect_content_type", "true")).lower() in ("true", "1")
+        type_overrides = self.settings.value("content_type_overrides", "") or ""
+        upload_rules = self.settings.value("upload_rules", "") or ""
         self.settings.endGroup()
         self.data_model.set_multipart_sizes(
             threshold_mb=threshold_mb, chunksize_mb=chunk_mb)
         self.data_model.set_upload_options(
             storage_class=storage_class, sse=sse, kms_key_id=kms,
             checksum_algorithm=checksum)
+        self.data_model.set_content_type_options(
+            detect=detect_type,
+            overrides=DataModel.parse_content_type_overrides(type_overrides))
+        self.data_model.set_upload_rules(
+            DataModel.parse_upload_rules(upload_rules))
 
     def bucket_enter_active(self) -> bool:
         th = self._bucket_enter_thread
@@ -6321,16 +9019,16 @@ class MainWindow(QMainWindow):
         )
 
     def _toggle_search(self):
-        if self.search_edit.isVisible() and self.search_edit.hasFocus():
+        if self._filter_row.isVisible() and self.search_edit.hasFocus():
             self._hide_search()
         else:
-            self.search_edit.show()
+            self._filter_row.show()
             self.search_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
             self.search_edit.selectAll()
 
     def _open_search_with_text(self, text: str):
         """Open the quick-find bar and append typed text (type-to-search)."""
-        self.search_edit.show()
+        self._filter_row.show()
         self.search_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
         self.search_edit.setText(self.search_edit.text() + text)
 
@@ -6338,24 +9036,51 @@ class MainWindow(QMainWindow):
         self.search_edit.blockSignals(True)
         self.search_edit.clear()
         self.search_edit.blockSignals(False)
-        self.search_edit.hide()
+        self._filter_row.hide()
         self.proxy.set_filter_text("")
+        self._update_filter_status()
         self.listview.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def filter_match_counts(self) -> tuple:
+        """``(shown, total)`` rows for the current filter, ignoring [..]."""
+        total = 0
+        shown = 0
+        for row in range(self.model.rowCount()):
+            name = str(self.model.item(row, 0).text()
+                       if self.model.item(row, 0) is not None else "")
+            if name == UP_ENTRY_LABEL:
+                continue
+            total += 1
+            if self.proxy.matches(name):
+                shown += 1
+        return shown, total
+
+    def _update_filter_status(self):
+        if not self.search_edit.text().strip():
+            self.filter_status.hide()
+            return
+        shown, total = self.filter_match_counts()
+        self.filter_status.setText(f"{shown} of {total}")
+        self.filter_status.setStyleSheet(
+            "color: #c62828;" if shown == 0 else "")
+        self.filter_status.show()
 
     def _on_search_text_changed(self, text):
         self.proxy.set_filter_text(text)
+        self._update_filter_status()
         # Keep a valid selection among the visible (filtered) rows.
         if self.proxy.rowCount() > 0 and not self.listview.currentIndex().isValid():
             self.listview.setCurrentIndex(self.proxy.index(0, 0))
 
     def _reset_search_on_navigate(self):
         # The filter is per-listing; clear it whenever the listing changes.
-        if self.search_edit.text() or self.search_edit.isVisible():
+        if self.search_edit.text() or self._filter_row.isVisible():
             self.search_edit.blockSignals(True)
             self.search_edit.clear()
             self.search_edit.blockSignals(False)
-            self.search_edit.hide()
+            self._filter_row.hide()
             self.proxy.set_filter_text("")
+            self._update_filter_status()
 
     def select_first(self):
         if self.proxy.rowCount() > 0:
@@ -6511,6 +9236,8 @@ class MainWindow(QMainWindow):
                     count=int(result.get("count", 0) or 0),
                     by_class=dict(result.get("by_class", {}) or {}),
                     largest=list(result.get("largest", []) or []),
+                    cost=result.get("cost"),
+                    colder=list(result.get("colder", []) or []),
                 )
 
         w.finished.connect(apply_result)
@@ -6585,8 +9312,15 @@ class MainWindow(QMainWindow):
 
                     act_empty_bucket = None
                     act_del_bucket = None
+                    act_bucket_tab = None
                     # Only allow delete if selection is actually a bucket row
                     if ixs and m and getattr(m, "t", None) == FSObjectType.BUCKET:
+                        act_bucket_tab = QAction(
+                            themed_icon("tab-new", os.path.join(
+                                self.current_dir, "icons", "folder_24px.svg")),
+                            "Open in new tab (Ctrl+T)",
+                        )
+                        self.menu.addAction(act_bucket_tab)
                         act_empty_bucket = QAction(
                             themed_icon(
                         "edit-clear",
@@ -6607,6 +9341,8 @@ class MainWindow(QMainWindow):
                     if not clk:
                         return False
 
+                    if act_bucket_tab and clk == act_bucket_tab:
+                        self.open_selection_in_new_tab()
                     if clk == act_new_bucket:
                         self.new_bucket()
                     if act_empty_bucket and clk == act_empty_bucket:
@@ -6633,6 +9369,8 @@ class MainWindow(QMainWindow):
                 rename_action = None
                 restore_action = None
                 storage_action = None
+                retype_action = None
+                new_tab_action = None
                 metadata_action = None
                 search_action = None
                 versioning_action = None
@@ -6739,6 +9477,13 @@ class MainWindow(QMainWindow):
                 self.menu.addAction(sync_action)
 
                 if ixs and not up_selected:
+                    if m and getattr(m, 't', None) == FSObjectType.FOLDER:
+                        new_tab_action = QAction(
+                            themed_icon("tab-new", os.path.join(
+                                self.current_dir, "icons", "folder_24px.svg")),
+                            "Open in new tab (Ctrl+T)",
+                        )
+                        self.menu.addAction(new_tab_action)
                     download_action = QAction(
                         themed_icon("emblem-downloads", os.path.join(
                                     self.current_dir, "icons", "download_24px.svg"
@@ -6852,6 +9597,17 @@ class MainWindow(QMainWindow):
                     )
                     self.menu.addAction(storage_action)
 
+                    retype_action = QAction(
+                        themed_icon(
+                        "text-x-generic",
+                        os.path.join(self.current_dir, "icons", "document_24px.svg")),
+                        "Fix Content-Type from extension",
+                    )
+                    retype_action.setToolTip(
+                        "Re-stamp Content-Type on the selection from each "
+                        "key's extension")
+                    self.menu.addAction(retype_action)
+
                     restore_action = QAction(
                         themed_icon(
                         "emblem-downloads",
@@ -6903,6 +9659,7 @@ class MainWindow(QMainWindow):
                         share_public_action, delete_action, copy_move_action,
                         rename_action, bulk_rename_action, storage_action,
                         restore_action, tags_action, metadata_action,
+                        retype_action, hold_action,
                         cut_clip_action, paste_clip_action, bulk_tags_action,
                     ):
                         if act is not None:
@@ -6958,6 +9715,8 @@ class MainWindow(QMainWindow):
                     self.download_as_zip()
                 if sync_action and clk == sync_action:
                     self.open_sync()
+                if new_tab_action and clk == new_tab_action:
+                    self.open_selection_in_new_tab()
                 if open_action and clk == open_action:
                     self.open_or_preview(key)
                 if versions_action and clk == versions_action:
@@ -6968,6 +9727,10 @@ class MainWindow(QMainWindow):
                     self.edit_metadata(key)
                 if storage_action and clk == storage_action:
                     self.change_storage_class_ui()
+                if retype_action and clk == retype_action:
+                    self.fix_content_type_ui()
+                if hold_action and clk == hold_action:
+                    self.toggle_legal_hold(key)
                 if restore_action and clk == restore_action:
                     self.restore_from_glacier()
                 if clk == properties_selected_action:
@@ -6985,7 +9748,7 @@ class MainWindow(QMainWindow):
                 if key == Qt.Key.Key_Escape:
                     # First Esc clears an active quick-find filter, second
                     # (or with no filter) cancels transfers.
-                    if self.search_edit.isVisible() or self.search_edit.text():
+                    if self._filter_row.isVisible() or self.search_edit.text():
                         self._hide_search()
                     else:
                         self.cancel_transfers()
@@ -7089,6 +9852,16 @@ class MainWindow(QMainWindow):
         self.data_model.no_ssl_check = prof.no_ssl_check
         self.data_model.session_token = getattr(prof, "session_token", "") or ""
         self.data_model.read_only = bool(getattr(prof, "read_only", False))
+        self.data_model.requester_pays = bool(
+            getattr(prof, "requester_pays", False))
+        self.data_model.public_base_url = str(
+            getattr(prof, "public_base_url", "") or "").rstrip("/")
+        self.data_model.proxy_url = str(getattr(prof, "proxy_url", "") or "")
+        self.data_model.ca_bundle = str(getattr(prof, "ca_bundle", "") or "")
+        self.session_expires = str(getattr(prof, "session_expires", "") or "")
+        self.aws_profile = str(getattr(prof, "aws_profile", "") or "")
+        self.credential_process = str(
+            getattr(prof, "credential_process", "") or "")
         self.set_accent(getattr(prof, "color", ""))
         self.data_model.binding_cache.clear()
         self._clear_undo_delete()
@@ -7112,6 +9885,17 @@ class MainWindow(QMainWindow):
         self._load_binding_cache()
         self._load_bookmarks()
         self._rebuild_bookmark_menu()
+        self._update_credential_status()
+        if getattr(self, "actRefreshCredentials", None) is not None:
+            self.actRefreshCredentials.setEnabled(
+                self.can_refresh_credentials())
+        # Tabs are locations inside one account, so the other profile's set
+        # is meaningless here.
+        self._load_tabs()
+        # Same for a watch: its bucket belongs to the account being left.
+        if self.watch_active():
+            self.stop_watch()
+        self._load_watch_config()
         self.navigate(show_loading=True)
         self.update_window_title()
 
@@ -7472,9 +10256,11 @@ class MainWindow(QMainWindow):
         self._park_nav_thread()
 
         th = QThread(self)
-        wk = NavigationWorker(self.data_model.clone_for_worker(), seq, bucket, prefix)
+        wk = NavigationWorker(self.data_model.clone_for_worker(), seq, bucket,
+                              prefix, max_items=self.listing_limit())
         wk.moveToThread(th)
         th.started.connect(wk.run)
+        wk.counted.connect(self._on_navigation_count)
         wk.finished.connect(self._on_navigation_finished)
         wk.finished.connect(th.quit)
         release_worker_on_finish(th, wk)
@@ -7483,6 +10269,359 @@ class MainWindow(QMainWindow):
         self._nav_thread = th
         self._nav_worker = wk
         th.start()
+
+    def tab_locations(self) -> list:
+        """The (bucket, prefix) each tab points at, in tab order."""
+        return [(entry["bucket"], entry["prefix"]) for entry in self._tabs]
+
+    @staticmethod
+    def tab_label(bucket: str, prefix: str) -> str:
+        """
+        A tab's caption: the deepest name that identifies the location.
+
+        The whole prefix would not fit and the bucket alone cannot tell two
+        folders apart, so the last path segment wins and the bucket is the
+        fallback.
+        """
+        if not bucket:
+            return "buckets"
+        trimmed = (prefix or "").strip("/")
+        if not trimmed:
+            return bucket
+        return trimmed.rsplit("/", 1)[-1]
+
+    def _sync_tab_bar(self):
+        """Rebuild the captions and show the bar only when it earns its row."""
+        self._tab_switching = True
+        try:
+            while self.tabbar.count() > len(self._tabs):
+                self.tabbar.removeTab(self.tabbar.count() - 1)
+            for index, entry in enumerate(self._tabs):
+                label = self.tab_label(entry["bucket"], entry["prefix"])
+                location = ("s3://%s/%s" % (entry["bucket"], entry["prefix"])
+                            if entry["bucket"] else "All buckets")
+                if index < self.tabbar.count():
+                    self.tabbar.setTabText(index, label)
+                else:
+                    self.tabbar.addTab(label)
+                self.tabbar.setTabToolTip(index, location)
+        finally:
+            self._tab_switching = False
+        self.tabbar.setVisible(len(self._tabs) > 1)
+
+    def _current_location(self) -> dict:
+        return self._new_tab_entry(self.data_model.bucket or "",
+                                   self.data_model.current_folder or "")
+
+    @staticmethod
+    def _new_tab_entry(bucket="", prefix="") -> dict:
+        """A tab: where it points, plus the trail it took to get there."""
+        return {"bucket": bucket, "prefix": prefix,
+                "history": [(bucket, prefix)], "pos": 0}
+
+    @staticmethod
+    def _entry_location(entry) -> tuple:
+        return (entry.get("bucket", ""), entry.get("prefix", ""))
+
+    def current_tab_entry(self):
+        index = self.tabbar.currentIndex()
+        if 0 <= index < len(self._tabs):
+            return self._tabs[index]
+        return None
+
+    @classmethod
+    def push_history(cls, entry, location):
+        """
+        Record a move in a tab's trail.
+
+        A move made after going back truncates the forward branch, the way a
+        browser does — otherwise "forward" would offer a route the user has
+        already left.
+        """
+        history = entry.setdefault("history", [])
+        position = int(entry.get("pos", len(history) - 1))
+        if history and 0 <= position < len(history) \
+                and history[position] == location:
+            return
+        del history[position + 1:]
+        history.append(location)
+        if len(history) > cls.HISTORY_DEPTH:
+            del history[:len(history) - cls.HISTORY_DEPTH]
+        entry["pos"] = len(history) - 1
+
+    def can_go_back(self) -> bool:
+        entry = self.current_tab_entry()
+        return bool(entry) and int(entry.get("pos", 0)) > 0
+
+    def can_go_forward(self) -> bool:
+        entry = self.current_tab_entry()
+        if not entry:
+            return False
+        return int(entry.get("pos", 0)) < len(entry.get("history", [])) - 1
+
+    def _step_history(self, delta):
+        entry = self.current_tab_entry()
+        if not entry:
+            return
+        history = entry.get("history") or []
+        position = int(entry.get("pos", 0)) + int(delta)
+        if not (0 <= position < len(history)):
+            return
+        entry["pos"] = position
+        bucket, prefix = history[position]
+        # The move itself must not be recorded, or back would bounce between
+        # two entries forever.
+        self._history_navigating = True
+        self.open_location(bucket, prefix)
+        self._update_history_buttons()
+
+    def goBack(self):
+        """Back to the previous location in this tab's trail (Alt+Left)."""
+        self._step_history(-1)
+
+    def goForward(self):
+        """Forward again after a Back (Alt+Right)."""
+        self._step_history(1)
+
+    def _update_history_buttons(self):
+        for name, enabled in (("btnBack", self.can_go_back()),
+                              ("btnForward", self.can_go_forward())):
+            action = getattr(self, name, None)
+            if action is not None:
+                action.setEnabled(enabled)
+
+    def _remember_current_tab(self):
+        """Store where the view is now on the tab that is showing it."""
+        if self._tab_switching or not self._tabs:
+            return
+        here = (self.data_model.bucket or "",
+                self.data_model.current_folder or "")
+        if self._tab_restore_pending:
+            self._tab_restore_pending = False
+            for position, entry in enumerate(self._tabs):
+                if self._entry_location(entry) == here:
+                    self._tab_switching = True
+                    try:
+                        self.tabbar.setCurrentIndex(position)
+                    finally:
+                        self._tab_switching = False
+                    self._update_history_buttons()
+                    return
+        index = self.tabbar.currentIndex()
+        if 0 <= index < len(self._tabs):
+            entry = self._tabs[index]
+            entry["bucket"], entry["prefix"] = here
+            if self._history_navigating:
+                self._history_navigating = False
+            else:
+                self.push_history(entry, here)
+            self._sync_tab_bar()
+            self._save_tabs()
+        self._update_history_buttons()
+
+    def new_tab(self):
+        """Open another tab on the current location."""
+        if not self._tabs:
+            self._tabs = [self._current_location()]
+        self._tabs.insert(self.tabbar.currentIndex() + 1,
+                          self._current_location())
+        self._sync_tab_bar()
+        self._tab_switching = True
+        try:
+            self.tabbar.setCurrentIndex(self.tabbar.currentIndex() + 1)
+        finally:
+            self._tab_switching = False
+        self._save_tabs()
+        self.statusBar().showMessage("New tab", 2000)
+
+    def close_tab(self, index=None):
+        """Close a tab; the last one stays, since the view needs a location."""
+        if len(self._tabs) <= 1:
+            self.statusBar().showMessage("The last tab stays open", 2000)
+            return
+        index = self.tabbar.currentIndex() if index is None else int(index)
+        if not (0 <= index < len(self._tabs)):
+            return
+        del self._tabs[index]
+        self._tab_switching = True
+        try:
+            self.tabbar.removeTab(index)
+        finally:
+            self._tab_switching = False
+        self._sync_tab_bar()
+        self._save_tabs()
+        self._goto_tab(self.tabbar.currentIndex())
+
+    def close_other_tabs(self, index=None):
+        index = self.tabbar.currentIndex() if index is None else int(index)
+        if not (0 <= index < len(self._tabs)) or len(self._tabs) <= 1:
+            return
+        self._tabs = [self._tabs[index]]
+        self._tab_switching = True
+        try:
+            while self.tabbar.count() > 1:
+                self.tabbar.removeTab(self.tabbar.count() - 1)
+            self.tabbar.setCurrentIndex(0)
+        finally:
+            self._tab_switching = False
+        self._sync_tab_bar()
+        self._save_tabs()
+
+    def open_in_new_tab(self, bucket, prefix):
+        """Add a tab for another location and switch to it."""
+        if not self._tabs:
+            self._tabs = [self._current_location()]
+        self._tabs.insert(self.tabbar.currentIndex() + 1,
+                          self._new_tab_entry(bucket or "", prefix or ""))
+        self._sync_tab_bar()
+        self._save_tabs()
+        self.tabbar.setCurrentIndex(self.tabbar.currentIndex() + 1)
+
+    def open_selection_in_new_tab(self):
+        """Open the selected bucket or folder in another tab."""
+        _item, name, kind = self.get_row_primary_item(
+            self.listview.currentIndex())
+        if not name or name == UP_ENTRY_LABEL:
+            return
+        if self.in_bucket_list_mode():
+            self.open_in_new_tab(name, "")
+            return
+        if kind != FSObjectType.FOLDER:
+            self.statusBar().showMessage("Only folders open in a tab", 2000)
+            return
+        self.open_in_new_tab(
+            self.data_model.bucket,
+            (self.data_model.current_folder or "") + name + "/")
+
+    def _tab_menu(self, pos):
+        index = self.tabbar.tabAt(pos)
+        menu = QMenu(self)
+        act_new = menu.addAction("New tab")
+        act_dup = menu.addAction("Duplicate tab")
+        menu.addSeparator()
+        act_close = menu.addAction("Close tab")
+        act_others = menu.addAction("Close other tabs")
+        act_close.setEnabled(len(self._tabs) > 1)
+        act_others.setEnabled(len(self._tabs) > 1)
+        chosen = menu.exec(self.tabbar.mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is act_new or chosen is act_dup:
+            self.new_tab()
+        elif chosen is act_close:
+            self.close_tab(index if index >= 0 else None)
+        elif chosen is act_others:
+            self.close_other_tabs(index if index >= 0 else None)
+
+    def next_tab(self, step=1):
+        if len(self._tabs) <= 1:
+            return
+        count = len(self._tabs)
+        self.tabbar.setCurrentIndex(
+            (self.tabbar.currentIndex() + int(step)) % count)
+
+    def _on_tab_moved(self, source, target):
+        if not (0 <= source < len(self._tabs)) or not (
+                0 <= target < len(self._tabs)):
+            return
+        self._tabs.insert(target, self._tabs.pop(source))
+        self._save_tabs()
+
+    def _on_tab_changed(self, index):
+        if self._tab_switching:
+            return
+        self._goto_tab(index)
+
+    def _goto_tab(self, index):
+        """Navigate the shared view to what a tab remembers."""
+        if not (0 <= index < len(self._tabs)):
+            return
+        self._update_history_buttons()
+        entry = self._tabs[index]
+        if (entry["bucket"] == (self.data_model.bucket or "")
+                and entry["prefix"] == (self.data_model.current_folder or "")):
+            return
+        self.open_location(entry["bucket"], entry["prefix"])
+
+    def open_location(self, bucket, prefix):
+        """Go to a bucket/prefix, entering the bucket first when it differs."""
+        if self.transfers_active():
+            self.statusBar().showMessage(
+                "Transfers active — navigation is disabled", 2000)
+            return
+        if not bucket:
+            self._return_to_bucket_list_mode()
+            self.navigate()
+            return
+        if bucket == (self.data_model.bucket or ""):
+            self.change_current_folder(prefix or "")
+            self.navigate(select_up_entry=True)
+            return
+        self.enter_bucket_async(bucket, target_prefix=prefix or "")
+
+    def _tabs_settings_key(self) -> str:
+        return f"tabs/{self.profile_name}"
+
+    def _save_tabs(self):
+        self.settings.beginGroup("common")
+        self.settings.setValue(
+            self._tabs_settings_key(),
+            json.dumps([[e["bucket"], e["prefix"]] for e in self._tabs]))
+        self.settings.endGroup()
+
+    def _load_tabs(self):
+        """
+        Restore this profile's tabs, falling back to a single one.
+
+        A stored tab is only a location, so a bucket that has since been
+        deleted costs one failed navigation, not a broken window.
+        """
+        self.settings.beginGroup("common")
+        raw = self.settings.value(self._tabs_settings_key(), "")
+        self.settings.endGroup()
+        entries = []
+        try:
+            for row in json.loads(raw or "[]"):
+                if isinstance(row, (list, tuple)) and len(row) == 2:
+                    # A trail is session state; only the location is restored.
+                    entries.append(self._new_tab_entry(
+                        str(row[0] or ""), str(row[1] or "")))
+        except (ValueError, TypeError):
+            entries = []
+        self._tabs = entries or [self._current_location()]
+        # The window opens wherever the remembered last location says, which
+        # is not necessarily tab 0. The first navigation selects the matching
+        # tab instead of overwriting whichever one happens to be current.
+        self._tab_restore_pending = True
+        self._sync_tab_bar()
+
+    def _set_listing_truncated(self, truncated: bool, shown: int):
+        if not truncated:
+            self.listing_notice.hide()
+            return
+        self.listing_notice.setText(
+            f"Showing the first {shown:,} entries of a larger prefix — raise "
+            "the listing limit in Transfer settings, or use Search "
+            "(Ctrl+Shift+F) to find what you need.")
+        self.listing_notice.show()
+        self.log(f"listing capped at {shown} entries")
+
+    def listing_limit(self) -> int:
+        """How many entries one listing may fetch; 0 means no cap."""
+        self.settings.beginGroup("common")
+        raw = self.settings.value("listing_limit", DEFAULT_LISTING_LIMIT)
+        self.settings.endGroup()
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return DEFAULT_LISTING_LIMIT
+
+    @pyqtSlot(int, int)
+    def _on_navigation_count(self, seq: int, count: int):
+        """Running count while a large prefix is still being listed."""
+        if seq != self._nav_seq:
+            return
+        self.statusBar().showMessage(f"Loading… {count:,} entries", 0)
 
     @pyqtSlot(int, object, str)
     def _on_navigation_finished(self, seq: int, payload: object, err_str: str):
@@ -7534,6 +10673,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "[%s][all buckets] — %d bucket(s)"
                 % (self.profile_name, len(buckets)), 0)
+            self._remember_current_tab()
             self.update_s3_path_label()
 
             if self._nav_pending_restore_name and self._select_by_name(self._nav_pending_restore_name):
@@ -7573,6 +10713,10 @@ class MainWindow(QMainWindow):
                     f"[{self.profile_name}][{self.data_model.bucket}] {show_folder}"
                     f" — {_listing_summary(items)}", 0)
 
+            self._set_listing_truncated(
+                bool(payload.get("truncated")), len(items))
+            self._remember_current_tab()
+
             self.update_s3_path_label()
 
             if self._nav_pending_restore_name and self._select_by_name(self._nav_pending_restore_name):
@@ -7592,15 +10736,6 @@ class MainWindow(QMainWindow):
             self.select_first()
             self.enable_action_buttons()
             return
-
-    def goBack(self):
-        if not self.data_model.bucket:
-            return
-        if self.transfers_active():
-            self.statusBar().showMessage("Transfers active — navigation is disabled", 2000)
-            return
-        self.change_current_folder(self.data_model.prev_folder)
-        self.navigate()
 
     def _resolve_overwrites(self, job, conflicts, *, what, index_of):
         """
@@ -7677,6 +10812,9 @@ class MainWindow(QMainWindow):
                                 source_model=None):
         if not job:
             return
+        if not self._credentials_ok_for_transfer():
+            self.log(f"{method} not started: credentials")
+            return
 
         label = self._queue_build_label(method, job)
         entry = _QEntry(
@@ -7747,11 +10885,18 @@ class MainWindow(QMainWindow):
         self.worker.error.connect(self._on_transfer_error)
 
         entry.error = None
+        entry.error_details = ""
+        entry.error_transient = False
 
         def _record_error(msg: str, _entry=entry):
             _entry.error = msg
 
+        def _record_details(text: str, transient: bool, _entry=entry):
+            _entry.error_details = text
+            _entry.error_transient = bool(transient)
+
         self.worker.error.connect(_record_error)
+        self.worker.details.connect(_record_details)
 
         def _transfer_ui_start(prefix_text: str):
             self.pb.reset()
@@ -7825,7 +10970,11 @@ class MainWindow(QMainWindow):
             elif entry.error:
                 # A failed job used to be reported as "done".
                 self.log(f"{method} failed")
+                if entry.error_details:
+                    # One line so it stays greppable in the log view.
+                    self.log(entry.error_details.replace("\n", " | "))
                 entry.status = "error"
+                self._maybe_auto_retry(entry)
             else:
                 self.log(f"{method} completed")
                 entry.status = "done"
@@ -7957,6 +11106,8 @@ class MainWindow(QMainWindow):
     DRAG_WARN_BYTES = 256 * 1024 * 1024
 
     HISTORY_LIMIT = 200
+    # Locations kept in one tab's back/forward trail.
+    HISTORY_DEPTH = 100
     HISTORY_JOB_LIMIT = 100   # only small jobs are worth storing for re-run
 
     def load_transfer_history(self) -> list:
@@ -8144,6 +11295,71 @@ class MainWindow(QMainWindow):
         self._clear_undo_delete()
         self.assign_thread_operation("undelete", [(k,) for k in keys])
         self.statusBar().showMessage(f"Restoring {len(keys)} item(s)…", 4000)
+
+    def auto_retry_enabled(self) -> bool:
+        self.settings.beginGroup("common")
+        raw = self.settings.value("auto_retry", "true")
+        self.settings.endGroup()
+        return str(raw).lower() in ("true", "1")
+
+    def _maybe_auto_retry(self, entry):
+        """
+        Re-queue a job the service asked us to try again, once.
+
+        Only the service's own "try again" answers qualify, and only once:
+        a job retried forever on a timer is a queue that never drains, and
+        an AccessDenied retried is just a slower AccessDenied.
+        """
+        if not entry.error_transient or entry.auto_retries >= 1:
+            return False
+        if not self.auto_retry_enabled():
+            return False
+        entry.auto_retries += 1
+        self.log(
+            f"{entry.method} hit a transient failure; retrying once in "
+            f"{AUTO_RETRY_DELAY_MS // 1000}s")
+        # An owned timer, not QTimer.singleShot: a static one keeps firing
+        # after the window is gone, and its callback would then start a
+        # transfer against a torn-down model. A parented QTimer dies with us.
+        self._pending_retries.append(entry)
+        self._retry_timer.start(AUTO_RETRY_DELAY_MS)
+        return True
+
+    def _run_pending_retries(self):
+        """Re-queue whatever the retry timer was holding."""
+        pending, self._pending_retries = self._pending_retries, []
+        if self._closing:
+            return
+        for entry in pending:
+            self._requeue(entry, automatic=True)
+
+    def _requeue(self, entry, automatic=False):
+        """Queue the same job again as a fresh entry."""
+        if automatic:
+            self.log(f"retrying {entry.method}: {entry.label}")
+        self.assign_thread_operation(
+            entry.method, entry.job, need_refresh=entry.need_refresh,
+            source_bucket=entry.source_bucket, dest_model=entry.dest_model,
+            source_model=entry.source_model)
+
+    def failed_entries(self) -> list:
+        """Every queued job that ended in an error, oldest first."""
+        return [entry for entry in
+                sorted(self._queue_entries.values(),
+                       key=lambda e: e.entry_id)
+                if entry.status == "error"]
+
+    def retry_failed_transfers(self):
+        """Re-queue every failed job in one go."""
+        failed = self.failed_entries()
+        if not failed:
+            self.statusBar().showMessage("Nothing has failed", 2000)
+            return
+        self.log(f"retrying {len(failed)} failed job(s)")
+        for entry in failed:
+            self._requeue(entry)
+        self.statusBar().showMessage(
+            f"Re-queued {len(failed)} failed job(s)", 4000)
 
     def _on_queue_retry_requested(self, entry_id: int):
         """Re-queue a failed or cancelled job as a fresh entry."""
@@ -8411,6 +11627,18 @@ class MainWindow(QMainWindow):
             DataModel.DEFAULT_MULTIPART_CHUNKSIZE_MB)
         cur_notify = str(
             self.settings.value("notify_on_complete", "true")).lower() in ("true", "1")
+        cur_detect_type = str(self.settings.value(
+            "detect_content_type", "true")).lower() in ("true", "1")
+        cur_type_overrides = DataModel.parse_content_type_overrides(
+            self.settings.value("content_type_overrides", "") or "")
+        self.settings.endGroup()
+        cur_listing_limit = self.listing_limit()
+        cur_auto_retry = self.auto_retry_enabled()
+        self.settings.beginGroup("common")
+        cur_upload_rules = DataModel.parse_upload_rules(
+            self.settings.value("upload_rules", "") or "")
+        cur_log_to_file = str(
+            self.settings.value("log_to_file", "true")).lower() in ("true", "1")
         self.settings.endGroup()
         cur_files = getattr(self.data_model, "parallel_files",
                             DataModel.DEFAULT_PARALLEL_FILES)
@@ -8438,6 +11666,12 @@ class MainWindow(QMainWindow):
             multipart_threshold_mb=cur_threshold,
             multipart_chunksize_mb=cur_chunk,
             resumable_uploads=cur_resumable,
+            detect_content_type=cur_detect_type,
+            content_type_overrides=cur_type_overrides,
+            listing_limit=cur_listing_limit,
+            auto_retry=cur_auto_retry,
+            upload_rules=cur_upload_rules,
+            log_to_file=cur_log_to_file,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -8456,7 +11690,27 @@ class MainWindow(QMainWindow):
             kms_key_id=dlg.kms_key_id(),
             checksum_algorithm=dlg.checksum_algorithm(),
         )
+        overrides = self.data_model.set_content_type_options(
+            detect=dlg.detect_content_type(),
+            overrides=dlg.content_type_overrides(),
+        )
         self.settings.beginGroup("common")
+        self.settings.setValue(
+            "detect_content_type",
+            "true" if dlg.detect_content_type() else "false")
+        self.settings.setValue(
+            "content_type_overrides",
+            DataModel.format_content_type_overrides(overrides))
+        self.settings.setValue("listing_limit", dlg.listing_limit())
+        self.settings.setValue(
+            "auto_retry", "true" if dlg.auto_retry() else "false")
+        self.settings.setValue(
+            "log_to_file", "true" if dlg.log_to_file() else "false")
+        self.log_file = LogFile(
+            LogFile.default_path() if dlg.log_to_file() else "")
+        rules = self.data_model.set_upload_rules(dlg.upload_rules())
+        self.settings.setValue(
+            "upload_rules", DataModel.format_upload_rules(rules))
         self.settings.setValue("transfer_concurrency", applied)
         self.settings.setValue("parallel_files", files)
         self.settings.setValue(
@@ -8686,6 +11940,14 @@ class MainWindow(QMainWindow):
             triggered=self.goBack,
         )
         self.btnBack.setShortcut(QKeySequence("Alt+Left"))
+        self.btnBack.setEnabled(False)
+        self.btnForward = QAction(
+            forward_icon(self.btnBack.icon()),
+            "Forward (Alt+Right)",
+            triggered=self.goForward,
+        )
+        self.btnForward.setShortcut(QKeySequence("Alt+Right"))
+        self.btnForward.setEnabled(False)
         self.btnUp = QAction(
             themed_icon("go-up", os.path.join(self.current_dir, "icons", "arrow_upward_24px.svg")),
             "Up (Backspace, Alt+Up)",
@@ -8872,6 +12134,7 @@ class MainWindow(QMainWindow):
         # Downloaded payloads staged for previews and drag-out live here; they
         # have to outlive the operation, so exit is the first safe moment.
         self.temp_workspace.cleanup()
+        self.second_pane.shutdown()
         e.accept()
 
     def _shutdown_threads(self):
@@ -8897,11 +12160,27 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        self._closing = True
+        self._pending_retries = []
+        try:
+            self._retry_timer.stop()
+        except Exception:
+            pass
+
+        # A watch keeps queueing work; stop the timer before the threads go.
+        try:
+            if self._watch_timer is not None:
+                self._watch_timer.stop()
+            self._watch = None
+        except Exception:
+            pass
+
         threads = [getattr(self, attr, None) for attr in (
             "thread",
             "_nav_thread",
             "_bucket_enter_thread",
             "_bucket_usage_thread",
+            "_watch_thread",
         )]
         # Navigations superseded before they finished: the window is about to
         # take its children down with it, so these have to be joined too.
@@ -9280,12 +12559,15 @@ class MainWindow(QMainWindow):
             return
         VersionsDialog(self, self, self.data_model, key).exec()
 
-    def restore_from_glacier(self):
+    def restore_from_glacier(self, items=None):
         """Initiate a Glacier / Deep Archive restore for the selection
-        (files and/or whole folders), run through the transfer queue."""
+        (files and/or whole folders), run through the transfer queue.
+
+        ``items`` overrides the listing selection so search results can drive
+        the same action."""
         if self.in_bucket_list_mode():
             return
-        items = self._collect_selected_targets()
+        items = self._collect_selected_targets() if items is None else items
         if not items:
             self.statusBar().showMessage("Select object(s) to restore", 2000)
             return
@@ -9307,12 +12589,12 @@ class MainWindow(QMainWindow):
             f"Restoring {len(job)} target(s) ({tier}, {days}d)…", 4000
         )
 
-    def change_storage_class_ui(self):
+    def change_storage_class_ui(self, items=None):
         """Change the storage class of the selection (files and/or whole
         folders), run through the transfer queue."""
         if self.in_bucket_list_mode():
             return
-        items = self._collect_selected_targets()
+        items = self._collect_selected_targets() if items is None else items
         if not items:
             self.statusBar().showMessage("Select object(s) to change", 2000)
             return
@@ -9342,12 +12624,856 @@ class MainWindow(QMainWindow):
             f"Setting storage class to {cls} on {len(job)} target(s)…", 4000
         )
 
+    def download_keys(self, keys):
+        """
+        Download an explicit list of object keys, keeping their prefixes.
+
+        Search results come from all over the bucket, so flattening them into
+        one folder would silently overwrite same-named objects from different
+        prefixes.
+        """
+        keys = [k for k in keys if k and not k.endswith("/")]
+        if not keys:
+            return
+        folder_path = QFileDialog.getExistingDirectory(self, "Select Folder")
+        if not folder_path:
+            return
+        job = []
+        for key in keys:
+            relative = key.replace("\\", "/").lstrip("/")
+            local_name = os.path.join(folder_path, *relative.split("/"))
+            job.append((key, local_name, None, folder_path))
+        conflicts = {entry[1] for entry in job if os.path.exists(entry[1])}
+        job = self._resolve_overwrites(
+            job, conflicts, what="file", index_of=self._download_target)
+        if not job:
+            return
+        for entry in job:
+            try:
+                os.makedirs(os.path.dirname(entry[1]), exist_ok=True)
+            except OSError as exc:
+                QMessageBox.critical(self, "Download", str(exc))
+                return
+        self.assign_thread_operation("download", job, need_refresh=False)
+        self.statusBar().showMessage(
+            f"Downloading {len(job)} object(s)…", 4000)
+
+    def delete_keys(self, keys):
+        """Delete an explicit list of object keys, after confirmation."""
+        keys = [k for k in keys if k]
+        if not keys:
+            return
+        if self.is_read_only():
+            self.statusBar().showMessage("Profile is read-only", 2000)
+            return
+        sample = "\n".join(keys[:10])
+        if len(keys) > 10:
+            sample += f"\n… and {len(keys) - 10} more"
+        answer = QMessageBox.question(
+            self, "Delete objects",
+            f"Delete {len(keys)} object(s) from {self.data_model.bucket}?"
+            f"\n\n{sample}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.assign_thread_operation("delete", list(keys))
+        self.statusBar().showMessage(f"Deleting {len(keys)} object(s)…", 4000)
+
+    def build_problem_report(self, log_lines=200) -> str:
+        """
+        Everything worth attaching to a bug report, in one place.
+
+        Assembled rather than asked for: nobody reconstructs a Qt plugin list
+        and the last failure's request id from memory.
+        """
+        sections = [
+            diagnostics.format_report(diagnostics.collect(
+                self.current_dir, version=__VERSION__,
+                model=self.data_model, profile_name=self.profile_name)),
+        ]
+        failures = [entry for entry in self._queue_entries.values()
+                    if entry.status == "error" and entry.error_details]
+        if failures:
+            latest = max(failures, key=lambda entry: entry.entry_id)
+            sections.append(
+                "== Last failure ==\n"
+                f"{latest.method}: {latest.label}\n{latest.error_details}")
+        tail = self.log_file.tail(log_lines)
+        if not tail:
+            tail = "\n".join(
+                self.logview.toPlainText().splitlines()[-log_lines:])
+        sections.append(f"== Log (last {log_lines} lines) ==\n{tail}")
+        return "\n\n".join(sections)
+
+    def report_problem(self):
+        """Show the problem report, ready to copy or save."""
+        text = self.build_problem_report()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Report a problem")
+        dialog.resize(820, 600)
+        view = QPlainTextEdit(text)
+        view.setReadOnly(True)
+        view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        note = QLabel(
+            "Check this over before sharing it: it names your endpoint, "
+            "region, buckets and file paths. It never contains your keys.")
+        note.setWordWrap(True)
+        copy_btn = QPushButton("Copy")
+        save_btn = QPushButton("Save…")
+        close_btn = QPushButton("Close")
+        copy_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(view.toPlainText()))
+        save_btn.clicked.connect(lambda: self._save_report(view.toPlainText()))
+        close_btn.clicked.connect(dialog.reject)
+        row = QHBoxLayout()
+        row.addWidget(copy_btn)
+        row.addWidget(save_btn)
+        row.addStretch(1)
+        row.addWidget(close_btn)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(view, 1)
+        layout.addWidget(note)
+        layout.addLayout(row)
+        dialog.exec()
+
+    def _save_report(self, text):
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Save report", "s3duck-report.txt",
+            "Text (*.txt);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+        except OSError as exc:
+            QMessageBox.critical(self, "Save report", str(exc))
+            return
+        self.statusBar().showMessage(f"Report saved to {path}", 4000)
+
+    def show_failure_details(self, entry_id):
+        """
+        What the service actually said about a failed job.
+
+        The log only ever kept ``str(exc)``, so a report of "it failed" could
+        never be traced back to a request on the provider's side.
+        """
+        entry = self._queue_entries.get(int(entry_id))
+        if entry is None:
+            return
+        text = entry.error_details or entry.error or "No details were recorded."
+        header = f"{entry.method}: {entry.label}"
+        box = QMessageBox(self)
+        box.setWindowTitle("Failure details")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(header)
+        box.setDetailedText(text)
+        copy_btn = box.addButton("Copy", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if box.clickedButton() is copy_btn:
+            QApplication.clipboard().setText(f"{header}\n{text}")
+            self.statusBar().showMessage("Failure details copied", 3000)
+
+    def credential_state(self):
+        """This profile's credential lifetime as ``(state, label)``."""
+        return expiry_state(getattr(self, "session_expires", ""))
+
+    def can_refresh_credentials(self) -> bool:
+        return bool(getattr(self, "credential_process", "")
+                    or getattr(self, "aws_profile", ""))
+
+    def _update_credential_status(self):
+        """Keep the status-bar countdown in step with the clock."""
+        state, label = self.credential_state()
+        if state == "none":
+            self.credential_status.hide()
+            return
+        if state == "expired":
+            text, colour = "credentials expired", "#c62828"
+        elif state == "soon":
+            text, colour = f"credentials {label}", "#b26a00"
+        else:
+            text, colour = f"credentials {label}", ""
+        self.credential_status.setText(text)
+        self.credential_status.setStyleSheet(
+            f"color: {colour};" if colour else "")
+        tip = "Tools -> Refresh credentials" if self.can_refresh_credentials() \
+            else "No credential process configured for this profile"
+        self.credential_status.setToolTip(tip)
+        self.credential_status.show()
+
+    def _persist_refreshed_credentials(self, minted) -> bool:
+        """
+        Write freshly minted credentials onto this profile's stored row.
+
+        Without this the refresh would last only until the window closed, and
+        the launcher would still show the lapsed expiry.
+        """
+        try:
+            crypto = require_crypto(resolve_credential_key(self.settings))
+        except CredentialError:
+            return False
+        self.settings.beginGroup("profiles")
+        count = self.settings.beginReadArray("profiles")
+        index = -1
+        for position in range(count):
+            self.settings.setArrayIndex(position)
+            if str(self.settings.value("name", "")) == str(self.profile_name):
+                index = position
+                break
+        self.settings.endArray()
+        if index < 0:
+            self.settings.endGroup()
+            return False
+        self.settings.beginWriteArray("profiles", count)
+        self.settings.setArrayIndex(index)
+        self.settings.setValue(
+            "access_key", crypto.encrypt(minted.get("access_key", "")))
+        self.settings.setValue(
+            "secret_key", crypto.encrypt(minted.get("secret_key", "")))
+        self.settings.setValue(
+            "session_token", crypto.encrypt(minted.get("session_token", "")))
+        self.settings.setValue("session_expires", minted.get("expires", ""))
+        self.settings.endArray()
+        self.settings.endGroup()
+        return True
+
+    def _mint_credentials(self):
+        """Fresh credentials from the credential process or ~/.aws."""
+        if getattr(self, "credential_process", ""):
+            command = self.credential_process
+
+            def _mint(_worker):
+                return run_credential_process(command)
+
+            minted, exc = run_with_progress(
+                self, "Refreshing credentials…", _mint)
+            if minted is None and exc is None:
+                return None
+            if exc is not None:
+                raise CredentialProcessError(str(exc))
+            return minted
+        name = getattr(self, "aws_profile", "")
+        if not name:
+            raise CredentialProcessError(
+                "This profile has no credential process and was not imported "
+                "from ~/.aws.")
+        entry = load_aws_profiles().get(name)
+        if not entry or not entry.get("access_key"):
+            raise CredentialProcessError(
+                f"Profile '{name}' has no usable credentials in ~/.aws.")
+        return {
+            "access_key": entry.get("access_key", ""),
+            "secret_key": entry.get("secret_key", ""),
+            "session_token": entry.get("session_token", ""),
+            "expires": entry.get("expires", ""),
+        }
+
+    def refresh_credentials(self):
+        """
+        Replace this session's credentials without reconnecting the profile.
+
+        The bucket bindings and the current listing survive, because only the
+        keys change; the cached client is dropped so the next call builds one
+        with them.
+        """
+        try:
+            minted = self._mint_credentials()
+        except CredentialProcessError as exc:
+            QMessageBox.critical(self, "Refresh credentials", str(exc))
+            return False
+        if minted is None:
+            return False
+        self.data_model.access_key = minted.get("access_key", "")
+        self.data_model.secret_key = minted.get("secret_key", "")
+        self.data_model.session_token = minted.get("session_token", "")
+        self.data_model._client = None
+        self.session_expires = minted.get("expires", "")
+        self._persist_refreshed_credentials(minted)
+        self._update_credential_status()
+        _state, label = self.credential_state()
+        self.log(f"credentials refreshed ({label or 'no expiry reported'})")
+        self.statusBar().showMessage("Credentials refreshed", 4000)
+        return True
+
+    def _credentials_ok_for_transfer(self) -> bool:
+        """
+        Guard the queue against credentials that will not outlive the job.
+
+        A transfer that dies half way through an expired session leaves parts
+        on the server and a confusing error, so this offers the refresh first.
+        """
+        state, label = self.credential_state()
+        if state in ("none", "ok"):
+            return True
+        if self.can_refresh_credentials():
+            question = (
+                f"This profile's credentials {label or 'have expired'}. "
+                "Refresh them before starting?")
+            answer = QMessageBox.question(
+                self, "Credentials", question,
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel)
+            if answer == QMessageBox.StandardButton.Cancel:
+                return False
+            if answer == QMessageBox.StandardButton.Yes:
+                return self.refresh_credentials()
+            return True
+        if state == "expired":
+            answer = QMessageBox.question(
+                self, "Credentials",
+                "This profile's credentials have expired and cannot be "
+                "refreshed from here. Start anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            return answer == QMessageBox.StandardButton.Yes
+        self.log(f"warning: credentials {label}")
+        return True
+
+    def dual_pane_active(self) -> bool:
+        return not self.second_pane.isHidden()
+
+    def toggle_dual_pane(self):
+        """Show or hide the second pane (F3)."""
+        if self.dual_pane_active():
+            self.second_pane.hide()
+            self.statusBar().showMessage("Single pane", 2000)
+            self.listview.setFocus(Qt.FocusReason.OtherFocusReason)
+        else:
+            if self.data_model.bucket:
+                self.second_pane.set_remote(
+                    self.data_model.bucket, self.data_model.current_folder or "")
+            else:
+                self.second_pane.refresh()
+            self.second_pane.show()
+            self.statusBar().showMessage(
+                "Dual pane — F5 copies to the other pane, F6 moves", 4000)
+        self._sync_pane_shortcuts()
+        if getattr(self, "actDualPane", None) is not None:
+            self.actDualPane.setText(
+                "Single pane (F3)" if self.dual_pane_active()
+                else "Dual pane (F3)")
+
+    def _sync_pane_shortcuts(self):
+        """
+        Hand F5/F6 to the panes only while there are two of them.
+
+        Refresh owns F5 the rest of the time; leaving both bound would make Qt
+        call the key ambiguous and fire neither.
+        """
+        active = self.dual_pane_active()
+        self._pane_copy_shortcut.setEnabled(active)
+        self._pane_move_shortcut.setEnabled(active)
+        if getattr(self, "btnRefresh", None) is None:
+            return
+        self.btnRefresh.setShortcuts(
+            [QKeySequence("Ctrl+R")] if active
+            else [QKeySequence("F5"), QKeySequence("Ctrl+R")])
+        self.btnRefresh.setText(
+            "Refresh (Ctrl+R)" if active else "Refresh (F5, Ctrl+R)")
+
+    def pane_sides(self) -> tuple:
+        """The two panes as comparable sides, or None when there is only one."""
+        if not self.dual_pane_active():
+            return None
+        if self.in_bucket_list_mode() or not self.data_model.bucket:
+            return None
+        left = ("remote", self.data_model.bucket,
+                self.data_model.current_folder or "")
+        if self.second_pane.current_mode() == SecondPane.LOCAL:
+            right = ("local", self.second_pane.local_target())
+        else:
+            bucket, prefix = self.second_pane.remote_target()
+            if not bucket:
+                return None
+            right = ("remote", bucket, prefix)
+        return left, right
+
+    def compare_panes(self):
+        """Show what differs between the two panes."""
+        sides = self.pane_sides()
+        if sides is None:
+            self.statusBar().showMessage(
+                "Open a bucket and the second pane (F3) to compare", 3000)
+            return
+        left, right = sides
+        PaneCompareDialog(self, self, left, right).exec()
+
+    def pane_transfer(self, move=False):
+        """
+        Send the focused pane's selection to the other pane (F5 / F6).
+
+        Which queue operation that is depends on the pair of sides, so the
+        four combinations are resolved here rather than in the panes.
+        """
+        if not self.dual_pane_active():
+            self.statusBar().showMessage("Press F3 for the second pane", 2000)
+            return
+        if self.is_read_only():
+            self.statusBar().showMessage("Profile is read-only", 2000)
+            return
+        second_focused = self.second_pane.view.hasFocus()
+        if second_focused:
+            self._transfer_from_second_pane(move)
+        else:
+            self._transfer_to_second_pane(move)
+
+    def _transfer_to_second_pane(self, move):
+        """Main listing (always remote) → the other pane."""
+        items = self._collect_selected_targets()
+        if not items:
+            self.statusBar().showMessage("Nothing selected", 2000)
+            return
+        if self.second_pane.current_mode() == SecondPane.LOCAL:
+            if move:
+                self.statusBar().showMessage(
+                    "Moving to a local folder is a download plus a delete; "
+                    "do them separately", 4000)
+                return
+            folder = self.second_pane.local_target()
+            job = []
+            for name, key, is_folder in items:
+                if is_folder:
+                    job.append((key, None, None, folder))
+                else:
+                    job.append((key, os.path.join(folder, name), None, folder))
+            conflicts = {entry[1] for entry in job
+                         if entry[1] and os.path.exists(entry[1])}
+            job = self._resolve_overwrites(
+                job, conflicts, what="file", index_of=self._download_target)
+            if not job:
+                return
+            self.assign_thread_operation("download", job, need_refresh=False)
+            self.statusBar().showMessage(
+                f"Downloading {len(job)} item(s) to the other pane…", 4000)
+            return
+
+        bucket, prefix = self.second_pane.remote_target()
+        if not bucket:
+            self.statusBar().showMessage("The other pane has no bucket", 2000)
+            return
+        # Same shape the clipboard paste builds, so the dst_bucket convention
+        # and the destination-inside-source guard are the proven ones.
+        clip = {"mode": "cut" if move else "copy",
+                "bucket": self.data_model.bucket,
+                "items": list(items)}
+        job, skipped = build_paste_job(clip, bucket, prefix or "")
+        if skipped:
+            self.log("Skipped (destination inside source): "
+                     + ", ".join(skipped))
+        if not job:
+            self.statusBar().showMessage("Nothing to send", 2000)
+            return
+        self.assign_thread_operation("move" if move else "copy", job)
+        self.statusBar().showMessage(
+            f"{'Moving' if move else 'Copying'} {len(job)} item(s)…", 4000)
+
+    def _transfer_from_second_pane(self, move):
+        """The other pane → the main listing (always remote)."""
+        if self.in_bucket_list_mode() or not self.data_model.bucket:
+            self.statusBar().showMessage("Open a bucket in the main pane", 2000)
+            return
+        selection = self.second_pane.selected()
+        if not selection:
+            self.statusBar().showMessage("Nothing selected", 2000)
+            return
+        target = self.data_model.current_folder or ""
+        if self.second_pane.current_mode() == SecondPane.LOCAL:
+            if move:
+                self.statusBar().showMessage(
+                    "Moving from a local folder would delete the original; "
+                    "upload it and remove it yourself", 4000)
+                return
+            folder = self.second_pane.local_target()
+            job = []
+            for name, is_dir, _size in selection:
+                path = os.path.join(folder, name)
+                if is_dir:
+                    for root, _dirs, files in os.walk(path):
+                        for filename in files:
+                            full = os.path.join(root, filename)
+                            rel = os.path.relpath(full, folder).replace(
+                                os.sep, "/")
+                            job.append((target + rel, full))
+                else:
+                    job.append((target + name, path))
+            if not job:
+                self.statusBar().showMessage("Nothing to upload", 2000)
+                return
+            self.assign_thread_operation("upload", job)
+            self.statusBar().showMessage(
+                f"Uploading {len(job)} file(s) to this prefix…", 4000)
+            return
+
+        bucket, prefix = self.second_pane.remote_target()
+        if not bucket:
+            return
+        clip = {
+            "mode": "cut" if move else "copy",
+            "bucket": bucket,
+            "items": [(name, (prefix or "") + name + ("/" if is_dir else ""),
+                       is_dir)
+                      for name, is_dir, _size in selection],
+        }
+        job, skipped = build_paste_job(clip, self.data_model.bucket, target)
+        if skipped:
+            self.log("Skipped (destination inside source): "
+                     + ", ".join(skipped))
+        if not job:
+            self.statusBar().showMessage("Nothing to bring here", 2000)
+            return
+        # copy/move resolve CopySource against their model's bucket, so a
+        # cross-bucket transfer must run on one bound to the SOURCE.
+        source_bucket = bucket if bucket != self.data_model.bucket else ""
+        self.assign_thread_operation(
+            "move" if move else "copy", job, source_bucket=source_bucket)
+        self.statusBar().showMessage(
+            f"{'Moving' if move else 'Copying'} {len(job)} item(s) here…", 4000)
+
+    def open_watch(self):
+        """Start or stop mirroring a local folder up to this prefix."""
+        if self.watch_active():
+            self.stop_watch()
+            return
+        if self.in_bucket_list_mode() or not self.data_model.bucket:
+            self.statusBar().showMessage("Open a bucket to watch a folder", 2000)
+            return
+        if self.is_read_only():
+            self.statusBar().showMessage("Profile is read-only", 2000)
+            return
+        prefix = self.data_model.current_folder or ""
+        dlg = WatchFolderDialog(
+            self, self.data_model.bucket, prefix, self._watch_config)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        config = dlg.config()
+        config["bucket"] = self.data_model.bucket
+        config["prefix"] = prefix
+        self._watch_config = config
+        self._save_watch_config()
+        self.start_watch(config)
+
+    def watch_active(self) -> bool:
+        return self._watch is not None
+
+    def start_watch(self, config):
+        """Begin the interval mirror described by *config*."""
+        self._watch = dict(config)
+        if self._watch_timer is None:
+            self._watch_timer = QTimer(self)
+            self._watch_timer.timeout.connect(self._watch_tick)
+        self._watch_timer.setInterval(
+            max(10, int(config.get("interval") or 300)) * 1000)
+        self._watch_timer.start()
+        self._update_watch_status()
+        self.log(
+            f"watching {config['local']} -> s3://{config['bucket']}/"
+            f"{config['prefix']} every {config['interval']}s")
+        self._watch_tick()
+
+    def stop_watch(self):
+        if self._watch_timer is not None:
+            self._watch_timer.stop()
+        self._watch = None
+        self._update_watch_status()
+        self.log("stopped watching")
+
+    def _update_watch_status(self):
+        if not self._watch:
+            self.watch_status.hide()
+        else:
+            self.watch_status.setText(
+                f"watching {os.path.basename(self._watch['local'].rstrip(os.sep))}")
+            self.watch_status.setToolTip(
+                f"{self._watch['local']} -> s3://{self._watch['bucket']}/"
+                f"{self._watch['prefix']}  (Tools -> Watch folder to stop)")
+            self.watch_status.show()
+        if getattr(self, "actWatchFolder", None) is not None:
+            self.actWatchFolder.setText(
+                "Stop watching folder" if self._watch else "Watch folder…")
+
+    def _watch_tick(self):
+        """
+        One comparison pass. Skipped while the queue is busy, so a slow upload
+        cannot pile a second copy of the same work behind itself.
+        """
+        if not self._watch or self._watch_thread is not None:
+            return
+        if self.transfers_active():
+            return
+        config = dict(self._watch)
+        clone = self.data_model.clone_for_worker()
+        clone.bucket = config["bucket"]
+
+        def _scan(_w):
+            local = scan_local_tree(config["local"])
+            remote = clone.list_tree(config["prefix"])
+            return build_sync_plan(
+                local, remote, direction="upload",
+                delete_extra=bool(config.get("delete_extra")),
+                exclude=config.get("exclude") or "")
+
+        self._watch_thread = QThread(self)
+        self._watch_worker = FuncWorker(_scan)
+        self._watch_worker.moveToThread(self._watch_thread)
+        self._watch_thread.started.connect(self._watch_worker.run)
+        self._watch_worker.done.connect(self._on_watch_planned)
+        self._watch_worker.done.connect(self._watch_thread.quit)
+        release_worker_on_finish(self._watch_thread, self._watch_worker)
+        self._watch_thread.finished.connect(self._watch_thread.deleteLater)
+        self._watch_thread.start()
+
+    def _on_watch_planned(self, result, exc):
+        thread, self._watch_thread = self._watch_thread, None
+        self._watch_worker = None
+        join_qthread(thread)
+        if not self._watch:
+            return
+        if exc is not None:
+            self.log(f"watch: could not compare ({exc})")
+            return
+        actions = [entry for entry in (result or [])
+                   if entry.get("action") != "skip"]
+        if not actions:
+            return
+        self.log(f"watch: {len(actions)} change(s) to send")
+        self.start_sync(actions, self._watch["local"], self._watch["prefix"],
+                        "upload")
+
+    def _watch_settings_key(self) -> str:
+        return f"watch/{self.profile_name}"
+
+    def _save_watch_config(self):
+        self.settings.beginGroup("common")
+        self.settings.setValue(
+            self._watch_settings_key(), json.dumps(self._watch_config or {}))
+        self.settings.endGroup()
+
+    def _load_watch_config(self):
+        """
+        Remember the last watch settings, but never start one on its own.
+
+        A background uploader that resumes at launch without being asked is
+        how a folder gets mirrored somewhere the user forgot about.
+        """
+        self.settings.beginGroup("common")
+        raw = self.settings.value(self._watch_settings_key(), "")
+        self.settings.endGroup()
+        try:
+            config = json.loads(raw or "{}")
+        except (ValueError, TypeError):
+            config = {}
+        self._watch_config = config if isinstance(config, dict) else {}
+
+    def export_manifest(self):
+        """Write a CSV record of what this prefix holds right now."""
+        if self.in_bucket_list_mode() or not self.data_model.bucket:
+            self.statusBar().showMessage("Open a bucket first", 2000)
+            return
+        prefix = self.data_model.current_folder or ""
+        suggested = (f"{self.data_model.bucket}-"
+                     f"{prefix.strip('/').replace('/', '-') or 'root'}"
+                     "-manifest.csv")
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Export manifest", suggested,
+            "Manifest (*.csv);;All files (*)")
+        if not path:
+            return
+        clone = self.data_model.clone_for_worker()
+        bucket = self.data_model.bucket
+
+        def _run(_worker):
+            return clone.list_object_digests(prefix)
+
+        entries, exc = run_with_progress(
+            self, f"Listing {bucket}/{prefix}…", _run)
+        if entries is None and exc is None:
+            return
+        if exc is not None:
+            QMessageBox.critical(self, "Export manifest", str(exc))
+            return
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            with open(path, "w", newline="") as handle:
+                handle.write(build_manifest(entries, bucket, prefix, stamp))
+        except OSError as exc:
+            QMessageBox.critical(self, "Export manifest", str(exc))
+            return
+        self.log(f"manifest written: {len(entries)} object(s) -> {path}")
+        self.statusBar().showMessage(
+            f"Manifest of {len(entries)} object(s) written", 4000)
+
+    def verify_manifest(self):
+        """Compare a stored manifest against what the prefix holds now."""
+        if self.in_bucket_list_mode() or not self.data_model.bucket:
+            self.statusBar().showMessage("Open a bucket first", 2000)
+            return
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Verify against manifest", "",
+            "Manifest (*.csv);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path) as handle:
+                meta, stored = parse_manifest(handle.read())
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Verify manifest", str(exc))
+            return
+
+        prefix = self.data_model.current_folder or ""
+        clone = self.data_model.clone_for_worker()
+
+        def _run(_worker):
+            return clone.list_object_digests(prefix)
+
+        entries, exc = run_with_progress(self, "Listing to compare…", _run)
+        if entries is None and exc is None:
+            return
+        if exc is not None:
+            QMessageBox.critical(self, "Verify manifest", str(exc))
+            return
+        current = {key: (size, etag) for key, size, etag, _mod in entries}
+        result = compare_manifest(stored, current)
+        self._show_manifest_result(meta, result)
+
+    def _show_manifest_result(self, meta, result):
+        lines = [
+            f"Taken: {meta.get('taken', '(unknown)')}",
+            f"Of: {meta.get('bucket', '?')}/{meta.get('prefix', '')}",
+            "",
+            f"unchanged: {result['same']}",
+            f"missing since: {len(result['missing'])}",
+            f"added since: {len(result['added'])}",
+            f"changed: {len(result['changed'])}",
+        ]
+        detail = []
+        for label, rows in (("MISSING", result["missing"]),
+                            ("ADDED", result["added"])):
+            for key in rows:
+                detail.append(f"{label}  {key}")
+        for key, reason in result["changed"]:
+            detail.append(f"CHANGED {key}  ({reason})")
+        for line in detail:
+            self.log(f"manifest: {line}")
+        box = QMessageBox(self)
+        box.setWindowTitle("Verify manifest")
+        box.setIcon(QMessageBox.Icon.Information if not detail
+                    else QMessageBox.Icon.Warning)
+        box.setText("\n".join(lines))
+        if detail:
+            box.setDetailedText("\n".join(detail))
+        box.exec()
+
+    def open_size_explorer(self):
+        """Drill into the bucket by prefix, sized by what it holds."""
+        if self.in_bucket_list_mode() or not self.data_model.bucket:
+            self.statusBar().showMessage("Open a bucket first", 2000)
+            return
+        SizeExplorerDialog(self, self, self.data_model,
+                           self.data_model.current_folder or "").exec()
+
+    def bucket_settings(self):
+        """Lifecycle, CORS, policy and Object Lock for the current bucket."""
+        if self.in_bucket_list_mode() or not self.data_model.bucket:
+            self.statusBar().showMessage("Enter a bucket first", 2000)
+            return
+        BucketSettingsDialog(self, self, self.data_model).exec()
+
+    def toggle_legal_hold(self, key: str):
+        """Place or clear a legal hold on one object."""
+        if not key or key.endswith("/"):
+            self.statusBar().showMessage("Legal holds are for files only", 2000)
+            return
+        if self.is_read_only():
+            self.statusBar().showMessage("Profile is read-only", 2000)
+            return
+        clone = self.data_model.clone_for_worker()
+        state, exc = run_with_progress(
+            self, "Reading the lock state…",
+            lambda _w: clone.get_object_lock_state(key))
+        if state is None and exc is None:
+            return  # cancelled
+        if exc is not None:
+            QMessageBox.warning(self, "Legal hold", str(exc))
+            return
+        if not state.get("supported"):
+            QMessageBox.information(
+                self, "Legal hold",
+                "Object Lock is not enabled on this bucket, so a legal hold "
+                "cannot be placed. It can only be turned on when a bucket is "
+                "created.")
+            return
+        currently_on = str(state.get("legal_hold") or "").upper() == "ON"
+        answer = QMessageBox.question(
+            self, "Legal hold",
+            (f"Remove the legal hold on '{key}'?" if currently_on else
+             f"Place a legal hold on '{key}'?\n\nWhile it is on, the object "
+             "cannot be deleted or overwritten — including by you."),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.data_model.set_object_legal_hold(
+                key, not currently_on, log_fn=self.log)
+        except Exception as exc:
+            QMessageBox.critical(self, "Legal hold", str(exc))
+            return
+        self.statusBar().showMessage(
+            "Legal hold removed" if currently_on else "Legal hold placed", 4000)
+
+    def fix_content_type_ui(self, items=None):
+        """
+        Re-stamp Content-Type across the selection from each key's extension.
+
+        Objects uploaded before content-type detection existed (or by another
+        tool that did not set one) are served as binary/octet-stream, which a
+        browser downloads instead of rendering.
+        """
+        if self.in_bucket_list_mode():
+            return
+        items = self._collect_selected_targets() if items is None else items
+        if not items:
+            self.statusBar().showMessage("Select object(s) to re-type", 2000)
+            return
+        job = [(key, is_folder) for _n, key, is_folder in items]
+        self.assign_thread_operation("set_content_type", job, need_refresh=False)
+        self.statusBar().showMessage(
+            f"Fixing Content-Type on {len(job)} target(s)…", 4000)
+
     def edit_metadata(self, key: str):
         """Edit an object's Content-Type / headers / custom metadata."""
         if not key or key.endswith("/") or key == UP_ENTRY_LABEL:
             self.statusBar().showMessage("Metadata editing is for files only", 2000)
             return
         MetadataDialog(self, self.data_model, key).exec()
+
+    def _saved_searches_key(self) -> str:
+        return f"searches/{self.profile_name}"
+
+    def load_saved_searches(self) -> list:
+        """
+        This profile's saved searches, newest format only.
+
+        A corrupt value costs the list, not the dialog — the search form still
+        opens with nothing saved.
+        """
+        self.settings.beginGroup("common")
+        raw = self.settings.value(self._saved_searches_key(), "")
+        self.settings.endGroup()
+        try:
+            entries = json.loads(raw or "[]")
+        except (ValueError, TypeError):
+            return []
+        if not isinstance(entries, list):
+            return []
+        return [entry for entry in entries
+                if isinstance(entry, dict) and entry.get("name")]
+
+    def store_saved_searches(self, entries):
+        self.settings.beginGroup("common")
+        self.settings.setValue(
+            self._saved_searches_key(), json.dumps(list(entries or [])))
+        self.settings.endGroup()
 
     def open_search(self):
         """Recursively search the current bucket/prefix by key substring."""
@@ -9372,8 +13498,11 @@ class MainWindow(QMainWindow):
         self.listview.setColumnHidden(index, not chosen.isChecked())
 
     def _log_context_menu(self, pos):
-        """Standard log actions plus Clear / Save — the view is capped at 3000
-        blocks and is otherwise lost on exit."""
+        """Standard log actions plus Clear / Save.
+
+        The view is capped at 3000 blocks; the rotating log file keeps the
+        rest, and this saves whatever is currently on screen.
+        """
         menu = self.logview.createStandardContextMenu()
         menu.addSeparator()
         act_clear = menu.addAction("Clear log")
@@ -9565,14 +13694,14 @@ class MainWindow(QMainWindow):
             f"{'Moving' if is_cut else 'Copying'} {len(job)} item(s) here…",
             3000)
 
-    def bulk_tags(self):
+    def bulk_tags(self, items=None):
         """Add / replace / remove tags across the whole selection."""
         if self.in_bucket_list_mode():
             return
         if self.is_read_only():
             self.statusBar().showMessage("Profile is read-only", 2000)
             return
-        items = self._collect_selected_targets()
+        items = self._collect_selected_targets() if items is None else items
         if not items:
             self.statusBar().showMessage("Select object(s) to tag", 2000)
             return

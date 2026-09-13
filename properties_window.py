@@ -2,7 +2,10 @@ from PyQt6.QtCore import *
 from PyQt6.QtWidgets import *
 from PyQt6.QtGui import *
 
-from utils import center_on_screen, release_worker_on_finish
+from utils import (
+    center_on_screen, DialogDismissMixin, join_qthread,
+    release_worker_on_finish,
+)
 
 
 class _SizeWorker(QObject):
@@ -23,7 +26,25 @@ class _SizeWorker(QObject):
             self.done.emit(None, exc)
 
 
-class PropertiesWindow(QDialog):
+class _LockWorker(QObject):
+    """Reads Object Lock state off the main thread (two more round trips)."""
+
+    done = pyqtSignal(object, object)  # (state_or_None, exception_or_None)
+
+    def __init__(self, model, key):
+        super().__init__()
+        self._model = model
+        self._key = key
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            self.done.emit(self._model.get_object_lock_state(self._key), None)
+        except Exception as exc:
+            self.done.emit(None, exc)
+
+
+class PropertiesWindow(DialogDismissMixin, QDialog):
     def __init__(self, *args, **kwargs):
         settings = kwargs.pop("settings")
         super().__init__(*args, **kwargs)
@@ -35,6 +56,8 @@ class PropertiesWindow(QDialog):
         self.model = model
         self._size_thread = None
         self._size_worker = None
+        self._lock_thread = None
+        self._lock_worker = None
 
         self.formGroupBox = QGroupBox("Properties")
         self.keyName = QLabel()
@@ -42,6 +65,7 @@ class PropertiesWindow(QDialog):
         self.eTag = QLabel()
         self.storageClass = QLabel()
         self.restoreStatus = QLabel()
+        self.objectLock = QLabel()
         self.publicUrl = QLineEdit()
         self.publicUrl.setReadOnly(True)
 
@@ -82,6 +106,7 @@ class PropertiesWindow(QDialog):
                     display_size = f"{int(content_length)} Bytes"
             except Exception:
                 pass
+            self._start_lock_probe(key)
 
         try:
             if not key:
@@ -102,12 +127,57 @@ class PropertiesWindow(QDialog):
         self.eTag.setText(display_etag)
         self.storageClass.setText(display_storage_class)
         self.restoreStatus.setText(display_restore or "—")
+        if is_folder:
+            self.objectLock.setText("—")
         self.publicUrl.setText(display_public_url)
 
         # A prefix has no single size to HEAD, so it needs a recursive listing.
         # That can span many pages, so never run it on the main thread.
         if display_size == "N/A":
             self._start_size_calc()
+
+    @staticmethod
+    def lock_summary(state) -> str:
+        """
+        Retention and legal-hold state as one line, or "" when there is none.
+
+        Most buckets have no Object Lock at all, so "not supported" reads the
+        same as "nothing to say" rather than as an error.
+        """
+        state = dict(state or {})
+        if not state.get("supported"):
+            return ""
+        parts = []
+        if state.get("mode"):
+            parts.append(f"{state['mode']} until {state.get('retain_until')}")
+        if str(state.get("legal_hold") or "").upper() == "ON":
+            parts.append("legal hold ON")
+        return " · ".join(parts)
+
+    def _start_lock_probe(self, key):
+        """Ask for the lock state in the background; it is two more calls."""
+        self.objectLock.setText("…")
+        try:
+            worker_model = self.model.clone_for_worker()
+        except Exception:
+            worker_model = self.model
+        self._lock_thread = QThread(self)
+        self._lock_worker = _LockWorker(worker_model, key)
+        self._lock_worker.moveToThread(self._lock_thread)
+        self._lock_thread.started.connect(self._lock_worker.run)
+        self._lock_worker.done.connect(self._on_lock_probed)
+        self._lock_worker.done.connect(self._lock_thread.quit)
+        release_worker_on_finish(self._lock_thread, self._lock_worker)
+        self._lock_thread.finished.connect(self._lock_thread.deleteLater)
+        self._lock_thread.start()
+
+    def _on_lock_probed(self, state, exc):
+        # Join here, not just drop the reference: the QThread is parented to
+        # this dialog, and one still running when the dialog is destroyed
+        # aborts the process.
+        self._stop_lock_thread()
+        self.objectLock.setText(
+            "—" if exc is not None else (self.lock_summary(state) or "—"))
 
     def _start_size_calc(self):
         self.size.setText("Calculating…")
@@ -131,22 +201,23 @@ class PropertiesWindow(QDialog):
             return
         self.size.setText(f"{int(size)} Bytes")
 
+    def _stop_lock_thread(self):
+        thread, self._lock_thread = self._lock_thread, None
+        self._lock_worker = None
+        join_qthread(thread)
+
     def _stop_size_thread(self):
         th, self._size_thread, self._size_worker = self._size_thread, None, None
-        if th is None:
-            return
-        try:
-            if th.isRunning():
-                th.quit()
-                th.wait(2000)
-        except RuntimeError:
-            pass
+        join_qthread(th)
 
-    def closeEvent(self, event):
-        # The worker thread is parented to this dialog; closing while it runs
-        # would destroy a running QThread and abort the process.
+    def stop_threads(self):
+        # Both probes are parented to this dialog, so one still running when
+        # the dialog is destroyed aborts the process. The mixin calls this
+        # from every way out — Escape included, which used to skip it. A probe
+        # still stuck in its request when the join gives up is detached there
+        # rather than left attached to a dialog on its way out.
         self._stop_size_thread()
-        super().closeEvent(event)
+        self._stop_lock_thread()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -165,5 +236,6 @@ class PropertiesWindow(QDialog):
         layout.addRow(QLabel("ETag"), self.eTag)
         layout.addRow(QLabel("Storage class"), self.storageClass)
         layout.addRow(QLabel("Restore"), self.restoreStatus)
+        layout.addRow(QLabel("Object Lock"), self.objectLock)
         layout.addRow(QLabel("Public URL"), self.publicUrl)
         self.formGroupBox.setLayout(layout)
