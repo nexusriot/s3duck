@@ -84,6 +84,8 @@ import model as model_module
 from model import (
     Model, Item, FSObjectType, TransferCancelled, ReadOnlyError, run_parallel,
     RateLimiter, plan_prefix_download, prefix_of, CHECKSUM_ALGORITHMS,
+    safe_local_path, DeleteRefused, local_name_is_writable,
+    MAX_LOCAL_NAME_BYTES,
 )
 from properties_window import PropertiesWindow
 from settings import SettingsWindow
@@ -145,6 +147,24 @@ class FakeS3Client:
     def delete_objects(self, **kw):
         self.calls.append(("delete_objects", kw))
         return {}
+
+    def list_objects_v2(self, **kw):
+        """The one-key existence probe. Answered from the same canned pages
+        the paginator serves, honouring Prefix and MaxKeys so the probe can
+        be told apart from a full listing."""
+        self.calls.append(("list_objects_v2", kw))
+        prefix = kw.get("Prefix") or ""
+        limit = int(kw.get("MaxKeys") or 1000)
+        hits = []
+        for page in self._paginators["list_objects_v2"]._pages:
+            for obj in (page.get("Contents") or []):
+                if str(obj.get("Key", "")).startswith(prefix):
+                    hits.append(obj)
+                    if len(hits) >= limit:
+                        break
+            if len(hits) >= limit:
+                break
+        return {"Contents": hits, "KeyCount": len(hits)}
 
     def delete_bucket(self, **kw):
         self.calls.append(("delete_bucket", kw))
@@ -886,6 +906,62 @@ class BatchDeleteTests(unittest.TestCase):
         self.assertEqual(
             [kw["Key"] for kw in c.calls_of("delete_object")], ["dir/a", "dir/b"])
 
+    def test_per_key_refusals_are_not_reported_as_a_successful_delete(self):
+        """DeleteObjects answers 200 with the refusals in ``Errors``; with
+        Quiet set that is the only thing the body carries. Ignoring it turned
+        an object-lock or AccessDenied refusal into a green queue row."""
+        class Refusing(FakeS3Client):
+            def delete_objects(self, **kw):
+                self.calls.append(("delete_objects", kw))
+                return {"Errors": [
+                    {"Key": "dir/a", "Code": "AccessDenied",
+                     "Message": "Access Denied"}]}
+
+        c = Refusing(list_pages=[{"Contents": [
+            {"Key": "dir/a", "Size": 1}, {"Key": "dir/b", "Size": 1}]}])
+        self.m._client = c
+        logged = []
+        with self.assertRaises(DeleteRefused) as caught:
+            self.m.delete("dir/", log_fn=logged.append)
+        self.assertIn("dir/a", str(caught.exception))
+        self.assertIn("AccessDenied", str(caught.exception))
+        self.assertTrue(any("refused" in line for line in logged))
+
+    def test_an_empty_errors_list_is_still_a_success(self):
+        class Quiet(FakeS3Client):
+            def delete_objects(self, **kw):
+                self.calls.append(("delete_objects", kw))
+                return {"Errors": []}
+
+        c = Quiet(list_pages=[{"Contents": [{"Key": "dir/a", "Size": 1}]}])
+        self.m._client = c
+        self.assertTrue(self.m.delete("dir/"))
+
+    def test_raise_on_delete_errors_summarises_a_long_list(self):
+        errors = [{"Key": f"k{i}", "Code": "AccessDenied"} for i in range(9)]
+        with self.assertRaises(DeleteRefused) as caught:
+            Model.raise_on_delete_errors({"Errors": errors})
+        message = str(caught.exception)
+        self.assertIn("9 object(s)", message)
+        self.assertIn("and 4 more", message)
+
+    def test_raise_on_delete_errors_accepts_a_bodyless_response(self):
+        Model.raise_on_delete_errors(None)
+        Model.raise_on_delete_errors({})
+
+    def test_purging_a_bucket_stops_when_a_key_is_refused(self):
+        """Without this the purge logged every object as deleted and the
+        DeleteBucket that follows failed with an unexplained BucketNotEmpty."""
+        class Refusing(FakeS3Client):
+            def delete_objects(self, **kw):
+                self.calls.append(("delete_objects", kw))
+                return {"Errors": [{"Key": "a", "Code": "AccessDenied"}]}
+
+        c = Refusing(list_pages=[{"Contents": [{"Key": "a", "Size": 1}]}])
+        with self.assertRaises(DeleteRefused):
+            self.m._purge_bucket_contents("b", c)
+        self.assertEqual(c.calls_of("delete_bucket"), [])
+
     def test_prefix_delete_is_cancellable(self):
         c = FakeS3Client(
             list_pages=[{"Contents": [{"Key": "dir/a", "Size": 1}]}])
@@ -996,6 +1072,50 @@ class ExistingKeysTests(unittest.TestCase):
     def test_empty_input(self):
         self.m._client = FakeS3Client(list_pages=[{}])
         self.assertEqual(self.m.existing_keys([]), set())
+
+    def test_a_folder_target_is_a_one_key_probe_not_a_full_listing(self):
+        """A top-level folder has no parent, so its "parent prefix" was the
+        bucket root: deciding whether "photos/" existed listed EVERY object
+        in the bucket, behind a modal dialog."""
+        c = FakeS3Client(list_pages=[{"Contents": [
+            {"Key": "photos/a.jpg", "Size": 1},
+            {"Key": "elsewhere/b.jpg", "Size": 1},
+        ]}])
+        self.m._client = c
+        self.assertEqual(self.m.existing_keys(["photos/"]), {"photos/"})
+        probes = c.calls_of("list_objects_v2")
+        self.assertEqual([p["Prefix"] for p in probes], ["photos/"])
+        self.assertEqual([p["MaxKeys"] for p in probes], [1])
+        self.assertEqual(
+            [kw["name"] for kw in c.calls_of("get_paginator")], [],
+            "a folder target must not trigger a recursive listing")
+
+    def test_a_folder_holding_only_placeholders_still_counts_as_existing(self):
+        """The old scan only looked at non-placeholder keys, so a folder
+        whose contents were all sub-folder markers was reported free and the
+        overwrite prompt never appeared."""
+        c = FakeS3Client(list_pages=[{"Contents": [
+            {"Key": "dst/sub/", "Size": 0},
+        ]}])
+        self.m._client = c
+        self.assertEqual(self.m.existing_keys(["dst/"]), {"dst/"})
+
+    def test_an_absent_folder_is_not_reported(self):
+        c = FakeS3Client(list_pages=[{"Contents": [
+            {"Key": "other/a.txt", "Size": 1},
+        ]}])
+        self.m._client = c
+        self.assertEqual(self.m.existing_keys(["missing/"]), set())
+
+    def test_files_and_folders_in_one_call(self):
+        c = FakeS3Client(list_pages=[{"Contents": [
+            {"Key": "dst/a.txt", "Size": 1},
+            {"Key": "dst/sub/deep.txt", "Size": 1},
+        ]}])
+        self.m._client = c
+        self.assertEqual(
+            self.m.existing_keys(["dst/a.txt", "dst/gone.txt", "dst/sub/"]),
+            {"dst/a.txt", "dst/sub/"})
 
 
 class PublicAccessSummaryTests(unittest.TestCase):
@@ -1884,6 +2004,81 @@ class WorkerBulkStorageTests(unittest.TestCase):
         self.assertNotIn("dir/", keys)               # placeholder skipped
         self.assertTrue(all(c == "GLACIER" for _k, c in model.storage_calls))
 
+    def test_one_refused_object_does_not_abandon_the_batch(self):
+        """FINDING (MinIO e2e): MinIO answers InvalidStorageClass for every
+        AWS class, so the first object aborted the whole selection and the
+        rest were never attempted. restore and delete_buckets already
+        tolerate a per-item failure; this now does too."""
+        class Refusing:
+            def __init__(self):
+                self.attempted = []
+
+            def get_keys(self, prefix, log_fn=None):
+                return [(prefix + "a.txt", 1), (prefix + "b.txt", 2)]
+
+            def change_storage_class(self, key, storage_class, log_fn=None):
+                self.attempted.append(key)
+                if key.endswith("a.txt"):
+                    raise RuntimeError("InvalidStorageClass")
+
+        model = Refusing()
+        worker = Worker(model, [("dir/", True, "GLACIER")])
+        errors = []
+        finished = []
+        worker.error.connect(errors.append)
+        worker.finished.connect(finished.append)
+        worker.set_storage_class()
+        self.assertEqual(model.attempted, ["dir/a.txt", "dir/b.txt"],
+                         "the batch stopped at the first refusal")
+        self.assertEqual(finished, [False])       # failed, not cancelled
+        self.assertTrue(errors)
+        self.assertIn("dir/a.txt", errors[0])
+
+    def test_an_object_already_in_the_class_is_a_no_op_not_a_failure(self):
+        """S3 refuses a copy onto itself that changes nothing — an
+        InvalidRequest on AWS and MinIO alike — so normalising a selection
+        to STANDARD failed on every object already in STANDARD."""
+        class AlreadyThere:
+            def __init__(self):
+                self.calls = []
+
+            def get_keys(self, prefix, log_fn=None):
+                return [(prefix + "a.txt", 1), (prefix + "b.txt", 2)]
+
+            def change_storage_class(self, key, storage_class, log_fn=None):
+                self.calls.append(key)
+                return False            # already in that class
+
+        model = AlreadyThere()
+        worker = Worker(model, [("dir/", True, "STANDARD")])
+        errors = []
+        lines = []
+        worker.error.connect(errors.append)
+        worker.progress.connect(lines.append)
+        worker.set_storage_class()
+        self.assertEqual(model.calls, ["dir/a.txt", "dir/b.txt"])
+        self.assertEqual(errors, [], "a no-op was reported as a failure")
+        self.assertTrue(any("2 already there" in line for line in lines))
+
+    def test_a_clean_batch_reports_no_error(self):
+        job = [("dir/", True, "GLACIER")]
+        worker, model = self._worker(job)
+        errors = []
+        worker.error.connect(errors.append)
+        worker.set_storage_class()
+        self.assertEqual(errors, [])
+
+    def test_cancelling_still_stops_the_batch(self):
+        """Per-object tolerance must not swallow a cancellation."""
+        job = [("dir/", True, "GLACIER")]
+        worker, model = self._worker(job)
+        worker._cancel_event.set()
+        finished = []
+        worker.finished.connect(finished.append)
+        worker.set_storage_class()
+        self.assertEqual(finished, [True])        # cancelled
+        self.assertEqual(model.storage_calls, [])
+
     def test_restore_recurses_folder(self):
         job = [("dir/", True, 5, "Bulk")]
         worker, model = self._worker(job)
@@ -1891,6 +2086,83 @@ class WorkerBulkStorageTests(unittest.TestCase):
         keys = [k for k, _d, _t in model.restore_calls]
         self.assertEqual(set(keys), {"dir/a.txt", "dir/b.txt"})
         self.assertTrue(all((d, t) == (5, "Bulk") for _k, d, t in model.restore_calls))
+
+
+class StorageClassNoOpTests(unittest.TestCase):
+    """Setting the class an object already has is a no-op, not an error."""
+
+    def setUp(self):
+        self.m = make_model(bucket="b")
+
+    class _Refusing(FakeS3Client):
+        """Answers a self-copy that changes nothing the way S3 does."""
+
+        def __init__(self, current=None, **kw):
+            super().__init__(**kw)
+            self._current = current
+
+        def copy_object(self, **kw):
+            self.calls.append(("copy_object", kw))
+            if (kw.get("StorageClass") or "STANDARD") == (
+                    self._current or "STANDARD"):
+                raise botocore.exceptions.ClientError(
+                    {"Error": {"Code": "InvalidRequest",
+                               "Message": "This copy request is illegal…"}},
+                    "CopyObject")
+            return {}
+
+        def head_object(self, **kw):
+            self.calls.append(("head_object", kw))
+            return {"StorageClass": self._current} if self._current else {}
+
+    def test_setting_the_same_class_returns_false_and_does_not_raise(self):
+        c = self._Refusing(current=None)          # absent => STANDARD
+        self.m._client = c
+        logs = []
+        self.assertIs(
+            self.m.change_storage_class("a.txt", "STANDARD", log_fn=logs.append),
+            False)
+        self.assertTrue(any("already STANDARD" in line for line in logs))
+
+    def test_a_real_change_returns_true_and_costs_one_request(self):
+        c = self._Refusing(current="STANDARD")
+        self.m._client = c
+        self.assertIs(self.m.change_storage_class("a.txt", "GLACIER"), True)
+        self.assertEqual(len(c.calls_of("head_object")), 0,
+                         "the happy path must not pay for a HEAD")
+
+    def test_an_invalid_request_for_another_reason_still_raises(self):
+        """Only "it is already there" is forgiven; anything else is a real
+        failure and must reach the user."""
+        class OtherwiseIllegal(FakeS3Client):
+            def copy_object(self, **kw):
+                raise botocore.exceptions.ClientError(
+                    {"Error": {"Code": "InvalidRequest", "Message": "nope"}},
+                    "CopyObject")
+
+            def head_object(self, **kw):
+                return {"StorageClass": "GLACIER"}
+
+        self.m._client = OtherwiseIllegal()
+        with self.assertRaises(botocore.exceptions.ClientError):
+            self.m.change_storage_class("a.txt", "DEEP_ARCHIVE")
+
+    def test_an_unsupported_class_still_raises(self):
+        class NoSuchClass(FakeS3Client):
+            def copy_object(self, **kw):
+                raise botocore.exceptions.ClientError(
+                    {"Error": {"Code": "InvalidStorageClass",
+                               "Message": "Invalid storage class"}},
+                    "CopyObject")
+
+        self.m._client = NoSuchClass()
+        with self.assertRaises(botocore.exceptions.ClientError):
+            self.m.change_storage_class("a.txt", "GLACIER")
+
+    def test_head_silence_reads_as_standard(self):
+        c = FakeS3Client()
+        self.m._client = c
+        self.assertEqual(self.m.current_storage_class("a.txt"), "STANDARD")
 
 
 class PresignedUrlModelTests(unittest.TestCase):
@@ -2098,6 +2370,38 @@ class DownloadTraversalGuardTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(tmp, "evil2")))
         self.assertTrue(any("unsafe" in ln for ln in logs))
 
+    def test_a_single_object_may_not_be_written_outside_the_folder(self):
+        """The whole-prefix path is filtered by plan_prefix_download, but a
+        single object arrives with its destination already chosen. This is
+        the backstop for every caller that builds one."""
+        m = make_model(bucket="b")
+        c = FakeS3Client()
+        m._client = c
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = os.path.join(os.path.dirname(tmp), "escaped.txt")
+            with self.assertRaises(ValueError) as caught:
+                m.download_file("k.txt", outside, tmp)
+            self.assertIn("outside", str(caught.exception))
+            self.assertEqual(c.calls_of("download_file"), [])
+
+    def test_a_destination_inside_the_folder_is_allowed(self):
+        m = make_model(bucket="b")
+        c = FakeS3Client()
+        m._client = c
+        with tempfile.TemporaryDirectory() as tmp:
+            m.download_file("k.txt", os.path.join(tmp, "sub", "k.txt"), tmp)
+            self.assertEqual(len(c.calls_of("download_file")), 1)
+
+    def test_no_folder_root_means_no_containment_check(self):
+        """Callers that genuinely have no containing root (a bare path from
+        the caller's own dialog) are not blocked by it."""
+        m = make_model(bucket="b")
+        c = FakeS3Client()
+        m._client = c
+        with tempfile.TemporaryDirectory() as tmp:
+            m.download_file("k.txt", os.path.join(tmp, "k.txt"), "")
+            self.assertEqual(len(c.calls_of("download_file")), 1)
+
 
 class CopyPrefixGuardTests(unittest.TestCase):
     def setUp(self):
@@ -2278,6 +2582,60 @@ class MultipartUploadTests(unittest.TestCase):
             [kw["name"] for kw in c.calls_of("get_paginator")].count("list_parts"),
             2,
         )
+
+    def test_presigned_urls_are_signed_with_sigv4(self):
+        """FINDING (found by the MinIO e2e run): with no explicit
+        signature_version botocore presigns against a custom endpoint using
+        SIGNATURE V2 — while still reporting "s3v4" on the config — and a
+        SigV2 presigned PUT is refused outright by MinIO and by every AWS
+        region launched after 2014. The upload-link feature was dead
+        everywhere but a legacy region."""
+        m = make_model(bucket="b", endpoint_url="http://minio.local:9000",
+                       use_path=True)
+        self.assertEqual(m.client.meta.config.signature_version, "s3v4")
+        for url in (m.presigned_get_url("k.txt", 60),
+                    m.presigned_put_url("k.txt", 60)):
+            self.assertIn("X-Amz-Algorithm=AWS4-HMAC-SHA256", url)
+            self.assertNotIn("AWSAccessKeyId=", url)
+
+    def test_a_prefix_is_filtered_locally_not_by_the_server(self):
+        """FINDING (found by the MinIO e2e run): MinIO treats the
+        ListMultipartUploads Prefix as an EXACT key match — "a/" returns
+        nothing while "a/old.bin" returns that one upload. The dialog is
+        opened with the current folder as its prefix, so sending it meant
+        "no incomplete uploads" everywhere except a bucket root."""
+        class PrefixRecording(_FakePaginator):
+            def __init__(self, pages):
+                super().__init__(pages)
+                self.kwargs = []
+
+            def paginate(self, **kwargs):
+                self.kwargs.append(kwargs)
+                return list(self._pages)
+
+        c = self._client()
+        recorder = PrefixRecording(c._paginators["list_multipart_uploads"]._pages)
+        c._paginators["list_multipart_uploads"] = recorder
+        self.m._client = c
+
+        out = self.m.list_multipart_uploads("a/")
+        self.assertEqual([u["key"] for u in out], ["a/new.bin", "a/old.bin"])
+        for kwargs in recorder.kwargs:
+            self.assertNotIn(
+                "Prefix", kwargs,
+                "the prefix must not be handed to the server")
+
+    def test_a_prefix_still_narrows_the_result(self):
+        c = FakeS3Client(mpu_pages=[{"Uploads": [
+            {"Key": "keep/a.bin", "UploadId": "u1", "Initiated": _dt(1)},
+            {"Key": "other/b.bin", "UploadId": "u2", "Initiated": _dt(2)},
+        ]}])
+        self.m._client = c
+        self.assertEqual(
+            [u["key"] for u in self.m.list_multipart_uploads("keep/")],
+            ["keep/a.bin"])
+        self.assertEqual(
+            len(self.m.list_multipart_uploads("")), 2)
 
     def test_abort_passes_upload_id(self):
         c = FakeS3Client()
@@ -5820,6 +6178,20 @@ class CrossProfileCopyTests(unittest.TestCase):
             self.src.copy_prefix_to_model("src/", self.dest, "")
         self.assertEqual(self.dest.uploads[0][1], "a.txt")
 
+    def test_a_whole_bucket_can_be_copied_from_the_root(self):
+        """prefix_of("") used to answer "/", which matches nothing on S3, so
+        a root-to-root copy listed zero keys and reported success."""
+        seen = []
+        self.src._client = types.SimpleNamespace(
+            get_object=lambda **kw: {"Body": io.BytesIO(b"z"),
+                                     "ContentLength": 1})
+        with patch.object(Model, "get_keys",
+                          lambda _s, p, **kw: seen.append(p) or [("a.txt", 1)]):
+            self.src.copy_prefix_to_model("", self.dest, "")
+        self.assertEqual(seen, [""], "the bucket root is the empty prefix")
+        self.assertEqual([key for _b, key, _d, _e in self.dest.uploads],
+                         ["a.txt"])
+
     def test_a_read_only_destination_refuses_a_whole_prefix(self):
         """And refuses it BEFORE listing: the per-file guard would also stop
         the copy, but only after a full recursive listing has been paid for."""
@@ -6156,17 +6528,79 @@ class PrefixDownloadPlanTests(unittest.TestCase):
         self.assertEqual(plan.unsafe, ["p/../../etc/passwd"])
         self.assertEqual([k for k, _p, _s in plan.files], ["p/ok.txt"])
 
+    def test_a_component_too_long_for_the_filesystem_is_refused(self):
+        """S3 allows a 1024-byte key with no per-component rule; ext4, APFS
+        and NTFS all stop at 255 bytes. Such a key is an ENAMETOOLONG, and
+        because the folder download fans out through run_parallel — which
+        re-raises the FIRST error — one of them used to abort the whole
+        folder."""
+        long_name = "L" * 300
+        plan = plan_prefix_download(
+            "d/", "/out", [("d/ok.txt", 1), (f"d/{long_name}.txt", 1),
+                           ("d/also.txt", 1)])
+        self.assertEqual([k for k, _p, _s in plan.files],
+                         ["d/ok.txt", "d/also.txt"])
+        self.assertEqual(plan.unsafe, [f"d/{long_name}.txt"])
+
+    def test_the_length_rule_counts_bytes_not_characters(self):
+        """200 emoji are 800 bytes: a character test would pass them and the
+        filesystem would still refuse."""
+        self.assertFalse(local_name_is_writable("x/" + "\U0001f986" * 200))
+        self.assertTrue(local_name_is_writable("x/" + "a" * MAX_LOCAL_NAME_BYTES))
+        self.assertFalse(
+            local_name_is_writable("x/" + "a" * (MAX_LOCAL_NAME_BYTES + 1)))
+
+    def test_the_length_rule_is_per_component_not_per_path(self):
+        """A deep tree of short names is fine however long the whole path."""
+        self.assertTrue(local_name_is_writable("/".join(["dir"] * 200)))
+
+    def test_safe_local_path_applies_the_same_length_rule(self):
+        base = os.path.join(os.sep, "out")
+        self.assertEqual(safe_local_path(base, "a/" + "L" * 300), "")
+        self.assertTrue(safe_local_path(base, "a/" + "L" * 200))
+
     def test_blank_keys_are_ignored(self):
         plan = plan_prefix_download("p/", "/out", [("", 0), (None, 0)])
         self.assertEqual((plan.files, plan.dirs, plan.unsafe), ([], [], []))
+
+    def test_safe_local_path_refuses_escaping_keys(self):
+        """Every other place a key becomes a local path (sync, the second
+        pane, search results) shares this rule with the folder download."""
+        base = os.path.join(os.sep, "out")
+        self.assertEqual(safe_local_path(base, "a/b.txt"),
+                         os.path.join(base, "a", "b.txt"))
+        for rel in ("../escape.txt", "../../escape.txt",
+                    "a/../../escape.txt", "/etc/passwd"):
+            with self.subTest(rel=rel):
+                landed = safe_local_path(base, rel)
+                if landed:
+                    self.assertTrue(
+                        landed.startswith(os.path.abspath(base) + os.sep),
+                        f"{rel!r} escaped to {landed!r}")
+
+    def test_safe_local_path_strips_a_leading_slash_rather_than_absolutising(self):
+        base = os.path.join(os.sep, "out")
+        self.assertEqual(safe_local_path(base, "/etc/passwd"),
+                         os.path.join(base, "etc", "passwd"))
+
+    def test_safe_local_path_rejects_empty_and_self(self):
+        base = os.path.join(os.sep, "out")
+        self.assertEqual(safe_local_path(base, ""), "")
+        self.assertEqual(safe_local_path(base, None), "")
+        self.assertEqual(safe_local_path(base, "."), "")
 
     def test_prefix_of_always_trailing_slashes(self):
         """Listings keyed on a bare name also match sibling prefixes — 'pics'
         matches 'pics-old/…' — so the slash is load-bearing."""
         self.assertEqual(prefix_of("pics"), "pics/")
         self.assertEqual(prefix_of("pics/"), "pics/")
-        self.assertEqual(prefix_of(""), "/")
-        self.assertEqual(prefix_of(None), "/")
+
+    def test_the_bucket_root_is_the_empty_prefix_not_a_slash(self):
+        """"/" as a listing filter matches only keys that literally begin
+        with a slash, so a caller reaching here with "" operated on nothing
+        instead of on everything."""
+        self.assertEqual(prefix_of(""), "")
+        self.assertEqual(prefix_of(None), "")
 
 
 class UploadOverwriteTests(unittest.TestCase):
@@ -8328,7 +8762,7 @@ class SyncDialogTests(unittest.TestCase):
     def _dlg(self, remote=None, prefix="pre/"):
         mw = _FakeMainWindow()
         mw.started = []
-        mw.start_sync = lambda *a: mw.started.append(a)
+        mw.start_sync = lambda *a, **kw: mw.started.append(a + (kw,))
         dlg = SyncDialog(None, mw, _FakeSyncModel(remote), prefix)
         self.addCleanup(dlg.close)
         return dlg, mw
@@ -8397,11 +8831,26 @@ class SyncDialogTests(unittest.TestCase):
                               return_value=QMessageBox.StandardButton.Yes):
                 dlg._run()
             self.assertEqual(len(mw.started), 1)
-            actions, local_dir, prefix, direction = mw.started[0]
+            actions, local_dir, prefix, direction = mw.started[0][:4]
             self.assertEqual(local_dir, tmp)
             self.assertEqual(prefix, "pre/")
             self.assertEqual(direction, "upload")
             self.assertEqual([a["rel"] for a in actions], ["f.txt"])
+
+    def test_the_plan_carries_the_bucket_it_was_compared_against(self):
+        """The job is bound to a model when it starts running, not when it is
+        queued, so the bucket has to travel with it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "f.txt"), "w") as handle:
+                handle.write("x")
+            dlg, mw = self._dlg()
+            dlg._local.setText(tmp)
+            dlg._preview()
+            self._settle(dlg)
+            with patch.object(main_window.QMessageBox, "question",
+                              return_value=QMessageBox.StandardButton.Yes):
+                dlg._run()
+            self.assertEqual(mw.started[0][-1].get("bucket"), "b")
 
     def test_declining_the_confirmation_does_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -8782,6 +9231,26 @@ class ZipDownloadWorkerTests(unittest.TestCase):
             worker.error.connect(errors.append)
             worker.zip_download()
             self.assertEqual(errors, ["read error"])
+
+    def test_a_failed_archive_is_removed_not_left_behind(self):
+        """A half-written zip opens and is simply missing its tail, which is
+        worse than no zip at all. Cancel already cleaned up; failure kept the
+        partial file and reported an error beside it."""
+        class FailingMidway(self.FakeModel):
+            def stream_object(self, key, chunk_size=1024 * 1024,
+                              cancel_event=None):
+                yield b"partial"
+                raise RuntimeError("connection reset")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zip_path = os.path.join(tmp, "out.zip")
+            worker = Worker(FailingMidway(),
+                            [(zip_path, "pre/", "pre/a.txt", False)])
+            finished = []
+            worker.finished.connect(finished.append)
+            worker.zip_download()
+            self.assertEqual(finished, [False])   # failed, not cancelled
+            self.assertFalse(os.path.exists(zip_path))
 
 
 class SetTagsWorkerTests(unittest.TestCase):
@@ -10329,6 +10798,29 @@ class KeyListActionTests(unittest.TestCase):
         for entry in job:
             self.assertTrue(os.path.isdir(os.path.dirname(entry[1])))
 
+    def test_download_keys_refuses_a_key_that_escapes_the_folder(self):
+        """Search spans the whole bucket, so a key with '..' segments is
+        exactly what turns up here."""
+        win = self._window()
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        queued = []
+        warned = []
+        with patch.object(main_window.QFileDialog, "getExistingDirectory",
+                          lambda *a, **kw: directory), \
+                patch.object(main_window.QMessageBox, "warning",
+                             lambda *a, **kw: warned.append(a)), \
+                patch.object(main_window.MainWindow, "assign_thread_operation",
+                             lambda _s, m, j, **kw: queued.append((m, j))):
+            win.download_keys(["../../escape.txt", "logs/ok.txt"])
+        self.assertTrue(warned, "the skip was not reported")
+        _method, job = queued[0]
+        self.assertEqual([entry[0] for entry in job], ["logs/ok.txt"])
+        for entry in job:
+            self.assertTrue(
+                os.path.abspath(entry[1]).startswith(
+                    os.path.abspath(directory) + os.sep))
+
     def test_download_keys_ignores_folder_markers(self):
         win = self._window()
         queued = []
@@ -10818,6 +11310,22 @@ class IncrementalListingTests(unittest.TestCase):
         m._client = FakeS3Client(list_pages=self._pages(500))
         items = m.list("p/", max_items=250)
         self.assertEqual(len(items), 250)
+        self.assertTrue(m.last_listing_truncated)
+
+    def test_a_listing_of_exactly_the_cap_is_not_truncated(self):
+        """Stopping at >= the cap reported a complete prefix as truncated,
+        which told the user to raise a limit that was hiding nothing."""
+        m = make_model(bucket="b")
+        m._client = FakeS3Client(list_pages=self._pages(300))
+        items = m.list("p/", max_items=300)
+        self.assertEqual(len(items), 300)
+        self.assertFalse(m.last_listing_truncated)
+
+    def test_one_past_the_cap_is_still_truncated(self):
+        m = make_model(bucket="b")
+        m._client = FakeS3Client(list_pages=self._pages(301))
+        items = m.list("p/", max_items=300)
+        self.assertEqual(len(items), 300)
         self.assertTrue(m.last_listing_truncated)
 
     def test_no_cap_means_no_cap(self):
@@ -11442,6 +11950,41 @@ class WatchModeTests(unittest.TestCase):
         return {"local": local, "bucket": "bkt", "prefix": "backup/",
                 "interval": 300, "exclude": "", "delete_extra": False}
 
+    def test_a_key_escaping_the_watched_folder_is_dropped_from_the_plan(self):
+        """The one containment site the download_file backstop cannot cover:
+        Worker.sync passes the file's OWN parent as folder_path, so if
+        start_sync builds an escaping path nothing downstream refuses it."""
+        win, _ = self._window()
+        queued = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, method, job, **kw: queued.append(job)), \
+             patch.object(main_window.QMessageBox, "warning",
+                          lambda *a, **kw: None):
+            win.start_sync(
+                [{"action": "download", "rel": "../../escape.txt", "size": 1},
+                 {"action": "download", "rel": "ok.txt", "size": 1}],
+                "/tmp/target", "pre/", "download", bucket="bkt")
+        self.assertEqual(len(queued), 1)
+        rels = [entry[1] for entry in queued[0]]
+        self.assertEqual(rels, ["ok.txt"])
+        for _action, _rel, local_path, _key, _size in queued[0]:
+            self.assertTrue(
+                os.path.abspath(local_path).startswith(
+                    os.path.abspath("/tmp/target") + os.sep),
+                f"{local_path} escaped the target folder")
+
+    def test_a_plan_that_is_entirely_unsafe_queues_nothing(self):
+        win, _ = self._window()
+        queued = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, method, job, **kw: queued.append(job)), \
+             patch.object(main_window.QMessageBox, "warning",
+                          lambda *a, **kw: None):
+            win.start_sync(
+                [{"action": "download", "rel": "../../escape.txt", "size": 1}],
+                "/tmp/target", "pre/", "download", bucket="bkt")
+        self.assertEqual(queued, [])
+
     def test_a_window_starts_with_no_watch(self):
         win, _ = self._window()
         self.assertFalse(win.watch_active())
@@ -11485,7 +12028,8 @@ class WatchModeTests(unittest.TestCase):
             win.start_watch(self._config())
         started = []
         with patch.object(main_window.MainWindow, "start_sync",
-                          lambda _s, a, l, p, d: started.append((a, l, p, d))):
+                          lambda _s, a, l, p, d, bucket="": started.append(
+                              (a, l, p, d, bucket))):
             win._on_watch_planned([
                 {"action": "skip", "rel": "a.txt", "size": 1},
                 {"action": "upload", "rel": "b.txt", "size": 2},
@@ -11493,6 +12037,26 @@ class WatchModeTests(unittest.TestCase):
         self.assertEqual(len(started), 1)
         self.assertEqual([e["rel"] for e in started[0][0]], ["b.txt"])
         self.assertEqual(started[0][3], "upload")
+
+    def test_the_pass_is_queued_against_the_watched_bucket(self):
+        """A queued job binds to a model when it STARTS. The watch fires on a
+        timer, long after the dialog closed, so without carrying the bucket
+        the mirror uploaded into whatever bucket was open by then — and with
+        "delete extras" on, deleted from it."""
+        win, _ = self._window()
+        config = self._config()
+        with patch.object(main_window.MainWindow, "_watch_tick",
+                          lambda _s: None):
+            win.start_watch(config)
+        # The user has navigated somewhere else since the watch started.
+        win.data_model.bucket = "some-other-bucket"
+        started = []
+        with patch.object(main_window.MainWindow, "start_sync",
+                          lambda _s, a, l, p, d, bucket="": started.append(
+                              bucket)):
+            win._on_watch_planned(
+                [{"action": "upload", "rel": "b.txt", "size": 2}], None)
+        self.assertEqual(started, [config["bucket"]])
 
     def test_an_all_skip_pass_queues_nothing(self):
         win, _ = self._window()
@@ -13236,6 +13800,20 @@ class CompareJobTests(unittest.TestCase):
                          os.path.join(os.sep, "out", "a", "one.txt"))
         self.assertFalse(kwargs["need_refresh"])
 
+    def test_a_remote_key_may_not_escape_the_local_pane(self):
+        """The pane pulls keys straight out of a bucket listing, so '..' in
+        one would otherwise be written outside the folder the pane shows."""
+        out = os.path.join(os.sep, "out")
+        job, method, _kw = self.build(
+            ("remote", "bkt", "src/"), ("local", out),
+            ["../../escape.txt", "ok.txt"])
+        self.assertEqual(method, "download")
+        self.assertEqual([entry[0] for entry in job], ["src/ok.txt"])
+        for entry in job:
+            self.assertTrue(
+                os.path.abspath(entry[1]).startswith(
+                    os.path.abspath(out) + os.sep))
+
     def test_same_bucket_remote_to_remote_is_a_plain_copy(self):
         job, method, kwargs = self.build(
             ("remote", "bkt", "a/"), ("remote", "bkt", "b/"), ["one.txt"])
@@ -13847,6 +14425,33 @@ class ManifestTests(unittest.TestCase):
     def test_a_truncated_manifest_is_refused(self):
         with self.assertRaises(ValueError):
             main_window.parse_manifest(main_window.MANIFEST_HEADER + "\n")
+
+    def test_a_key_containing_a_newline_survives_the_round_trip(self):
+        """csv quotes such a key correctly; splitting the text into lines
+        before the reader saw it tore the record in half, and verification
+        then reported the object as both missing AND added."""
+        entries = [("odd\nkey.txt", 5, "etag-n", "2026-01-01"),
+                   ("plain.txt", 6, "etag-p", "2026-01-02")]
+        text = main_window.build_manifest(entries, "bkt", "", "stamp")
+        _meta, records = main_window.parse_manifest(text)
+        self.assertEqual(sorted(records),
+                         sorted(["odd\nkey.txt", "plain.txt"]))
+        self.assertEqual(records["odd\nkey.txt"], (5, "etag-n"))
+
+    def test_a_key_starting_with_a_hash_is_not_eaten_as_metadata(self):
+        """Only the leading comment block is metadata. Treating any later
+        '#' line as a comment silently dropped such an object."""
+        entries = [("#notes.txt", 7, "etag-h", "2026-01-01")]
+        text = main_window.build_manifest(entries, "bkt", "", "stamp")
+        meta, records = main_window.parse_manifest(text)
+        self.assertEqual(records, {"#notes.txt": (7, "etag-h")})
+        self.assertNotIn("notes.txt", meta)
+
+    def test_a_comma_in_a_key_still_round_trips(self):
+        entries = [("a,b.txt", 3, "etag-c", "2026-01-01")]
+        _meta, records = main_window.parse_manifest(
+            main_window.build_manifest(entries))
+        self.assertEqual(records, {"a,b.txt": (3, "etag-c")})
 
     def test_unparseable_rows_are_skipped_not_fatal(self):
         text = (main_window.build_manifest(self.ENTRIES)

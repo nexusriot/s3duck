@@ -39,7 +39,8 @@ from model import Model as DataModel
 from model import FSObjectType
 from model import TransferCancelled
 from model import run_parallel
-from model import CHECKSUM_ALGORITHMS, plan_prefix_download, prefix_of
+from model import (CHECKSUM_ALGORITHMS, plan_prefix_download, prefix_of,
+                   safe_local_path)
 from utils import (
     CredentialError, CredentialProcessError, DialogDismissMixin, FuncWorker,
     TempWorkspace,
@@ -56,7 +57,7 @@ from theme import apply_theme, THEMES
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.20.2"
+__VERSION__ = "0.21.0"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -766,20 +767,26 @@ def parse_manifest(text) -> tuple:
     Raises ValueError on anything that is not one of ours — verifying against
     an arbitrary CSV would report every object as changed.
     """
-    lines = str(text or "").splitlines()
-    if not lines or not lines[0].startswith(MANIFEST_HEADER):
+    raw = str(text or "")
+    if not raw.startswith(MANIFEST_HEADER):
         raise ValueError("This is not an s3duck manifest.")
     meta = {}
-    body = []
-    for line in lines[1:]:
-        if line.startswith("#"):
-            label, _, value = line[1:].partition(":")
-            meta[label.strip()] = value.strip()
-        else:
-            body.append(line)
-    if not body:
+    # Only the LEADING comment block is metadata, and the CSV body is handed
+    # to the reader whole rather than pre-split into lines. Splitting first
+    # tore a record whose key contains a newline in half, and treating any
+    # later '#' line as metadata swallowed a key that simply starts with one
+    # — both made verification report the object as missing AND added.
+    _header_line, _sep, rest = raw.partition("\n")
+    while rest.startswith("#"):
+        line, sep, following = rest.partition("\n")
+        label, _, value = line[1:].partition(":")
+        meta[label.strip()] = value.strip()
+        rest = following
+        if not sep:
+            break
+    if not rest.strip():
         raise ValueError("The manifest has no entries.")
-    reader = csv.reader(body)
+    reader = csv.reader(io.StringIO(rest))
     header = next(reader, [])
     if [column.strip() for column in header] != list(MANIFEST_COLUMNS):
         raise ValueError("The manifest columns are not the expected ones.")
@@ -2251,6 +2258,7 @@ class Worker(QObject):
         so nothing is staged on disk twice.
         """
         cancelled = False
+        failed = False
         archive = None
         try:
             zip_path = self.job[0][0]
@@ -2308,6 +2316,7 @@ class Worker(QObject):
             if "cancelled" in msg.lower():
                 cancelled = True
             else:
+                failed = True
                 self.progress.emit(f"zip download failed: {msg}")
                 self.details.emit(describe_client_error(exc), is_transient_error(exc))
                 self.error.emit(msg)
@@ -2317,8 +2326,11 @@ class Worker(QObject):
                     archive.close()
                 except Exception:
                     pass
-            # A cancelled or failed archive is unusable; do not leave it behind.
-            if cancelled:
+            # A cancelled or failed archive is unusable; do not leave it
+            # behind. A half-written zip that opens and is simply missing its
+            # tail is worse than no zip at all, so the failure path removes it
+            # too — it used to keep one and report an error beside it.
+            if cancelled or failed:
                 try:
                     os.remove(self.job[0][0])
                 except OSError:
@@ -2403,15 +2415,41 @@ class Worker(QObject):
     def set_storage_class(self):
         # job = [(key, is_folder, storage_class)]
         cancelled = False
+        changed = 0
+        unchanged = 0
+        failures = []
         try:
             for key, is_folder, storage_class in self.job:
                 if self._cancel_event.is_set():
                     raise TransferCancelled("cancelled")
                 for k in self._iter_object_keys(key, is_folder):
                     self.progress.emit(f"storage-class {storage_class}: {k}")
-                    self.data_model.change_storage_class(
-                        k, storage_class, log_fn=self.progress.emit
-                    )
+                    try:
+                        if self.data_model.change_storage_class(
+                                k, storage_class,
+                                log_fn=self.progress.emit):
+                            changed += 1
+                        else:
+                            unchanged += 1
+                    except TransferCancelled:
+                        raise
+                    except Exception as exc:
+                        # One object the service will not move must not
+                        # abandon the rest of the selection — the same
+                        # bargain restore and delete_buckets already make.
+                        # A backend that rejects the class outright (MinIO
+                        # answers InvalidStorageClass) would otherwise fail
+                        # the whole batch on its first object.
+                        failures.append(f"{k}: {exc}")
+                        self.progress.emit(
+                            f"storage-class failed for {k}: {exc}")
+            self.progress.emit(
+                f"storage class: {changed} changed, {unchanged} already "
+                f"there, {len(failures)} failed")
+            if failures:
+                self.error.emit(
+                    f"{len(failures)} object(s) could not be changed:\n\n"
+                    + "\n".join(failures[:10]))
         except Exception as exc:
             msg = str(exc) or exc.__class__.__name__
             if "cancelled" in msg.lower():
@@ -4900,6 +4938,16 @@ class PaneCompareDialog(DialogDismissMixin, QDialog):
         if not job:
             self._summary.setText("Nothing that can be copied that way.")
             return
+        # build_job drops a key whose local destination would escape the
+        # pane's folder. Say so rather than quietly copying fewer items than
+        # were selected.
+        dropped = len(rows) - len(job)
+        if dropped:
+            QMessageBox.warning(
+                self, "Copy",
+                f"{dropped} object(s) were skipped because their key would "
+                f"be written outside {target[1]}."
+            )
         self.accept()
         self._mw.assign_thread_operation(method, job, **kwargs)
         self._mw.statusBar().showMessage(
@@ -4925,7 +4973,11 @@ class PaneCompareDialog(DialogDismissMixin, QDialog):
             prefix = source[2] or ""
             job = []
             for rel in rels:
-                local = os.path.join(target[1], rel.replace("/", os.sep))
+                # A key carrying ".." would otherwise be written outside the
+                # pane's folder; the same rule a folder download applies.
+                local = safe_local_path(target[1], rel)
+                if not local:
+                    continue
                 job.append((prefix + rel, local, None, target[1]))
             return job, "download", {"need_refresh": False}
         if source[0] == "remote" and target[0] == "remote":
@@ -5204,7 +5256,8 @@ class SyncDialog(DialogDismissMixin, QDialog):
             return
         self.accept()
         self._mw.start_sync(
-            todo, self._local.text().strip(), self._prefix, self.direction())
+            todo, self._local.text().strip(), self._prefix, self.direction(),
+            bucket=self._model.bucket)
 
 
 class BulkTagsDialog(QDialog):
@@ -12639,10 +12692,24 @@ class MainWindow(QMainWindow):
         if not folder_path:
             return
         job = []
+        unsafe = []
         for key in keys:
-            relative = key.replace("\\", "/").lstrip("/")
-            local_name = os.path.join(folder_path, *relative.split("/"))
+            # Search spans the whole bucket, so a key with ".." segments is
+            # exactly the kind of thing that turns up here.
+            local_name = safe_local_path(folder_path, key)
+            if not local_name:
+                unsafe.append(key)
+                continue
             job.append((key, local_name, None, folder_path))
+        if unsafe:
+            QMessageBox.warning(
+                self, "Download",
+                f"{len(unsafe)} object(s) were skipped because their key "
+                f"would write outside {folder_path}:\n\n"
+                + "\n".join(unsafe[:10])
+            )
+            if not job:
+                return
         conflicts = {entry[1] for entry in job if os.path.exists(entry[1])}
         job = self._resolve_overwrites(
             job, conflicts, what="file", index_of=self._download_target)
@@ -13237,8 +13304,10 @@ class MainWindow(QMainWindow):
         if not actions:
             return
         self.log(f"watch: {len(actions)} change(s) to send")
+        # The plan was compared against the watched bucket, which is not
+        # necessarily the one the window is showing by now.
         self.start_sync(actions, self._watch["local"], self._watch["prefix"],
-                        "upload")
+                        "upload", bucket=self._watch["bucket"])
 
     def _watch_settings_key(self) -> str:
         return f"watch/{self.profile_name}"
@@ -13841,19 +13910,47 @@ class MainWindow(QMainWindow):
         SyncDialog(self, self, self.data_model,
                    self.data_model.current_folder or "").exec()
 
-    def start_sync(self, actions, local_dir, prefix, direction):
-        """Turn an approved sync plan into a queued transfer job."""
+    def start_sync(self, actions, local_dir, prefix, direction, bucket=""):
+        """
+        Turn an approved sync plan into a queued transfer job.
+
+        *bucket* is the bucket the plan was compared against. It is carried
+        explicitly because a queued job is bound to a model when it STARTS:
+        without it the job ran against whatever bucket happened to be open by
+        then, which a folder watch (planned on a timer, long after the dialog
+        closed) hits every time the user has navigated elsewhere — uploading
+        into the wrong bucket and, with "delete extras" on, deleting from it.
+        """
         job = []
+        unsafe = []
         for entry in actions:
             rel = entry["rel"]
-            local_path = os.path.join(local_dir, rel.replace("/", os.sep))
+            # A remote key may hold ".." segments or a leading "/", which
+            # would put the local side of the action outside the folder the
+            # user chose. Such an action is dropped, not silently redirected.
+            local_path = safe_local_path(local_dir, rel)
+            if not local_path:
+                unsafe.append(rel)
+                continue
             key = (prefix or "") + rel
             job.append((entry["action"], rel, local_path, key,
                         int(entry.get("size") or 0)))
+        if unsafe:
+            self.log(
+                f"sync: skipped {len(unsafe)} object(s) whose key escapes "
+                f"'{local_dir}': " + ", ".join(unsafe[:5])
+            )
+            QMessageBox.warning(
+                self, "Sync",
+                f"{len(unsafe)} object(s) were skipped because their key "
+                f"would write outside {local_dir}:\n\n"
+                + "\n".join(unsafe[:10])
+            )
         if not job:
             return
         # A sync can delete or overwrite locally, so refresh the listing after.
-        self.assign_thread_operation("sync", job)
+        self.assign_thread_operation(
+            "sync", job, source_bucket=bucket or self.data_model.bucket or "")
         summary = summarize_sync_plan(actions)
         self.log(
             f"sync {direction}: {len(job)} action(s), "

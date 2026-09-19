@@ -59,7 +59,7 @@ pull request:
 - **Upload rules by destination** — `archive/* -> class=GLACIER, tag:team=infra`: a small per-profile table that decides the storage class and tags from the key an upload is heading for, so a storage policy is applied rather than remembered
 - **Content-Type detection** — every upload is stamped with a type derived from the file extension, so a public link renders in a browser instead of downloading as `binary/octet-stream`; the table is overridable per extension, and the object context menu's "Fix Content-Type from extension" re-stamps objects that were uploaded before (or by something else)
 - **Additional checksums** — upload with CRC32/SHA1/SHA256; CRC32 is requested as a whole-object checksum so multipart objects stay verifiable, unlike a multipart ETag
-- **Checksum verification** — optionally compare each downloaded file against the object's stored digest and fail the transfer on a mismatch. A multipart object is settled by asking the service for its real part boundaries (`GetObjectAttributes`) and rebuilding the composite digest from them, so "multipart, not comparable" is now the exception rather than the rule; where a backend does not implement that call, verification still degrades to reporting the object as not comparable rather than failing it
+- **Checksum verification** — optionally compare each downloaded file against the object's stored digest and fail the transfer on a mismatch. A multipart object is settled by asking the service for its real part boundaries (`GetObjectAttributes`) and rebuilding the composite digest from them, so "multipart, not comparable" is now the exception rather than the rule; where a backend does not implement that call, verification still degrades to reporting the object as not comparable rather than failing it (MinIO does implement it — the end-to-end suite checks)
 - **Parallel transfers** — configurable number of files moving at once *and* multipart connections within each file; applies to uploads, downloads (including whole prefixes) and sync
 - **Transfer settings** — files in flight, connections per file, bandwidth limit, multipart part size and threshold, resumable uploads, automatic retry of transient failures, the per-listing entry limit, the session log file, Content-Type detection with its override table, the upload rules by destination, plus the storage class, checksum and server-side encryption (SSE-S3 / SSE-KMS) applied to uploads — all persisted across sessions
 - **Overwrite protection** — uploads (dialog, folder upload and drag-in), downloads (single files *and* whole folders), copies, moves, renames and pastes all detect existing destinations and offer Skip / Overwrite / Cancel
@@ -122,6 +122,44 @@ Planned work and known limitations are tracked in [ROADMAP.md](ROADMAP.md).
 
 ---
 
+## Testing
+
+`make` lists every target; `make check` runs both suites.
+
+Two suites. The unit suite stubs boto3 and needs nothing but Python:
+
+```
+make test
+```
+
+which is `python -m unittest discover -s tests -t .` — the `-t .` is
+load-bearing, see `tests/__init__.py` for why.
+
+The end-to-end suite drives `model.py` against a **real** S3 server, because
+every claim this project makes about how a server behaves is otherwise
+unverified. It brings up a throwaway MinIO in Docker, runs, and removes
+everything it created:
+
+```
+make e2e
+```
+
+It skips itself when no endpoint is configured, so the command above is the
+only way it costs anything — a plain `unittest discover` stays offline and
+green. To run it against a server you already have instead:
+
+```
+S3DUCK_TEST_ENDPOINT=http://localhost:9000 \
+S3DUCK_TEST_ACCESS_KEY=... S3DUCK_TEST_SECRET_KEY=... \
+    python -m unittest discover -s tests/e2e -t .
+```
+
+The runner image holds boto3 and nothing else: `model.py` imports no Qt, so
+this needs no display and no PyQt6. Alongside the round trips it records what
+the backend under test actually implements — `GetObjectAttributes`,
+conditional writes, ACLs, restore, Object Lock — so a documented limitation
+that stops being true shows up as a test result rather than as stale prose.
+
 ## Requirements
 
 | Dependency    | Version  | Purpose                          |
@@ -155,24 +193,37 @@ python3 s3duck.py
 
 ## Building
 
+`make` on its own lists every target. Each one delegates to the script below
+it, so the two never disagree about how something is built; the version is
+read from `__VERSION__` in `main_window.py` rather than repeated anywhere.
+
+```bash
+make deb          # this machine's architecture
+make debs         # amd64 + arm64
+make bin          # self-contained Linux binary
+make clean        # build/, dist/, caches, PyInstaller leftovers
+```
+
 ### Debian / Ubuntu package
 ```bash
 sudo apt-get install git devscripts build-essential lintian upx-ucl
-./build_deb.sh              # auto-detects amd64 / arm64
+make deb                    # or: ./build_deb.sh
 ./build_deb.sh arm64        # explicit architecture
 ```
-Output: `build/s3duck_<version>_<arch>.deb`
+Output: `build/s3duck_<version>_<arch>.deb`, checkable with `make check-deb`
 
 ### Linux binary (PyInstaller)
 ```bash
-./build_linux_bin.sh
+make bin                    # or: ./build_linux_bin.sh
 ```
+`make bin` puts `.venv/bin` on PATH first, because `requirements.txt`
+installs PyInstaller into the venv rather than onto the system PATH.
 
 ### macOS binary + DMG
 ```bash
-./build_macos_bin.sh                  # native arch
-./build_macos_bin.sh universal2       # fat binary (x86_64 + arm64)
-./build_dmg.sh
+make macos                            # native arch
+make macos ARCH=universal2            # fat binary (x86_64 + arm64)
+make dmg
 ```
 
 ### Windows binary
@@ -203,10 +254,13 @@ s3duck/
 ├── resources/           App icon (ico/icns/png), screenshots, .desktop file
 ├── DEBIAN/              Debian package metadata (control, postinst, prerm)
 ├── tests/               Offscreen unit suite (test_units.py)
+│   └── e2e/             End-to-end suite + its MinIO compose harness
 ├── tools/               CI helpers and the icon report
 │
+├── Makefile             Front door: make test / e2e / deb / bin / clean
 ├── requirements.txt     Python dependencies
 ├── s3duck.spec          PyInstaller build spec
+├── run_e2e.sh           End-to-end suite against a throwaway MinIO
 ├── build_deb.sh         Build .deb package
 ├── build_linux_bin.sh   Build Linux self-contained binary
 ├── build_macos_bin.sh   Build macOS self-contained binary

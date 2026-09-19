@@ -107,11 +107,12 @@ credential-storage choice in 0.18.0. What is left:
   (files-in-flight × chunk fan-out); concurrency is bounded but can exceed
   the configured file parallelism.
 - Verifying a multipart object needs its real part boundaries, which come
-  from `GetObjectAttributes`. AWS answers it; most S3-compatible backends do
-  not, and there the old behaviour stands — verification reports the object as
-  "not comparable" and passes. Uploading with an additional CRC32 checksum
-  (Transfer settings) makes an object verifiable everywhere, since a
-  full-object checksum needs no part boundaries at all.
+  from `GetObjectAttributes`. AWS answers it and so does MinIO (the
+  end-to-end suite asserts this); on a backend that does not, the old
+  behaviour stands — verification reports the object as "not comparable" and
+  passes. Uploading with an additional CRC32 checksum (Transfer settings)
+  makes an object verifiable everywhere, since a full-object checksum needs
+  no part boundaries at all.
 - Bundled PNG twins are a fixed 48px raster, so on a Qt build without the SVG
   plugin icons do not scale as crisply as the SVGs would. Installing
   `python3-pyqt6.qtsvg` restores vector icons; the .deb recommends it.
@@ -132,6 +133,15 @@ credential-storage choice in 0.18.0. What is left:
   bindings live at once would make Qt call the key ambiguous and fire
   neither, so the second pane takes it over while it is open. `Ctrl+R`
   refreshes in either mode.
+- MinIO refuses an object key containing a `..` or `.` path component
+  (`XMinioInvalidResourceName`), while AWS S3 accepts one — they are legal
+  keys. The download paths therefore keep their own containment check rather
+  than trusting the server to be the strict one; the end-to-end suite records
+  which kind of backend it is talking to instead of assuming.
+- MinIO answers `ListMultipartUploads` as if `Prefix` were an exact key
+  match, so the prefix is filtered client-side. The list is bounded by
+  in-flight uploads rather than by objects, so this costs nothing in
+  practice.
 - The bundled storage prices are AWS list prices for us-east-1 and cover
   storage only. They are shown for an `*.amazonaws.com` endpoint and hidden
   elsewhere, because quoting them at a MinIO or Ceph endpoint would be

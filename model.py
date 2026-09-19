@@ -30,6 +30,10 @@ class ReadOnlyError(Exception):
     """Raised when a write is attempted on a profile marked read-only."""
 
 
+class DeleteRefused(Exception):
+    """Raised when DeleteObjects answered 200 but refused individual keys."""
+
+
 def run_parallel(items, fn, workers, cancel_event=None):
     """
     Apply fn to every item, up to *workers* at a time.
@@ -145,16 +149,75 @@ BUILTIN_CONTENT_TYPES = {
 
 
 def prefix_of(key) -> str:
-    """A folder key as a listing prefix — always trailing-slashed."""
+    """
+    A folder key as a listing prefix — always trailing-slashed.
+
+    The empty key is the bucket root, and the root's prefix is the empty
+    string. Answering "/" instead looked harmless and was not: as a listing
+    filter it matches only keys that literally begin with a slash, so a caller
+    that reached here with "" quietly operated on nothing at all rather than
+    on everything.
+    """
     text = str(key or "")
+    if not text:
+        return ""
     return text if text.endswith("/") else text + "/"
+
+
+# One path component's limit, in BYTES, on every mainstream filesystem:
+# ext4, APFS and NTFS all stop at 255. S3 allows a 1024-byte key with no
+# such per-component rule, so a perfectly legal key can name a file the
+# local filesystem cannot create.
+MAX_LOCAL_NAME_BYTES = 255
+
+
+def local_name_is_writable(rel) -> bool:
+    """
+    True when every component of *rel* is short enough to exist locally.
+
+    A 300-character component is a legal S3 key and an ENAMETOOLONG on
+    ext4. Checked in BYTES, not characters, because that is what the
+    filesystem counts — 200 emoji are 800 bytes and would pass a character
+    test while failing the real one.
+    """
+    for part in str(rel or "").replace("\\", "/").split("/"):
+        if len(part.encode("utf-8", "surrogatepass")) > MAX_LOCAL_NAME_BYTES:
+            return False
+    return True
+
+
+def safe_local_path(base_dir, rel) -> str:
+    """
+    Where *rel* lands under *base_dir*, or "" when it cannot go there.
+
+    Two ways a key fails to be a local path, and both end in "". First,
+    escape: "../../.bashrc" and "/etc/passwd" are legal keys that anyone
+    who can write to the bucket can create, and joining one onto a download
+    folder writes outside the folder the user picked. Second, length: a
+    component over the filesystem's limit is an ENAMETOOLONG rather than a
+    file. plan_prefix_download has always refused the first for a
+    whole-folder download; this is the same rule for every other place a key
+    becomes a local path (sync, the second pane, search results).
+    """
+    base = os.path.abspath(base_dir or ".")
+    text = str(rel or "").replace("\\", "/").lstrip("/")
+    if not text:
+        return ""
+    if not local_name_is_writable(text):
+        return ""
+    candidate = os.path.abspath(os.path.join(base, *text.split("/")))
+    # Strictly below the base: landing *on* it ("." or "a/..") names the
+    # directory, which is not somewhere an object can be written either.
+    if not candidate.startswith(base + os.sep):
+        return ""
+    return candidate
 
 
 class PrefixDownloadPlan(NamedTuple):
     base_dir: str
     dirs: list
     files: list      # [(key, out_path, size)]
-    unsafe: list     # keys that would escape base_dir
+    unsafe: list     # keys that cannot be written under base_dir
 
 
 def plan_prefix_download(key, folder_path, entries) -> PrefixDownloadPlan:
@@ -178,6 +241,14 @@ def plan_prefix_download(key, folder_path, entries) -> PrefixDownloadPlan:
         out_path = os.path.join(base_dir, rel)
         # Keys may contain ".." segments; never write outside base_dir.
         if not os.path.abspath(out_path).startswith(root):
+            unsafe.append(k)
+            continue
+        # A component over the filesystem's limit is an ENAMETOOLONG, not a
+        # file — and because the whole-prefix download fans out through
+        # run_parallel, which re-raises the first error, ONE such key used to
+        # abort the entire folder. Skipping it costs that object and saves
+        # the other nine hundred.
+        if not local_name_is_writable(rel):
             unsafe.append(k)
             continue
         if str(k).endswith("/"):
@@ -878,6 +949,13 @@ class Model:
 
         config_args = {
             "s3": s3_config,
+            # Pinned, not left to the resolver. Against a custom endpoint
+            # botocore presigns with SIGNATURE V2 unless told otherwise —
+            # even though the client reports "s3v4" — and a SigV2 presigned
+            # PUT is refused outright by MinIO (403 SignatureDoesNotMatch)
+            # and by every AWS region launched after 2014. The upload-link
+            # feature was therefore dead anywhere but a legacy region.
+            "signature_version": "s3v4",
             "connect_timeout": self.timeout,
             "read_timeout": self.read_timeout,
             "retries": {"max_attempts": self.retries, "mode": "standard"},
@@ -1373,14 +1451,19 @@ class Model:
             nonlocal pending, deleted
             if not pending:
                 return
-            bucket_client.delete_objects(
+            resp = bucket_client.delete_objects(
                 Bucket=bucket_name,
                 Delete={"Objects": pending, "Quiet": True},
             )
+            # Counted before the check so the log says how far the purge got;
+            # a refused key would otherwise be reported as deleted and the
+            # DeleteBucket that follows would fail with an unexplained
+            # BucketNotEmpty.
             deleted += len(pending)
+            pending = []
             if log_fn:
                 log_fn(f"{bucket_name}: deleted {deleted} object(s)")
-            pending = []
+            self.raise_on_delete_errors(resp, log_fn=log_fn)
 
         # List everything
         for page in paginator.paginate(Bucket=bucket_name, Prefix=""):
@@ -1559,7 +1642,12 @@ class Model:
 
                 if page_cb is not None:
                     page_cb(len(items))
-                if limit and len(items) >= limit:
+                # Strictly past the limit, not merely at it: a prefix holding
+                # exactly *limit* entries is complete, and reporting it as
+                # truncated told the user to raise a cap that was not
+                # hiding anything. Costs at most one more page at the
+                # boundary, which is what it takes to know the difference.
+                if limit and len(items) > limit:
                     # Stop rather than build a model the view cannot render;
                     # the caller says so instead of pretending this is all.
                     del items[limit:]
@@ -1668,7 +1756,9 @@ class Model:
             os.makedirs(plan.base_dir, exist_ok=True)
             if log_fn:
                 for k in plan.unsafe:
-                    log_fn(f"skipped unsafe key (escapes target dir): {k}")
+                    log_fn("skipped unsafe key (escapes the target "
+                           f"directory, or is too long for this "
+                           f"filesystem): {k}")
             for out_path in plan.dirs:
                 os.makedirs(out_path, exist_ok=True)
             for _k, out_path, _size in plan.files:
@@ -1683,6 +1773,19 @@ class Model:
                 cancel_event=cancel_event,
             )
             return
+
+        # A whole-prefix download is filtered by plan_prefix_download above;
+        # a single object arrives with its destination already chosen, so the
+        # same containment rule is enforced here rather than trusted to every
+        # caller that builds one.
+        if folder_path:
+            root = os.path.abspath(folder_path)
+            target = os.path.abspath(local_name)
+            if target != root and not target.startswith(root + os.sep):
+                raise ValueError(
+                    f"Refusing to download '{key}': the destination "
+                    f"'{local_name}' is outside '{folder_path}'"
+                )
 
         size = None
         etag = ""
@@ -2291,6 +2394,34 @@ class Model:
             self.rebind_bucket(log_fn=log_fn)
             self.client.delete_object(Bucket=self.bucket, Key=key)
 
+    @staticmethod
+    def raise_on_delete_errors(resp, log_fn=None, limit=5):
+        """
+        Turn the per-key refusals in a DeleteObjects response into a failure.
+
+        DeleteObjects answers HTTP 200 even when it refused individual keys:
+        the refusals come back in ``Errors``, and with ``Quiet`` set that is
+        the only thing the body carries. Not reading it reported an
+        object-lock, MFA-delete or per-key AccessDenied refusal as a
+        completed delete — the queue row went green and the objects were
+        still there.
+        """
+        errors = (resp or {}).get("Errors") or []
+        if not errors:
+            return
+        described = []
+        for err in errors[:limit]:
+            code = err.get("Code") or "error"
+            described.append(f"{err.get('Key', '?')} ({code})")
+        if len(errors) > limit:
+            described.append(f"and {len(errors) - limit} more")
+        detail = ", ".join(described)
+        if log_fn:
+            log_fn(f"delete refused for {len(errors)} object(s): {detail}")
+        raise DeleteRefused(
+            f"The service refused to delete {len(errors)} object(s): {detail}"
+        )
+
     def _delete_batch(self, keys, log_fn=None):
         """
         Remove up to DELETE_BATCH_SIZE keys in one DeleteObjects call, falling
@@ -2301,7 +2432,9 @@ class Model:
         payload = {"Objects": [{"Key": k} for k in keys], "Quiet": True}
 
         def _do():
-            self.client.delete_objects(Bucket=self.bucket, Delete=payload)
+            resp = self.client.delete_objects(
+                Bucket=self.bucket, Delete=payload)
+            self.raise_on_delete_errors(resp, log_fn=log_fn)
 
         try:
             _do()
@@ -2959,28 +3092,51 @@ class Model:
             pass
         return out
 
+    def prefix_has_anything(self, prefix: str) -> bool:
+        """
+        Whether a single object exists under *prefix*, asked as cheaply as
+        the protocol allows.
+
+        MaxKeys=1 and no pagination: the question is existence, and reading
+        a whole folder to answer it is what made the overwrite check the
+        most expensive operation in the app.
+        """
+        if not prefix or not self.bucket:
+            return False
+        resp = self.client.list_objects_v2(
+            Bucket=self.bucket, Prefix=prefix, MaxKeys=1)
+        return int(resp.get("KeyCount") or 0) > 0 or bool(resp.get("Contents"))
+
     def existing_keys(self, keys) -> set:
         """
-        Return the subset of *keys* that already exist, using one recursive
-        listing per distinct parent prefix rather than a HEAD per key.
+        Return the subset of *keys* that already exist.
+
+        File targets are settled with one recursive listing per distinct
+        parent prefix rather than a HEAD per key. Folder targets are settled
+        with a one-key probe of the folder itself, which fixes two things
+        the shared listing got wrong: a top-level folder like "photos/" has
+        no parent, so its "parent prefix" was the bucket root and the check
+        listed EVERY object in the bucket to decide one question; and a
+        folder holding nothing but sub-folder placeholders was reported as
+        free, because the old scan only counted non-placeholder keys.
         """
         wanted = {k for k in keys if k}
         if not wanted or not self.bucket:
             return set()
+
+        folders = {k for k in wanted if k.endswith("/")}
+        files = wanted - folders
+
+        found = {folder for folder in folders
+                 if self.prefix_has_anything(folder)}
+
         prefixes = set()
-        for key in wanted:
-            base = key.rstrip("/")
-            prefixes.add(base.rsplit("/", 1)[0] + "/" if "/" in base else "")
-        found = set()
+        for key in files:
+            prefixes.add(key.rsplit("/", 1)[0] + "/" if "/" in key else "")
         for prefix in prefixes:
             for k, _size in self.get_keys(prefix):
-                if k in wanted:
+                if k in files:
                     found.add(k)
-                elif k and k.endswith("/") is False:
-                    # A folder target conflicts if anything lives under it.
-                    for w in wanted:
-                        if w.endswith("/") and k.startswith(w):
-                            found.add(w)
         return found
 
     def direct_object_url(self, key: str) -> str:
@@ -3687,8 +3843,11 @@ class Model:
                              progress_cb=None, cancel_event=None, log_fn=None):
         """Copy a whole prefix into another profile, preserving its shape."""
         dst_model._guard_write()
+        # An empty prefix on either side means the bucket root, which
+        # prefix_of answers as "" — a guard here would only hide a
+        # regression in it.
         source = prefix_of(src_prefix)
-        target = prefix_of(dst_prefix) if dst_prefix else ""
+        target = prefix_of(dst_prefix)
         for key, _size in self.get_keys(source, log_fn=log_fn):
             if cancel_event is not None and cancel_event.is_set():
                 raise TransferCancelled("cancelled")
@@ -3814,17 +3973,29 @@ class Model:
         if not bucket:
             raise ValueError("Bucket is empty; select a bucket first")
 
+        wanted = prefix or ""
+
         def _fetch():
             client = client_obj if client_obj is not None else self.client
             out = []
             paginator = client.get_paginator("list_multipart_uploads")
-            for page in paginator.paginate(Bucket=bucket, Prefix=prefix or ""):
+            # Prefix is filtered HERE, not by the server. MinIO treats the
+            # ListMultipartUploads Prefix as an exact key match: asking for
+            # "photos/" returns nothing while "photos/big.bin" returns that
+            # one upload. Sending it therefore reported "no incomplete
+            # uploads" for every prefix — which is where the dialog is
+            # opened from, so the feature quietly did nothing everywhere
+            # except a bucket root. The list is bounded by in-flight uploads,
+            # not by objects, so listing them all is cheap.
+            for page in paginator.paginate(Bucket=bucket):
                 if cancel_event is not None and cancel_event.is_set():
                     raise TransferCancelled("cancelled")
                 for up in (page.get("Uploads", []) or []):
                     key = up.get("Key")
                     upload_id = up.get("UploadId")
                     if not key or not upload_id:
+                        continue
+                    if wanted and not key.startswith(wanted):
                         continue
                     out.append({
                         "key": key,
@@ -4123,8 +4294,28 @@ class Model:
         except Exception as exc:
             return False, str(exc)
 
+    def current_storage_class(self, key: str) -> str:
+        """An object's storage class, with S3's silence read as STANDARD.
+
+        HeadObject omits StorageClass entirely for a STANDARD object rather
+        than naming it, so an absent field and "STANDARD" are the same
+        answer.
+        """
+        head = self.client.head_object(Bucket=self.bucket, Key=key)
+        return head.get("StorageClass") or "STANDARD"
+
     def change_storage_class(self, key: str, storage_class: str, log_fn=None):
-        """Change an object's storage class via a server-side copy onto itself."""
+        """
+        Change an object's storage class via a server-side copy onto itself.
+
+        Returns True when the object moved, False when it was already in the
+        requested class. S3 refuses a copy onto itself that changes nothing —
+        "This copy request is illegal…", an InvalidRequest, on AWS and MinIO
+        alike — so normalising a selection to STANDARD failed on every object
+        already in STANDARD. That is a no-op, not an error, and the happy
+        path still costs exactly one request: the class is only looked up
+        after the service has objected.
+        """
         self._guard_write()
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
@@ -4139,8 +4330,28 @@ class Model:
                 MetadataDirective="COPY",
             )
 
+        def _already_there():
+            try:
+                return self.current_storage_class(key) == storage_class
+            except Exception:
+                return False
+
         try:
             _do()
+            return True
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code == "InvalidRequest" and _already_there():
+                if log_fn:
+                    log_fn(f"{key} is already {storage_class}")
+                return False
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error changing storage class of '{key}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
+            _do()
+            return True
         except Exception as exc:
             if not self._is_region_error(exc):
                 raise
@@ -4148,6 +4359,7 @@ class Model:
                 log_fn(f"Region error changing storage class of '{key}': {exc}")
             self.rebind_bucket(log_fn=log_fn)
             _do()
+            return True
 
     def get_object_metadata(self, key: str) -> dict:
         """

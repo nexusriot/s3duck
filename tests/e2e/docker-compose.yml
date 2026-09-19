@@ -1,0 +1,45 @@
+# Hermetic end-to-end run: a throwaway MinIO plus a runner that drives
+# model.py against it. Nothing outside this file is required, and nothing
+# outlives `docker compose down -v`.
+#
+#   ./run_e2e.sh                     from the repository root
+#   docker compose -f tests/e2e/docker-compose.yml run --rm runner
+
+name: s3duck-e2e
+
+services:
+  minio:
+    image: quay.io/minio/minio:latest
+    # A data volume is deliberately absent: the server is disposable, and
+    # a run that depended on what a previous one left behind would not be
+    # hermetic.
+    command: server /data --address :9000
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      # Object Lock needs this off; it is a throwaway server on a private
+      # compose network either way.
+      MINIO_BROWSER: "off"
+    healthcheck:
+      # mc is in the image; curl is not.
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 3s
+
+  runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      S3DUCK_TEST_ENDPOINT: http://minio:9000
+      S3DUCK_TEST_ACCESS_KEY: minioadmin
+      S3DUCK_TEST_SECRET_KEY: minioadmin
+      S3DUCK_TEST_REGION: us-east-1
+    volumes:
+      # Read-only: the suite must not be able to edit the tree it is testing.
+      - ../..:/app:ro
