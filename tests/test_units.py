@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import botocore.exceptions
+import botocore.session
 try:
     from awscrt import checksums as _crt_checksums
 except ImportError:
@@ -89,7 +90,8 @@ from model import (
     Model, Item, FSObjectType, TransferCancelled, ReadOnlyError, run_parallel,
     RateLimiter, plan_prefix_download, prefix_of, CHECKSUM_ALGORITHMS,
     safe_local_path, DeleteRefused, local_name_is_writable,
-    MAX_LOCAL_NAME_BYTES, ObjectExists,
+    MAX_LOCAL_NAME_BYTES, ObjectExists, client_accepts,
+    drop_unsendable_checksum_args,
 )
 from properties_window import PropertiesWindow
 from settings import SettingsWindow
@@ -6794,6 +6796,227 @@ class ConditionalUploadTests(unittest.TestCase):
         self.assertEqual(c.completed["big.bin"], self.payload)
 
 
+class OldBotocoreConditionalWriteTests(unittest.TestCase):
+    """
+    REGRESSION: every upload failed outright on an installed botocore older
+    than IfNoneMatch — "Unknown parameter in input: IfNoneMatch". boto3
+    validates arguments against the service model it ships with, so the
+    refusal is a client-side ParamValidationError, not a ClientError, and so
+    went straight past the fallbacks for a backend that cannot be
+    conditional. Overwrite protection is on by default, which made it every
+    upload rather than an opt-in corner.
+    """
+
+    PART = 1024
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.small = os.path.join(self.dir, "small.txt")
+        with open(self.small, "wb") as handle:
+            handle.write(b"duck")
+        self.big = os.path.join(self.dir, "big.bin")
+        self.payload = os.urandom(self.PART * 3)
+        with open(self.big, "wb") as handle:
+            handle.write(self.payload)
+
+    def _model(self, client, threshold_mb=1):
+        m = make_model(bucket="bkt")
+        m._client = client
+        m.upload_chunk_size = self.PART
+        m.multipart_threshold_mb = threshold_mb
+        m.transfer_concurrency = 1
+        m.upload_state_dir = os.path.join(self.dir, "state")
+        return m
+
+    @staticmethod
+    def _param_error(parameter="IfNoneMatch"):
+        return botocore.exceptions.ParamValidationError(
+            report=f'Unknown parameter in input: "{parameter}", must be one '
+                   'of: ACL, Body, Bucket, CacheControl, Key, Metadata')
+
+    @staticmethod
+    def _service_model():
+        return botocore.session.get_session().get_service_model("s3")
+
+    @classmethod
+    def _without(cls, parameter, *operations):
+        """The real S3 service model with ``parameter`` taken back out of
+        ``operations`` — what an older botocore shipped."""
+        real = cls._service_model()
+
+        class _Model:
+            def operation_model(self, name):
+                op = real.operation_model(name)
+                if name not in operations:
+                    return op
+                return types.SimpleNamespace(
+                    input_shape=types.SimpleNamespace(members={
+                        k: v for k, v in op.input_shape.members.items()
+                        if k != parameter}))
+
+        return _Model()
+
+    def test_the_probe_reads_the_installed_service_model(self):
+        c = _ConditionalPutClient()
+        m = self._model(c)
+        c.meta = types.SimpleNamespace(service_model=self._without(
+            "IfNoneMatch", "PutObject", "CompleteMultipartUpload"))
+        self.assertFalse(m.supports_conditional_create())
+        real = self._service_model()
+        c.meta = types.SimpleNamespace(service_model=real)
+        self.assertEqual(
+            m.supports_conditional_create(),
+            "IfNoneMatch" in real.operation_model(
+                "PutObject").input_shape.members,
+            "the probe disagrees with the installed botocore")
+
+    def test_either_half_missing_is_enough_to_stand_down(self):
+        """Both routes a conditional upload may take have to carry it, so
+        knowing the parameter on only one of them is not support."""
+        for operation in ("PutObject", "CompleteMultipartUpload"):
+            with self.subTest(operation=operation):
+                c = _ConditionalPutClient()
+                c.meta = types.SimpleNamespace(
+                    service_model=self._without("IfNoneMatch", operation))
+                self.assertFalse(self._model(c).supports_conditional_create())
+
+    def test_a_client_with_no_service_model_is_assumed_capable(self):
+        """A model this build cannot describe must not silently disable a
+        feature the service does have."""
+        self.assertTrue(client_accepts(object(), "PutObject", "IfNoneMatch"))
+
+    def test_one_clients_answer_is_never_handed_to_another(self):
+        """REGRESSION GUARD: caching by (operation, parameter) alone made the
+        first client asked answer for every client after it."""
+        old = types.SimpleNamespace(meta=types.SimpleNamespace(
+            service_model=self._without("IfNoneMatch", "PutObject")))
+        new = types.SimpleNamespace(
+            meta=types.SimpleNamespace(service_model=self._service_model()))
+        self.assertFalse(client_accepts(old, "PutObject", "IfNoneMatch"))
+        self.assertEqual(
+            client_accepts(new, "PutObject", "IfNoneMatch"),
+            "IfNoneMatch" in self._service_model().operation_model(
+                "PutObject").input_shape.members)
+        self.assertTrue(client_accepts(object(), "PutObject", "IfNoneMatch"))
+
+    def test_an_old_botocore_still_uploads_small_files(self):
+        c = _ConditionalPutClient()
+        c.meta = types.SimpleNamespace(service_model=self._without(
+            "IfNoneMatch", "PutObject", "CompleteMultipartUpload"))
+        logged = []
+        m = self._model(c)
+        m.multipart_threshold_mb = 1024
+        m.upload_file(self.small, "small.txt", if_none_match=True,
+                      log_fn=logged.append)
+        self.assertEqual(c.managed, ["small.txt"], "the upload never happened")
+        self.assertEqual(c.puts, [], "sent a parameter boto3 would refuse")
+        self.assertTrue(any("conditional" in line for line in logged), logged)
+
+    def test_an_old_botocore_still_uploads_large_files(self):
+        """And without being dragged onto the resumable writer, which only
+        exists to carry a precondition this build cannot send."""
+        c = _ConditionalPutClient()
+        c.meta = types.SimpleNamespace(service_model=self._without(
+            "IfNoneMatch", "PutObject", "CompleteMultipartUpload"))
+        m = self._model(c, threshold_mb=0)
+        m.resumable_uploads = False
+        m.upload_file(self.big, "big.bin", if_none_match=True)
+        self.assertEqual(c.managed, ["big.bin"])
+        self.assertNotIn("IfNoneMatch", c.completed_kw or {})
+
+    def test_a_refused_parameter_falls_back_instead_of_failing(self):
+        """The safety net under the probe: whatever the model claimed, a
+        client-side refusal of the parameter is still only a missing
+        feature, and the bytes have not been sent yet."""
+        c = _ConditionalPutClient(put_error=self._param_error())
+        logged = []
+        m = self._model(c)
+        m.multipart_threshold_mb = 1024
+        m.upload_file(self.small, "small.txt", if_none_match=True,
+                      log_fn=logged.append)
+        self.assertEqual(c.managed, ["small.txt"])
+        self.assertTrue(any("conditional" in line for line in logged), logged)
+
+    def test_a_refused_completion_completes_without_the_precondition(self):
+        """Here the parts are already uploaded, so falling back beats losing
+        the whole transfer."""
+        c = _ConditionalPutClient()
+        c.fail_complete = self._param_error()
+        self._model(c, threshold_mb=0).upload_file(
+            self.big, "big.bin", if_none_match=True)
+        self.assertEqual(c.completed["big.bin"], self.payload)
+
+    def test_an_unrelated_parameter_error_is_still_a_failure(self):
+        """REGRESSION GUARD: reading every ParamValidationError as "no
+        conditional writes" would hide a real bug in the arguments and
+        overwrite the object as the consolation prize."""
+        c = _ConditionalPutClient(put_error=self._param_error("Bogus"))
+        with self.assertRaises(botocore.exceptions.ParamValidationError):
+            self._model(c).upload_file(self.small, "small.txt",
+                                       if_none_match=True)
+        self.assertEqual(c.managed, [], "overwrote after an unrelated error")
+
+    def test_checksum_type_is_dropped_when_botocore_cannot_send_it(self):
+        """REGRESSION: ChecksumType is the same kind of recent parameter as
+        IfNoneMatch, so turning on a CRC checksum failed every multipart
+        upload on an older botocore with the identical error."""
+        c = _ConditionalPutClient()
+        c.meta = types.SimpleNamespace(
+            service_model=self._without("ChecksumType",
+                                        "CreateMultipartUpload"))
+        m = self._model(c)
+        m.set_upload_options(checksum_algorithm="CRC32")
+        args = m.upload_args_for(self.small, "small.txt")
+        self.assertEqual(args.get("ChecksumAlgorithm"), "CRC32",
+                         "dropped more than it had to")
+        self.assertNotIn("ChecksumType", args)
+
+    def test_checksum_type_survives_where_botocore_knows_it(self):
+        c = _ConditionalPutClient()
+        c.meta = types.SimpleNamespace(service_model=self._service_model())
+        m = self._model(c)
+        m.set_upload_options(checksum_algorithm="CRC32")
+        args = m.upload_args_for(self.small, "small.txt")
+        known = "ChecksumType" in self._service_model().operation_model(
+            "CreateMultipartUpload").input_shape.members
+        self.assertEqual("ChecksumType" in args, known)
+
+    def test_an_algorithm_this_botocore_never_heard_of_is_dropped(self):
+        """CRC64NVME does not exist in an older model at all, and the whole
+        point of the type is the algorithm — so both go."""
+        real = self._service_model()
+        shape = real.operation_model("PutObject").input_shape.members[
+            "ChecksumAlgorithm"]
+        enum = list(getattr(shape, "enum", None) or [])
+        if not enum:
+            self.skipTest("this botocore does not constrain the algorithm")
+        client = types.SimpleNamespace(
+            meta=types.SimpleNamespace(service_model=real))
+        args = drop_unsendable_checksum_args(
+            client, {"ChecksumAlgorithm": "CRC64NVME",
+                     "ChecksumType": "FULL_OBJECT", "ACL": "private"})
+        self.assertNotIn("ChecksumAlgorithm", args)
+        self.assertNotIn("ChecksumType", args)
+        self.assertEqual(args.get("ACL"), "private",
+                         "took an unrelated argument with it")
+
+    def test_an_algorithm_this_botocore_knows_is_kept(self):
+        client = types.SimpleNamespace(
+            meta=types.SimpleNamespace(service_model=self._service_model()))
+        args = drop_unsendable_checksum_args(
+            client, {"ChecksumAlgorithm": "SHA256"})
+        self.assertEqual(args.get("ChecksumAlgorithm"), "SHA256")
+
+    def test_a_stub_client_keeps_every_checksum_argument(self):
+        """Nothing is known about it, so nothing is taken away."""
+        args = drop_unsendable_checksum_args(
+            object(), {"ChecksumAlgorithm": "CRC64NVME",
+                       "ChecksumType": "FULL_OBJECT"})
+        self.assertEqual(args, {"ChecksumAlgorithm": "CRC64NVME",
+                                "ChecksumType": "FULL_OBJECT"})
+
+
 class CrossProfileCopyTests(unittest.TestCase):
     """Server-side copy cannot use two sets of credentials, so moving objects
     between accounts or providers had no route at all."""
@@ -12225,6 +12448,77 @@ class ConditionalWriteTests(unittest.TestCase):
             m.put_object_body("a.txt", b"x", if_match='"abc"'), "new")
         self.assertEqual(len(attempts), 2)
         self.assertNotIn("IfMatch", attempts[1])
+
+    def test_an_old_boto3_checks_by_hand_instead_of_failing_the_save(self):
+        """REGRESSION: IfMatch is old on GetObject but was added to PutObject
+        in the same 2024 wave as IfNoneMatch, so an older botocore refuses it
+        client-side — a ParamValidationError, which the ClientError fallback
+        below never saw. Save failed outright on every distribution build."""
+        client = FakeS3Client(head_object_resp={"ETag": '"abc"'})
+        client.meta = types.SimpleNamespace(
+            service_model=OldBotocoreConditionalWriteTests._without(
+                "IfMatch", "PutObject"))
+        attempts = []
+        client.put_object = lambda **kw: (
+            attempts.append(kw) or {"ETag": '"new"'})
+        logged = []
+        m = self._model(client)
+        self.assertEqual(
+            m.put_object_body("a.txt", b"x", if_match='"abc"',
+                              log_fn=logged.append), "new")
+        self.assertEqual(len(attempts), 1, "sent a doomed request anyway")
+        self.assertNotIn("IfMatch", attempts[0])
+        self.assertTrue(any("conditional" in line for line in logged), logged)
+
+    def test_an_old_boto3_still_refuses_a_changed_object(self):
+        """Standing down from the header must not stand down from the
+        promise: the HEAD is what catches the concurrent save instead."""
+        client = FakeS3Client(head_object_resp={"ETag": '"different"'})
+        client.meta = types.SimpleNamespace(
+            service_model=OldBotocoreConditionalWriteTests._without(
+                "IfMatch", "PutObject"))
+
+        def _put(**_kw):
+            raise AssertionError("must not write after a failed check")
+
+        client.put_object = _put
+        m = self._model(client)
+        with self.assertRaises(Model.PreconditionFailed):
+            m.put_object_body("a.txt", b"x", if_match='"abc"')
+
+    def test_a_refused_if_match_degrades_rather_than_failing(self):
+        """The safety net under the probe, for a build whose service model
+        and whose validator disagree."""
+        client = FakeS3Client(head_object_resp={"ETag": '"abc"'})
+        attempts = []
+
+        def _put(**kw):
+            attempts.append(kw)
+            if "IfMatch" in kw:
+                raise botocore.exceptions.ParamValidationError(
+                    report='Unknown parameter in input: "IfMatch"')
+            return {"ETag": '"new"'}
+
+        client.put_object = _put
+        m = self._model(client)
+        self.assertEqual(
+            m.put_object_body("a.txt", b"x", if_match='"abc"'), "new")
+        self.assertEqual(len(attempts), 2)
+        self.assertNotIn("IfMatch", attempts[1])
+
+    def test_an_unrelated_parameter_error_still_fails_the_save(self):
+        """REGRESSION GUARD: writing unconditionally after any argument
+        error would overwrite the very object the precondition protects."""
+        client = FakeS3Client(head_object_resp={"ETag": '"abc"'})
+
+        def _put(**_kw):
+            raise botocore.exceptions.ParamValidationError(
+                report='Unknown parameter in input: "Bogus"')
+
+        client.put_object = _put
+        m = self._model(client)
+        with self.assertRaises(botocore.exceptions.ParamValidationError):
+            m.put_object_body("a.txt", b"x", if_match='"abc"')
 
     def test_the_hand_check_still_refuses_a_changed_object(self):
         client = FakeS3Client(head_object_resp={"ETag": '"different"'})

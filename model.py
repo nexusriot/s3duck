@@ -16,7 +16,9 @@ import uuid
 import os
 import boto3
 import botocore
+import botocore.session
 import threading
+import types
 from urllib.parse import quote, urlencode, urlparse
 
 from boto3.s3.transfer import TransferConfig
@@ -509,6 +511,83 @@ class _ProgressReader:
         return True
 
 
+def client_accepts(client, operation: str, parameter: str) -> bool:
+    """
+    Whether this client's botocore knows ``parameter`` on ``operation``.
+
+    boto3 validates arguments client-side against the service model it ships
+    with, so a parameter added to S3 after the installed botocore was built
+    raises ParamValidationError before a request is ever sent. That is not a
+    ClientError, so it slips past the fallbacks that handle a backend saying
+    "not implemented" — asking the model first is what keeps a too-old
+    botocore from turning into a failed transfer.
+
+    Not cached here: botocore already caches the operation model, which
+    leaves this a dict lookup, and an answer cached per parameter alone
+    would be one client's answer handed to another.
+
+    Anything that cannot be asked answers True: a model this build cannot
+    describe should not disable a feature the service does have.
+    """
+    try:
+        shape = client.meta.service_model.operation_model(
+            operation).input_shape
+    except Exception:
+        return True
+    return shape is None or parameter in shape.members
+
+
+def installed_sdk_accepts(operation: str, parameter: str) -> bool:
+    """
+    The same question asked of the installed botocore rather than of a live
+    client, so Diagnostics can answer it with no profile connected.
+    """
+    try:
+        return client_accepts(
+            types.SimpleNamespace(meta=types.SimpleNamespace(
+                service_model=botocore.session.get_session(
+                ).get_service_model("s3"))),
+            operation, parameter)
+    except Exception:
+        return True
+
+
+def client_knows_checksum(client, algorithm: str) -> bool:
+    """Whether this botocore accepts ``algorithm`` as a ChecksumAlgorithm."""
+    try:
+        shape = client.meta.service_model.operation_model(
+            "PutObject").input_shape.members["ChecksumAlgorithm"]
+    except Exception:
+        return True
+    allowed = getattr(shape, "enum", None)
+    return not allowed or algorithm in allowed
+
+
+def drop_unsendable_checksum_args(client, args: dict) -> dict:
+    """
+    Remove checksum arguments this botocore cannot send.
+
+    The same trap as IfNoneMatch: ChecksumType and the CRC64NVME algorithm
+    are recent additions, and boto3 refuses an unknown one client-side
+    before any request goes out — so an upload with checksums turned on
+    failed outright rather than falling back. Dropping them costs the
+    whole-object checksum; keeping them costs the upload.
+
+    Mutates and returns ``args``, which is already a per-call copy.
+    """
+    if not args:
+        return args
+    if "ChecksumType" in args and not client_accepts(
+            client, "CreateMultipartUpload", "ChecksumType"):
+        args.pop("ChecksumType", None)
+    algorithm = args.get("ChecksumAlgorithm")
+    if algorithm and not client_knows_checksum(client, algorithm):
+        # Without an algorithm the type means nothing either.
+        args.pop("ChecksumAlgorithm", None)
+        args.pop("ChecksumType", None)
+    return args
+
+
 class Model:
     # Parallel multipart threads per transfer; user-tunable at runtime via
     # set_transfer_concurrency ("Transfer settings…" in the UI).
@@ -979,7 +1058,7 @@ class Model:
             if rule.get("tags"):
                 # S3 wants the tag set as a url-encoded query string here.
                 args["Tagging"] = urlencode(sorted(rule["tags"].items()))
-        return args
+        return drop_unsendable_checksum_args(self.client, args)
 
     def clone_for_worker(self):
         """
@@ -3135,7 +3214,8 @@ class Model:
             self.client.complete_multipart_upload(
                 **(dict(complete, IfNoneMatch="*") if if_none_match
                    else complete))
-        except botocore.exceptions.ClientError as exc:
+        except (botocore.exceptions.ClientError,
+                botocore.exceptions.ParamValidationError) as exc:
             if not if_none_match:
                 raise
             if self._object_already_there(exc):
@@ -3176,6 +3256,11 @@ class Model:
         precondition exists to prevent — so only a plain "not implemented",
         or a complaint naming the header itself, counts.
         """
+        if isinstance(exc, botocore.exceptions.ParamValidationError):
+            # boto3 refused the argument before sending anything: the
+            # installed botocore predates IfNoneMatch. Same outcome as a
+            # backend without conditional writes, and nothing was written.
+            return "ifnonematch" in str(exc).lower()
         response = getattr(exc, "response", None) or {}
         error = response.get("Error") or {}
         code = str(error.get("Code", ""))
@@ -3184,6 +3269,18 @@ class Model:
             return True
         text = f"{code} {error.get('Message', '')}".lower()
         return "if-none-match" in text or "ifnonematch" in text
+
+    def supports_conditional_create(self) -> bool:
+        """
+        Whether this build can send IfNoneMatch at all.
+
+        Both routes a conditional upload may take have to carry it — the
+        single PUT and the completion of a multipart upload — so a botocore
+        that knows only one of them still cannot promise "skip existing".
+        """
+        return (client_accepts(self.client, "PutObject", "IfNoneMatch")
+                and client_accepts(self.client, "CompleteMultipartUpload",
+                                   "IfNoneMatch"))
 
     def _put_object_if_absent(self, local_file, key, size, progress_cb=None,
                               cancel_event=None, log_fn=None) -> bool:
@@ -3211,7 +3308,8 @@ class Model:
                         handle, size, key, progress_cb,
                         cancel_event=cancel_event, limiter=self.rate_limiter),
                     IfNoneMatch="*", **extra)
-        except botocore.exceptions.ClientError as exc:
+        except (botocore.exceptions.ClientError,
+                botocore.exceptions.ParamValidationError) as exc:
             if self._object_already_there(exc):
                 raise ObjectExists(key) from exc
             if self._conditional_write_unsupported(exc):
@@ -3249,6 +3347,16 @@ class Model:
             total = os.path.getsize(local_file)
         except Exception:
             total = None
+
+        if if_none_match and not self.supports_conditional_create():
+            # An installed botocore too old to know the parameter would raise
+            # ParamValidationError on every single upload. The paths below
+            # recover from that, but only after the bytes have been sent, so
+            # the cheap check happens here instead — once, before any work.
+            if log_fn:
+                log_fn("this boto3 build has no conditional writes "
+                       "(IfNoneMatch); uploading without the precondition")
+            if_none_match = False
 
         if if_none_match and total is not None:
             # boto3's managed upload cannot carry the precondition — IfNoneMatch
@@ -4187,7 +4295,9 @@ class Model:
             raise TransferCancelled("cancelled")
         resp = self.client.get_object(Bucket=self.bucket, Key=src_key)
         body = resp["Body"]
-        extra = self._carried_extra_args(resp, dst_model.upload_extra_args)
+        extra = drop_unsendable_checksum_args(
+            dst_model.client,
+            self._carried_extra_args(resp, dst_model.upload_extra_args))
         callback = None
         if progress_cb is not None:
             callback = _BotoProgressAdapter(
@@ -4240,7 +4350,8 @@ class Model:
         dst_client, _endpoint, _region, _use_path = self._try_bind_bucket(dst_bucket)
         resp = self.client.get_object(Bucket=self.bucket, Key=src_key)
         body = resp["Body"]
-        extra = self._carried_extra_args(resp, self.upload_extra_args)
+        extra = drop_unsendable_checksum_args(
+            dst_client, self._carried_extra_args(resp, self.upload_extra_args))
 
         dst_client.upload_fileobj(
             body, dst_bucket, dst_key,
@@ -5423,8 +5534,32 @@ class Model:
                 raise self.PreconditionFailed(
                     "The object changed on the server since it was opened.")
 
+        # IfMatch is old on GetObject but was added to PutObject in the same
+        # 2024 wave as IfNoneMatch, so an older botocore refuses it before
+        # the request goes out. Standing down here keeps Save working; the
+        # by-hand ETag check below is the same degradation a backend without
+        # conditional writes already gets.
+        if expected and not client_accepts(self.client, "PutObject", "IfMatch"):
+            if log_fn:
+                log_fn("this boto3 build has no conditional writes "
+                       "(If-Match); checking the ETag by hand")
+            _verify_by_hand()
+            expected = ""
+
         try:
             resp = _put(bool(expected))
+        except botocore.exceptions.ParamValidationError as exc:
+            # The probe above should have caught this; a refusal here still
+            # means the parameter never left, so Save degrades rather than
+            # failing on a build whose model says one thing and whose
+            # validator does another.
+            if not expected or "ifmatch" not in str(exc).lower():
+                raise
+            if log_fn:
+                log_fn("this boto3 build has no conditional writes "
+                       "(If-Match); checking the ETag by hand")
+            _verify_by_hand()
+            resp = _put(False)
         except botocore.exceptions.ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
             status = exc.response.get(

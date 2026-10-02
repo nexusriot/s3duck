@@ -17,7 +17,7 @@ import cryptography
 from PyQt6.QtCore import PYQT_VERSION_STR, QT_VERSION_STR
 from PyQt6.QtGui import QIcon, QImageReader
 
-from model import CHECKSUM_ALGORITHMS
+from model import CHECKSUM_ALGORITHMS, installed_sdk_accepts
 from utils import ICON_PROBE_SIZE, bundled_icon, icon_is_visible
 
 try:
@@ -157,6 +157,15 @@ def collect(root, *, version="", model=None, profile_name="") -> list:
             # Which upload checksums this install can both send and verify
             # locally; the list is built from that, not from what S3 accepts.
             ("Checksums available", ", ".join(CHECKSUM_ALGORITHMS)),
+            # A distribution's python3-botocore often predates these, and the
+            # app then quietly drops the parameter rather than failing the
+            # upload — which is exactly the question someone reads this
+            # report to answer.
+            ("Conditional writes (If-None-Match)",
+             _yes_no(installed_sdk_accepts("PutObject", "IfNoneMatch"))),
+            ("Whole-object checksums (ChecksumType)",
+             _yes_no(installed_sdk_accepts("CreateMultipartUpload",
+                                           "ChecksumType"))),
         ]),
     ]
     if model is not None:

@@ -58,7 +58,7 @@ from theme import apply_theme, THEMES
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.23.0"
+__VERSION__ = "0.23.1"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 

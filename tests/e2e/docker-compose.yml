@@ -59,3 +59,36 @@ services:
     volumes:
       # Read-only: the suite must not be able to edit the tree it is testing.
       - ../..:/app:ro
+
+  # The same suite against the oldest SDK this app supports, because the
+  # version is a dimension the backend cannot stand in for.
+  #
+  # Users who install the .deb get the distribution's python3-botocore, not
+  # the pin in requirements.txt. boto3 validates arguments client-side
+  # against the service model it ships with, so a parameter S3 gained after
+  # that build — IfNoneMatch, IfMatch on PutObject, ChecksumType — raises
+  # ParamValidationError before a request goes out. That is not a
+  # ClientError, so it bypasses every "the backend cannot do this" fallback
+  # in the app: overwrite protection failed every upload, and Save failed
+  # every in-place edit, on a machine where nothing was wrong with the
+  # backend at all. A run here is the only thing that exercises standing
+  # down from them.
+  #
+  # 1.26.76 is the floor rather than any particular distribution's version:
+  # guard the oldest supported and the ones above it follow.
+  runner-old:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BOTO3_VERSION: "1.26.76"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      S3DUCK_TEST_ENDPOINT: http://minio:9000
+      S3DUCK_TEST_ACCESS_KEY: minioadmin
+      S3DUCK_TEST_SECRET_KEY: minioadmin
+      S3DUCK_TEST_REGION: us-east-1
+    volumes:
+      - ../..:/app:ro
