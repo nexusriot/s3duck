@@ -17,12 +17,20 @@ import cryptography
 from PyQt6.QtCore import PYQT_VERSION_STR, QT_VERSION_STR
 from PyQt6.QtGui import QIcon, QImageReader
 
+from model import CHECKSUM_ALGORITHMS
 from utils import ICON_PROBE_SIZE, bundled_icon, icon_is_visible
 
 try:
     from PyQt6 import QtSvg
 except ImportError:
     QtSvg = None
+
+try:
+    import awscrt
+    from awscrt import checksums as _crt_checksums
+except ImportError:
+    awscrt = None
+    _crt_checksums = None
 
 try:
     from PyQt6 import QtPdf
@@ -145,6 +153,10 @@ def collect(root, *, version="", model=None, profile_name="") -> list:
             ("boto3", getattr(boto3, "__version__", "?")),
             ("botocore", getattr(botocore, "__version__", "?")),
             ("cryptography", getattr(cryptography, "__version__", "?")),
+            ("awscrt", awscrt_version()),
+            # Which upload checksums this install can both send and verify
+            # locally; the list is built from that, not from what S3 accepts.
+            ("Checksums available", ", ".join(CHECKSUM_ALGORITHMS)),
         ]),
     ]
     if model is not None:
@@ -193,6 +205,18 @@ def collect(root, *, version="", model=None, profile_name="") -> list:
              str(getattr(model, "upload_state_dir", "?"))),
         ]))
     return sections
+
+
+def awscrt_version() -> str:
+    """The awscrt build in use, or why its checksums are unavailable.
+
+    Without it CRC32C and CRC64NVME are simply not offered: botocore needs
+    it to send them and this app needs it to verify them, so the two halves
+    are missing together rather than one outliving the other.
+    """
+    if _crt_checksums is None:
+        return "not installed (no CRC32C / CRC64NVME)"
+    return getattr(awscrt, "__version__", "installed")
 
 
 def _yes_no(value) -> str:

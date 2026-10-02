@@ -55,14 +55,14 @@ pull request:
 - **Download as ZIP** — stream a selection (files and whole folders) straight into one archive, without staging it on disk twice
 - **Drag out** — drag objects from the list onto a file manager; the selection is downloaded to a temp folder first, with progress and a size warning. Staged payloads are removed when the app exits, and a crashed run's leftovers are reclaimed on the next start
 - **Resumable uploads** — a large upload is sent part by part with its upload id recorded, so an interrupted transfer resumes instead of restarting; a cancelled one deliberately leaves the parts on the server (clean them up from Incomplete uploads)
-- **Resumable downloads** — large files download as parallel ranges into a `.s3duckpart` file with a progress sidecar, so an interrupted transfer picks up where it stopped instead of restarting (a changed ETag discards the stale partial)
+- **Resumable downloads** — large files download as parallel ranges into a `.s3duckpart` file with a progress sidecar, so an interrupted transfer picks up where it stopped instead of restarting (a changed ETag discards the stale partial). This applies to every download route — a single file, a whole folder, a sync, a drag-out — because they all go through one per-object path rather than each deciding for itself
 - **Upload rules by destination** — `archive/* -> class=GLACIER, tag:team=infra`: a small per-profile table that decides the storage class and tags from the key an upload is heading for, so a storage policy is applied rather than remembered
 - **Content-Type detection** — every upload is stamped with a type derived from the file extension, so a public link renders in a browser instead of downloading as `binary/octet-stream`; the table is overridable per extension, and the object context menu's "Fix Content-Type from extension" re-stamps objects that were uploaded before (or by something else)
-- **Additional checksums** — upload with CRC32/SHA1/SHA256; CRC32 is requested as a whole-object checksum so multipart objects stay verifiable, unlike a multipart ETag
-- **Checksum verification** — optionally compare each downloaded file against the object's stored digest and fail the transfer on a mismatch. A multipart object is settled by asking the service for its real part boundaries (`GetObjectAttributes`) and rebuilding the composite digest from them, so "multipart, not comparable" is now the exception rather than the rule; where a backend does not implement that call, verification still degrades to reporting the object as not comparable rather than failing it (MinIO does implement it — the end-to-end suite checks)
+- **Additional checksums** — upload with CRC32/SHA1/SHA256, plus CRC32C and CRC64NVME (AWS's own current default) where `awscrt` is installed. Every CRC is requested as a whole-object checksum, so multipart objects stay verifiable unlike a multipart ETag. The list is built from what this machine can *recompute*, not from what S3 accepts: an algorithm we could send but not reproduce would make every verified download a verification that never happened, so the two halves appear and disappear together (Tools → Diagnostics…, which names the ones available here)
+- **Checksum verification** — optionally compare each downloaded file against the object's stored digest and fail the transfer on a mismatch, for every file of a whole-folder download as much as for a single object. A multipart object is settled by asking the service for its real part boundaries (`GetObjectAttributes`) and rebuilding the composite digest from them, so "multipart, not comparable" is now the exception rather than the rule; where a backend does not implement that call, verification still degrades to reporting the object as not comparable rather than failing it (MinIO does implement it — the end-to-end suite checks)
 - **Parallel transfers** — configurable number of files moving at once *and* multipart connections within each file; applies to uploads, downloads (including whole prefixes) and sync
 - **Transfer settings** — files in flight, connections per file, bandwidth limit, multipart part size and threshold, resumable uploads, automatic retry of transient failures, the per-listing entry limit, the session log file, Content-Type detection with its override table, the upload rules by destination, plus the storage class, checksum and server-side encryption (SSE-S3 / SSE-KMS) applied to uploads — all persisted across sessions
-- **Overwrite protection** — uploads (dialog, folder upload and drag-in), downloads (single files *and* whole folders), copies, moves, renames and pastes all detect existing destinations and offer Skip / Overwrite / Cancel
+- **Overwrite protection** — uploads (dialog, folder upload and drag-in), downloads (single files *and* whole folders), copies, moves, renames and pastes all detect existing destinations and offer Skip / Overwrite / Cancel. For uploads the answer is then *enforced by the service*: unless you chose Overwrite, every write carries an `If-None-Match` precondition, so an object that appears after the check — the gap a check-then-write always leaves — is refused and reported as skipped instead of being replaced. A backend without conditional writes degrades to the old check-then-write and says so in the log
 - **Sync with a local folder** (`Ctrl+E`) — compare a directory against a prefix in either direction, review a dry-run plan (upload / download / delete / skip with a reason per file), then run it through the queue; supports exclude globs (`*.tmp`, `node_modules/`) and optionally deleting extras at the destination
 - **Transfer queue** — queued jobs with per-row progress, cancel, and retry for failed or cancelled entries; "Retry failed" re-queues every failure at once, and a job the service itself asked us to repeat (throttling, 5xx, a dropped connection) is retried once automatically
 - **Transfer history** — a persisted log of past jobs (when, what, bytes, outcome) with one-click re-run for small jobs, from the queue panel
@@ -72,6 +72,7 @@ pull request:
 - **Undo delete** (`Ctrl+Z`) — on a versioning-enabled bucket a delete only writes a delete marker, so the last delete can be rolled back by removing those markers
 - **Clipboard** (`Ctrl+C` / `Ctrl+X` / `Ctrl+V`) — copy or cut a selection and paste it into any folder or bucket; copying also puts the `s3://` URIs on the system clipboard for use elsewhere
 - **Copy / Move** — server-side copy or move of a multi-selection, within a bucket or **across buckets**; when the destination lives in another region or account (where a server-side copy is impossible) the object is streamed through instead of failing
+- **Objects over 5 GiB** — S3 refuses a `CopyObject` whose source is larger than that, which used to be a hard failure for every copy onto itself: rename, bulk rename, paste, change storage class, edit metadata and "Fix Content-Type". Such an object is now rebuilt at the destination from `UploadPartCopy` ranges, which the service still performs itself — not the streaming fallback, and no part of it travels through this machine. Where the listing already knows the size, the doomed single copy is skipped rather than bought with a request
 - **Rename** — in-place rename of a file or folder (server-side copy + delete), on the context menu or `F2`
 - **Bulk rename** (`Shift+F2`) — rename a whole selection by find-and-replace (optionally regex, with backreferences) or a `{name}/{ext}/{n}` numbering template, with a live preview and duplicate/invalid-name checks
 - **Create folder** — creates an S3 prefix placeholder
@@ -154,6 +155,15 @@ S3DUCK_TEST_ACCESS_KEY=... S3DUCK_TEST_SECRET_KEY=... \
     python -m unittest discover -s tests/e2e -t .
 ```
 
+MinIO archived its open-source server in 2025 — `quay.io/minio/minio` stopped
+granting anonymous pulls, the Docker Hub repository went away, and `dl.min.io`
+answers `410 Gone` for every community binary — so the compose file names the
+Alpine project's rebuild of the final community release, pinned to that exact
+upstream tag. It stays on MinIO rather than moving to another server because
+half the limitations documented here are statements about how MinIO behaves,
+and a different backend would answer differently and quietly stop checking
+them. `S3DUCK_TEST_MINIO_IMAGE` overrides the image if you host your own.
+
 The runner image holds boto3 and nothing else: `model.py` imports no Qt, so
 this needs no display and no PyQt6. Alongside the round trips it records what
 the backend under test actually implements — `GetObjectAttributes`,
@@ -169,6 +179,7 @@ that stops being true shows up as a test result rather than as stale prose.
 | boto3         | ≥ 1.42   | AWS / S3-compatible SDK          |
 | cryptography  | ≥ 46.0   | Fernet credential encryption     |
 | keyring       | optional | Keep the credential key in the OS secret store |
+| awscrt        | optional | CRC32C and CRC64NVME upload checksums          |
 | pyinstaller   | ≥ 6.18   | Binary packaging (optional)      |
 
 ---

@@ -30,6 +30,16 @@ class ReadOnlyError(Exception):
     """Raised when a write is attempted on a profile marked read-only."""
 
 
+class ObjectExists(Exception):
+    """
+    A conditional write was refused because the key was already taken.
+
+    Raised instead of overwriting, so a job the user asked to skip existing
+    objects for keeps that promise even when the object appeared after the
+    destination was checked.
+    """
+
+
 class DeleteRefused(Exception):
     """Raised when DeleteObjects answered 200 but refused individual keys."""
 
@@ -95,10 +105,97 @@ def as_epoch(value) -> float:
         return 0.0
 
 
-# Checksums S3 can store that we can also recompute locally. CRC32C is
-# deliberately absent: it needs a third-party module, and an algorithm we
-# cannot verify would pass every download unchecked.
-CHECKSUM_ALGORITHMS = ("CRC32", "SHA1", "SHA256")
+# Checksums S3 can store, and how to recompute one here. An algorithm we
+# cannot recompute locally is worse than none at all, because verification
+# would then pass every download unchecked -- so what the UI offers is built
+# from what this machine can actually compute, not from what S3 accepts.
+#
+# CRC32, SHA1 and SHA256 come from the standard library. CRC32C and CRC64NVME
+# need awscrt, which is also the module botocore itself computes them with, so
+# the two halves -- sending the checksum and verifying it afterwards -- appear
+# and disappear together rather than one silently outliving the other.
+try:
+    from awscrt import checksums as _crt_checksums
+except Exception:  # pragma: no cover - depends on what is installed
+    _crt_checksums = None
+
+# Which algorithms the installed botocore can actually send. Asking it rather
+# than assuming keeps one out of the UI on an SDK that would reject the
+# parameter outright. The name is private, hence the guard and the fallback
+# to the set every supported botocore has had.
+try:
+    from botocore.httpchecksum import (
+        _SUPPORTED_CHECKSUM_ALGORITHMS as _BOTOCORE_CHECKSUM_NAMES)
+except Exception:  # pragma: no cover - private name, guarded on purpose
+    _BOTOCORE_CHECKSUM_NAMES = ("crc32", "sha1", "sha256")
+
+
+class _CrcDigest:
+    """A CRC accumulated over blocks, answered the way S3 stores it."""
+
+    def __init__(self, fn, width):
+        self._fn = fn
+        self._width = width
+        self._value = 0
+
+    def update(self, block):
+        self._value = self._fn(block, self._value)
+
+    def b64(self) -> str:
+        fmt = ">I" if self._width == 4 else ">Q"
+        mask = (1 << (self._width * 8)) - 1
+        return base64.b64encode(
+            struct.pack(fmt, self._value & mask)).decode()
+
+
+class _HashDigest:
+    """A hashlib digest, answered the way S3 stores it."""
+
+    def __init__(self, name):
+        self._digest = hashlib.new(name)
+
+    def update(self, block):
+        self._digest.update(block)
+
+    def b64(self) -> str:
+        return base64.b64encode(self._digest.digest()).decode()
+
+
+def _checksum_digests() -> dict:
+    """Algorithm name -> factory for something that digests blocks."""
+    out = {
+        "CRC32": lambda: _CrcDigest(zlib.crc32, 4),
+        "SHA1": lambda: _HashDigest("sha1"),
+        "SHA256": lambda: _HashDigest("sha256"),
+    }
+    if _crt_checksums is not None:
+        sendable = {str(name).upper() for name in _BOTOCORE_CHECKSUM_NAMES}
+        for name, attr, width in (("CRC32C", "crc32c", 4),
+                                  ("CRC64NVME", "crc64nvme", 8)):
+            fn = getattr(_crt_checksums, attr, None)
+            if fn is not None and name in sendable:
+                out[name] = (lambda fn=fn, width=width:
+                             _CrcDigest(fn, width))
+    return out
+
+
+CHECKSUM_DIGESTS = _checksum_digests()
+
+# What the UI offers and the order a stored checksum is looked for in.
+CHECKSUM_ALGORITHMS = tuple(
+    name for name in ("CRC32", "CRC32C", "CRC64NVME", "SHA1", "SHA256")
+    if name in CHECKSUM_DIGESTS
+)
+
+# Every checksum S3 may have stored, computable here or not. Recognising one
+# we cannot compute is what lets a download say why it was not verified
+# instead of reporting a comparison that never happened.
+KNOWN_CHECKSUM_ALGORITHMS = ("CRC32", "CRC32C", "CRC64NVME", "SHA1", "SHA256")
+
+# CRCs compose across parts, so S3 can keep a whole-object checksum for a
+# multipart upload instead of a per-part composite. CRC64NVME is full-object
+# only -- it has no composite form at all.
+FULL_OBJECT_CHECKSUMS = ("CRC32", "CRC32C", "CRC64NVME")
 
 # What an object gets when nothing better is known. S3's own default for a
 # body uploaded without a Content-Type.
@@ -363,6 +460,55 @@ class _BotoProgressAdapter:
         self.cb(self.total, cur, self.key)
 
 
+class _ProgressReader:
+    """
+    A request body that paces, reports progress and can be cancelled while
+    it is being read.
+
+    The managed transfer gets all three from its Callback; a request this
+    file sends itself has no callback, so it gets them from the body. Bytes
+    are only charged and reported the first time they go past: botocore may
+    rewind and re-read a seekable body — to compute a checksum, or to retry
+    a request — and billing the shared bandwidth ceiling twice for one
+    upload is exactly the bug that would otherwise hide in here.
+    """
+
+    def __init__(self, handle, total, key, cb, cancel_event=None,
+                 limiter=None):
+        self._handle = handle
+        self.total = max(1, int(total or 0))
+        self.key = key
+        self.cb = cb
+        self.cancel_event = cancel_event
+        self.limiter = limiter
+        self._high = 0
+
+    def read(self, size=-1):
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise TransferCancelled("cancelled")
+        block = self._handle.read(-1 if size is None else size)
+        if not block:
+            return block
+        position = self._handle.tell()
+        fresh = position - self._high
+        if fresh > 0:
+            self._high = position
+            if self.limiter is not None:
+                self.limiter.consume(fresh)
+            if self.cb is not None:
+                self.cb(self.total, min(position, self.total), self.key)
+        return block
+
+    def seek(self, offset, whence=0):
+        return self._handle.seek(offset, whence)
+
+    def tell(self):
+        return self._handle.tell()
+
+    def seekable(self):
+        return True
+
+
 class Model:
     # Parallel multipart threads per transfer; user-tunable at runtime via
     # set_transfer_concurrency ("Transfer settings…" in the UI).
@@ -396,6 +542,20 @@ class Model:
     MIN_MULTIPART_CHUNKSIZE_MB = 5      # S3's own floor for a non-final part
     MAX_MULTIPART_CHUNKSIZE_MB = 512
     PART_SUFFIX = ".s3duckpart"
+
+    # CopyObject refuses a source bigger than this. Past it the only
+    # server-side route is a multipart upload whose parts are UploadPartCopy
+    # ranges of the source — still server-side, still no bytes through this
+    # process, but a different call that has to be made deliberately.
+    MAX_SINGLE_COPY_BYTES = 5 * 1024 * 1024 * 1024
+    MIN_COPY_PART_BYTES = 5 * 1024 * 1024   # S3's floor for a non-final part
+    MAX_MULTIPART_PARTS = 10000             # S3's ceiling on part count
+
+    # What a by-hand multipart upload names when the user configured no
+    # checksum of their own. It is not a preference: botocore 1.36 and newer
+    # put exactly this on every UploadPart whether we ask or not, so saying
+    # it out loud on CreateMultipartUpload is what keeps the two agreeing.
+    DEFAULT_PART_CHECKSUM = "CRC32"
 
     def __init__(
         self,
@@ -637,10 +797,11 @@ class Model:
         algorithm = str(checksum_algorithm or "").upper()
         if algorithm in CHECKSUM_ALGORITHMS:
             args["ChecksumAlgorithm"] = algorithm
-            if algorithm == "CRC32":
+            if algorithm in FULL_OBJECT_CHECKSUMS:
                 # Without this a multipart upload stores a per-part composite,
                 # which is as unverifiable as a multipart ETag. Only the CRC
-                # algorithms support a whole-object checksum.
+                # algorithms support a whole-object checksum; CRC64NVME has no
+                # other form, so S3 would reject a composite request for it.
                 args["ChecksumType"] = "FULL_OBJECT"
             self.checksum_algorithm = algorithm
         else:
@@ -965,8 +1126,41 @@ class Model:
             config_args["proxies"] = proxies
         params.update({"config": botocore.config.Config(**config_args)})
         client = self.session.client("s3", **params)
+        self._register_ranged_checksum_guard(client)
         if self.requester_pays:
             self._register_requester_pays(client)
+        return client
+
+    @staticmethod
+    def _skip_range_response_checksum(params=None, context=None, **_kwargs):
+        """
+        Take response-checksum validation off a ranged GET.
+
+        botocore 1.36 and newer put ChecksumMode=ENABLED on every GetObject
+        and then compare the body they receive against the checksum the
+        service returned. AWS omits that header on a partial response — a
+        whole-object digest cannot describe a slice of the object — but a
+        backend that returns it anyway makes botocore compare the slice
+        against the whole and raise FlexibleChecksumError every time. Every
+        ranged read then fails, which is every download past the resume
+        threshold: on such a backend no large file could be fetched at all.
+
+        Only the ranged reads are narrowed. A whole-object GET is still
+        validated, because there the comparison means something.
+        """
+        headers = (params or {}).get("headers") or {}
+        if not any(str(name).lower() == "range" for name in headers):
+            return
+        checksum = (context or {}).get("checksum")
+        if checksum:
+            checksum.pop("response_algorithms", None)
+
+    def _register_ranged_checksum_guard(self, client):
+        # before-call, because botocore resolves the checksum context just
+        # before emitting it — the one point where the decision is made and
+        # the request headers are both visible.
+        client.meta.events.register(
+            "before-call.s3.GetObject", self._skip_range_response_checksum)
         return client
 
     def _register_requester_pays(self, client):
@@ -1768,7 +1962,10 @@ class Model:
             # parallel-files setting would do nothing for "download a folder".
             run_parallel(
                 plan.files,
-                lambda item: _download_one(self.bucket, item[0], item[1], item[2]),
+                lambda item: self._download_object(
+                    item[0], item[1], size=item[2], progress_cb=progress_cb,
+                    cancel_event=cancel_event, log_fn=log_fn,
+                    fetch=_download_one),
                 self.parallel_files,
                 cancel_event=cancel_event,
             )
@@ -1787,35 +1984,55 @@ class Model:
                     f"'{local_name}' is outside '{folder_path}'"
                 )
 
-        size = None
+        self._download_object(key, local_name, progress_cb=progress_cb,
+                              cancel_event=cancel_event, log_fn=log_fn,
+                              fetch=_download_one)
+
+    def _download_object(self, key, out_path, size=None, progress_cb=None,
+                         cancel_event=None, log_fn=None, fetch=None):
+        """
+        Download one object the way every download should behave: resumable
+        when it is large, verified when verification is on.
+
+        Both callers go through here. They used to not: a single object got
+        the ranged path and the digest check, while each file of a whole
+        folder went straight to the managed transfer — so the setting that
+        exists to catch a corrupt download did nothing for a folder, and the
+        large file most likely to be interrupted was the one that could not
+        resume.
+
+        *size*, when a listing already supplied it, is what decides whether
+        the object is large. The HEAD that fetches the stored digest is only
+        paid for when something will actually use it.
+        """
         etag = ""
         head = None
-        try:
+        ranged = size is None or int(size) >= int(self.resume_threshold)
+
+        if ranged or self.verify_downloads:
             if cancel_event is not None and cancel_event.is_set():
                 raise TransferCancelled("cancelled")
-            head = self.head_with_checksum(key)
-            size = head.get("ContentLength")
-            etag = self.normalize_etag(head.get("ETag"))
-        except TransferCancelled:
-            raise
-        except Exception as exc:
-            if self._is_region_error(exc):
-                if log_fn:
-                    log_fn(f"Region error on head_object for '{key}': {exc}")
-                self.rebind_bucket(log_fn=log_fn)
+            for attempt in (1, 2):
                 try:
                     head = self.head_with_checksum(key)
                     size = head.get("ContentLength")
                     etag = self.normalize_etag(head.get("ETag"))
-                except Exception:
-                    pass  # non-fatal; proceed without size
+                    break
+                except TransferCancelled:
+                    raise
+                except Exception as exc:
+                    if attempt == 2 or not self._is_region_error(exc):
+                        break  # non-fatal; proceed without size
+                    if log_fn:
+                        log_fn(f"Region error on head_object for '{key}': {exc}")
+                    self.rebind_bucket(log_fn=log_fn)
 
         if cancel_event is not None and cancel_event.is_set():
             raise TransferCancelled("cancelled")
 
         # ensure parent dir exists (cheap safety)
         try:
-            parent = os.path.dirname(local_name)
+            parent = os.path.dirname(out_path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
         except Exception:
@@ -1825,15 +2042,15 @@ class Model:
         # instead of starting over; small ones stay on the managed transfer.
         if size is not None and int(size) >= int(self.resume_threshold):
             self._download_ranged(
-                key, local_name, size, etag, progress_cb=progress_cb,
+                key, out_path, size, etag, progress_cb=progress_cb,
                 cancel_event=cancel_event, log_fn=log_fn,
             )
             return
 
-        _download_one(self.bucket, key, local_name, size)
+        fetch(self.bucket, key, out_path, size)
 
         if self.verify_downloads and (etag or head):
-            if not self.verify_download(local_name, etag, head=head,
+            if not self.verify_download(out_path, etag, head=head,
                                         log_fn=log_fn, key=key):
                 raise Exception(
                     f"Checksum mismatch after downloading '{key}'; the local "
@@ -1867,24 +2084,19 @@ class Model:
         """
         The object checksum S3 would report for this file, base64-encoded.
 
-        Only algorithms computable from the standard library are offered —
-        CRC32C would need a third-party module, and a checksum we cannot
-        recompute locally is worse than none because it would silently pass.
+        Only algorithms this machine can recompute are accepted — a checksum
+        we cannot reproduce is worse than none, because it would silently
+        pass every download instead of comparing anything.
         """
         name = str(algorithm or "").upper()
-        if name not in CHECKSUM_ALGORITHMS:
+        factory = CHECKSUM_DIGESTS.get(name)
+        if factory is None:
             raise ValueError(f"unsupported checksum algorithm: {algorithm}")
-        if name == "CRC32":
-            crc = 0
-            with open(path, "rb") as handle:
-                for block in iter(lambda: handle.read(chunk_size), b""):
-                    crc = zlib.crc32(block, crc)
-            return base64.b64encode(struct.pack(">I", crc & 0xFFFFFFFF)).decode()
-        digest = hashlib.new("sha1" if name == "SHA1" else "sha256")
+        digest = factory()
         with open(path, "rb") as handle:
             for block in iter(lambda: handle.read(chunk_size), b""):
                 digest.update(block)
-        return base64.b64encode(digest.digest()).decode()
+        return digest.b64()
 
     def get_object_parts(self, key: str, version_id: str = "") -> list:
         """
@@ -1957,10 +2169,8 @@ class Model:
         """
         name = str(algorithm or "").upper()
         md5 = hashlib.md5()
-        crc = 0
-        digest = None
-        if name in ("SHA1", "SHA256"):
-            digest = hashlib.new("sha1" if name == "SHA1" else "sha256")
+        factory = CHECKSUM_DIGESTS.get(name)
+        digest = factory() if factory is not None else None
         remaining = int(length)
         while remaining > 0:
             block = handle.read(min(1024 * 1024, remaining))
@@ -1968,17 +2178,9 @@ class Model:
                 break
             remaining -= len(block)
             md5.update(block)
-            if name == "CRC32":
-                crc = zlib.crc32(block, crc)
-            elif digest is not None:
+            if digest is not None:
                 digest.update(block)
-        if name == "CRC32":
-            checksum = base64.b64encode(
-                struct.pack(">I", crc & 0xFFFFFFFF)).decode()
-        elif digest is not None:
-            checksum = base64.b64encode(digest.digest()).decode()
-        else:
-            checksum = ""
+        checksum = digest.b64() if digest is not None else ""
         return checksum, md5.digest()
 
     @classmethod
@@ -2097,9 +2299,24 @@ class Model:
 
     @staticmethod
     def stored_checksum(head) -> tuple:
-        """(algorithm, value) from a head_object response, or ("", "")."""
+        """
+        (algorithm, value) from a head_object response, or ("", "").
+
+        A checksum this machine can recompute is preferred over one it
+        cannot: an object carrying only a CRC64NVME on a build without awscrt
+        must not shadow an ETag that is still perfectly comparable. The
+        uncomputable one is still returned when it is all there is, so the
+        caller can say why nothing was compared.
+        """
+        head = head or {}
         for name in CHECKSUM_ALGORITHMS:
-            value = (head or {}).get(f"Checksum{name}")
+            value = head.get(f"Checksum{name}")
+            if value:
+                return name, str(value)
+        for name in KNOWN_CHECKSUM_ALGORITHMS:
+            if name in CHECKSUM_DIGESTS:
+                continue
+            value = head.get(f"Checksum{name}")
             if value:
                 return name, str(value)
         return "", ""
@@ -2116,6 +2333,14 @@ class Model:
         too does this report "not comparable" and pass.
         """
         algorithm, expected = self.stored_checksum(head)
+        if algorithm and algorithm not in CHECKSUM_DIGESTS:
+            # Stored with an algorithm this build cannot reproduce. Falling
+            # through to the ETag compares something real; pretending the
+            # checksum matched would not.
+            if log_fn:
+                log_fn(f"checksum skipped ({algorithm} needs the awscrt "
+                       f"module): {path}")
+            algorithm, expected = "", ""
         if algorithm and expected:
             if self.checksum_is_composite(expected):
                 verdict = self._verify_by_parts(
@@ -2806,7 +3031,7 @@ class Model:
             marker = following
 
     def _upload_resumable(self, local_file, key, size, progress_cb=None,
-                          cancel_event=None, log_fn=None):
+                          cancel_event=None, log_fn=None, if_none_match=False):
         """
         Upload a large file part by part so an interruption can resume.
 
@@ -2821,6 +3046,14 @@ class Model:
         mtime = os.path.getmtime(local_file)
         state_path = self._upload_state_path(key, local_file)
         extra = self.upload_args_for(local_file, key)
+        # CreateMultipartUpload is sent what we pass and nothing more, while
+        # botocore adds a default checksum to every UploadPart on its own.
+        # A service that checks a part against the upload it belongs to then
+        # refuses all of them ("Checksum Type mismatch, expected: null,
+        # actual: crc32"), which no amount of retrying fixes. Naming the
+        # algorithm makes the two agree and changes nothing on the wire that
+        # the SDK was not already sending.
+        extra.setdefault("ChecksumAlgorithm", self.DEFAULT_PART_CHECKSUM)
 
         upload_id = self._read_upload_state(
             state_path, key, size, mtime, chunk)
@@ -2893,9 +3126,28 @@ class Model:
                   if field != "Size"}
                  for entry in sorted(done.values(),
                                      key=lambda p: p["PartNumber"])]
-        self.client.complete_multipart_upload(
-            Bucket=self.bucket, Key=key, UploadId=upload_id,
-            MultipartUpload={"Parts": parts})
+        # The precondition belongs on the completion: that is the moment the
+        # object appears, and the only point in a multipart upload a service
+        # can still refuse without having already replaced anything.
+        complete = dict(Bucket=self.bucket, Key=key, UploadId=upload_id,
+                        MultipartUpload={"Parts": parts})
+        try:
+            self.client.complete_multipart_upload(
+                **(dict(complete, IfNoneMatch="*") if if_none_match
+                   else complete))
+        except botocore.exceptions.ClientError as exc:
+            if not if_none_match:
+                raise
+            if self._object_already_there(exc):
+                # The parts stay: aborting here would throw away a transfer
+                # whose outcome the caller may yet want to retry over the top.
+                raise ObjectExists(key) from exc
+            if not self._conditional_write_unsupported(exc):
+                raise
+            if log_fn:
+                log_fn(f"this backend has no conditional writes; completing "
+                       f"'{key}' without the precondition")
+            self.client.complete_multipart_upload(**complete)
         # Only now is the record useless.
         try:
             os.remove(state_path)
@@ -2904,10 +3156,86 @@ class Model:
         if log_fn:
             log_fn(f"uploaded {key} in {total_parts} part(s)")
 
-    def upload_file(self, local_file, key, progress_cb=None, cancel_event=None, log_fn=None):
+    @staticmethod
+    def _object_already_there(exc) -> bool:
+        """Whether a conditional write was refused because the key is taken."""
+        response = getattr(exc, "response", None) or {}
+        code = (response.get("Error") or {}).get("Code", "")
+        status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+        return code in ("PreconditionFailed", "ConditionalRequestConflict") \
+            or status in (412, 409)
+
+    @staticmethod
+    def _conditional_write_unsupported(exc) -> bool:
+        """
+        Whether the backend has no conditional writes at all, as opposed to
+        having refused this particular one.
+
+        Deliberately narrow. A broad reading would turn an unrelated failure
+        into a silent unconditional retry, which is the one outcome the
+        precondition exists to prevent — so only a plain "not implemented",
+        or a complaint naming the header itself, counts.
+        """
+        response = getattr(exc, "response", None) or {}
+        error = response.get("Error") or {}
+        code = str(error.get("Code", ""))
+        status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+        if code in ("NotImplemented", "XNotImplemented") or status == 501:
+            return True
+        text = f"{code} {error.get('Message', '')}".lower()
+        return "if-none-match" in text or "ifnonematch" in text
+
+    def _put_object_if_absent(self, local_file, key, size, progress_cb=None,
+                              cancel_event=None, log_fn=None) -> bool:
+        """
+        PutObject carrying IfNoneMatch, so a key that appeared since the
+        destination check is refused rather than silently overwritten.
+
+        Returns False when the backend has no conditional writes, leaving the
+        caller to fall back; raises ObjectExists when the key was taken.
+        """
+        if cancel_event is not None and cancel_event.is_set():
+            raise TransferCancelled("cancelled")
+        extra = dict(self.upload_args_for(local_file, key) or {})
+        # PutObject has no ChecksumType — a single PUT is a whole object by
+        # construction — and sending it is a hard ParamValidationError.
+        extra.pop("ChecksumType", None)
+        total = max(1, int(size or 0))
+        if progress_cb is not None:
+            progress_cb(total, 0, key)
+        try:
+            with open(local_file, "rb") as handle:
+                self.client.put_object(
+                    Bucket=self.bucket, Key=key,
+                    Body=_ProgressReader(
+                        handle, size, key, progress_cb,
+                        cancel_event=cancel_event, limiter=self.rate_limiter),
+                    IfNoneMatch="*", **extra)
+        except botocore.exceptions.ClientError as exc:
+            if self._object_already_there(exc):
+                raise ObjectExists(key) from exc
+            if self._conditional_write_unsupported(exc):
+                if log_fn:
+                    log_fn(f"this backend has no conditional writes; "
+                           f"uploading '{key}' without the precondition")
+                return False
+            raise
+        if progress_cb is not None:
+            progress_cb(total, int(size or 0), key)
+        return True
+
+    def upload_file(self, local_file, key, progress_cb=None, cancel_event=None,
+                    log_fn=None, if_none_match=False):
         """
         Upload a file (with progress) or create a folder placeholder if local_file is None.
         Automatically retries once on region/endpoint errors.
+
+        ``if_none_match`` asks the service to refuse the write if the key is
+        already taken, raising ObjectExists. Checking the destination first
+        and then writing is a snapshot with a gap after it; the precondition
+        is what closes the gap, so "skip existing" means it even when the
+        object appears mid-job. A backend without conditional writes degrades
+        to the old check-then-write, and says so in the log.
         """
         self._guard_write()
         if local_file is None:
@@ -2921,6 +3249,42 @@ class Model:
             total = os.path.getsize(local_file)
         except Exception:
             total = None
+
+        if if_none_match and total is not None:
+            # boto3's managed upload cannot carry the precondition — IfNoneMatch
+            # is not in s3transfer's allowed ExtraArgs — so a conditional
+            # upload goes through the calls this file makes itself. A large
+            # file therefore takes the resumable writer even when resumable
+            # uploads are off: it is the only multipart path we control.
+            def _do_conditional():
+                """True when the write happened; False to fall through."""
+                if int(total) < self.multipart_threshold_bytes:
+                    return self._put_object_if_absent(
+                        local_file, key, total, progress_cb=progress_cb,
+                        cancel_event=cancel_event, log_fn=log_fn)
+                self._upload_resumable(
+                    local_file, key, total, progress_cb=progress_cb,
+                    cancel_event=cancel_event, log_fn=log_fn,
+                    if_none_match=True)
+                return True
+
+            # The same one-shot rebind the other two routes have. Without it
+            # this method's own promise — retry once on a region error —
+            # stopped holding the moment the user chose to skip existing
+            # objects.
+            try:
+                if _do_conditional():
+                    return
+            except (TransferCancelled, ObjectExists):
+                raise
+            except Exception as exc:
+                if not self._is_region_error(exc):
+                    raise
+                if log_fn:
+                    log_fn(f"Region error uploading '{key}': {exc}")
+                self.rebind_bucket(log_fn=log_fn)
+                if _do_conditional():
+                    return
 
         if (self.resumable_uploads and total is not None
                 and int(total) >= self.multipart_threshold_bytes):
@@ -3886,19 +4250,185 @@ class Model:
         if log_fn:
             log_fn(f"streamed {src_key} -> {dst_bucket}/{dst_key}")
 
+    # Codes a service answers when CopyObject is refused for the source's
+    # size. None of them is distinctive — AWS says InvalidRequest, which is
+    # also what a copy onto itself that changes nothing returns — so the
+    # source gets measured rather than the message parsed.
+    COPY_TOO_LARGE_CODES = (
+        "InvalidRequest", "EntityTooLarge", "InvalidArgument",
+    )
+
+    @classmethod
+    def copy_part_size(cls, size, preferred=0) -> int:
+        """
+        Part size for a multipart copy of an object of *size* bytes.
+
+        Large enough that the object fits in S3's 10 000 parts, never below
+        its 5 MiB floor for a non-final part. The configured multipart chunk
+        size is honoured when it satisfies both.
+        """
+        size = int(size)
+        needed = (size + cls.MAX_MULTIPART_PARTS - 1) // cls.MAX_MULTIPART_PARTS
+        return max(int(preferred or 0), needed, cls.MIN_COPY_PART_BYTES)
+
+    def _oversized_copy_source(self, exc, src_key, src_bucket="") -> int:
+        """
+        The source's size when a CopyObject was refused for being too big,
+        else 0.
+
+        Measuring beats matching the message: the wording differs between
+        AWS, MinIO and Ceph, while the 5 GiB rule does not.
+        """
+        response = getattr(exc, "response", None) or {}
+        code = (response.get("Error") or {}).get("Code", "")
+        if code not in self.COPY_TOO_LARGE_CODES:
+            return 0
+        try:
+            head = self.client.head_object(
+                Bucket=src_bucket or self.bucket, Key=src_key)
+            size = int(head.get("ContentLength") or 0)
+        except Exception:
+            return 0
+        return size if size > self.MAX_SINGLE_COPY_BYTES else 0
+
+    def _copy_create_args(self, src_key, *, src_bucket="", extra=None) -> dict:
+        """
+        What CreateMultipartUpload must be told so a multipart copy preserves
+        what CopyObject would have preserved on its own.
+
+        CopyObject has MetadataDirective=COPY; a multipart upload has no such
+        thing — it defines the new object outright, so anything not passed
+        here is lost. *extra* is the caller's own intent (a new storage class,
+        replacement metadata) and wins over what the source carried.
+        """
+        args = {}
+        try:
+            head = self.client.head_object(
+                Bucket=src_bucket or self.bucket, Key=src_key)
+        except Exception:
+            head = {}
+        for field in ("ContentType", "CacheControl", "ContentDisposition",
+                      "ContentEncoding", "ContentLanguage", "StorageClass",
+                      "ServerSideEncryption", "SSEKMSKeyId",
+                      "WebsiteRedirectLocation"):
+            value = head.get(field)
+            if value:
+                args[field] = value
+        metadata = head.get("Metadata") or {}
+        if metadata:
+            args["Metadata"] = dict(metadata)
+        args.update(extra or {})
+        return args
+
+    def _copy_multipart(self, src_key, dst_key, *, size, dst_bucket="",
+                        src_bucket="", create_args=None, log_fn=None,
+                        cancel_event=None):
+        """
+        Server-side copy of an object too large for a single CopyObject.
+
+        S3 caps a CopyObject source at 5 GiB. Past that the object is rebuilt
+        at the destination out of UploadPartCopy ranges, which the service
+        still performs itself — this is not the streaming fallback, and no
+        part of the object travels through this process.
+        """
+        self._guard_write()
+        dst_bucket = dst_bucket or self.bucket
+        src_bucket = src_bucket or self.bucket
+        size = int(size)
+        part = self.copy_part_size(size, self.multipart_chunksize_bytes)
+        total_parts = max(1, (size + part - 1) // part)
+        copy_source = {"Bucket": src_bucket, "Key": src_key}
+
+        upload_id = self.client.create_multipart_upload(
+            Bucket=dst_bucket, Key=dst_key, **(create_args or {})
+        )["UploadId"]
+        parts = {}
+        lock = threading.Lock()
+
+        def _copy_part(number):
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+            start = (number - 1) * part
+            end = min(start + part, size) - 1
+            resp = self.client.upload_part_copy(
+                Bucket=dst_bucket, Key=dst_key, UploadId=upload_id,
+                PartNumber=number, CopySource=copy_source,
+                CopySourceRange=f"bytes={start}-{end}",
+            )
+            result = resp.get("CopyPartResult") or {}
+            entry = {"PartNumber": number, "ETag": result.get("ETag")}
+            for field, value in result.items():
+                if field.startswith("Checksum"):
+                    entry[field] = value
+            with lock:
+                parts[number] = entry
+
+        try:
+            run_parallel(list(range(1, total_parts + 1)), _copy_part,
+                         self.transfer_concurrency, cancel_event=cancel_event)
+            self.client.complete_multipart_upload(
+                Bucket=dst_bucket, Key=dst_key, UploadId=upload_id,
+                MultipartUpload={"Parts": [parts[n] for n in sorted(parts)]},
+            )
+        except Exception:
+            # Nothing here is resumable the way an upload is: the parts are
+            # copies the service made, not bytes this machine still holds, so
+            # leaving them behind would only bill for an upload that nobody
+            # is coming back to finish.
+            try:
+                self.client.abort_multipart_upload(
+                    Bucket=dst_bucket, Key=dst_key, UploadId=upload_id)
+            except Exception:
+                pass
+            raise
+        if log_fn:
+            log_fn(f"copied {src_key} -> {dst_bucket}/{dst_key} server-side "
+                   f"in {total_parts} part(s)")
+
     def copy_object(self, src_key: str, dst_key: str, dst_bucket: str = None,
-                    log_fn=None, allow_stream=True):
+                    log_fn=None, allow_stream=True, size=None,
+                    cancel_event=None):
         """
         Copy one object, server-side when possible.
 
-        A cross-region or cross-account destination cannot be reached by the
-        source's client, so on those errors the bytes are streamed through this
-        process instead of failing.
+        Three routes, cheapest first. A single CopyObject handles almost
+        everything. A source over S3's 5 GiB copy limit is rebuilt from
+        UploadPartCopy ranges, which is still server-side. Only a
+        cross-region or cross-account destination — which the source's client
+        cannot reach at all — falls back to moving the bytes through this
+        process.
+
+        *size*, when the caller already knows it, saves the round trip that
+        would otherwise be spent discovering the limit by being refused.
         """
         self._guard_write()
         dst_bucket = dst_bucket or self.bucket
         cross_bucket = dst_bucket != self.bucket
         copy_source = {"Bucket": self.bucket, "Key": src_key}
+
+        def _multipart(known_size):
+            try:
+                self._copy_multipart(
+                    src_key, dst_key, size=known_size, dst_bucket=dst_bucket,
+                    create_args=self._copy_create_args(src_key),
+                    log_fn=log_fn, cancel_event=cancel_event)
+            except botocore.exceptions.ClientError as exc:
+                # The size route and the location route are independent: a
+                # destination this client cannot reach refuses the multipart
+                # copy exactly as it refuses the single one, and the answer
+                # is the same fallback.
+                code = exc.response.get("Error", {}).get("Code", "")
+                if not (allow_stream and cross_bucket
+                        and code in self.CROSS_LOCATION_CODES):
+                    raise
+                if log_fn:
+                    log_fn(f"Multipart copy refused ({code}); streaming "
+                           f"'{src_key}' to bucket '{dst_bucket}' instead")
+                self._stream_copy(src_key, dst_key, dst_bucket, log_fn=log_fn)
+
+        if size is not None and int(size) > self.MAX_SINGLE_COPY_BYTES:
+            _multipart(int(size))
+            return
 
         def _do():
             self.client.copy_object(CopySource=copy_source, Bucket=dst_bucket, Key=dst_key)
@@ -3908,6 +4438,13 @@ class Model:
             return
         except botocore.exceptions.ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
+            oversized = self._oversized_copy_source(exc, src_key)
+            if oversized:
+                if log_fn:
+                    log_fn(f"'{src_key}' is over the {self.MAX_SINGLE_COPY_BYTES} "
+                           f"byte single-copy limit; copying it in parts")
+                _multipart(oversized)
+                return
             if (allow_stream and cross_bucket
                     and code in self.CROSS_LOCATION_CODES):
                 if log_fn:
@@ -3946,14 +4483,20 @@ class Model:
                     f"Destination '{dst_prefix}' is inside source "
                     f"'{src_prefix}'; copying a folder into itself is not allowed"
                 )
-        def _copy_one(key):
+        def _copy_one(item):
+            key, size = item
             rel = key[len(src_prefix):]
             dst_key = dst_prefix + rel
             if log_fn:
                 log_fn(f"copying {key} -> {dst_key}")
-            self.copy_object(key, dst_key, dst_bucket=dst_bucket, log_fn=log_fn)
+            # The listing already knows the size, so an object over the
+            # single-copy limit goes straight to the multipart route rather
+            # than spending a request to be told it is too big.
+            self.copy_object(key, dst_key, dst_bucket=dst_bucket,
+                             log_fn=log_fn, size=size,
+                             cancel_event=cancel_event)
 
-        keys = [k for k, _ in self.get_keys(src_prefix, log_fn=log_fn) if k]
+        keys = [(k, s) for k, s in self.get_keys(src_prefix, log_fn=log_fn) if k]
         run_parallel(keys, _copy_one, self.parallel_files,
                      cancel_event=cancel_event)
 
@@ -4341,10 +4884,27 @@ class Model:
             return True
         except botocore.exceptions.ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
+            # Order matters: an object already in the requested class also
+            # answers InvalidRequest, and rewriting a 50 GiB object in parts
+            # to change nothing is an expensive way to say "no-op".
             if code == "InvalidRequest" and _already_there():
                 if log_fn:
                     log_fn(f"{key} is already {storage_class}")
                 return False
+            oversized = self._oversized_copy_source(exc, key)
+            if oversized:
+                # A copy onto itself, in parts. The class is the whole point
+                # of the copy, so it is the one thing the source must not
+                # supply back.
+                if log_fn:
+                    log_fn(f"'{key}' is over the single-copy limit; "
+                           f"re-writing it in parts as {storage_class}")
+                self._copy_multipart(
+                    key, key, size=oversized,
+                    create_args=self._copy_create_args(
+                        key, extra={"StorageClass": storage_class}),
+                    log_fn=log_fn)
+                return True
             if not self._is_region_error(exc):
                 raise
             if log_fn:
@@ -4417,6 +4977,28 @@ class Model:
             self.client.copy_object(**params)
 
         try:
+            _do()
+        except botocore.exceptions.ClientError as exc:
+            oversized = self._oversized_copy_source(exc, key)
+            if oversized:
+                # The same REPLACE, in parts. CreateMultipartUpload takes the
+                # replacement fields directly, so the source is not consulted
+                # at all here — a REPLACE copy was never going to keep what
+                # the caller did not pass.
+                if log_fn:
+                    log_fn(f"'{key}' is over the single-copy limit; "
+                           f"re-writing its metadata in parts")
+                create = {field: value for field, value in params.items()
+                          if field not in ("CopySource", "Bucket", "Key",
+                                           "MetadataDirective")}
+                self._copy_multipart(key, key, size=oversized,
+                                     create_args=create, log_fn=log_fn)
+                return
+            if not self._is_region_error(exc):
+                raise
+            if log_fn:
+                log_fn(f"Region error setting metadata of '{key}': {exc}")
+            self.rebind_bucket(log_fn=log_fn)
             _do()
         except Exception as exc:
             if not self._is_region_error(exc):
@@ -4637,7 +5219,10 @@ class Model:
             return "", ""
 
         checksum = resp.get("Checksum") or {}
-        for name in CHECKSUM_ALGORITHMS:
+        # Every algorithm S3 may have stored counts here, not only the ones
+        # this build can recompute: comparing two stored digests to each
+        # other needs no local implementation of the algorithm at all.
+        for name in KNOWN_CHECKSUM_ALGORITHMS:
             value = checksum.get(f"Checksum{name}")
             if value and not self.checksum_is_composite(value):
                 return "full", f"{name}:{value}"
@@ -4651,7 +5236,7 @@ class Model:
         parts = []
         for part in node.get("Parts") or []:
             digest = ""
-            for name in CHECKSUM_ALGORITHMS:
+            for name in KNOWN_CHECKSUM_ALGORITHMS:
                 if part.get(f"Checksum{name}"):
                     digest = f"{name}:{part[f'Checksum{name}']}"
                     break

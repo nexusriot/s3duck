@@ -56,6 +56,10 @@ credential-storage choice in 0.18.0. What is left:
 
 - **Pause / resume for the transfer queue** — cancel+retry exists; a true
   pause that keeps partial state would round it out.
+- **Object Lock retention on a multipart copy** — a copy over 5 GiB is
+  rebuilt by CreateMultipartUpload, which does not inherit the source's
+  retention the way CopyObject does; the carried fields stop at metadata and
+  encryption.
 - **Trash convention** — optional "move to `.trash/` prefix" instead of
   delete, with an empty-trash action (complements undo-delete, which needs
   versioning).
@@ -75,10 +79,6 @@ credential-storage choice in 0.18.0. What is left:
 - **Cross-profile move** — copying between profiles landed; deleting the
   source afterwards (a true move) is the obvious follow-up, and needs the
   same are-you-sure care as any cross-account delete.
-- **CRC32C checksums** — CRC32/SHA1/SHA256 are supported because they can be
-  recomputed locally from the standard library. CRC32C would need
-  `google-crc32c`; offering an algorithm we cannot verify would silently pass
-  every download.
 - **S3 Select preview** — run simple SQL over CSV/JSON objects in the preview
   dialog instead of downloading them.
 - **QR code for presigned links** — hand a download link to a phone.
@@ -88,6 +88,28 @@ credential-storage choice in 0.18.0. What is left:
 - **Localization** — externalize user-facing strings.
 
 ## Known limitations (accepted for now)
+
+- A multipart upload this app drives itself names CRC32 explicitly on
+  `CreateMultipartUpload`, because botocore puts that same checksum on every
+  `UploadPart` whether it is asked to or not, and a service that checks a
+  part against the upload it belongs to refuses all of them otherwise. The
+  object therefore carries a per-part composite CRC32 unless a whole-object
+  checksum was configured, which is what the SDK was already sending.
+- A byte-range GET has response-checksum validation taken off it. AWS omits
+  the checksum header on a partial response; a backend that returns the
+  whole-object one anyway would otherwise have botocore compare a slice
+  against the whole and fail every ranged read — which is every download
+  past the resume threshold. A whole-object GET is still validated.
+
+- A multipart server-side copy gives the new object a multipart ETag, even
+  when the source had a plain one. The bytes are identical; the ETag is a
+  function of how the object was written, and a 5 GiB-plus object cannot be
+  written in one piece.
+- CRC32C and CRC64NVME need `awscrt`, which is also the module botocore
+  computes them with. Without it they are not offered at all, because an
+  algorithm this app could send but not recompute would make verification
+  pass every download unchecked. An object that already carries only a
+  CRC64NVME is reported as not comparable and settled on its ETag instead.
 
 - A cross-profile copy or sync cannot be re-run from transfer history: the
   stored record is JSON and never held the other profile's connection. The

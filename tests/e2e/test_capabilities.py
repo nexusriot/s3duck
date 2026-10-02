@@ -14,7 +14,7 @@ import urllib.request
 
 import botocore.exceptions
 
-from model import CHECKSUM_ALGORITHMS
+from model import CHECKSUM_ALGORITHMS, Model, ObjectExists
 from tests.e2e.harness import ServerCase
 
 
@@ -124,8 +124,19 @@ class ChecksumTests(ServerCase):
                     self.model.upload_file(src, key)
                     head = self.model.head_with_checksum(key)
                     name, value = self.model.stored_checksum(head)
-                    self.assertTrue(
-                        value, f"{algorithm} was not stored by the backend")
+                    if not value:
+                        # CRC32/SHA1/SHA256 have been in S3's flexible
+                        # checksums since they shipped, so a backend that
+                        # drops one is a backend this app is wrong about.
+                        # CRC32C and CRC64NVME are newer, and a server that
+                        # accepts the upload but stores nothing is a gap to
+                        # record rather than a bug here: verification falls
+                        # back to the ETag, which is what it did before.
+                        self.assertNotIn(
+                            algorithm, ("CRC32", "SHA1", "SHA256"),
+                            f"{algorithm} was not stored by the backend")
+                        print(f"\n    {algorithm}: accepted but not stored")
+                        continue
                     out = os.path.join(tmp, "out.bin")
                     self.model.verify_downloads = True
                     try:
@@ -314,3 +325,218 @@ class BackendCapabilityTests(ServerCase):
         if not ok:
             self.assertTrue(reason, "refused without saying why")
             print(f"\n    restore: refused — {reason}")
+
+
+class MultipartServerSideCopyTests(ServerCase):
+    """
+    S3 refuses a CopyObject whose source is over 5 GiB, so every copy onto
+    itself — rename, storage class, metadata — had a ceiling. The multipart
+    copy that replaces it is a different protocol, and whether a backend
+    implements UploadPartCopy at all is exactly the kind of claim this suite
+    exists to check rather than assume.
+
+    A real 5 GiB source is not worth a test run, so the part-by-part path is
+    driven directly: the routing above it is settled by the unit suite, and
+    what needs a server is whether the parts arrive and reassemble.
+    """
+
+    def setUp(self):
+        self.payload = os.urandom(12 * 1024 * 1024)     # 3 parts at 5 MiB
+        self.model.client.put_object(
+            Bucket=self.bucket, Key="copy/src.bin", Body=self.payload,
+            ContentType="application/x-duck",
+            Metadata={"owner": "vlad"})
+
+    def test_a_part_by_part_copy_reassembles_byte_for_byte(self):
+        self.model._copy_multipart(
+            "copy/src.bin", "copy/dst.bin", size=len(self.payload),
+            create_args=self.model._copy_create_args("copy/src.bin"))
+        self.assertEqual(self.body("copy/dst.bin"), self.payload)
+
+    def test_it_really_is_server_side(self):
+        """The ETag of the copy is multipart, which is only possible if the
+        service assembled it — a streamed copy of this size would too, so
+        the stronger evidence is that the bytes never passed through here:
+        UploadPartCopy is the only call that moved them."""
+        self.model._copy_multipart(
+            "copy/src.bin", "copy/side.bin", size=len(self.payload),
+            create_args=self.model._copy_create_args("copy/src.bin"))
+        head = self.model.client.head_object(Bucket=self.bucket,
+                                             Key="copy/side.bin")
+        self.assertIn("-", head["ETag"].strip('"'),
+                      "the copy is not multipart, so it was not assembled "
+                      "from parts")
+
+    def test_the_metadata_survives(self):
+        """CreateMultipartUpload defines the object outright; anything the
+        copy does not pass is simply gone."""
+        self.model._copy_multipart(
+            "copy/src.bin", "copy/meta.bin", size=len(self.payload),
+            create_args=self.model._copy_create_args("copy/src.bin"))
+        head = self.model.client.head_object(Bucket=self.bucket,
+                                             Key="copy/meta.bin")
+        self.assertEqual(head.get("ContentType"), "application/x-duck")
+        self.assertEqual(head.get("Metadata"), {"owner": "vlad"})
+
+    def test_a_failed_copy_leaves_no_billable_parts(self):
+        """A source that is not there fails after the upload has started, so
+        this is the abort path rather than a refusal before it."""
+        before = self.model.client.list_multipart_uploads(
+            Bucket=self.bucket).get("Uploads") or []
+        with self.assertRaises(Exception):
+            self.model._copy_multipart(
+                "copy/missing.bin", "copy/nope.bin", size=len(self.payload),
+                create_args={})
+        after = self.model.client.list_multipart_uploads(
+            Bucket=self.bucket).get("Uploads") or []
+        self.assertEqual(len(after), len(before),
+                         "an abandoned multipart upload was left behind")
+
+
+class ConditionalUploadTests(ServerCase):
+    """
+    Overwrite protection checks the destination and then writes, which is a
+    snapshot with a gap after it. IfNoneMatch closes the gap — where the
+    backend has it. Whether this one does is the claim under test.
+    """
+
+    def _upload(self, key, body, **kw):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "payload.bin")
+            with open(path, "wb") as handle:
+                handle.write(body)
+            self.model.upload_file(path, key, **kw)
+
+    def test_a_small_upload_is_refused_or_the_backend_says_it_cannot(self):
+        self.model.set_multipart_sizes(threshold_mb=16)
+        self.put("cond/small.txt", b"original")
+        try:
+            self._upload("cond/small.txt", b"replacement", if_none_match=True)
+        except ObjectExists:
+            self.assertEqual(self.body("cond/small.txt"), b"original")
+            print("\n    conditional upload: enforced")
+            return
+        # The documented degradation: no conditional writes here, so the
+        # write went through exactly as it did before this existed.
+        self.assertEqual(self.body("cond/small.txt"), b"replacement")
+        print("\n    conditional upload: not supported, degraded")
+
+    def test_a_free_key_is_not_refused(self):
+        """The other half: the precondition must not block a new object."""
+        self.model.set_multipart_sizes(threshold_mb=16)
+        self._upload("cond/free.txt", b"new", if_none_match=True)
+        self.assertEqual(self.body("cond/free.txt"), b"new")
+
+    def test_a_multipart_upload_carries_it_to_the_completion(self):
+        """That is the only point a multipart write can still be refused
+        without having already replaced anything.
+
+        An upload checksum is configured on purpose. Without one, botocore
+        adds a default CRC32 to UploadPart while CreateMultipartUpload
+        carries none, and a backend that checks the two against each other
+        rejects the part — which has nothing to do with the precondition
+        under test here.
+        """
+        self.model.set_multipart_sizes(threshold_mb=5, chunksize_mb=5)
+        self.model.resumable_uploads = True
+        self.model.set_upload_options(checksum_algorithm="CRC32")
+        self.addCleanup(self.model.set_upload_options, checksum_algorithm="")
+        payload = os.urandom(12 * 1024 * 1024)
+        self.put("cond/big.bin", b"original")
+        try:
+            self._upload("cond/big.bin", payload, if_none_match=True)
+        except ObjectExists:
+            self.assertEqual(self.body("cond/big.bin"), b"original")
+            print("\n    conditional completion: enforced")
+            return
+        self.assertEqual(self.body("cond/big.bin"), payload)
+        print("\n    conditional completion: not supported, degraded")
+
+
+class RangedReadTests(ServerCase):
+    """
+    Every download past the resume threshold is a series of byte-range GETs,
+    so whatever a backend does with checksums on a partial response decides
+    whether large files can be downloaded here at all.
+    """
+
+    def setUp(self):
+        self.payload = os.urandom(64 * 1024)
+        self.model.client.put_object(
+            Bucket=self.bucket, Key="rng/src.bin", Body=self.payload)
+
+    def test_a_byte_range_can_be_read(self):
+        """REGRESSION: botocore asks every GetObject to validate its body
+        against the checksum the service returned. AWS omits that header on
+        a partial response; a backend that returns the whole-object one
+        anyway made botocore compare a slice against the whole and fail
+        every ranged read — so no large file could be downloaded."""
+        resp = self.model.client.get_object(
+            Bucket=self.bucket, Key="rng/src.bin", Range="bytes=0-1023")
+        self.assertEqual(resp["Body"].read(), self.payload[:1024])
+        returned = {name for name in resp if name.startswith("Checksum")}
+        print(f"\n    ranged response checksums: {returned or 'none'}")
+
+    def test_a_whole_object_read_is_still_checked(self):
+        """The guard narrows the behaviour to ranged reads; it must not
+        switch validation off for the reads where it means something."""
+        resp = self.model.client.get_object(
+            Bucket=self.bucket, Key="rng/src.bin")
+        self.assertEqual(resp["Body"].read(), self.payload)
+
+    def test_a_large_download_arrives_whole(self):
+        """The path all of the above exists to serve."""
+        self.model.resume_threshold = 1
+        self.model.resume_chunk_size = 16 * 1024
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = os.path.join(tmp, "out.bin")
+                self.model.download_file("rng/src.bin", out, tmp)
+                with open(out, "rb") as handle:
+                    self.assertEqual(handle.read(), self.payload)
+        finally:
+            self.model.resume_threshold = Model.RESUME_THRESHOLD
+
+
+class PrefixDownloadTests(ServerCase):
+    """
+    A whole-folder download used to run through the managed transfer with no
+    digest check and no resume, while a single object got both. These are
+    the same promises, so they are tested against a real server the same way.
+    """
+
+    BODIES = {"tree/a.txt": b"alpha" * 1000,
+              "tree/sub/b.txt": b"beta" * 1000}
+
+    def setUp(self):
+        for key, body in self.BODIES.items():
+            self.model.client.put_object(
+                Bucket=self.bucket, Key=key, Body=body)
+
+    def test_a_folder_download_verifies_every_file(self):
+        self.model.verify_downloads = True
+        self.addCleanup(setattr, self.model, "verify_downloads", False)
+        logged = []
+        with tempfile.TemporaryDirectory() as tmp:
+            self.model.download_file("tree/", None, tmp, log_fn=logged.append)
+            for key, body in self.BODIES.items():
+                out = os.path.join(tmp, "tree", key[len("tree/"):])
+                with open(out, "rb") as handle:
+                    self.assertEqual(handle.read(), body)
+        checked = [line for line in logged if "checksum ok" in line]
+        self.assertEqual(len(checked), len(self.BODIES), logged)
+
+    def test_a_large_file_in_a_folder_download_is_resumable(self):
+        self.model.resume_threshold = 1
+        self.model.resume_chunk_size = 1024
+        self.addCleanup(setattr, self.model, "resume_threshold",
+                        Model.RESUME_THRESHOLD)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.model.download_file("tree/", None, tmp)
+            for key, body in self.BODIES.items():
+                out = os.path.join(tmp, "tree", key[len("tree/"):])
+                with open(out, "rb") as handle:
+                    self.assertEqual(handle.read(), body)
+                self.assertFalse(
+                    os.path.exists(out + Model.PART_SUFFIX),
+                    "a finished download left its partial file behind")

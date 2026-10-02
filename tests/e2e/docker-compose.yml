@@ -9,10 +9,18 @@ name: s3duck-e2e
 
 services:
   minio:
-    image: quay.io/minio/minio:latest
-    # A data volume is deliberately absent: the server is disposable, and
-    # a run that depended on what a previous one left behind would not be
-    # hermetic.
+    # MinIO archived its open-source server in 2025. quay.io/minio/minio no
+    # longer grants anonymous pulls, the Docker Hub repository is gone, and
+    # dl.min.io answers 410 for every community binary and hotfix — so the
+    # image this file used to name cannot be fetched by anyone any more.
+    #
+    # This is the Alpine project's rebuild of the FINAL community release,
+    # pinned to that exact upstream tag. Staying on MinIO matters more than
+    # staying current here: half of this project's documented limitations
+    # are statements about how MinIO behaves, and a different server would
+    # answer differently and quietly stop checking them. Override it with
+    # S3DUCK_TEST_MINIO_IMAGE to point at a MinIO you host yourself.
+    image: ${S3DUCK_TEST_MINIO_IMAGE:-alpine/minio:RELEASE.2025-10-15T17-29-55Z}
     command: server /data --address :9000
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -20,9 +28,17 @@ services:
       # Object Lock needs this off; it is a throwaway server on a private
       # compose network either way.
       MINIO_BROWSER: "off"
+    # tmpfs rather than a volume, for the reason the old file gave for
+    # having no volume at all: a run that depended on what a previous one
+    # left behind would not be hermetic. It also settles ownership, which a
+    # named volume does not — the server runs as uid 100 and a fresh volume
+    # arrives owned by root, which MinIO reports as "file access denied".
+    tmpfs:
+      - /data:uid=100,gid=101,mode=0750
     healthcheck:
-      # mc is in the image; curl is not.
-      test: ["CMD", "mc", "ready", "local"]
+      # This image carries no mc and no curl; wget is what it has.
+      test: ["CMD", "wget", "-q", "-O", "-",
+             "http://127.0.0.1:9000/minio/health/live"]
       interval: 2s
       timeout: 5s
       retries: 30

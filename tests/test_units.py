@@ -32,6 +32,10 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import botocore.exceptions
+try:
+    from awscrt import checksums as _crt_checksums
+except ImportError:
+    _crt_checksums = None
 from PyQt6 import sip
 from PyQt6.QtCore import (
     QByteArray, QEvent, QObject, QPointF, QRect, QSettings, Qt, QThread, QUrl,
@@ -85,7 +89,7 @@ from model import (
     Model, Item, FSObjectType, TransferCancelled, ReadOnlyError, run_parallel,
     RateLimiter, plan_prefix_download, prefix_of, CHECKSUM_ALGORITHMS,
     safe_local_path, DeleteRefused, local_name_is_writable,
-    MAX_LOCAL_NAME_BYTES,
+    MAX_LOCAL_NAME_BYTES, ObjectExists,
 )
 from properties_window import PropertiesWindow
 from settings import SettingsWindow
@@ -711,6 +715,18 @@ class DeleteBucketUsesBoundClientTests(unittest.TestCase):
         self.assertEqual(bound.calls_of("delete_bucket"), [])
 
 
+class _StubClient:
+    """Enough of a boto3 client for _make_client to finish: it registers
+    event handlers on whatever comes back, so a bare object() would make
+    these tests fail for a reason that has nothing to do with tokens."""
+
+    def __init__(self):
+        self.registered = []
+        self.meta = types.SimpleNamespace(
+            events=types.SimpleNamespace(
+                register=lambda name, handler: self.registered.append(name)))
+
+
 class SessionTokenTests(unittest.TestCase):
     """Temporary credentials (STS / SSO / assumed role) need a session token;
     without one those credentials cannot be used at all."""
@@ -722,7 +738,7 @@ class SessionTokenTests(unittest.TestCase):
         class FakeSession:
             def client(self, _name, **kw):
                 captured.update(kw)
-                return object()
+                return _StubClient()
 
         m.session = FakeSession()
         m._make_client()
@@ -735,11 +751,24 @@ class SessionTokenTests(unittest.TestCase):
         class FakeSession:
             def client(self, _name, **kw):
                 captured.update(kw)
-                return object()
+                return _StubClient()
 
         m.session = FakeSession()
         m._make_client()
         self.assertNotIn("aws_session_token", captured)
+
+    def test_every_client_gets_the_ranged_checksum_guard(self):
+        """It is not optional the way requester-pays is: a client built
+        without it cannot read a byte range on some backends at all."""
+        m = make_model()
+
+        class FakeSession:
+            def client(self, _name, **kw):
+                return _StubClient()
+
+        m.session = FakeSession()
+        client = m._make_client()
+        self.assertIn("before-call.s3.GetObject", client.registered)
 
     def test_clone_carries_the_token(self):
         m = make_model(session_token="TOKEN")
@@ -1441,6 +1470,245 @@ class CrossLocationCopyTests(unittest.TestCase):
                                allow_stream=False)
 
 
+class _CopyPartClient(FakeS3Client):
+    """A server that refuses an oversized CopyObject and records the
+    multipart copy that follows."""
+
+    def __init__(self, source_size=0, copy_error=None, fail_on_part=None,
+                 head=None, **kw):
+        super().__init__(**kw)
+        self.source_size = int(source_size)
+        self._copy_error = copy_error
+        self.fail_on_part = fail_on_part
+        self._head = dict(head or {})
+        self.created = []
+        self.ranges = []
+        self.completed = []
+        self.aborted = []
+
+    def head_object(self, **kw):
+        self.calls.append(("head_object", kw))
+        return dict(self._head, ContentLength=self.source_size)
+
+    def copy_object(self, **kw):
+        self.calls.append(("copy_object", kw))
+        if self._copy_error is not None:
+            raise self._copy_error
+        return {}
+
+    def create_multipart_upload(self, Bucket, Key, **kw):
+        self.created.append((Bucket, Key, kw))
+        return {"UploadId": "mpu-1"}
+
+    def upload_part_copy(self, **kw):
+        self.calls.append(("upload_part_copy", kw))
+        number = kw["PartNumber"]
+        self.ranges.append((number, kw["CopySourceRange"], kw["CopySource"]))
+        if self.fail_on_part == number:
+            raise RuntimeError("part copy failed")
+        return {"CopyPartResult": {"ETag": f'"part{number}"'}}
+
+    def complete_multipart_upload(self, **kw):
+        self.completed.append(kw)
+        return {"ETag": '"assembled"'}
+
+    def abort_multipart_upload(self, **kw):
+        self.aborted.append(kw)
+        return {}
+
+
+class MultipartServerSideCopyTests(unittest.TestCase):
+    """
+    S3 refuses a CopyObject whose source is over 5 GiB. Every copy onto
+    itself — rename, storage class, metadata, Content-Type — went through
+    that one call, so each of them failed outright on a large object while
+    the cross-bucket case quietly degraded to pulling the bytes through this
+    machine.
+    """
+
+    HUGE = Model.MAX_SINGLE_COPY_BYTES + 1
+
+    def setUp(self):
+        self.m = make_model(bucket="bkt")
+        self.m.transfer_concurrency = 1       # deterministic part order
+
+    @staticmethod
+    def _too_big():
+        return botocore.exceptions.ClientError(
+            {"Error": {"Code": "InvalidRequest",
+                       "Message": "The specified copy source is larger than "
+                                  "the maximum allowable size for a copy "
+                                  "source: 5368709120"}},
+            "CopyObject")
+
+    def test_part_size_never_goes_below_the_floor(self):
+        self.assertEqual(Model.copy_part_size(1), Model.MIN_COPY_PART_BYTES)
+        self.assertEqual(Model.copy_part_size(10, preferred=1024),
+                         Model.MIN_COPY_PART_BYTES)
+
+    def test_part_size_grows_so_the_object_fits_in_ten_thousand_parts(self):
+        """A 5 TiB object at the 5 MiB floor would need a million parts."""
+        size = 5 * 1024 ** 4
+        part = Model.copy_part_size(size, preferred=8 * 1024 * 1024)
+        self.assertLessEqual((size + part - 1) // part, Model.MAX_MULTIPART_PARTS)
+
+    def test_a_configured_chunk_size_is_honoured_when_it_fits(self):
+        self.assertEqual(
+            Model.copy_part_size(100 * 1024 * 1024, preferred=32 * 1024 * 1024),
+            32 * 1024 * 1024)
+
+    def test_a_known_oversized_source_skips_the_doomed_single_copy(self):
+        """THE POINT: the listing already knew the size, so the 5 GiB refusal
+        does not have to be bought with a request."""
+        c = _CopyPartClient(source_size=self.HUGE)
+        self.m._client = c
+        self.m.copy_object("big.bin", "copy.bin", size=self.HUGE)
+        self.assertEqual(c.calls_of("copy_object"), [])
+        self.assertEqual(len(c.completed), 1)
+
+    def test_an_oversized_source_is_copied_in_parts_server_side(self):
+        c = _CopyPartClient(source_size=self.HUGE, copy_error=self._too_big())
+        self.m._client = c
+        self.m.copy_object("big.bin", "copy.bin")
+
+        self.assertEqual(len(c.created), 1, "no multipart upload started")
+        part = Model.copy_part_size(self.HUGE, self.m.multipart_chunksize_bytes)
+        expected = (self.HUGE + part - 1) // part
+        self.assertEqual(len(c.ranges), expected)
+        # Contiguous, inclusive, and stopping at the last byte of the object.
+        first, last = c.ranges[0], c.ranges[-1]
+        self.assertEqual(first[1], f"bytes=0-{part - 1}")
+        self.assertEqual(last[1], f"bytes={(expected - 1) * part}-{self.HUGE - 1}")
+        self.assertEqual(first[2], {"Bucket": "bkt", "Key": "big.bin"})
+
+    def test_the_parts_are_completed_in_order(self):
+        """run_parallel finishes them in whatever order it likes; S3 rejects
+        a completion whose part numbers are not ascending."""
+        c = _CopyPartClient(source_size=self.HUGE, copy_error=self._too_big())
+        self.m._client = c
+        self.m.transfer_concurrency = 4
+        self.m.copy_object("big.bin", "copy.bin")
+        numbers = [p["PartNumber"]
+                   for p in c.completed[0]["MultipartUpload"]["Parts"]]
+        self.assertEqual(numbers, sorted(numbers))
+        self.assertEqual(numbers[0], 1)
+
+    def test_no_bytes_pass_through_this_process(self):
+        """The whole point of the multipart route: it is still server-side,
+        so it must not reach for the streaming fallback."""
+        c = _CopyPartClient(source_size=self.HUGE, copy_error=self._too_big())
+        self.m._client = c
+        self.m.copy_object("big.bin", "copy.bin")
+        self.assertEqual(c.calls_of("get_object"), [])
+
+    def test_a_failed_part_aborts_the_upload(self):
+        """Nothing here is resumable — the parts are copies the service made,
+        not bytes this machine still holds — so leaving them would bill for
+        an upload nobody is coming back to finish."""
+        c = _CopyPartClient(source_size=self.HUGE, copy_error=self._too_big(),
+                            fail_on_part=1)
+        self.m._client = c
+        with self.assertRaises(RuntimeError):
+            self.m.copy_object("big.bin", "copy.bin")
+        self.assertEqual([a["UploadId"] for a in c.aborted], ["mpu-1"])
+        self.assertEqual(c.completed, [])
+
+    def test_the_source_metadata_is_carried_onto_the_new_object(self):
+        """CopyObject preserves metadata by itself; a multipart upload defines
+        the object outright, so anything not passed here is lost."""
+        c = _CopyPartClient(
+            source_size=self.HUGE, copy_error=self._too_big(),
+            head={"ContentType": "text/csv", "CacheControl": "max-age=60",
+                  "Metadata": {"owner": "vlad"}})
+        self.m._client = c
+        self.m.copy_object("big.csv", "copy.csv")
+        _bucket, _key, kw = c.created[0]
+        self.assertEqual(kw.get("ContentType"), "text/csv")
+        self.assertEqual(kw.get("CacheControl"), "max-age=60")
+        self.assertEqual(kw.get("Metadata"), {"owner": "vlad"})
+
+    def test_a_small_object_refused_for_another_reason_is_not_rerouted(self):
+        """REGRESSION GUARD: InvalidRequest is also what a copy onto itself
+        that changes nothing returns. Measuring the source is what tells the
+        two apart; matching the code alone would reroute both."""
+        c = _CopyPartClient(source_size=1024, copy_error=self._too_big())
+        self.m._client = c
+        with self.assertRaises(botocore.exceptions.ClientError):
+            self.m.copy_object("small.bin", "copy.bin", allow_stream=False)
+        self.assertEqual(c.created, [])
+
+    def test_storage_class_of_a_huge_object_is_changed_in_parts(self):
+        c = _CopyPartClient(source_size=self.HUGE, copy_error=self._too_big(),
+                            head={"ContentType": "text/csv",
+                                  "StorageClass": "STANDARD_IA"})
+        self.m._client = c
+        self.assertTrue(self.m.change_storage_class("big.csv", "GLACIER"))
+        _bucket, key, kw = c.created[0]
+        self.assertEqual(key, "big.csv", "did not copy onto itself")
+        self.assertEqual(kw.get("StorageClass"), "GLACIER",
+                         "the source's class won over the requested one")
+        self.assertEqual(kw.get("ContentType"), "text/csv")
+
+    def test_metadata_of_a_huge_object_is_replaced_in_parts(self):
+        c = _CopyPartClient(source_size=self.HUGE, copy_error=self._too_big())
+        self.m._client = c
+        self.m.set_object_metadata("big.csv", content_type="text/csv",
+                                   metadata={"owner": "vlad"})
+        _bucket, key, kw = c.created[0]
+        self.assertEqual(key, "big.csv")
+        self.assertEqual(kw.get("ContentType"), "text/csv")
+        self.assertEqual(kw.get("Metadata"), {"owner": "vlad"})
+        self.assertNotIn("MetadataDirective", kw,
+                         "a multipart upload has no MetadataDirective")
+        self.assertNotIn("CopySource", kw)
+
+    def test_an_already_correct_class_is_a_no_op_even_on_a_huge_object(self):
+        """REGRESSION GUARD: an object already in the requested class also
+        answers InvalidRequest. Rewriting a 50 GiB object in parts to change
+        nothing is an expensive way to say no-op."""
+        c = _CopyPartClient(source_size=self.HUGE, copy_error=self._too_big(),
+                            head={"StorageClass": "GLACIER"})
+        self.m._client = c
+        self.assertFalse(self.m.change_storage_class("big.csv", "GLACIER"))
+        self.assertEqual(c.created, [], "rewrote the object to change nothing")
+
+    def test_a_huge_cross_region_copy_still_falls_back_to_streaming(self):
+        """The size route and the location route are independent: a bucket
+        this client cannot reach refuses the multipart copy exactly as it
+        refuses the single one."""
+        c = _CopyPartClient(source_size=self.HUGE)
+
+        def _refuse(**kw):
+            c.calls.append(("create_multipart_upload", kw))
+            raise botocore.exceptions.ClientError(
+                {"Error": {"Code": "PermanentRedirect", "Message": "elsewhere"}},
+                "CreateMultipartUpload")
+
+        c.create_multipart_upload = _refuse
+        c.get_object = lambda **kw: {"Body": io.BytesIO(b"payload")}
+        uploaded = []
+        c.upload_fileobj = (lambda body, bucket, key, **kw:
+                            uploaded.append((bucket, key)))
+        self.m._client = c
+        self.m._try_bind_bucket = lambda name: (c, "ep", "eu-north-1", True)
+        self.m.copy_object("big.bin", "copy.bin", dst_bucket="other",
+                           size=self.HUGE)
+        self.assertEqual(uploaded, [("other", "copy.bin")])
+
+    def test_a_prefix_copy_passes_the_size_it_already_listed(self):
+        """REGRESSION GUARD: a folder copy that re-discovers every size by
+        being refused pays a wasted request per large object."""
+        sizes = {}
+        self.m.get_keys = lambda prefix, log_fn=None: [
+            ("src/big.bin", self.HUGE), ("src/small.bin", 10)]
+        self.m.copy_object = (
+            lambda key, dst, dst_bucket=None, log_fn=None, size=None,
+            cancel_event=None: sizes.__setitem__(key, size))
+        self.m.copy_prefix("src/", "dst/")
+        self.assertEqual(sizes, {"src/big.bin": self.HUGE,
+                                 "src/small.bin": 10})
+
+
 class ChecksumTests(unittest.TestCase):
     def setUp(self):
         self.m = make_model(bucket="b")
@@ -1586,6 +1854,59 @@ class ResumableDownloadTests(unittest.TestCase):
                 m.download_file("big.bin", out, tmp)
             self.assertIn("Checksum mismatch", str(ctx.exception))
         m._client.head_object = original_head
+
+
+class RangedResponseChecksumTests(unittest.TestCase):
+    """
+    REGRESSION (every large download, on some backends): botocore 1.36 and
+    newer set ChecksumMode=ENABLED on every GetObject and then compare the
+    body they receive against the checksum the service returned. AWS omits
+    that header on a partial response — a whole-object digest cannot
+    describe a slice of the object — but a backend that returns it anyway
+    makes botocore compare the slice against the whole and raise
+    FlexibleChecksumError. Every ranged read then fails, which means no file
+    over the resume threshold can be downloaded at all.
+    """
+
+    def _emit(self, headers):
+        """Fire the real event on a real client and report the context."""
+        m = make_model(bucket="b")
+        context = {"checksum": {"response_algorithms": ["crc32"]}}
+        m.client.meta.events.emit(
+            "before-call.s3.GetObject",
+            model=m.client.meta.service_model.operation_model("GetObject"),
+            params={"headers": headers},
+            request_signer=None,
+            context=context,
+        )
+        return context["checksum"]
+
+    def test_a_ranged_get_does_not_validate_against_a_whole_object_digest(self):
+        self.assertNotIn("response_algorithms",
+                         self._emit({"Range": "bytes=0-1023"}))
+
+    def test_the_header_is_matched_however_it_is_spelled(self):
+        """botocore normalises header case on its own schedule; a guard that
+        only sees one spelling is a guard that stops working quietly."""
+        self.assertNotIn("response_algorithms",
+                         self._emit({"range": "bytes=0-1023"}))
+
+    def test_a_whole_object_get_still_validates(self):
+        """The check is worth keeping where it means something: this must
+        narrow the behaviour to ranged reads, not switch it off."""
+        self.assertEqual(self._emit({})["response_algorithms"], ["crc32"])
+
+    def test_a_request_without_a_checksum_context_is_left_alone(self):
+        m = make_model(bucket="b")
+        context = {}
+        m.client.meta.events.emit(
+            "before-call.s3.GetObject",
+            model=m.client.meta.service_model.operation_model("GetObject"),
+            params={"headers": {"Range": "bytes=0-9"}},
+            request_signer=None,
+            context=context,
+        )
+        self.assertEqual(context, {})
 
 
 class RateLimiterTests(unittest.TestCase):
@@ -2401,6 +2722,119 @@ class DownloadTraversalGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             m.download_file("k.txt", os.path.join(tmp, "k.txt"), "")
             self.assertEqual(len(c.calls_of("download_file")), 1)
+
+
+class _PrefixDownloadClient(FakeS3Client):
+    """A server holding a few objects under one prefix, able to hand back
+    whole files or byte ranges."""
+
+    def __init__(self, bodies, corrupt=()):
+        pages = [{"Contents": [{"Key": k, "Size": len(v)}
+                               for k, v in bodies.items()]}]
+        super().__init__(list_pages=pages)
+        self.bodies = dict(bodies)
+        # Keys whose advertised ETag will not match what they serve.
+        self.corrupt = set(corrupt)
+        self.ranges = []
+
+    def _etag(self, key):
+        if key in self.corrupt:
+            return '"' + "0" * 32 + '"'
+        return '"' + hashlib.md5(self.bodies[key]).hexdigest() + '"'
+
+    def head_object(self, **kw):
+        self.calls.append(("head_object", kw))
+        key = kw["Key"]
+        return {"ContentLength": len(self.bodies[key]),
+                "ETag": self._etag(key)}
+
+    def download_file(self, bucket, key, out_path, **kw):
+        self.calls.append(("download_file", {"args": (bucket, key, out_path),
+                                             "kwargs": kw}))
+        with open(out_path, "wb") as handle:
+            handle.write(self.bodies[key])
+
+    def get_object(self, **kw):
+        self.calls.append(("get_object", kw))
+        key = kw["Key"]
+        body = self.bodies[key]
+        rng = kw.get("Range")
+        if rng:
+            start, end = (int(n) for n in rng.split("=")[1].split("-"))
+            self.ranges.append((key, start, end))
+            body = body[start:end + 1]
+        return {"Body": io.BytesIO(body), "ContentLength": len(body)}
+
+
+class PrefixDownloadParityTests(unittest.TestCase):
+    """
+    REGRESSION (silent): "Verify downloads" and resumable downloads were
+    wired into the single-object path only. A whole-folder download ran
+    through the managed transfer and returned without ever comparing a
+    digest — so the setting that exists to catch a corrupt download did
+    nothing for the downloads most likely to be interrupted.
+    """
+
+    BODIES = {"docs/a.txt": b"alpha" * 10,
+              "docs/b.txt": b"beta" * 10,
+              "docs/sub/c.txt": b"gamma" * 10}
+
+    def _model(self, client, **attrs):
+        m = make_model(bucket="b")
+        m._client = client
+        m.parallel_files = 1            # deterministic order
+        m.resume_threshold = 1 << 30    # nothing is "large" unless asked
+        for name, value in attrs.items():
+            setattr(m, name, value)
+        return m
+
+    def test_every_file_in_a_folder_download_is_verified(self):
+        c = _PrefixDownloadClient(self.BODIES)
+        m = self._model(c, verify_downloads=True)
+        logged = []
+        with tempfile.TemporaryDirectory() as tmp:
+            m.download_file("docs/", None, tmp, log_fn=logged.append)
+            for key, body in self.BODIES.items():
+                out = os.path.join(tmp, "docs", key[len("docs/"):])
+                with open(out, "rb") as handle:
+                    self.assertEqual(handle.read(), body)
+        checked = [line for line in logged if "checksum ok" in line]
+        self.assertEqual(len(checked), len(self.BODIES), logged)
+
+    def test_a_corrupt_file_fails_the_folder_download(self):
+        """THE POINT: it used to succeed."""
+        c = _PrefixDownloadClient(self.BODIES, corrupt={"docs/b.txt"})
+        m = self._model(c, verify_downloads=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(Exception) as caught:
+                m.download_file("docs/", None, tmp)
+            self.assertIn("Checksum mismatch", str(caught.exception))
+
+    def test_verification_off_costs_no_extra_request(self):
+        """The cheap path has to stay cheap: a folder of small objects must
+        not grow a HEAD per file just because the code paths merged."""
+        c = _PrefixDownloadClient(self.BODIES)
+        m = self._model(c, verify_downloads=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            m.download_file("docs/", None, tmp)
+        self.assertEqual(c.calls_of("head_object"), [])
+        self.assertEqual(len(c.calls_of("download_file")), len(self.BODIES))
+
+    def test_a_large_file_in_a_folder_download_takes_the_ranged_path(self):
+        """Resumable downloads were single-object only too, so the 8 GiB
+        file inside a folder was the one that restarted from zero."""
+        c = _PrefixDownloadClient(self.BODIES)
+        m = self._model(c, resume_threshold=1)
+        m.resume_chunk_size = 16
+        with tempfile.TemporaryDirectory() as tmp:
+            m.download_file("docs/", None, tmp)
+            for key, body in self.BODIES.items():
+                out = os.path.join(tmp, "docs", key[len("docs/"):])
+                with open(out, "rb") as handle:
+                    self.assertEqual(handle.read(), body)
+        self.assertEqual(c.calls_of("download_file"), [],
+                         "still used the managed, non-resumable transfer")
+        self.assertTrue(c.ranges, "no ranged requests were made")
 
 
 class CopyPrefixGuardTests(unittest.TestCase):
@@ -4093,6 +4527,9 @@ class _MultipartClient:
         self.part_calls = []
         self.managed = []          # upload_file() calls (the boto3 fast path)
         self.aborted = []
+        self.completed_kw = {}
+        # Raised once by complete_multipart_upload, for the conditional paths.
+        self.fail_complete = None
 
     def create_multipart_upload(self, Bucket, Key, **kw):
         self.created += 1
@@ -4123,7 +4560,12 @@ class _MultipartClient:
                     "NextPartNumberMarker": head[-1]["PartNumber"]}
         return {"Parts": rows, "IsTruncated": False}
 
-    def complete_multipart_upload(self, Bucket, Key, UploadId, MultipartUpload):
+    def complete_multipart_upload(self, Bucket, Key, UploadId, MultipartUpload,
+                                  **kw):
+        self.completed_kw = kw
+        if self.fail_complete is not None:
+            error, self.fail_complete = self.fail_complete, None
+            raise error
         parts = self.uploads[UploadId]["parts"]
         order = [p["PartNumber"] for p in MultipartUpload["Parts"]]
         self.completed[Key] = b"".join(parts[n] for n in order)
@@ -4171,6 +4613,36 @@ class ResumableUploadTests(unittest.TestCase):
         self.assertEqual(client.completed["big.bin"], self.payload)
         self.assertEqual(sorted(n for n, _c in client.part_calls),
                          [1, 2, 3, 4])
+
+    def test_the_upload_and_its_parts_agree_on_a_checksum_algorithm(self):
+        """
+        REGRESSION: botocore 1.36 and newer add a default CRC32 to every
+        UploadPart, while CreateMultipartUpload is sent exactly what we pass
+        and nothing more. A backend that checks the two against each other
+        then rejects every part — "Checksum Type mismatch, expected: null,
+        actual: crc32" — and no resumable upload could complete at all.
+
+        Leaving the algorithm to the SDK is what caused it, so the fix is
+        to name it: the assertion is that it was named, not merely that the
+        two happen to agree on nothing.
+        """
+        client = _MultipartClient()
+        self._model(client).upload_file(self.path, "big.bin")
+        created = client.uploads["upload-1"]["kw"].get("ChecksumAlgorithm")
+        self.assertTrue(created,
+                        "CreateMultipartUpload left the algorithm to the SDK")
+        self.assertEqual({algo for _n, algo in client.part_calls}, {created},
+                         "the parts carry a different algorithm")
+
+    def test_a_configured_algorithm_is_not_overridden(self):
+        """The user's choice wins; the default only fills a gap."""
+        client = _MultipartClient()
+        model = self._model(client)
+        model.set_upload_options(checksum_algorithm="SHA256")
+        model.upload_file(self.path, "big.bin")
+        created = client.uploads["upload-1"]["kw"]
+        self.assertEqual(created.get("ChecksumAlgorithm"), "SHA256")
+        self.assertEqual({algo for _n, algo in client.part_calls}, {"SHA256"})
 
     def test_the_record_is_removed_once_the_upload_completes(self):
         self._model(_MultipartClient()).upload_file(self.path, "big.bin")
@@ -4653,7 +5125,7 @@ class DebianPackagingTests(unittest.TestCase):
     }
     # Imported behind a guard, so the app runs without them: these belong in
     # Recommends, and requiring them in Depends would be wrong.
-    OPTIONAL = {"keyring": "python3-keyring"}
+    OPTIONAL = {"keyring": "python3-keyring", "awscrt": "python3-awscrt"}
     # Needed at runtime without being imported: Qt loads these as plugins.
     RUNTIME_ONLY = {"python3-pyqt6.qtsvg"}
 
@@ -6093,6 +6565,235 @@ class _RecordingDest:
         self.folders.append(key)
 
 
+class _ConditionalPutClient(_MultipartClient):
+    """Records PutObject, optionally answering the precondition."""
+
+    def __init__(self, put_error=None, **kw):
+        super().__init__(**kw)
+        self.put_error = put_error
+        self.puts = []
+        # Called with the running byte count as the body is consumed.
+        self.on_body_read = None
+
+    def put_object(self, **kw):
+        self.puts.append(kw)
+        body = kw.get("Body")
+        if hasattr(body, "read"):
+            # A real service reads the body; cancellation and progress are
+            # only observable to a fake that does the same.
+            sofar = 0
+            while True:
+                block = body.read(8)
+                if not block:
+                    break
+                sofar += len(block)
+                if self.on_body_read is not None:
+                    self.on_body_read(sofar)
+        if self.put_error is not None:
+            error, self.put_error = self.put_error, None
+            raise error
+        return {"ETag": '"written"'}
+
+
+def _client_error(code, status=400, op="PutObject"):
+    return botocore.exceptions.ClientError(
+        {"Error": {"Code": code, "Message": code},
+         "ResponseMetadata": {"HTTPStatusCode": status}}, op)
+
+
+class ConditionalUploadTests(unittest.TestCase):
+    """
+    Overwrite protection was a snapshot: the destination was listed, the user
+    chose, and then the writes went out unconditionally. Anything appearing
+    in between was overwritten by a job whose whole instruction was to skip
+    what already existed.
+    """
+
+    PART = 1024
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.small = os.path.join(self.dir, "small.txt")
+        with open(self.small, "wb") as handle:
+            handle.write(b"duck")
+        self.big = os.path.join(self.dir, "big.bin")
+        self.payload = os.urandom(self.PART * 3)
+        with open(self.big, "wb") as handle:
+            handle.write(self.payload)
+
+    def _model(self, client, threshold_mb=1):
+        """threshold_mb=1 leaves small.txt on the single-PUT path;
+        threshold_mb=0 puts everything on the multipart one."""
+        m = make_model(bucket="bkt")
+        m._client = client
+        m.upload_chunk_size = self.PART
+        m.multipart_threshold_mb = threshold_mb
+        m.transfer_concurrency = 1
+        m.upload_state_dir = os.path.join(self.dir, "state")
+        return m
+
+    def test_a_small_upload_carries_the_precondition(self):
+        c = _ConditionalPutClient()
+        self._model(c).upload_file(self.small, "small.txt", if_none_match=True)
+        self.assertEqual(len(c.puts), 1)
+        self.assertEqual(c.puts[0]["IfNoneMatch"], "*")
+        self.assertEqual(c.managed, [], "went through the managed upload")
+
+    def test_without_the_flag_nothing_changes(self):
+        """The precondition is opt-in: an explicit Overwrite must still
+        overwrite, and that path is the managed upload as before."""
+        c = _ConditionalPutClient()
+        m = self._model(c)
+        m.multipart_threshold_mb = 1024
+        m.upload_file(self.small, "small.txt")
+        self.assertEqual(c.puts, [])
+        self.assertEqual(c.managed, ["small.txt"])
+
+    def test_checksum_type_is_not_sent_on_a_single_put(self):
+        """REGRESSION GUARD: PutObject has no ChecksumType — a single PUT is a
+        whole object by construction — and sending it is a hard
+        ParamValidationError, not something the service ignores."""
+        c = _ConditionalPutClient()
+        m = self._model(c)
+        m.set_upload_options(checksum_algorithm="CRC32")
+        m.upload_file(self.small, "small.txt", if_none_match=True)
+        self.assertEqual(c.puts[0].get("ChecksumAlgorithm"), "CRC32")
+        self.assertNotIn("ChecksumType", c.puts[0])
+
+    def test_a_taken_key_raises_instead_of_overwriting(self):
+        c = _ConditionalPutClient(
+            put_error=_client_error("PreconditionFailed", 412))
+        with self.assertRaises(ObjectExists):
+            self._model(c).upload_file(self.small, "small.txt",
+                                       if_none_match=True)
+
+    def test_a_backend_without_conditional_writes_degrades(self):
+        """It is the old check-then-write, which is still what the user got
+        yesterday — and it says so rather than failing the upload."""
+        logged = []
+        c = _ConditionalPutClient(
+            put_error=_client_error("NotImplemented", 501))
+        m = self._model(c)
+        m.multipart_threshold_mb = 1024
+        m.upload_file(self.small, "small.txt", if_none_match=True,
+                      log_fn=logged.append)
+        self.assertEqual(c.managed, ["small.txt"])
+        self.assertTrue(any("conditional" in line for line in logged), logged)
+
+    def test_an_unrelated_failure_is_not_retried_unconditionally(self):
+        """REGRESSION GUARD: reading every error as 'unsupported' would turn
+        the precondition into a slower way of overwriting."""
+        c = _ConditionalPutClient(put_error=_client_error("AccessDenied", 403))
+        with self.assertRaises(botocore.exceptions.ClientError):
+            self._model(c).upload_file(self.small, "small.txt",
+                                       if_none_match=True)
+        self.assertEqual(c.managed, [])
+
+    def test_a_region_error_is_retried_like_every_other_upload(self):
+        """REGRESSION: the conditional path returned early and skipped the
+        one-shot rebind every other upload route has, so upload_file's own
+        promise — "automatically retries once on region/endpoint errors" —
+        stopped being true the moment the user chose to skip existing
+        objects."""
+        c = _ConditionalPutClient(put_error=botocore.exceptions.ClientError(
+            {"Error": {"Code": "PermanentRedirect", "Message": "elsewhere"},
+             "ResponseMetadata": {"HTTPStatusCode": 301}}, "PutObject"))
+        m = self._model(c)
+        rebinds = []
+        m.rebind_bucket = lambda log_fn=None: rebinds.append(True)
+        m.upload_file(self.small, "small.txt", if_none_match=True)
+        self.assertEqual(len(rebinds), 1, "never rebound the bucket")
+        self.assertEqual(len(c.puts), 2, "never retried the write")
+        self.assertEqual(c.puts[-1]["IfNoneMatch"], "*",
+                         "the retry dropped the precondition")
+
+    def test_a_region_error_on_a_large_conditional_upload_is_retried(self):
+        c = _ConditionalPutClient()
+        c.fail_complete = botocore.exceptions.ClientError(
+            {"Error": {"Code": "PermanentRedirect", "Message": "elsewhere"},
+             "ResponseMetadata": {"HTTPStatusCode": 301}},
+            "CompleteMultipartUpload")
+        m = self._model(c, threshold_mb=0)
+        rebinds = []
+        m.rebind_bucket = lambda log_fn=None: rebinds.append(True)
+        m.upload_file(self.big, "big.bin", if_none_match=True)
+        self.assertEqual(len(rebinds), 1)
+        self.assertEqual(c.completed["big.bin"], self.payload)
+
+    def test_cancelling_a_conditional_upload_stops_it_mid_body(self):
+        """REGRESSION: the cancel event was only checked before the request,
+        so a conditional upload of a large-but-sub-threshold file ignored
+        Cancel until the whole body had been sent."""
+        cancel = threading.Event()
+        c = _ConditionalPutClient()
+        c.on_body_read = lambda sofar: cancel.set()
+        m = self._model(c)
+        with self.assertRaises(TransferCancelled):
+            m.upload_file(self.small, "small.txt", if_none_match=True,
+                          cancel_event=cancel)
+
+    def test_a_conditional_upload_reports_progress_as_it_goes(self):
+        """Not just 0 and then done: the single PUT is the only path for a
+        file just under the multipart threshold, which can be large."""
+        c = _ConditionalPutClient()
+        seen = []
+        m = self._model(c)
+        m.upload_file(self.small, "small.txt", if_none_match=True,
+                      progress_cb=lambda total, cur, key: seen.append(cur))
+        self.assertTrue(seen, "no progress at all")
+        self.assertEqual(seen[-1], os.path.getsize(self.small))
+
+    def test_the_rate_limiter_is_charged_for_what_was_actually_sent(self):
+        """Charging the whole file up front and then failing would bill the
+        shared ceiling for bytes that never left."""
+        charged = []
+        c = _ConditionalPutClient()
+        m = self._model(c)
+        m.rate_limiter = types.SimpleNamespace(
+            consume=lambda n: charged.append(n))
+        m.upload_file(self.small, "small.txt", if_none_match=True)
+        self.assertEqual(sum(charged), os.path.getsize(self.small))
+
+    def test_a_large_upload_puts_the_precondition_on_the_completion(self):
+        """That is the moment the object appears, and the last point a
+        service can refuse without having already replaced anything."""
+        c = _ConditionalPutClient()
+        self._model(c, threshold_mb=0).upload_file(
+            self.big, "big.bin", if_none_match=True)
+        self.assertEqual(c.completed_kw.get("IfNoneMatch"), "*")
+        self.assertEqual(c.completed["big.bin"], self.payload)
+
+    def test_a_large_upload_is_conditional_even_with_resume_turned_off(self):
+        """boto3's managed upload cannot carry the precondition at all, so the
+        only multipart path left is the one this file drives itself."""
+        c = _ConditionalPutClient()
+        m = self._model(c, threshold_mb=0)
+        m.resumable_uploads = False
+        m.upload_file(self.big, "big.bin", if_none_match=True)
+        self.assertEqual(c.completed_kw.get("IfNoneMatch"), "*")
+        self.assertEqual(c.managed, [])
+
+    def test_a_taken_key_on_completion_raises_and_keeps_the_parts(self):
+        """Aborting would throw away a whole transfer whose outcome the user
+        may yet want to retry over the top."""
+        c = _ConditionalPutClient()
+        c.fail_complete = _client_error("PreconditionFailed", 412,
+                                        "CompleteMultipartUpload")
+        with self.assertRaises(ObjectExists):
+            self._model(c, threshold_mb=0).upload_file(
+                self.big, "big.bin", if_none_match=True)
+        self.assertEqual(c.aborted, [])
+
+    def test_a_completion_degrades_when_the_backend_cannot_be_conditional(self):
+        c = _ConditionalPutClient()
+        c.fail_complete = _client_error("NotImplemented", 501,
+                                        "CompleteMultipartUpload")
+        self._model(c, threshold_mb=0).upload_file(
+            self.big, "big.bin", if_none_match=True)
+        self.assertEqual(c.completed["big.bin"], self.payload)
+
+
 class CrossProfileCopyTests(unittest.TestCase):
     """Server-side copy cannot use two sets of credentials, so moving objects
     between accounts or providers had no route at all."""
@@ -6245,9 +6946,17 @@ class AdditionalChecksumTests(unittest.TestCase):
                            "AK", "SK", "bkt", False, False)
 
     def _expected(self, algorithm):
+        """What S3 would store, computed without going through the model."""
         if algorithm == "CRC32":
             return base64.b64encode(
                 struct.pack(">I", zlib.crc32(self.data) & 0xFFFFFFFF)).decode()
+        if algorithm == "CRC32C":
+            return base64.b64encode(struct.pack(
+                ">I", _crt_checksums.crc32c(self.data) & 0xFFFFFFFF)).decode()
+        if algorithm == "CRC64NVME":
+            return base64.b64encode(struct.pack(
+                ">Q", _crt_checksums.crc64nvme(self.data)
+                & 0xFFFFFFFFFFFFFFFF)).decode()
         digest = hashlib.new(algorithm.lower(), self.data).digest()
         return base64.b64encode(digest).decode()
 
@@ -6258,9 +6967,14 @@ class AdditionalChecksumTests(unittest.TestCase):
                                  self._expected(algorithm))
 
     def test_an_algorithm_we_cannot_compute_is_refused(self):
-        """CRC32C needs a third-party module; accepting it would mean
-        'verified' downloads that were never actually checked."""
-        for bad in ("CRC32C", "MD5", "", None):
+        """Accepting one would mean 'verified' downloads that were never
+        actually checked. Which algorithms those are depends on the install,
+        so the list is asked for rather than assumed — only the names that
+        are never computable are hardcoded."""
+        never = ["MD5", "", None, "SHA512"]
+        absent = [name for name in model_module.KNOWN_CHECKSUM_ALGORITHMS
+                  if name not in model_module.CHECKSUM_DIGESTS]
+        for bad in never + absent:
             with self.subTest(algorithm=bad):
                 with self.assertRaises(ValueError):
                     Model.file_checksum(self.path, bad)
@@ -6332,7 +7046,11 @@ class AdditionalChecksumTests(unittest.TestCase):
         self.assertNotIn("ChecksumType", args)
 
     def test_an_unsupported_algorithm_is_not_sent(self):
-        args = self.model.set_upload_options(checksum_algorithm="CRC32C")
+        """Which algorithms are available depends on the install, so the name
+        used here is one that is never computable rather than one that merely
+        was not, back when the list was fixed."""
+        self.assertNotIn("MD5", model_module.CHECKSUM_DIGESTS)
+        args = self.model.set_upload_options(checksum_algorithm="MD5")
         self.assertNotIn("ChecksumAlgorithm", args)
         self.assertEqual(self.model.checksum_algorithm, "")
 
@@ -6603,6 +7321,124 @@ class PrefixDownloadPlanTests(unittest.TestCase):
         self.assertEqual(prefix_of(None), "")
 
 
+class ChecksumRegistryTests(unittest.TestCase):
+    """
+    What the UI offers is built from what this machine can recompute. An
+    algorithm we can send but not reproduce would make every verified
+    download a verification that never happened.
+    """
+
+    def test_only_computable_algorithms_are_offered(self):
+        for name in CHECKSUM_ALGORITHMS:
+            with self.subTest(algorithm=name):
+                self.assertIn(name, model_module.CHECKSUM_DIGESTS)
+                self.assertIn(name, model_module.KNOWN_CHECKSUM_ALGORITHMS)
+
+    def test_the_stdlib_algorithms_are_always_there(self):
+        """They need nothing installed, so their absence would be a bug."""
+        for name in ("CRC32", "SHA1", "SHA256"):
+            self.assertIn(name, CHECKSUM_ALGORITHMS)
+
+    def test_the_offered_order_is_the_known_order(self):
+        """The order decides which stored checksum is picked first, so it has
+        to be stable rather than whatever a dict happened to yield."""
+        known = list(model_module.KNOWN_CHECKSUM_ALGORITHMS)
+        self.assertEqual(list(CHECKSUM_ALGORITHMS),
+                         [n for n in known if n in CHECKSUM_ALGORITHMS])
+
+    def test_a_crc_is_packed_the_way_s3_stores_it(self):
+        """Big-endian, to the algorithm's own width, then base64 — a 64-bit
+        CRC written into four bytes would mismatch every object."""
+        wide = model_module._CrcDigest(lambda block, previous: 0x0102030405060708, 8)
+        wide.update(b"x")
+        self.assertEqual(base64.b64decode(wide.b64()),
+                         bytes([1, 2, 3, 4, 5, 6, 7, 8]))
+        narrow = model_module._CrcDigest(lambda block, previous: 0x01020304, 4)
+        narrow.update(b"x")
+        self.assertEqual(base64.b64decode(narrow.b64()), bytes([1, 2, 3, 4]))
+
+    @unittest.skipIf(_crt_checksums is None or
+                     not hasattr(_crt_checksums, "crc64nvme"),
+                     "awscrt with crc64nvme is not installed")
+    def test_crc64nvme_is_offered_when_it_can_be_computed(self):
+        self.assertIn("CRC64NVME", CHECKSUM_ALGORITHMS)
+
+    def test_every_crc_asks_for_a_whole_object_checksum(self):
+        """A per-part composite is as unverifiable as a multipart ETag, and
+        CRC64NVME has no composite form at all."""
+        m = make_model(bucket="bkt")
+        for name in CHECKSUM_ALGORITHMS:
+            with self.subTest(algorithm=name):
+                args = m.set_upload_options(checksum_algorithm=name)
+                if name.startswith("CRC"):
+                    self.assertEqual(args.get("ChecksumType"), "FULL_OBJECT")
+                else:
+                    self.assertNotIn("ChecksumType", args)
+
+    def test_a_computable_checksum_wins_over_one_we_cannot_reproduce(self):
+        """REGRESSION GUARD: an object carrying a CRC64NVME on a build without
+        awscrt must not shadow a SHA256 that is perfectly comparable."""
+        with patch.object(model_module, "CHECKSUM_ALGORITHMS",
+                          ("CRC32", "SHA1", "SHA256")), \
+             patch.object(model_module, "CHECKSUM_DIGESTS",
+                          {"CRC32": None, "SHA1": None, "SHA256": None}):
+            self.assertEqual(
+                Model.stored_checksum({"ChecksumCRC64NVME": "aaaaaaaaaaaa=",
+                                       "ChecksumSHA256": "sha"}),
+                ("SHA256", "sha"))
+
+    def test_an_uncomputable_checksum_is_still_reported(self):
+        """So a download can say why nothing was compared, instead of
+        reporting a comparison it never made."""
+        with patch.object(model_module, "CHECKSUM_ALGORITHMS",
+                          ("CRC32", "SHA1", "SHA256")), \
+             patch.object(model_module, "CHECKSUM_DIGESTS",
+                          {"CRC32": None, "SHA1": None, "SHA256": None}):
+            self.assertEqual(
+                Model.stored_checksum({"ChecksumCRC64NVME": "nvme"}),
+                ("CRC64NVME", "nvme"))
+
+
+class UncomputableChecksumDownloadTests(unittest.TestCase):
+    """AWS now stamps CRC64NVME on uploads by default, so an object arriving
+    with one this build cannot reproduce is the ordinary case, not the
+    exotic one."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.path = os.path.join(self.dir, "payload.bin")
+        self.data = b"duck" * 100
+        with open(self.path, "wb") as handle:
+            handle.write(self.data)
+        self.model = make_model(bucket="bkt")
+
+    @contextlib.contextmanager
+    def _without_awscrt(self):
+        with patch.object(model_module, "CHECKSUM_ALGORITHMS",
+                          ("CRC32", "SHA1", "SHA256")),              patch.object(model_module, "CHECKSUM_DIGESTS",
+                          {name: model_module.CHECKSUM_DIGESTS[name]
+                           for name in ("CRC32", "SHA1", "SHA256")}):
+            yield
+
+    def test_it_falls_back_to_the_etag_rather_than_passing_blindly(self):
+        """THE POINT: the ETag still proves something; the unreadable
+        checksum proves nothing, and must not stand in for it."""
+        logged = []
+        head = {"ChecksumCRC64NVME": "AAAAAAAAAAA="}
+        with self._without_awscrt():
+            ok = self.model.verify_download(
+                self.path, "0" * 32, head=head, log_fn=logged.append)
+        self.assertFalse(ok, "a wrong ETag passed")
+        self.assertTrue(any("awscrt" in line for line in logged), logged)
+
+    def test_a_matching_etag_still_verifies(self):
+        head = {"ChecksumCRC64NVME": "AAAAAAAAAAA="}
+        with self._without_awscrt():
+            self.assertTrue(self.model.verify_download(
+                self.path, hashlib.md5(self.data).hexdigest(), head=head))
+
+
 class UploadOverwriteTests(unittest.TestCase):
     """REGRESSION (silent data loss): download, copy/move, paste and rename all
     checked their destination, but every upload path replaced remote objects
@@ -6706,6 +7542,45 @@ class UploadOverwriteTests(unittest.TestCase):
             self.win.upload()
         self.assertEqual(started, [])
 
+    def test_a_clean_job_still_asks_the_service_not_to_overwrite(self):
+        """THE POINT: the destination check is a snapshot. Nothing conflicted
+        when it was taken, which is not the same as nothing conflicting by
+        the time the bytes arrive."""
+        job = [("a.txt", "/tmp/a.txt")]
+        with patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: set()):
+            self.assertEqual(self.win._guard_upload(job), (job, True))
+
+    def test_choosing_skip_keeps_the_precondition(self):
+        job = [("a.txt", "/tmp/a.txt"), ("b.txt", "/tmp/b.txt")]
+        with patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: {"a.txt"}), \
+             self.answering(OverwriteDialog.SKIP):
+            remaining, if_none_match = self.win._guard_upload(job)
+        self.assertEqual(remaining, [("b.txt", "/tmp/b.txt")])
+        self.assertTrue(if_none_match)
+
+    def test_choosing_overwrite_drops_the_precondition(self):
+        """Otherwise the service would refuse exactly the writes the user
+        just asked for."""
+        job = [("a.txt", "/tmp/a.txt")]
+        with patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: {"a.txt"}), \
+             self.answering(OverwriteDialog.OVERWRITE):
+            self.assertEqual(self.win._guard_upload(job), (job, False))
+
+    def test_the_choice_reaches_the_queued_job(self):
+        started = []
+        with patch.object(main_window, "QFileDialog") as fd, \
+             patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: set()), \
+             patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append(kw)):
+            fd.return_value.getOpenFileNames.return_value = (
+                ["/tmp/a.txt"], "All (*)")
+            self.win.upload()
+        self.assertEqual([kw.get("if_none_match") for kw in started], [True])
+
     def test_folder_markers_are_not_treated_as_conflicts(self):
         """A directory placeholder only creates a prefix, so it must never be
         offered as an object about to be overwritten."""
@@ -6727,7 +7602,7 @@ class UploadOverwriteTests(unittest.TestCase):
         with patch.object(main_window.MainWindow, "_destination_conflicts",
                           lambda _s, keys, bucket=None: {"dir/f.txt"}), \
              self.answering(OverwriteDialog.SKIP):
-            self.assertIsNone(self.win._guard_upload(job))
+            self.assertEqual(self.win._guard_upload(job), (None, False))
 
     def test_upload_folder_is_guarded(self):
         started = []
@@ -8328,6 +9203,112 @@ class ListObjectDigestsTests(unittest.TestCase):
     def test_requires_a_bucket(self):
         with self.assertRaises(ValueError):
             make_model(bucket="").list_object_digests("")
+
+
+class ConditionalUploadWorkerTests(unittest.TestCase):
+    """A key taken mid-job is the outcome the user asked for, not a failure
+    to abort the rest of the batch over."""
+
+    class _Model:
+        parallel_files = 1
+
+        def __init__(self, taken=()):
+            self.taken = set(taken)
+            self.uploaded = []
+            self.flags = []
+
+        def upload_file(self, local, key, progress_cb=None, cancel_event=None,
+                        log_fn=None, if_none_match=False):
+            self.flags.append(if_none_match)
+            if key in self.taken:
+                raise ObjectExists(key)
+            if progress_cb is not None:
+                size = os.path.getsize(local)
+                progress_cb(size, size, key)
+            self.uploaded.append(key)
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def _file(self, name, size):
+        path = os.path.join(self.dir, name)
+        with open(path, "wb") as handle:
+            handle.write(b"x" * size)
+        return path
+
+    def _run(self, model, job, if_none_match=True):
+        worker = main_window.Worker(model, job, if_none_match=if_none_match)
+        messages, failures = [], []
+        self.batches = []
+        worker.progress.connect(messages.append)
+        worker.error.connect(failures.append)
+        worker.batch_progress.connect(
+            lambda done, total: self.batches.append((done, total)))
+        worker.upload()
+        return messages, failures
+
+    def test_a_skipped_file_still_completes_the_batch_progress(self):
+        """REGRESSION: a skipped object's bytes were counted into the batch
+        total but never into the done count, so a job that skipped anything
+        finished with the progress bar stuck short of the end — looking like
+        a transfer that died rather than one that did what was asked."""
+        model = self._Model(taken={"b.txt"})
+        job = [("a.txt", self._file("a.txt", 100)),
+               ("b.txt", self._file("b.txt", 400))]
+        self._run(model, job)
+        done, total = self.batches[-1]
+        self.assertEqual(total, 500)
+        self.assertEqual(done, 500, "the skipped file's bytes never landed")
+
+    def test_a_partly_sent_skip_is_credited_once(self):
+        """The conditional write reports progress as the body goes out and
+        is only refused at the end, so some of a skipped file's bytes are
+        already counted. Crediting the whole size again would overshoot."""
+        sent = {}
+
+        class _PartialModel(self._Model):
+            def upload_file(self, local, key, progress_cb=None, **kw):
+                size = os.path.getsize(local)
+                if progress_cb is not None:
+                    progress_cb(size, size // 2, key)
+                    sent[key] = size // 2
+                raise ObjectExists(key)
+
+        job = [("a.txt", self._file("a.txt", 400))]
+        self._run(_PartialModel(), job)
+        done, total = self.batches[-1]
+        self.assertEqual((done, total), (400, 400))
+
+    def test_one_taken_key_does_not_stop_the_rest(self):
+        model = self._Model(taken={"b.txt"})
+        job = [("a.txt", self._file("a.txt", 10)),
+               ("b.txt", self._file("b.txt", 10)),
+               ("c.txt", self._file("c.txt", 10))]
+        messages, failures = self._run(model, job)
+        self.assertEqual(model.uploaded, ["a.txt", "c.txt"])
+        self.assertEqual(failures, [], "a skip was reported as a failure")
+        self.assertTrue(any("already exists" in m for m in messages), messages)
+
+    def test_the_skips_are_counted_in_the_log(self):
+        model = self._Model(taken={"a.txt", "b.txt"})
+        messages, _ = self._run(
+            model, [("a.txt", self._file("a.txt", 10)),
+                    ("b.txt", self._file("b.txt", 10))])
+        self.assertTrue(any("skipped 2 object(s)" in m for m in messages),
+                        messages)
+
+    def test_the_flag_reaches_every_file(self):
+        model = self._Model()
+        self._run(model, [("a.txt", self._file("a.txt", 10)),
+                          ("b.txt", self._file("b.txt", 10))])
+        self.assertEqual(model.flags, [True, True])
+
+    def test_without_the_flag_the_model_is_asked_to_overwrite(self):
+        model = self._Model()
+        self._run(model, [("a.txt", self._file("a.txt", 10))],
+                  if_none_match=False)
+        self.assertEqual(model.flags, [False])
 
 
 class BookmarkStorageTests(unittest.TestCase):
@@ -12609,6 +13590,58 @@ class RedactUrlCredentialsTests(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertNotIn(
                     "s3cr3t", diagnostics.redact_url_credentials(url))
+
+
+class E2EHarnessTests(unittest.TestCase):
+    """
+    The end-to-end suite is only worth having if it can start. MinIO
+    archived its open-source server in 2025 — anonymous pulls revoked on
+    quay.io, the Docker Hub repository gone, dl.min.io answering 410 for
+    every community binary — which broke `make e2e` and the CI job that runs
+    it, everywhere, with no change on this side.
+
+    These are the cheap parts of that lesson: name a tag, and keep the
+    server and the suite's claims about it in step.
+    """
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _compose(self):
+        with open(os.path.join(self.ROOT, "tests", "e2e",
+                               "docker-compose.yml")) as handle:
+            return handle.read()
+
+    def _image(self):
+        for line in self._compose().splitlines():
+            line = line.strip()
+            if line.startswith("image:"):
+                return line.split(":", 1)[1].strip()
+        return ""
+
+    def test_the_server_image_is_pinned(self):
+        """A floating tag means the suite measures a different server than
+        it did yesterday without anyone deciding to — and the drift shows up
+        as a test failure attributed to this code."""
+        image = self._image()
+        self.assertTrue(image, "no image in the e2e compose file")
+        # An ${VAR:-default} override still has to carry a pinned default.
+        default = image.split(":-")[-1].rstrip("}") if ":-" in image else image
+        self.assertNotIn(":latest", default, "the e2e server floats on latest")
+        self.assertRegex(default, r":[^:}]+$", "the e2e server has no tag")
+
+    def test_the_backend_is_still_minio(self):
+        """Half the limitations in ROADMAP.md are statements about how MinIO
+        behaves. Swapping the backend without revisiting them would leave
+        prose that nothing checks any more."""
+        self.assertIn("minio", self._image().lower())
+
+    def test_the_healthcheck_uses_something_the_image_has(self):
+        """REGRESSION: the old healthcheck called mc, which the image that
+        replaced it does not carry — a wrong healthcheck never goes healthy,
+        and compose then waits for the full timeout before failing."""
+        compose = self._compose()
+        self.assertIn("healthcheck", compose)
+        self.assertNotIn('"mc"', compose)
 
 
 class DocumentationAccuracyTests(unittest.TestCase):

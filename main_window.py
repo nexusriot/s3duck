@@ -39,7 +39,8 @@ from model import Model as DataModel
 from model import FSObjectType
 from model import TransferCancelled
 from model import run_parallel
-from model import (CHECKSUM_ALGORITHMS, plan_prefix_download, prefix_of,
+from model import (CHECKSUM_ALGORITHMS, ObjectExists, plan_prefix_download,
+                   prefix_of,
                    safe_local_path)
 from utils import (
     CredentialError, CredentialProcessError, DialogDismissMixin, FuncWorker,
@@ -57,7 +58,7 @@ from theme import apply_theme, THEMES
 
 
 OS_FAMILY_MAP = {"Linux": "🐧", "Windows": "⊞ Win", "Darwin": " MacOS"}
-__VERSION__ = "0.21.0"
+__VERSION__ = "0.23.0"
 
 UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 
@@ -1607,10 +1608,11 @@ class Tree(QTreeView):
                 path = str(url.toLocalFile())
                 job.extend(_build_upload_job_for_path(
                     path, self.parent.data_model.current_folder))
-            job = self.parent._guard_upload(job)
+            job, if_none_match = self.parent._guard_upload(job)
             if not job:
                 return
-            self.parent.assign_thread_operation("upload", job)
+            self.parent.assign_thread_operation(
+                "upload", job, if_none_match=if_none_match)
         else:
             event.ignore()
 
@@ -1746,11 +1748,15 @@ class Worker(QObject):
     # whether the service was asking for patience rather than saying no.
     details = pyqtSignal(str, bool)
 
-    def __init__(self, data_model, job, dest_model=None):
+    def __init__(self, data_model, job, dest_model=None, if_none_match=False):
         super().__init__()
         self.data_model = data_model
         self.job = job
         self.dest_model = dest_model
+        # Ask the service to refuse an upload whose key is already taken.
+        # Set when the user chose to skip existing objects, so that choice
+        # survives an object appearing between the check and the write.
+        self.if_none_match = bool(if_none_match)
         self._cancel_event = threading.Event()
 
     @property
@@ -1929,6 +1935,9 @@ class Worker(QObject):
 
                 return _cb
 
+            skipped = []
+            skipped_lock = threading.Lock()
+
             def _upload_one(item):
                 key, local_name = item
                 if local_name is not None:
@@ -1936,16 +1945,44 @@ class Worker(QObject):
                 else:
                     msg = "creating folder %s" % key
                 self.progress.emit(msg)
-                self.data_model.upload_file(
-                    local_name, key,
-                    progress_cb=make_cb() if local_name else None,
-                    cancel_event=self._cancel_event,
-                    log_fn=self.progress.emit,
-                )
+                callback = make_cb() if local_name else None
+                try:
+                    self.data_model.upload_file(
+                        local_name, key,
+                        progress_cb=callback,
+                        cancel_event=self._cancel_event,
+                        log_fn=self.progress.emit,
+                        if_none_match=self.if_none_match,
+                    )
+                except ObjectExists:
+                    # The key was taken between the destination check and the
+                    # write. Skipping is what the user asked for, so this is
+                    # an outcome to report, not a failure to abort the batch
+                    # over.
+                    with skipped_lock:
+                        skipped.append(key)
+                    self.progress.emit(
+                        f"skipped {key}: it already exists")
+                    # Its bytes went into the batch total, so without this the
+                    # bar stops short of the end and a job that did exactly
+                    # what was asked looks like one that died. The callback
+                    # credits the difference, which matters because a
+                    # conditional write is refused only after the body has
+                    # partly gone out and been counted already.
+                    if callback is not None:
+                        try:
+                            size = int(os.path.getsize(local_name))
+                            callback(max(1, size), size, key)
+                        except OSError:
+                            pass
 
             run_parallel(self.job, _upload_one, self._file_workers,
                          cancel_event=self._cancel_event)
 
+            if skipped:
+                self.progress.emit(
+                    f"skipped {len(skipped)} object(s) that appeared at the "
+                    f"destination during the upload")
             self.batch_progress.emit(int(done_all), int(total_bytes_all))
 
         except Exception as exc:
@@ -7751,7 +7788,8 @@ class PresignedLinkDialog(QDialog):
 
 class _QEntry:
     def __init__(self, entry_id, method, job, need_refresh=True, label="",
-                 source_bucket="", dest_model=None, source_model=None):
+                 source_bucket="", dest_model=None, source_model=None,
+                 if_none_match=False):
         self.entry_id = entry_id
         self.method = method
         self.job = job
@@ -7767,6 +7805,9 @@ class _QEntry:
         # Set when the job reads from a model other than the window's — a pull
         # from another profile.
         self.source_model = source_model
+        # An upload that must not overwrite: the user chose to skip what was
+        # already there, so every write carries a precondition.
+        self.if_none_match = bool(if_none_match)
         self.status = "queued"
         self.thread = None
         self.worker = None
@@ -10862,7 +10903,7 @@ class MainWindow(QMainWindow):
 
     def assign_thread_operation(self, method, job, need_refresh=True,
                                 source_bucket="", dest_model=None,
-                                source_model=None):
+                                source_model=None, if_none_match=False):
         if not job:
             return
         if not self._credentials_ok_for_transfer():
@@ -10879,6 +10920,7 @@ class MainWindow(QMainWindow):
             source_bucket=source_bucket,
             dest_model=dest_model,
             source_model=source_model,
+            if_none_match=if_none_match,
         )
         self._queue_next_id += 1
         # Kept so a failed/cancelled row can be re-run from the queue panel.
@@ -10925,7 +10967,8 @@ class MainWindow(QMainWindow):
         # race whatever the main thread reads from the shared model. The
         # binding cache is still shared, so discoveries are not lost.
         self.worker = Worker(self._worker_model_for(entry), job,
-                             dest_model=entry.dest_model)
+                             dest_model=entry.dest_model,
+                             if_none_match=entry.if_none_match)
         self.worker.moveToThread(self.thread)
 
         entry.thread = self.thread
@@ -11638,10 +11681,11 @@ class MainWindow(QMainWindow):
                 else (self.data_model.current_folder + basename)
             )
             job.append((key, name))
-        job = self._guard_upload(job)
+        job, if_none_match = self._guard_upload(job)
         if not job:
             return
-        self.assign_thread_operation("upload", job)
+        self.assign_thread_operation("upload", job,
+                                     if_none_match=if_none_match)
 
     def upload_folder(self, folder=None):
         """Upload a whole local directory tree into the current folder (or
@@ -11656,10 +11700,11 @@ class MainWindow(QMainWindow):
         # an explicit destination prefix.
         dest = folder if isinstance(folder, str) else self.data_model.current_folder
         job = _build_upload_job_for_path(path, dest)
-        job = self._guard_upload(job)
+        job, if_none_match = self._guard_upload(job)
         if not job:
             return
-        self.assign_thread_operation("upload", job)
+        self.assign_thread_operation("upload", job,
+                                     if_none_match=if_none_match)
 
     def transfer_settings(self):
         """Concurrency plus the storage class / encryption applied to uploads."""
@@ -12501,22 +12546,29 @@ class MainWindow(QMainWindow):
         its destination; uploads did not, and silently replaced remote
         objects. Directory placeholder entries (local path None) only create a
         prefix, so they are never conflicts.
+
+        Returns ``(job, if_none_match)``, or ``(None, False)`` when there is
+        nothing left to do. The destination check is a snapshot, so when the
+        answer was "do not overwrite" the writes themselves carry a
+        precondition; the only way to tell that apart from "overwrite" is
+        whether a known conflict survived into the job.
         """
         if not job:
-            return None
+            return None, False
         keys = [key for key, local in job if local is not None]
         conflicts = self._destination_conflicts(keys)
         if conflicts is None:
-            return None
+            return None, False
         job = self._resolve_overwrites(
             job, conflicts, what="object", index_of=lambda e: e[0])
         if not job:
-            return None
+            return None, False
         if not any(local is not None for _key, local in job):
             # Only folder markers left — nothing would actually be uploaded.
             self.statusBar().showMessage("Nothing left to upload", 2000)
-            return None
-        return job
+            return None, False
+        overwriting = any(key in conflicts for key, _local in job)
+        return job, not overwriting
 
     def _download_target(self, entry):
         """The local path an entry writes to — a file, or a folder's root."""
