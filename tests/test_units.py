@@ -6840,6 +6840,26 @@ class OldBotocoreConditionalWriteTests(unittest.TestCase):
         return botocore.session.get_session().get_service_model("s3")
 
     @classmethod
+    def _knowing_algorithms(cls, *names):
+        """The real service model with PutObject's ChecksumAlgorithm enum
+        replaced, so "an algorithm this botocore never heard of" means the
+        same thing whatever botocore is installed."""
+        real = cls._service_model()
+
+        class _Model:
+            def operation_model(self, name):
+                op = real.operation_model(name)
+                if name != "PutObject":
+                    return op
+                members = dict(op.input_shape.members)
+                members["ChecksumAlgorithm"] = types.SimpleNamespace(
+                    enum=list(names))
+                return types.SimpleNamespace(
+                    input_shape=types.SimpleNamespace(members=members))
+
+        return _Model()
+
+    @classmethod
     def _without(cls, parameter, *operations):
         """The real S3 service model with ``parameter`` taken back out of
         ``operations`` — what an older botocore shipped."""
@@ -6983,16 +7003,16 @@ class OldBotocoreConditionalWriteTests(unittest.TestCase):
         self.assertEqual("ChecksumType" in args, known)
 
     def test_an_algorithm_this_botocore_never_heard_of_is_dropped(self):
-        """CRC64NVME does not exist in an older model at all, and the whole
-        point of the type is the algorithm — so both go."""
-        real = self._service_model()
-        shape = real.operation_model("PutObject").input_shape.members[
-            "ChecksumAlgorithm"]
-        enum = list(getattr(shape, "enum", None) or [])
-        if not enum:
-            self.skipTest("this botocore does not constrain the algorithm")
+        """An older model lists no CRC64NVME at all, and the whole point of
+        the type is the algorithm — so both go.
+
+        The enum is stubbed rather than read from the installed botocore: a
+        current one lists CRC64NVME, where keeping it is the right answer,
+        and the assertion would then be testing the SDK's age, not the code.
+        """
         client = types.SimpleNamespace(
-            meta=types.SimpleNamespace(service_model=real))
+            meta=types.SimpleNamespace(service_model=self._knowing_algorithms(
+                "CRC32", "CRC32C", "SHA1", "SHA256")))
         args = drop_unsendable_checksum_args(
             client, {"ChecksumAlgorithm": "CRC64NVME",
                      "ChecksumType": "FULL_OBJECT", "ACL": "private"})
@@ -7003,10 +7023,22 @@ class OldBotocoreConditionalWriteTests(unittest.TestCase):
 
     def test_an_algorithm_this_botocore_knows_is_kept(self):
         client = types.SimpleNamespace(
-            meta=types.SimpleNamespace(service_model=self._service_model()))
+            meta=types.SimpleNamespace(service_model=self._knowing_algorithms(
+                "CRC32", "CRC64NVME")))
+        for algorithm in ("CRC32", "CRC64NVME"):
+            with self.subTest(algorithm=algorithm):
+                args = drop_unsendable_checksum_args(
+                    client, {"ChecksumAlgorithm": algorithm,
+                             "ChecksumType": "FULL_OBJECT"})
+                self.assertEqual(args.get("ChecksumAlgorithm"), algorithm)
+
+    def test_a_model_that_does_not_constrain_the_algorithm_keeps_it(self):
+        """No enum is not an empty enum: nothing is known to be excluded."""
+        client = types.SimpleNamespace(
+            meta=types.SimpleNamespace(service_model=self._knowing_algorithms()))
         args = drop_unsendable_checksum_args(
-            client, {"ChecksumAlgorithm": "SHA256"})
-        self.assertEqual(args.get("ChecksumAlgorithm"), "SHA256")
+            client, {"ChecksumAlgorithm": "CRC64NVME"})
+        self.assertEqual(args.get("ChecksumAlgorithm"), "CRC64NVME")
 
     def test_a_stub_client_keeps_every_checksum_argument(self):
         """Nothing is known about it, so nothing is taken away."""
