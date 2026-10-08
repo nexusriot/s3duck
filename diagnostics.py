@@ -37,8 +37,9 @@ try:
 except ImportError:
     QtPdf = None
 
-ICON_SOURCES = ("main_window.py", "s3duck.py", "settings.py",
-                "properties_window.py", "profile_switcher.py")
+# Directories that are not the application, for the source walk below.
+NON_APP_DIRS = {".venv", "__pycache__", ".git", "build", "dist", "tests",
+                "tools", ".idea", ".github", "icons", "resources", "DEBIAN"}
 
 
 def image_formats() -> list:
@@ -66,16 +67,25 @@ def svg_supported(root=None) -> bool:
 
 def icon_calls(source_text) -> list:
     """
-    ``(theme_name, bundled_filename)`` for every ``themed_icon(...)`` call.
+    ``(theme_name, bundled_filename)`` for every icon the app asks for.
 
     Parsed rather than pattern-matched: the calls wrap across lines, and a
     line-oriented regex reports a present fallback as missing.
+
+    Two shapes count. ``themed_icon(name, path)`` is the direct one. The
+    context menu instead passes the pair to its builder, which makes the
+    ``themed_icon`` call itself once with variables -- so matching only the
+    direct shape would silently drop around thirty menu icons from a report
+    whose entire job is to say how every icon resolves.
     """
     found = []
     for node in ast.walk(ast.parse(source_text)):
-        if not (isinstance(node, ast.Call)
-                and getattr(node.func, "id", "") == "themed_icon"
-                and node.args):
+        if not isinstance(node, ast.Call):
+            continue
+        direct = getattr(node.func, "id", "") == "themed_icon"
+        viabuilder = (isinstance(node.func, ast.Attribute)
+                      and node.func.attr == "add")
+        if not (direct or viabuilder) or not node.args:
             continue
         name = getattr(node.args[0], "value", None)
         if not isinstance(name, str):
@@ -87,6 +97,10 @@ def icon_calls(source_text) -> list:
                         and isinstance(sub.value, str)
                         and sub.value.endswith((".svg", ".png", ".ico"))):
                     bundled = sub.value
+        # A bare `.add("something", ...)` that names no icon file is some
+        # other add() entirely.
+        if viabuilder and not bundled:
+            continue
         found.append((name, bundled))
     return found
 
@@ -99,12 +113,17 @@ def icon_status(root) -> dict:
     that started all this.
     """
     pairs = set()
-    for source in ICON_SOURCES:
-        path = os.path.join(root, source)
-        if not os.path.exists(path):
-            continue
-        with open(path) as handle:
-            pairs.update(icon_calls(handle.read()))
+    # Walked rather than listed: the sources moved into packages, and a
+    # hardcoded tuple of filenames would quietly report on a handful of them
+    # while saying nothing about the rest.
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in NON_APP_DIRS and not d.startswith(".")]
+        for name in filenames:
+            if not name.endswith(".py"):
+                continue
+            with open(os.path.join(dirpath, name), encoding="utf-8") as handle:
+                pairs.update(icon_calls(handle.read()))
 
     themed = bundled = blank = hollow = 0
     for name, filename in sorted(pairs):

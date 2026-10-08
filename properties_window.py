@@ -1,6 +1,8 @@
-from PyQt6.QtCore import *
-from PyQt6.QtWidgets import *
-from PyQt6.QtGui import *
+from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtWidgets import (
+    QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QLabel, QLineEdit,
+    QVBoxLayout,
+)
 
 from utils import (
     center_on_screen, DialogDismissMixin, join_qthread,

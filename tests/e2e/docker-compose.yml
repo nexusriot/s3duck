@@ -60,6 +60,34 @@ services:
       # Read-only: the suite must not be able to edit the tree it is testing.
       - ../..:/app:ro
 
+  # The GUI suite: the real MainWindow, headless, against the same server.
+  #
+  # tests/e2e stops at model.py on purpose — it needs no display and no Qt,
+  # which is what keeps it small and fast. That leaves everything between a
+  # user gesture and model.py untested against anything real: the navigation
+  # worker, the transfer queue, the per-worker model clones and the queued
+  # signals that carry results back onto the UI thread. This service covers
+  # exactly that seam, and pays for PyQt6 to do it.
+  #
+  # Its build context is this directory's sibling so the two Dockerfiles stay
+  # next to the suites they build.
+  runner-gui:
+    build:
+      context: ..
+      dockerfile: e2e_gui/Dockerfile
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      S3DUCK_TEST_ENDPOINT: http://minio:9000
+      S3DUCK_TEST_ACCESS_KEY: minioadmin
+      S3DUCK_TEST_SECRET_KEY: minioadmin
+      S3DUCK_TEST_REGION: us-east-1
+    volumes:
+      # Read-only like the others: the suite must not be able to edit the tree
+      # it is testing. Qt and the app write only under /tmp.
+      - ../..:/app:ro
+
   # The same suite against the oldest SDK this app supports, because the
   # version is a dimension the backend cannot stand in for.
   #

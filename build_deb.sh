@@ -1,10 +1,10 @@
 #!/bin/env bash
 
-# Single source of truth: __VERSION__ in main_window.py. Hardcoding it here
+# Single source of truth: __VERSION__ in version.py. Hardcoding it here
 # let the package version drift behind the app version.
-version=$(sed -n 's/^__VERSION__ = "\(.*\)"$/\1/p' main_window.py)
+version=$(sed -n 's/^__VERSION__ = "\(.*\)"$/\1/p' version.py)
 if [ -z "$version" ]; then
-  echo "cannot read __VERSION__ from main_window.py"; exit 1
+  echo "cannot read __VERSION__ from version.py"; exit 1
 fi
 
 # Detect or accept architecture
@@ -42,7 +42,19 @@ cp resources/ducky.ico $res_dir
 cp resources/ducky.png $lib_dir
 cp resources/s3duck.desktop $lib_dir
 cp LICENSE $lib_dir
+# The top-level modules, then every package beside them. A flat `cp *.py` was
+# what shipped before, and it would drop a package directory silently: the
+# install then dies on its first import. Packages are discovered by their
+# __init__.py rather than listed, so adding one needs no edit here -- but
+# tests/ is a package too and has no business in the payload, so it is named.
 cp *.py $lib_dir
+find . -mindepth 2 -maxdepth 2 -name __init__.py \
+     -not -path './.venv/*' -not -path './build/*' -not -path './tests/*' \
+     -printf '%h\0' \
+  | xargs -0 -r -I{} cp -r {} $lib_dir
+# cp -r brings the build host's bytecode along, which is dead weight in the
+# package and stale the moment the interpreter differs.
+find $lib_dir -name __pycache__ -type d -prune -exec rm -rf {} +
 
 
 sed -i "s/_version_/$version/g" $folder_name/DEBIAN/control
