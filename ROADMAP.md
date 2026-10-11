@@ -138,6 +138,16 @@ credential-storage choice in 0.18.0. What is left:
 - Bundled PNG twins are a fixed 48px raster, so on a Qt build without the SVG
   plugin icons do not scale as crisply as the SVGs would. Installing
   `python3-pyqt6.qtsvg` restores vector icons; the .deb recommends it.
+- Bucket settings offers every document AWS does, and a backend is free to
+  implement only some of them. The MinIO the end-to-end suite runs against
+  stores lifecycle rules, a bucket policy and bucket tags, and refuses CORS
+  and default encryption with `NotImplemented` and website hosting with
+  `MalformedXML` — the last of which reads like a bad request from this app,
+  though raw boto3 is refused the same way for every shape the API allows.
+  The dialog reports whatever the server said rather than hiding the controls,
+  because which ones work is a property of the endpoint, not of the app, and
+  `tests/e2e/test_bucket_admin.py` asserts the refusal carries a code there is
+  something to show.
 - The command palette lists the toolbar and window-level actions. Context-menu
   entries are built on demand when the menu opens, so they are not in it.
 - Cancelling a background scan (destination check, drag-out measure, duplicate

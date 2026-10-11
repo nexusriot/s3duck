@@ -18,14 +18,10 @@ import sys
 from PyQt6.QtGui import QIcon, QImageReader
 from PyQt6.QtWidgets import QApplication
 
-from diagnostics import icon_calls
-from utils import (
-    ICON_PROBE_SIZE, bundled_icon, icon_is_visible, themed_icon,
-)
+from diagnostics import NON_APP_DIRS, icon_calls
+from utils import ICON_PROBE_SIZE, icon_is_visible, themed_icon
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SOURCES = ("main_window.py", "s3duck.py", "settings.py",
-           "properties_window.py", "profile_switcher.py")
 
 
 def main() -> int:
@@ -42,14 +38,18 @@ def main() -> int:
     # Distinct (name, fallback) pairs: the same theme name is used at more
     # than one site with different bundled art, and collapsing by name alone
     # would report whichever site happened to be parsed last.
+    # Walked, not listed: a hardcoded tuple of filenames stopped covering the
+    # sources the moment they moved into packages, and a report that silently
+    # shrinks is worse than no report.
     seen = set()
-    for source in SOURCES:
-        path = os.path.join(ROOT, source)
-        if not os.path.exists(path):
-            continue
-        with open(path) as handle:
-            text = handle.read()
-        seen.update(icon_calls(text))
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames
+                       if d not in NON_APP_DIRS and not d.startswith(".")]
+        for name in filenames:
+            if not name.endswith(".py"):
+                continue
+            with open(os.path.join(dirpath, name), encoding="utf-8") as handle:
+                seen.update(icon_calls(handle.read()))
 
     print(f"{'theme name':32} {'claimed':8} {'visible':8} used")
     blanks = hollow = 0

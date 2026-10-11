@@ -1,7 +1,7 @@
 """
 End-to-end tests against a real S3-compatible server.
 
-Everything in tests/test_units.py stubs boto3, which is what makes that suite
+Everything in tests/unit/ stubs boto3, which is what makes that suite
 fast and offline — but it also means every claim this project makes about how
 a *server* behaves is unverified. The README and ROADMAP are full of
 "AWS answers this; most S3-compatible backends do not", and there is exactly
@@ -23,4 +23,11 @@ or point it at any endpoint you already have::
 It targets model.py rather than the GUI on purpose: that module is the whole
 S3 surface and imports nothing from Qt, so the runner needs no display and no
 Qt at all.
+
+The GUI above it is covered by its sibling, ``tests/e2e_gui``, which drives the
+real MainWindow against the same kind of throwaway server on Qt's offscreen
+platform. The split is deliberate: everything that can be checked without Qt
+is checked here, where it is fast and the image is small, and only the seam
+that genuinely needs a window — the navigation worker, the transfer queue, the
+signals that carry a worker's result back onto the UI thread — pays for PyQt6.
 """

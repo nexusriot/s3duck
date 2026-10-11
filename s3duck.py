@@ -7,7 +7,7 @@ import urllib3
 from copy import deepcopy
 from PyQt6.QtGui import QIcon, QColor, QFont, QFontMetrics, QAction
 from PyQt6 import QtCore
-from PyQt6.QtCore import *
+from PyQt6.QtCore import QRect, QSettings, QSize, Qt
 from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
 from model import Model as DataModel
 from settings import SettingsWindow
 from main_window import MainWindow
+from core.profile import ProfileSettings
 from utils import (
     str_to_bool, center_on_screen, export_profile_bundle,
     import_profile_bundle, BundleError, Crypto, CredentialError,
@@ -39,6 +40,7 @@ from utils import (
     InstanceServer, send_to_running_instance,
 )
 from theme import apply_theme
+from settings_store import SettingsStore
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -376,7 +378,7 @@ class Profiles(QDialog):
         self.btnEdit.setEnabled(False)
         self.btnDelete.setEnabled(False)
         self.btnRun.setEnabled(False)
-        self.main_settings = None
+        self.main_profile = None
         vbox.addLayout(hbox)
         self.setLayout(vbox)
         self.resize(350, 250)
@@ -387,9 +389,8 @@ class Profiles(QDialog):
         self.unlock_credentials()
         self.load()
         self.populate_list()
-        self.settings.beginGroup("common")
-        last_profile = self.settings.value("last_profile", "") or ""
-        self.settings.endGroup()
+        with SettingsStore(self.settings).group():
+            last_profile = self.settings.value("last_profile", "") or ""
         row = preselect_row(self.items, last_profile)
         if row >= 0:
             self.listWidget.setCurrentIndex(
@@ -811,33 +812,32 @@ class Profiles(QDialog):
         return super().eventFilter(source, event)
 
     def load(self):
-        self.settings.beginGroup("profiles")
-        for index in range(self.settings.beginReadArray("profiles")):
-            self.settings.setArrayIndex(index)
-            self.items.append(
-                SettingsItem(
-                    self.settings.value("name"),
-                    self.settings.value("url"),
-                    self.settings.value("region"),
-                    self.settings.value("bucket_name"),
-                    self.settings.value("access_key"),
-                    self.settings.value("secret_key"),
-                    self.settings.value("no_ssl_check", "false"),
-                    self.settings.value("use_path", "false"),
-                    self.settings.value("session_token", ""),
-                    self.settings.value("read_only", "false"),
-                    self.settings.value("color", ""),
-                    self.settings.value("session_expires", ""),
-                    self.settings.value("aws_profile", ""),
-                    self.settings.value("credential_process", ""),
-                    self.settings.value("public_base_url", ""),
-                    self.settings.value("requester_pays", "false"),
-                    self.settings.value("proxy_url", ""),
-                    self.settings.value("ca_bundle", ""),
+        with SettingsStore(self.settings).group("profiles"):
+            for index in range(self.settings.beginReadArray("profiles")):
+                self.settings.setArrayIndex(index)
+                self.items.append(
+                    SettingsItem(
+                        self.settings.value("name"),
+                        self.settings.value("url"),
+                        self.settings.value("region"),
+                        self.settings.value("bucket_name"),
+                        self.settings.value("access_key"),
+                        self.settings.value("secret_key"),
+                        self.settings.value("no_ssl_check", "false"),
+                        self.settings.value("use_path", "false"),
+                        self.settings.value("session_token", ""),
+                        self.settings.value("read_only", "false"),
+                        self.settings.value("color", ""),
+                        self.settings.value("session_expires", ""),
+                        self.settings.value("aws_profile", ""),
+                        self.settings.value("credential_process", ""),
+                        self.settings.value("public_base_url", ""),
+                        self.settings.value("requester_pays", "false"),
+                        self.settings.value("proxy_url", ""),
+                        self.settings.value("ca_bundle", ""),
+                    )
                 )
-            )
-        self.settings.endArray()
-        self.settings.endGroup()
+            self.settings.endArray()
 
     def onStart(self):
         elem = self._current_item_index()
@@ -909,34 +909,33 @@ class Profiles(QDialog):
         reason = str(exc) if exc is not None else None
 
         if ok:
-            # Pass empty bucket so MainWindow starts in bucket-list mode
-            settings = (
-                self.current_dir,
-                self.settings,
-                item.name,
-                item.url,
-                item.region,
-                "",  # no bucket selected at start
-                acc_key,
-                secret_key,
-                no_ssl_check,
-                use_path,
-                session_token,
-                read_only,
-                item.color,
-                item.session_expires,
-                item.aws_profile,
-                item.credential_process,
-                item.public_base_url,
-                str_to_bool(item.requester_pays),
-                item.proxy_url,
-                item.ca_bundle,
+            profile = ProfileSettings(
+                profile_name=item.name,
+                accent=item.color,
+                url=item.url,
+                region=item.region,
+                # Empty, so MainWindow starts in bucket-list mode.
+                bucket="",
+                use_path=use_path,
+                no_ssl_check=no_ssl_check,
+                proxy_url=item.proxy_url,
+                ca_bundle=item.ca_bundle,
+                public_base_url=item.public_base_url,
+                access_key=acc_key,
+                secret_key=secret_key,
+                session_token=session_token,
+                session_expires=item.session_expires,
+                aws_profile=item.aws_profile,
+                credential_process=item.credential_process,
+                read_only=read_only,
+                requester_pays=str_to_bool(item.requester_pays),
             )
-            self.settings.beginGroup("common")
-            self.settings.setValue("last_profile", item.name)
-            self.settings.endGroup()
-            self.main_settings = settings
-            self.main_window = MainWindow(settings=self.main_settings)
+            with SettingsStore(self.settings).group():
+                self.settings.setValue("last_profile", item.name)
+            self.main_profile = profile
+            self.main_window = MainWindow(current_dir=self.current_dir,
+                                          qsettings=self.settings,
+                                          profile=profile)
             self.main_window.show()
             self.hide()
             pending = getattr(self, "pending_location", "")
@@ -1085,31 +1084,30 @@ class Profiles(QDialog):
             self, "Import profiles", f"Imported {added} profile(s).")
 
     def save_settings(self):
-        self.settings.beginGroup("profiles")
-        self.settings.beginWriteArray("profiles")
-        for index, item in enumerate(self.items):
-            self.settings.setArrayIndex(index)
-            self.settings.setValue("name", item.name)
-            self.settings.setValue("url", item.url)
-            self.settings.setValue("region", item.region)
-            self.settings.setValue("bucket_name", item.bucket_name)
-            self.settings.setValue("access_key", item.enc_access_key)
-            self.settings.setValue("secret_key", item.enc_secret_key)
-            self.settings.setValue("no_ssl_check", item.no_ssl_check)
-            self.settings.setValue("use_path", item.use_path)
-            self.settings.setValue("session_token", item.enc_session_token)
-            self.settings.setValue("read_only", item.read_only)
-            self.settings.setValue("color", item.color)
-            self.settings.setValue("session_expires", item.session_expires)
-            self.settings.setValue("aws_profile", item.aws_profile)
-            self.settings.setValue(
-                "credential_process", item.credential_process)
-            self.settings.setValue("public_base_url", item.public_base_url)
-            self.settings.setValue("requester_pays", item.requester_pays)
-            self.settings.setValue("proxy_url", item.proxy_url)
-            self.settings.setValue("ca_bundle", item.ca_bundle)
-        self.settings.endArray()
-        self.settings.endGroup()
+        with SettingsStore(self.settings).group("profiles"):
+            self.settings.beginWriteArray("profiles")
+            for index, item in enumerate(self.items):
+                self.settings.setArrayIndex(index)
+                self.settings.setValue("name", item.name)
+                self.settings.setValue("url", item.url)
+                self.settings.setValue("region", item.region)
+                self.settings.setValue("bucket_name", item.bucket_name)
+                self.settings.setValue("access_key", item.enc_access_key)
+                self.settings.setValue("secret_key", item.enc_secret_key)
+                self.settings.setValue("no_ssl_check", item.no_ssl_check)
+                self.settings.setValue("use_path", item.use_path)
+                self.settings.setValue("session_token", item.enc_session_token)
+                self.settings.setValue("read_only", item.read_only)
+                self.settings.setValue("color", item.color)
+                self.settings.setValue("session_expires", item.session_expires)
+                self.settings.setValue("aws_profile", item.aws_profile)
+                self.settings.setValue(
+                    "credential_process", item.credential_process)
+                self.settings.setValue("public_base_url", item.public_base_url)
+                self.settings.setValue("requester_pays", item.requester_pays)
+                self.settings.setValue("proxy_url", item.proxy_url)
+                self.settings.setValue("ca_bundle", item.ca_bundle)
+            self.settings.endArray()
 
     def populate_list(self):
         self.listWidget.clear()
@@ -1358,9 +1356,8 @@ def main():
 
     # Apply the saved theme before any window is shown.
     _settings = QSettings("s3duck", "s3duck")
-    _settings.beginGroup("common")
-    _saved_theme = _settings.value("theme", "system") or "system"
-    _settings.endGroup()
+    with SettingsStore(_settings).group():
+        _saved_theme = _settings.value("theme", "system") or "system"
     apply_theme(app, _saved_theme)
 
     profiles = Profiles(startup=args)
