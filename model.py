@@ -1,42 +1,21 @@
-from concurrent.futures import ThreadPoolExecutor
-from datetime import timezone
-from enum import Enum
-from typing import NamedTuple
-import base64
-import fnmatch
-import hashlib
-import struct
-import zlib
-import json
-import mimetypes
-import platform
-import re
-import time
-import uuid
 import os
-import boto3
-import botocore
-import botocore.session
+import platform
 import threading
-import types
-from urllib.parse import quote, urlencode, urlparse
 
-from boto3.s3.transfer import TransferConfig
+import boto3
 
 from core import lifecycle as _lifecycle
 from core import pricing as _pricing
-from core.checksums import _CrcDigest, _HashDigest
+from core.checksums import _CrcDigest  # noqa: F401  (re-exported)
 from core.errors import (  # noqa: F401  (re-exported: model is the front door)
     DeleteRefused, ObjectExists, ReadOnlyError, TransferCancelled,
 )
-from core.naming import as_epoch  # noqa: F401  (re-exported)
 from s3.common import (  # noqa: F401  (re-exported: model is the front door)
-    BUILTIN_CONTENT_TYPES, CHECKSUM_ALGORITHMS, CHECKSUM_DIGESTS,
-    FALLBACK_CONTENT_TYPE, FULL_OBJECT_CHECKSUMS, KNOWN_CHECKSUM_ALGORITHMS,
-    MAX_LOCAL_NAME_BYTES, RateLimiter, _BotoProgressAdapter, _ProgressReader,
-    client_accepts, client_knows_checksum, drop_unsendable_checksum_args,
-    installed_sdk_accepts, local_name_is_writable, plan_prefix_download,
-    prefix_of, run_parallel, safe_local_path,
+    CHECKSUM_ALGORITHMS, CHECKSUM_DIGESTS, KNOWN_CHECKSUM_ALGORITHMS,
+    MAX_LOCAL_NAME_BYTES, RateLimiter, _BotoProgressAdapter, client_accepts,
+    drop_unsendable_checksum_args, installed_sdk_accepts,
+    local_name_is_writable, plan_prefix_download, prefix_of, run_parallel,
+    safe_local_path,
 )
 from s3.binding import BindingMixin
 from s3.bucket_admin import BucketAdminMixin
@@ -46,9 +25,7 @@ from s3.download import DownloadMixin
 from s3.listing import ListingMixin
 from s3.object_admin import ObjectAdminMixin
 from s3.upload import UploadMixin
-from core.entries import (  # noqa: F401  (re-exported)
-    FSObjectType, Item, PrefixDownloadPlan,
-)
+from core.entries import FSObjectType, Item  # noqa: F401  (re-exported)
 from core import endpoints as _endpoints
 from core import integrity as _integrity
 from core import objects as _objects
@@ -507,6 +484,7 @@ class Model(
     MIN_COPY_PART_BYTES = _parts.MIN_COPY_PART_BYTES
     MAX_MULTIPART_PARTS = _parts.MAX_MULTIPART_PARTS
     copy_part_size = staticmethod(_parts.copy_part_size)
+    upload_part_size = staticmethod(_parts.upload_part_size)
     _multipart_upload_size = staticmethod(_parts._multipart_upload_size)
 
     parse_restore_status = staticmethod(_objects.parse_restore_status)

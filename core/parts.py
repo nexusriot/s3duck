@@ -24,6 +24,26 @@ def copy_part_size(size, preferred=0) -> int:
     return max(int(preferred or 0), needed, MIN_COPY_PART_BYTES)
 
 
+def upload_part_size(size, preferred) -> int:
+    """
+    Part size for a multipart upload of *size* bytes.
+
+    S3 numbers parts 1..10 000 and refuses anything past that, so a fixed
+    part size is only usable up to ``part x 10 000`` — 80 GiB at the default
+    8 MiB, which is exactly the range the resumable writer exists for. The
+    size is raised just far enough to fit, and otherwise left alone.
+
+    No 5 MiB floor here, unlike ``copy_part_size``: the configured chunk is
+    already clamped to it by ``set_multipart_sizes``, and raising a smaller
+    one would silently rewrite a part size a caller chose on purpose. The
+    ceiling is what S3 enforces; the floor is a setting.
+    """
+    size = int(size)
+    preferred = max(1, int(preferred or 0))
+    needed = (size + MAX_MULTIPART_PARTS - 1) // MAX_MULTIPART_PARTS
+    return max(preferred, needed)
+
+
 def _multipart_upload_size(client, bucket, key, upload_id) -> int:
     """Sum the sizes of the parts already uploaded for one multipart upload."""
     total = 0

@@ -1,7 +1,7 @@
 """Deleting objects, versions, prefixes and whole buckets.
 """
 
-import botocore.session
+import botocore.exceptions
 from core.errors import TransferCancelled
 
 

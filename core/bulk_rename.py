@@ -56,6 +56,14 @@ def bulk_rename_plan(items, *, mode=BULK_RENAME_FIND, find="", replace="",
                 )
             except (KeyError, IndexError) as exc:
                 return [], [f"Unknown placeholder in template: {exc}"]
+            except ValueError as exc:
+                # A half-typed template is the normal state of the box while
+                # someone is typing in it: "{" alone, "{name!z}" and
+                # "{name:d}" are all ValueError, and the preview recomputes
+                # on every keystroke. PyQt6 turns an exception escaping that
+                # slot into a process abort, so the dialog has to be told
+                # what is wrong rather than the app dying mid-word.
+                return [], [f"Invalid template: {exc}"]
             counter += 1
 
         new = (new or "").strip()

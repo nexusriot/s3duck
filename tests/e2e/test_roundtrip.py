@@ -9,7 +9,7 @@ import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-from model import FSObjectType, TransferCancelled     # noqa: F401
+from model import FSObjectType  # noqa: F401
 from tests.e2e.harness import ServerCase
 
 

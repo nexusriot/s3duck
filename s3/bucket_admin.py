@@ -1,7 +1,7 @@
 """A bucket's own settings: policy, CORS, lifecycle, encryption, locking.
 """
 
-import botocore.session
+import botocore.exceptions
 import json
 
 

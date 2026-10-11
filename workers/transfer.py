@@ -36,6 +36,14 @@ def job_runner(label):
 
     Cancellation is deliberately not a failure. The user asked for it, so it
     reports nothing and only tells ``finished`` what happened.
+
+    It is recognised by TYPE. The test used to be the word "cancelled"
+    anywhere in str(exc), and that test can only ever err one way: towards
+    silence. A delete refused on "cancelled-orders.csv", or a backend whose
+    error body says "request cancelled by peer", was reported to the user as
+    their own cancellation -- no dialog, no red row, no log line about what
+    actually went wrong. The reverse mistake is harmless by comparison, so
+    anything that is not a TransferCancelled is now a failure.
     """
     def decorate(operation):
         @functools.wraps(operation)
@@ -45,7 +53,7 @@ def job_runner(label):
                 operation(self)
             except Exception as exc:
                 msg = str(exc) or exc.__class__.__name__
-                if "cancelled" in msg.lower():
+                if isinstance(exc, TransferCancelled):
                     cancelled = True
                 else:
                     self.progress.emit(f"{label} failed: {msg}")

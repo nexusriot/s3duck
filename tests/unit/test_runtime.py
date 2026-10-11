@@ -1,6 +1,7 @@
 """Process-level concerns: CLI, instance handover, logging."""
 
 import botocore.session
+import diagnostics
 import main_window
 import os
 import profile_switcher
@@ -12,10 +13,10 @@ import unittest
 import utils
 from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QDialogButtonBox
-from model import Model
+from model import Model, TransferCancelled, installed_sdk_accepts
 from tests.support import (
-    PROJECT_ROOT, _MultipartClient, _StubModel, _ensure_qapp,
-    make_main_window, patch_app_wide,
+    PROJECT_ROOT, FakeS3Client, _MultipartClient, _StubModel, _ensure_qapp,
+    make_main_window, make_model, patch_app_wide,
 )
 from unittest.mock import patch
 from utils import TempWorkspace, pid_is_alive
@@ -379,6 +380,133 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(settings.value("last_location/prod"), "logs/2026/")
         settings.endGroup()
         self.assertEqual(win.profile_name, "dev")
+class _DeniedListClient(FakeS3Client):
+    """A bucket the credentials cannot read."""
+
+    def get_paginator(self, name):
+        raise botocore.exceptions.ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "Access denied"}},
+            "ListObjectsV2")
+
+
+class _RefusingPutClient(FakeS3Client):
+    """A bucket that refuses the probe key but answers the cleanup."""
+
+    def put_object(self, **kw):
+        raise botocore.exceptions.ClientError(
+            {"Error": {"Code": "QuotaExceeded",
+                       "Message": "Bucket quota exceeded"}},
+            "PutObject")
+
+
+class _DeleteOnlyModel:
+    """Just enough model for Worker.delete()."""
+
+    parallel_files = 1
+
+    def __init__(self, on_delete):
+        self.delete = on_delete
+
+
+class Review024RegressionTests(unittest.TestCase):
+    """Findings from the 0.24.0 review, each reproduced before being fixed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def test_the_sdk_capability_probe_actually_asks_botocore(self):
+        """FINDING: installed_sdk_accepts built its throwaway client with
+        types.SimpleNamespace, and s3/common.py never imported types. Every
+        call raised NameError, which the function's own "anything that cannot
+        be asked answers True" handler swallowed -- so the Diagnostics report
+        answered "Yes" to "Conditional writes (If-None-Match)" on every
+        build, including the distribution botocore the row exists to warn
+        about. A parameter that certainly does not exist proves the probe is
+        reading the service model rather than defaulting."""
+        self.assertFalse(
+            installed_sdk_accepts("PutObject", "NoSuchParameterAtAll"))
+        self.assertTrue(installed_sdk_accepts("PutObject", "Bucket"))
+
+    def test_an_unaskable_operation_still_answers_yes(self):
+        """The documented fallback has to survive the fix: a model this build
+        cannot describe must not disable a feature the service does have."""
+        self.assertTrue(installed_sdk_accepts("NoSuchOperation", "Whatever"))
+
+    def test_the_diagnostics_report_reflects_the_installed_botocore(self):
+        text = diagnostics.format_report(diagnostics.collect(PROJECT_ROOT))
+        self.assertIn("Conditional writes (If-None-Match)", text)
+
+    def test_a_read_only_profile_passes_its_own_check(self):
+        """FINDING: check_profile proved a bucket by creating and deleting a
+        probe key. That write goes through _guard_write, so every correctly
+        configured read-only profile reported "Check failed: This profile is
+        read-only" -- the check contradicting the setting beside it."""
+        model = make_model(bucket="bkt", read_only=True)
+        model._client = FakeS3Client(
+            list_pages=[{"Contents": [{"Key": "a.txt", "Size": 1}]}])
+        ok, reason = model.check_profile()
+        self.assertTrue(ok, reason)
+        self.assertIsNone(reason)
+        self.assertEqual(model._client.calls_of("put_object"), [],
+                         "the read-only check wrote to the bucket")
+
+    def test_a_read_only_profile_still_reports_a_real_failure(self):
+        model = make_model(bucket="bkt", read_only=True)
+        model._client = _DeniedListClient()
+        ok, reason = model.check_profile()
+        self.assertFalse(ok)
+        self.assertIn("denied", (reason or "").lower())
+
+    def test_a_writable_profile_still_gets_the_write_probe(self):
+        model = make_model(bucket="bkt")
+        model._client = FakeS3Client()
+        ok, reason = model.check_profile()
+        self.assertTrue(ok, reason)
+        self.assertEqual(len(model._client.calls_of("put_object")), 1)
+        self.assertEqual(len(model._client.calls_of("delete_object")), 1)
+
+    def test_a_failed_probe_reports_the_creates_reason_not_the_cleanups(self):
+        """The cleanup used to run in a finally and raise over the top of the
+        reason the create had given, so the only failure ever reported was
+        the delete's."""
+        model = make_model(bucket="bkt")
+        model._client = _RefusingPutClient()
+        ok, reason = model.check_profile()
+        self.assertFalse(ok)
+        self.assertIn("quota", (reason or "").lower())
+
+    def test_a_failure_that_says_cancelled_is_still_a_failure(self):
+        """FINDING: job_runner decided "was this a cancellation?" by looking
+        for the word in str(exc). A delete refused on a key like
+        "cancelled-orders.csv" was therefore reported as the user's own
+        cancellation -- no error dialog, no red queue row, nothing in the log
+        about what actually went wrong."""
+        def _boom(key, **_kw):
+            raise RuntimeError("AccessDenied on cancelled-orders.csv")
+
+        worker = main_window.Worker(
+            _DeleteOnlyModel(_boom), ["cancelled-orders.csv"])
+        errors, finished = [], []
+        worker.error.connect(errors.append)
+        worker.finished.connect(finished.append)
+        worker.delete()
+        self.assertEqual(finished, [False], "reported as a cancellation")
+        self.assertEqual(len(errors), 1, "the failure was swallowed")
+
+    def test_a_real_cancellation_is_still_silent(self):
+        def _cancel(key, **_kw):
+            raise TransferCancelled("cancelled")
+
+        worker = main_window.Worker(_DeleteOnlyModel(_cancel), ["a.txt"])
+        errors, finished = [], []
+        worker.error.connect(errors.append)
+        worker.finished.connect(finished.append)
+        worker.delete()
+        self.assertEqual(finished, [True])
+        self.assertEqual(errors, [])
+
+
 class E2EHarnessTests(unittest.TestCase):
     """
     The end-to-end suite is only worth having if it can start. MinIO

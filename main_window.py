@@ -1,17 +1,6 @@
-import csv
-import difflib
-import fnmatch
-import io
-import json
 import os
-import re
 import sys
-import pathlib
-import time
-import zipfile
-from datetime import datetime, timedelta, timezone
-from datetime import time as dtime
-import threading
+from datetime import datetime, timezone
 
 try:
     from PyQt6 import sip
@@ -32,43 +21,29 @@ from PyQt6 import QtWidgets
 # no way to tell which module a name came from, and no way to split this file
 # without guessing. The list is what the module actually uses.
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit, QDialog,
-    QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
-    QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
-    QProgressDialog, QPushButton, QRadioButton, QScrollArea, QSizePolicy,
-    QSpinBox, QSplitter, QStackedWidget, QSystemTrayIcon, QTabBar, QTabWidget,
-    QTableWidget, QTableWidgetItem, QToolButton, QTreeView, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QDialog, QFileDialog,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
+    QMessageBox, QPlainTextEdit, QProgressBar, QProgressDialog,
+    QPushButton, QSplitter, QSystemTrayIcon, QTabBar, QToolButton,
+    QVBoxLayout, QWidget,
 )
 from PyQt6.QtCore import (
-    QDate, QEvent, QItemSelectionModel, QModelIndex, QObject, QPoint, QSize,
-    QSortFilterProxyModel, QSysInfo, QThread, QTimer, Qt, pyqtSignal, pyqtSlot,
+    QEvent, QModelIndex, QPoint, QSize, QSysInfo, QTimer, Qt,
 )
-from PyQt6.QtGui import QIcon, QStandardItemModel, QStandardItem, QAction
-from PyQt6.QtGui import QFontDatabase, QShortcut, QKeySequence, QPainter, QPen, QColor, QFont, QFontMetrics, QPalette
-from PyQt6.QtGui import QDesktopServices, QPixmap, QActionGroup
-from PyQt6.QtGui import QDrag, QSyntaxHighlighter, QTextCharFormat
-from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QMimeData, QRectF, QUrl
+from PyQt6.QtGui import QIcon, QStandardItemModel, QAction
+from PyQt6.QtGui import (
+    QFontDatabase, QShortcut, QKeySequence, QColor, QFont, QPalette,
+)
+from PyQt6.QtGui import QActionGroup
 from model import Model as DataModel
 from model import FSObjectType
-from model import TransferCancelled
-from model import run_parallel
-from model import (CHECKSUM_ALGORITHMS, ObjectExists, plan_prefix_download,
-                   prefix_of,
-                   safe_local_path)
+from model import safe_local_path
 from utils import (
-    CredentialError, CredentialProcessError, DialogDismissMixin, FuncWorker,
-    TempWorkspace,
-    expiry_state, join_qthread, load_aws_profiles, normalize_accent,
-    reap_finished_workers, release_worker_on_finish, require_crypto,
-    describe_client_error, forward_icon, is_transient_error, LogFile,
-    resolve_credential_key, run_credential_process, run_with_progress,
-    scan_local_tree, themed_icon,
+    TempWorkspace, normalize_accent, reap_finished_workers, forward_icon,
+    LogFile, run_with_progress, themed_icon,
 )
 from properties_window import PropertiesWindow
 import diagnostics
-from profile_switcher import ProfileSwitchWindow, load_profiles, decrypt_profile
 from theme import apply_theme, THEMES
 from version import __VERSION__
 from settings_store import SettingsStore
@@ -86,28 +61,20 @@ from ui.window.transfers import TransferQueueMixin
 from ui.window.usage import UsageMixin
 from ui.window.watch import WatchMixin
 from ui.constants import (
-    AUTO_RETRY_DELAY_MS, CREDENTIAL_CHECK_INTERVAL_MS, DEFAULT_LISTING_LIMIT,
-    EMA_ALPHA, LIST_COLUMNS, LIST_COLUMN_DEFAULT_WIDTHS,
-    LIST_OPTIONAL_COLUMNS, OS_FAMILY_MAP, RATE_WINDOW_SEC,
-    STALL_DECAY_INTERVAL_SEC, TICK_INTERVAL_MS, UP_ENTRY_LABEL,
+    CREDENTIAL_CHECK_INTERVAL_MS, LIST_COLUMNS, LIST_COLUMN_DEFAULT_WIDTHS,
+    LIST_OPTIONAL_COLUMNS, OS_FAMILY_MAP, TICK_INTERVAL_MS, UP_ENTRY_LABEL,
 )
 from ui.dialogs.bookmarks import BookmarksDialog
-from ui.dialogs.bucket_settings import (
-    BucketSettingsDialog, LifecycleRuleDialog,
-)
+from ui.dialogs.bucket_settings import BucketSettingsDialog
 from ui.dialogs.bulk import BulkRenameDialog, BulkTagsDialog
-from ui.dialogs.compare import (
-    PaneCompareDialog, SyncDialog, WatchFolderDialog,
-)
+from ui.dialogs.compare import PaneCompareDialog, SyncDialog
 from ui.dialogs.copy_move import (
     CopyMoveDialog, CrossProfileCopyDialog, CrossProfileSyncDialog,
 )
 from ui.dialogs.diagnostics import DiagnosticsDialog
 from ui.dialogs.duplicates import DuplicateFinderDialog
-from ui.dialogs.filter_list import (
-    CommandPaletteDialog, FilterListDialog, QuickOpenDialog,
-)
-from ui.dialogs.history import OverwriteDialog, TransferHistoryDialog
+from ui.dialogs.filter_list import CommandPaletteDialog, QuickOpenDialog
+from ui.dialogs.history import OverwriteDialog
 from ui.dialogs.incomplete_uploads import IncompleteUploadsDialog
 from ui.dialogs.presigned import PresignedLinkDialog
 from ui.dialogs.preview import PreviewDialog
@@ -115,30 +82,22 @@ from ui.dialogs.search import SearchDialog
 from ui.dialogs.shortcuts import ShortcutsDialog
 from ui.dialogs.tags import MetadataDialog, TagsDialog
 from ui.dialogs.transfer_settings import TransferSettingsDialog
-from ui.dialogs.usage import BucketUsageDialog, SizeExplorerDialog
+from ui.dialogs.usage import BucketUsageDialog
 from ui.dialogs.versions import VersionDiffDialog, VersionsDialog
 from ui.widgets.breadcrumb import Breadcrumb
-from ui.widgets.charts import PieWidget, TreemapWidget
+from ui.widgets.charts import TreemapWidget
 from ui.widgets.click_guard import _OneShotClickGuard
-from ui.widgets.highlighters import CodeHighlighter, DiffHighlighter
-from ui.widgets.listing import ListItem, Tree, UpTopProxyModel
+from ui.widgets.listing import Tree, UpTopProxyModel
 from ui.widgets.profile_picker import ProfilePicker, build_profile_model
 from ui.widgets.queue_panel import (
     TransferQueuePanel, _QEntry, _QueueRow,
 )
 from ui.widgets.second_pane import SecondPane  # noqa: F401
-from workers.navigation import (  # noqa: F401  (re-exported)
-    BucketEnterWorker, LISTING_COUNT_INTERVAL_SEC, NavigationWorker,
-)
-from workers.transfer import (  # noqa: F401  (re-exported)
-    PROGRESS_EMIT_INTERVAL_SEC, PROGRESS_MIN_BYTE_DELTA, Worker,
-)
-from workers.usage import UsageWorker  # noqa: F401  (re-exported)
+from workers.transfer import Worker  # noqa: F401  (re-exported)
 # Pure domain logic, extracted to core/. Re-exported here because the
 # window and the dialogs are still its callers; the names are unchanged.
 from core.naming import (  # noqa: F401
-    DOC_EXT, MEDIA_EXT, _to_epoch, categorize_key, _human_bytes,
-    _dest_inside_source,
+    _to_epoch, categorize_key, _human_bytes, _dest_inside_source,
 )
 from core.transfer_jobs import (  # noqa: F401
     _build_upload_job_for_path, build_paste_job,
@@ -147,31 +106,28 @@ from core.bulk_rename import (  # noqa: F401
     BULK_RENAME_FIND, BULK_RENAME_TEMPLATE, bulk_rename_plan,
 )
 from core.dedup import (  # noqa: F401
-    _etag_is_comparable, find_duplicate_groups, summarize_duplicate_groups,
+    find_duplicate_groups, summarize_duplicate_groups,
     select_redundant_keys,
 )
 from core.bookmarks import (  # noqa: F401
     bookmark_label, parse_bookmarks, serialize_bookmarks, add_bookmark_to,
 )
 from core.sync_plan import (  # noqa: F401
-    SYNC_MTIME_TOLERANCE_SEC, build_exclude_matcher, build_sync_plan,
-    build_compare_plan, summarize_compare_plan, summarize_sync_plan,
+    build_exclude_matcher, build_sync_plan, build_compare_plan,
+    summarize_compare_plan, summarize_sync_plan,
 )
 from core.manifest import (  # noqa: F401
-    MANIFEST_HEADER, MANIFEST_COLUMNS, build_manifest, parse_manifest,
-    compare_manifest,
+    MANIFEST_HEADER, build_manifest, parse_manifest, compare_manifest,
 )
 from core.treemap import (  # noqa: F401
-    build_prefix_tree, node_at_path, treemap_children, _treemap_row,
-    _treemap_worst, squarify,
+    build_prefix_tree, node_at_path, treemap_children, squarify,
 )
 from core.commands import (  # noqa: F401
-    LISTVIEW_KEY_HELP, clean_action_label, collect_shortcuts,
-    command_entries, palette_score, filter_commands,
+    LISTVIEW_KEY_HELP, collect_shortcuts, command_entries, palette_score,
+    filter_commands,
 )
 from core.locations import (  # noqa: F401
-    parse_s3_location,
-    CROSS_PROFILE_METHODS, serialize_location, parse_location,
+    parse_s3_location, serialize_location, parse_location,
     location_entries, build_profile_sync_job,
 )
 from core.formatting import (  # noqa: F401

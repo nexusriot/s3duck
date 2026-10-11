@@ -19,9 +19,7 @@ from PyQt6.QtGui import QIcon, QImageReader
 from PyQt6.QtWidgets import QApplication
 
 from diagnostics import NON_APP_DIRS, icon_calls
-from utils import (
-    ICON_PROBE_SIZE, bundled_icon, icon_is_visible, themed_icon,
-)
+from utils import ICON_PROBE_SIZE, icon_is_visible, themed_icon
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

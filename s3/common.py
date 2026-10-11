@@ -2,23 +2,19 @@
 
 Model's mixins all need these -- the checksum table, the progress adapters,
 the rate limiter, the local-path safety rules -- and none of them can import
-Model to get them without a cycle. model.py re-exports every name, so
-`from model import run_parallel` and friends keep working.
+Model to get them without a cycle. model.py re-exports the names its own
+callers ask it for, so `from model import run_parallel` and friends keep
+working; a name nothing imports from model is reached from here instead.
 """
 
-import base64
-import fnmatch
-import hashlib
-import mimetypes
 import os
-import re
-import struct
 import threading
 import time
+import types
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 
-import botocore
+import botocore.session
 
 from core.checksums import _CrcDigest, _HashDigest
 from core.entries import PrefixDownloadPlan

@@ -6,7 +6,8 @@ bucket is a probe rather than a constructor argument.
 """
 
 import boto3
-import botocore.session
+import botocore.config
+import botocore.exceptions
 import os
 import threading
 import uuid
@@ -213,19 +214,28 @@ bucket is a probe rather than a constructor argument.
             self._client = self._make_client()
         return self._client
 
-    def _can_list_bucket(self, client_obj, bucket_name: str) -> bool:
-        """True if this client can list a single page of *bucket_name*."""
-        try:
-            paginator = client_obj.get_paginator("list_objects_v2")
-            iterator = paginator.paginate(
+    @staticmethod
+    def _list_one_page(client_obj, bucket_name: str) -> bool:
+        """List a single page of *bucket_name*, letting the failure out.
+
+        The cheapest proof that a client can read a bucket. _can_list_bucket
+        wants the yes/no; check_profile wants the reason, so the raising form
+        is the one that is written down.
+        """
+        paginator = client_obj.get_paginator("list_objects_v2")
+        for _page in paginator.paginate(
                 Bucket=bucket_name,
                 Prefix="",
                 Delimiter="/",
                 PaginationConfig={"MaxItems": 1},
-            )
-            for _ in iterator:
-                break
-            return True
+        ):
+            break
+        return True
+
+    def _can_list_bucket(self, client_obj, bucket_name: str) -> bool:
+        """True if this client can list a single page of *bucket_name*."""
+        try:
+            return self._list_one_page(client_obj, bucket_name)
         except Exception:
             return False
 
@@ -471,7 +481,14 @@ bucket is a probe rather than a constructor argument.
         """
         Profile check.
         - If bucket is empty: verify credentials by listing buckets.
-        - If bucket is set: verify write/delete by creating a temp folder key.
+        - If the profile is read-only: verify the bucket can be listed.
+        - Otherwise: verify write/delete by creating a temp folder key.
+
+        A read-only profile gets the read check and not the write one. The
+        write probe goes through _guard_write, so asking a read-only profile
+        to prove it can write reported every correctly-configured one as
+        "Check failed: This profile is read-only" — the check contradicting
+        the setting the user had just chosen.
         """
         if not self.bucket:
             try:
@@ -480,19 +497,43 @@ bucket is a probe rather than a constructor argument.
             except Exception as exc:
                 return False, str(exc)
 
-        res_c = res_d = False
+        if self.read_only:
+            try:
+                self._list_one_page(self.client, self.bucket)
+                return True, None
+            except botocore.exceptions.ClientError as exc:
+                return False, exc.response["Error"]["Message"]
+            except Exception as exc:
+                return False, str(exc)
+
+        created = removed = False
         reason = None
         key = str(uuid.uuid4())
         try:
-            try:
-                res_c = self.create_folder(key)
-            finally:
-                res_d = self.delete(key)
+            self.create_folder(key)
         except botocore.exceptions.ClientError as exc:
             reason = exc.response["Error"]["Message"]
         except Exception as exc:
             reason = str(exc)
-        return bool(res_c) and res_d, reason
+        else:
+            # Not having raised is the success: the old test was whether
+            # PutObject's RESPONSE was truthy, which is a property of the
+            # backend's reply rather than of the write. A service answering
+            # a bare body would have failed a profile that works.
+            created = True
+            # Only once the probe key exists is there anything to clean up,
+            # and the cleanup must not overwrite the reason the create gave:
+            # a delete that fails for its own reason used to be the only
+            # failure reported.
+            try:
+                self.delete(key)
+            except botocore.exceptions.ClientError as exc:
+                reason = exc.response["Error"]["Message"]
+            except Exception as exc:
+                reason = str(exc)
+            else:
+                removed = True
+        return created and removed, reason
 
     def get_bucket_hints(self, bucket_name: str):
         """

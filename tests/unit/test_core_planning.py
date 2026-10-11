@@ -172,6 +172,29 @@ class BulkRenamePlanTests(unittest.TestCase):
             bulk_rename_plan([("a.txt", False)], find="", replace="x"),
             ([], []),
         )
+
+    def test_malformed_template_is_reported_not_raised(self):
+        """REGRESSION (crash): str.format raises ValueError -- not just the
+        KeyError/IndexError that were caught -- for a stray brace, an unknown
+        conversion and a format code a string cannot take. The preview
+        recomputes on every keystroke in the template box, so "{" as the
+        first character of a new template reached a Qt slot as an unhandled
+        ValueError, and PyQt6 aborts the process when one escapes a slot."""
+        for template in ("{", "}", "{name!z}", "{name:d}", "{name:{}}"):
+            with self.subTest(template=template):
+                plan, problems = bulk_rename_plan(
+                    [("a.txt", False)], mode=BULK_RENAME_TEMPLATE,
+                    template=template)
+                self.assertEqual(plan, [])
+                self.assertEqual(len(problems), 1)
+                self.assertTrue(problems[0])
+
+    def test_a_valid_template_still_works_after_the_guard(self):
+        plan, problems = bulk_rename_plan(
+            [("a.txt", False)], mode=BULK_RENAME_TEMPLATE,
+            template="{name}-{n}{ext}")
+        self.assertEqual(plan, [("a.txt", "a-1.txt")])
+        self.assertEqual(problems, [])
 class BuildSyncPlanTests(unittest.TestCase):
     def test_upload_direction(self):
         local = {"new.txt": (10, 100.0), "same.txt": (5, 100.0),

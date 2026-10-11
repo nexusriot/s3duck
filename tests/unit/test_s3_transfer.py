@@ -8,6 +8,7 @@ import tempfile
 import threading
 import types
 import unittest
+import unittest.mock
 from main_window import Worker
 from model import (
     DeleteRefused, MAX_LOCAL_NAME_BYTES, Model, ObjectExists, ReadOnlyError,
@@ -1127,6 +1128,38 @@ class ResumableUploadTests(unittest.TestCase):
         self.assertEqual(client.completed["big.bin"], self.payload)
         self.assertEqual(sorted(n for n, _c in client.part_calls),
                          [1, 2, 3, 4])
+
+    def test_the_part_size_grows_rather_than_exceed_ten_thousand_parts(self):
+        """REGRESSION: S3 numbers parts 1..10 000, so a fixed part size only
+        reaches ``part x 10 000`` -- 80 GiB at the default 8 MiB. Past that
+        this writer kept counting and the upload was refused on the part that
+        crossed the line, after everything before it had been sent. The
+        server-side copy path has clamped for this all along (copy_part_size)
+        and boto3's managed upload adjusts too, so turning resumable uploads
+        OFF was what made a very large file transferable.
+
+        One byte per part here would need 3 089 parts for this payload;
+        the ceiling is lowered instead of the file enlarged."""
+        client = _MultipartClient()
+        model = self._model(client)
+        model.upload_chunk_size = 1
+        with unittest.mock.patch(
+                "core.parts.MAX_MULTIPART_PARTS", 4):
+            model.upload_file(self.path, "big.bin")
+        self.assertLessEqual(len(client.part_calls), 4)
+        self.assertEqual(client.completed["big.bin"], self.payload,
+                         "the clamped part size assembled a different object")
+
+    def test_a_part_size_that_already_fits_is_left_alone(self):
+        self.assertEqual(
+            Model.upload_part_size(self.PART * 4, self.PART), self.PART)
+
+    def test_the_part_size_rises_just_far_enough(self):
+        size = 100 * 1024 ** 3                      # 100 GiB
+        part = Model.upload_part_size(size, 8 * 1024 * 1024)
+        self.assertLessEqual((size + part - 1) // part,
+                             Model.MAX_MULTIPART_PARTS)
+        self.assertGreaterEqual(part, 8 * 1024 * 1024)
 
     def test_the_upload_and_its_parts_agree_on_a_checksum_algorithm(self):
         """

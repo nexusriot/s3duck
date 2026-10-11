@@ -1,7 +1,7 @@
 """Server-side copy, and the stream-through fallback when it is refused.
 """
 
-import botocore.session
+import botocore.exceptions
 import threading
 from core.errors import TransferCancelled
 from s3.common import (

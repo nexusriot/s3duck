@@ -1,7 +1,7 @@
 """Putting bytes in: multipart, resume, and the rules that shape a PUT.
 """
 
-import botocore.session
+import botocore.exceptions
 import fnmatch
 import hashlib
 import json
@@ -302,7 +302,14 @@ class UploadMixin:
         because that is exactly what the next attempt resumes from — the
         Incomplete-uploads tool is how an abandoned one gets cleaned up.
         """
-        chunk = int(self.upload_chunk_size)
+        # Raised when the configured part size would need more than S3's
+        # 10 000 parts. Without this a file over chunk x 10 000 — 80 GiB at
+        # the default 8 MiB — was refused on the part that crossed the line,
+        # after everything before it had already been sent. boto3's managed
+        # upload has adjusted for this all along (s3transfer's
+        # ChunksizeAdjuster), so turning resumable uploads OFF used to be
+        # what made a very large file transferable.
+        chunk = int(self.upload_part_size(size, self.upload_chunk_size))
         total_parts = max(1, (int(size) + chunk - 1) // chunk)
         mtime = os.path.getmtime(local_file)
         state_path = self._upload_state_path(key, local_file)

@@ -1,7 +1,7 @@
 """Getting bytes out, and proving they arrived intact.
 """
 
-import botocore.session
+import botocore.exceptions
 import hashlib
 import json
 import os

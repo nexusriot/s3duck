@@ -1,7 +1,7 @@
 """One object's metadata, tags, class, versions and integrity.
 """
 
-import botocore.session
+import botocore.exceptions
 import os
 from core.errors import TransferCancelled
 from s3.common import (

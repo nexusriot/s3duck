@@ -1,7 +1,7 @@
 """Reading what is in a bucket or under a prefix.
 """
 
-import botocore.session
+import botocore.exceptions
 from core.entries import FSObjectType, Item
 from core.errors import TransferCancelled
 from core.naming import as_epoch
