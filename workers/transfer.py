@@ -183,7 +183,11 @@ class Worker(QObject):
                 raise TransferCancelled("cancelled")
             msg = "moving %s -> /dev/null" % key
             self.progress.emit(msg)
-            self.data_model.delete(key, log_fn=self.progress.emit)
+            # The event, not just the check above: deleting a prefix is one
+            # call per batch of a thousand keys, so without it Cancel did
+            # nothing until a whole folder had been walked.
+            self.data_model.delete(key, log_fn=self.progress.emit,
+                                   cancel_event=self._cancel_event)
 
     @job_runner("upload")
     def upload(self):
@@ -334,10 +338,31 @@ class Worker(QObject):
                     cancel_event=self._cancel_event,
                     log_fn=self.progress.emit)
 
+    @staticmethod
+    def _copy_row(row):
+        """
+        One copy/move job row as
+        ``(src_key, dst_key, is_folder, dst_bucket_or_None, storage_class)``.
+
+        The fifth field is what the listing the row was built from already
+        knew, so the copy need not spend a HEAD rediscovering it. Rows
+        without one are read as "unknown", not as STANDARD: a job replayed
+        from a history written before rows carried the class must still land
+        in the class it finds, and the model asks the source when nobody
+        tells it. A folder row carries no class at all -- the recursive copy
+        reads one per object out of its own listing.
+        """
+        src_key, dst_key, is_folder, dst_bucket = row[:4]
+        storage_class = row[4] if len(row) > 4 else None
+        return src_key, dst_key, is_folder, dst_bucket, storage_class or None
+
     @job_runner("copy")
     def copy(self):
-        # job = [(src_key, dst_key, is_folder, dst_bucket_or_None)]
-        for src_key, dst_key, is_folder, dst_bucket in self.job:
+        # job = [(src_key, dst_key, is_folder, dst_bucket_or_None,
+        #         storage_class)]
+        for row in self.job:
+            (src_key, dst_key, is_folder, dst_bucket,
+             storage_class) = self._copy_row(row)
             if self._cancel_event.is_set():
                 raise TransferCancelled("cancelled")
             where = f" in {dst_bucket}" if dst_bucket else ""
@@ -353,12 +378,17 @@ class Worker(QObject):
                 self.progress.emit(f"copying {src_key} -> {dst_key}{where}")
                 self.data_model.copy_object(
                     src_key, dst_key, dst_bucket=dst_bucket,
-                    log_fn=self.progress.emit)
+                    log_fn=self.progress.emit,
+                    storage_class=storage_class,
+                    cancel_event=self._cancel_event)
 
     @job_runner("move")
     def move(self):
-        # job = [(src_key, dst_key, is_folder, dst_bucket_or_None)]
-        for src_key, dst_key, is_folder, dst_bucket in self.job:
+        # job = [(src_key, dst_key, is_folder, dst_bucket_or_None,
+        #         storage_class)]
+        for row in self.job:
+            (src_key, dst_key, is_folder, dst_bucket,
+             storage_class) = self._copy_row(row)
             if self._cancel_event.is_set():
                 raise TransferCancelled("cancelled")
             where = f" in {dst_bucket}" if dst_bucket else ""
@@ -374,14 +404,18 @@ class Worker(QObject):
                 self.progress.emit(f"moving {src_key} -> {dst_key}{where}")
                 self.data_model.copy_object(
                     src_key, dst_key, dst_bucket=dst_bucket,
-                    log_fn=self.progress.emit)
+                    log_fn=self.progress.emit,
+                    storage_class=storage_class,
+                    cancel_event=self._cancel_event)
         # Sources are removed only after every copy succeeded, so a failure
         # mid-way never leaves the data deleted-but-not-copied.
-        for src_key, _dst_key, _is_folder, _dst_bucket in self.job:
+        for row in self.job:
+            src_key = row[0]
             if self._cancel_event.is_set():
                 raise TransferCancelled("cancelled")
             self.progress.emit(f"removing {src_key}")
-            self.data_model.delete(src_key, log_fn=self.progress.emit)
+            self.data_model.delete(src_key, log_fn=self.progress.emit,
+                                   cancel_event=self._cancel_event)
 
     @job_runner("bucket delete")
     def delete_buckets(self):
@@ -476,7 +510,8 @@ class Worker(QObject):
                 )
             elif action == "delete_remote":
                 self.progress.emit(f"sync delete remote {rel}")
-                self.data_model.delete(key, log_fn=self.progress.emit)
+                self.data_model.delete(key, log_fn=self.progress.emit,
+                                       cancel_event=self._cancel_event)
             elif action == "delete_local":
                 self.progress.emit(f"sync delete local {rel}")
                 try:

@@ -315,6 +315,17 @@ class DownloadMixin:
             with open(part_path, "wb") as handle:
                 handle.truncate(size)
             done = set()
+        else:
+            # A partial file whose sidecar is gone (a failed meta write, a
+            # half-cleaned directory) is kept — every chunk is re-fetched
+            # anyway — but it is NOT trusted to be the right length. One left
+            # by a larger object would otherwise keep its tail past `size`,
+            # and os.replace below would hand that over as the finished file.
+            try:
+                with open(part_path, "r+b") as handle:
+                    handle.truncate(size)
+            except OSError:
+                pass
 
         state_lock = threading.Lock()
         transferred = len(done) * chunk_size

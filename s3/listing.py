@@ -7,6 +7,29 @@ from core.errors import TransferCancelled
 from core.naming import as_epoch
 
 
+def expecting_region(exc) -> str:
+    """
+    The region a backend named in an ``AuthorizationHeaderMalformed``, or "".
+
+    The message is the only place the answer appears -- there is no header
+    and no structured field for it -- so the quoted name is read out of it:
+    "... the region 'us-east-1' is wrong; expecting 'eu-north-1'".
+    """
+    if not isinstance(exc, botocore.exceptions.ClientError):
+        return ""
+    error = exc.response.get("Error", {}) or {}
+    if error.get("Code", "") != "AuthorizationHeaderMalformed":
+        return ""
+    message = error.get("Message", "") or str(exc)
+    marker = "expecting '"
+    start = message.find(marker)
+    if start == -1:
+        return ""
+    rest = message[start + len(marker):]
+    end = rest.find("'")
+    return rest[:end].strip() if end != -1 else ""
+
+
 class ListingMixin:
     """Reading what is in a bucket or under a prefix.
     """
@@ -55,19 +78,9 @@ class ListingMixin:
                 break  # success
             except botocore.exceptions.ClientError as exc:
                 last_err = exc
-                err_code = exc.response.get("Error", {}).get("Code", "")
-                if err_code == "AuthorizationHeaderMalformed":
-                    msg = exc.response.get("Error", {}).get("Message", "") or str(exc)
-                    expecting_region = None
-                    marker = "expecting '"
-                    idx = msg.find(marker)
-                    if idx != -1:
-                        rest = msg[idx + len(marker):]
-                        endq = rest.find("'")
-                        if endq != -1:
-                            expecting_region = rest[:endq].strip()
-                    if expecting_region and expecting_region not in tried and expecting_region not in queue:
-                        queue.append(expecting_region)
+                hinted = expecting_region(exc)
+                if hinted and hinted not in tried and hinted not in queue:
+                    queue.append(hinted)
             except Exception as exc:
                 last_err = exc
 
@@ -97,44 +110,21 @@ class ListingMixin:
         take a long, completely silent minute.
         """
         paginator = client_obj.get_paginator("list_objects_v2")
+        items = []
+        truncated = False
+        limit = int(max_items or 0)
+        # One try around BOTH building the iterator and walking it. paginate()
+        # sends nothing -- it returns a lazy PageIterator -- so every failure,
+        # the region hint included, arrives on the first `for page in pages`.
+        # Reading the hint next to paginate() meant it was never read at all:
+        # the mismatch surfaced one line further down, where it was classified
+        # as fatal, and `list()`'s retry in the hinted region never ran.
         try:
             pages = paginator.paginate(
                 Bucket=bucket_name,
                 Prefix=prefix or "",
                 Delimiter="/",
             )
-        except botocore.exceptions.ClientError as exc:
-            err_code = exc.response.get("Error", {}).get("Code", "")
-
-            # AuthorizationHeaderMalformed: maybe wrong region
-            if err_code == "AuthorizationHeaderMalformed":
-                msg = exc.response.get("Error", {}).get("Message", "") or str(exc)
-                expecting_region = None
-                marker = "expecting '"
-                idx = msg.find(marker)
-                if idx != -1:
-                    rest = msg[idx + len(marker):]
-                    endq = rest.find("'")
-                    if endq != -1:
-                        expecting_region = rest[:endq].strip()
-                return False, [], expecting_region, None, False
-
-            # Access/NoSuchKey/etc: treat as **fatal** now (surface real boto3 message)
-            if err_code in ("NoSuchKey", "AccessDenied", "AllAccessDisabled"):
-                return False, [], None, exc, False
-
-            # other real failure
-            return False, [], None, exc, False
-
-        except Exception as exc:
-            # unknown non-ClientError; treat as fatal
-            return False, [], None, exc, False
-
-        # We got a paginator successfully. Now accumulate.
-        items = []
-        truncated = False
-        limit = int(max_items or 0)
-        try:
             for page in pages:
                 folders = [fld2["Prefix"] for fld2 in page.get("CommonPrefixes", [])]
                 objects = [obj for obj in page.get("Contents", [])]
@@ -177,11 +167,16 @@ class ListingMixin:
                     truncated = True
                     break
         except botocore.exceptions.ClientError as exc:
-            err_code = exc.response.get("Error", {}).get("Code", "")
-            if err_code in ("NoSuchKey", "AccessDenied", "AllAccessDisabled"):
-                return False, [], None, exc, False
+            # A named region is a retry, not a failure: the caller tries it
+            # and promotes it when it works. Anything else -- AccessDenied,
+            # NoSuchKey, a backend that is simply unhappy -- is fatal, and
+            # the original boto3 message is what gets surfaced.
+            hinted = expecting_region(exc)
+            if hinted:
+                return False, [], hinted, None, False
             return False, [], None, exc, False
         except Exception as exc:
+            # unknown non-ClientError; treat as fatal
             return False, [], None, exc, False
 
         return True, items, None, None, truncated
@@ -201,7 +196,7 @@ class ListingMixin:
         self.last_listing_truncated = False
 
         # 1. Try with the current live client
-        ok, items, expecting_region, fatal_exc, cut = self._list_bucket_once(
+        ok, items, hinted_region, fatal_exc, cut = self._list_bucket_once(
             self.client, self.bucket, prefix, page_cb=page_cb,
             max_items=max_items
         )
@@ -213,16 +208,16 @@ class ListingMixin:
             raise fatal_exc
 
         # 2. If server told us a better region, try that region
-        if expecting_region:
-            tmp_client = self._make_client(region=expecting_region)
-            (ok2, items2, expecting_region2,
+        if hinted_region:
+            tmp_client = self._make_client(region=hinted_region)
+            (ok2, items2, _hint2,
              fatal_exc2, cut2) = self._list_bucket_once(
                 tmp_client, self.bucket, prefix, page_cb=page_cb,
                 max_items=max_items
             )
             if ok2:
                 # success in new region -> adopt it permanently for this bucket
-                self.region_name = expecting_region
+                self.region_name = hinted_region
                 self._client = tmp_client
                 self.last_listing_truncated = cut2
                 return items2
@@ -234,11 +229,18 @@ class ListingMixin:
             f"Cannot list bucket '{self.bucket}' at prefix '{prefix}' with available regions."
         )
 
-    def get_keys(self, prefix, log_fn=None):
+    def get_keys_with_class(self, prefix, log_fn=None):
         """
-        Return [(Key, Size), ...] for ALL objects under 'prefix', paginated.
-        Includes 'folder placeholder' keys (ending with '/').
-        Automatically retries once after rebinding on region/endpoint errors.
+        Return [(Key, Size, StorageClass), ...] for ALL objects under
+        'prefix', paginated. Includes 'folder placeholder' keys (ending with
+        '/'). Automatically retries once after rebinding on region/endpoint
+        errors.
+
+        The class comes free with ListObjectsV2 -- it is in the same element
+        as the key and the size -- which is the only reason a recursive copy
+        can preserve it without a HEAD per object. S3 omits the field for a
+        STANDARD object rather than naming it, so an absent one is read as
+        STANDARD, exactly as HeadObject's silence is.
         """
         def _fetch():
             paginator = self.client.get_paginator("list_objects_v2")
@@ -246,7 +248,8 @@ class ListingMixin:
             result = []
             for page in pages:
                 for obj in page.get("Contents", []) or []:
-                    result.append((obj.get("Key"), obj.get("Size")))
+                    result.append((obj.get("Key"), obj.get("Size"),
+                                   obj.get("StorageClass") or "STANDARD"))
             return result
 
         try:
@@ -258,6 +261,19 @@ class ListingMixin:
                 log_fn(f"Region error listing '{prefix}': {exc}")
             self.rebind_bucket(log_fn=log_fn)
             return _fetch()
+
+    def get_keys(self, prefix, log_fn=None):
+        """
+        Return [(Key, Size), ...] for ALL objects under 'prefix', paginated.
+
+        The narrow view of get_keys_with_class, kept because most callers --
+        measuring, deleting, downloading -- have no use for a storage class,
+        and widening the tuple they unpack would touch every one of them to
+        buy nothing.
+        """
+        return [(key, size)
+                for key, size, _storage_class
+                in self.get_keys_with_class(prefix, log_fn=log_fn)]
 
     def get_keys_for_bucket(self, bucket_name: str, prefix: str = ""):
         """

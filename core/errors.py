@@ -19,3 +19,12 @@ class ObjectExists(Exception):
     """
 class DeleteRefused(Exception):
     """Raised when DeleteObjects answered 200 but refused individual keys."""
+class ArchivedObject(Exception):
+    """
+    A copy was refused because the source is archived and not restored.
+
+    GLACIER and DEEP_ARCHIVE objects cannot be read at all until a restore
+    has completed, and a server-side copy reads the source. The service says
+    InvalidObjectState, which means nothing to anyone who has not met it
+    before; this carries the object, its class and what to do instead.
+    """

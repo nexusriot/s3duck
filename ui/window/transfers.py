@@ -451,6 +451,11 @@ class TransferQueueMixin:
             else:
                 if entry.source_bucket:
                     record["source_bucket"] = entry.source_bucket
+                if entry.if_none_match:
+                    # Stored with the job: re-running an upload the user
+                    # asked to skip existing objects for must still skip
+                    # them, however long afterwards it is replayed.
+                    record["if_none_match"] = True
         entries = self.load_transfer_history()
         entries.insert(0, record)
         self._save_transfer_history(entries)
@@ -482,6 +487,7 @@ class TransferQueueMixin:
             method,
             [tuple(i) if isinstance(i, list) else i for i in job],
             source_bucket=entry.get("source_bucket") or "",
+            if_none_match=bool(entry.get("if_none_match")),
         )
 
     def auto_retry_enabled(self) -> bool:
@@ -523,10 +529,14 @@ class TransferQueueMixin:
         """Queue the same job again as a fresh entry."""
         if automatic:
             self.log(f"retrying {entry.method}: {entry.label}")
+        # if_none_match travels with the job: it is the user's answer to the
+        # overwrite prompt, and a retry that drops it is a retry that quietly
+        # overwrites what they asked to skip.
         self.assign_thread_operation(
             entry.method, entry.job, need_refresh=entry.need_refresh,
             source_bucket=entry.source_bucket, dest_model=entry.dest_model,
-            source_model=entry.source_model)
+            source_model=entry.source_model,
+            if_none_match=entry.if_none_match)
 
     def failed_entries(self) -> list:
         """Every queued job that ended in an error, oldest first."""
@@ -553,12 +563,9 @@ class TransferQueueMixin:
         if entry is None or entry.status not in ("cancelled", "error"):
             return
         self.log(f"retrying {entry.method}: {entry.label}")
-        # The cross-profile jobs carry live models; dropping them re-queued a
-        # job the worker could only refuse.
-        self.assign_thread_operation(
-            entry.method, entry.job, need_refresh=entry.need_refresh,
-            source_bucket=entry.source_bucket, dest_model=entry.dest_model,
-            source_model=entry.source_model)
+        # Through _requeue, so the cross-profile models and the overwrite
+        # answer travel with the job exactly as they do on an auto-retry.
+        self._requeue(entry)
 
     def _toggle_queue_panel(self):
         if self._queue_panel.isVisible():

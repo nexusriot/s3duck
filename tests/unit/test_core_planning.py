@@ -508,10 +508,26 @@ class BuildPasteJobTests(unittest.TestCase):
     def test_same_bucket_paste_targets_the_current_prefix(self):
         job, skipped = build_paste_job(self._clip(), "src", "to/")
         self.assertEqual(job, [
-            ("from/a.txt", "to/a.txt", False, None),
-            ("from/dir/", "to/dir/", True, None),
+            ("from/a.txt", "to/a.txt", False, None, ""),
+            ("from/dir/", "to/dir/", True, None, ""),
         ])
         self.assertEqual(skipped, [])
+
+    def test_the_remembered_storage_class_rides_on_the_row(self):
+        """REGRESSION: a paste built rows with no class on them, so pasting
+        a STANDARD_IA object re-tiered it to STANDARD."""
+        clip = self._clip()
+        clip["classes"] = {"from/a.txt": "STANDARD_IA"}
+        job, _skipped = build_paste_job(clip, "src", "to/")
+        self.assertEqual([(entry[0], entry[4]) for entry in job],
+                         [("from/a.txt", "STANDARD_IA"),
+                          ("from/dir/", "")])
+
+    def test_a_payload_that_remembers_nothing_leaves_it_empty(self):
+        """The other pane lists no storage class; the copy asks the source
+        rather than assuming STANDARD."""
+        job, _skipped = build_paste_job(self._clip(), "src", "to/")
+        self.assertEqual({entry[4] for entry in job}, {""})
 
     def test_cross_bucket_paste_carries_the_destination(self):
         job, _skipped = build_paste_job(self._clip(), "other", "to/")

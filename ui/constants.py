@@ -10,6 +10,10 @@ UP_ENTRY_LABEL = "[..]"  # special row to go one level up
 # hidden by default; the header context menu toggles them.
 LIST_COLUMNS = ("Name", "Size", "Modified", "Storage class", "ETag")
 LIST_COLUMN_DEFAULT_WIDTHS = (320, 80, 140, 110, 240)
+# Where a copy, move or rename reads the class it has to keep the object in.
+# Derived rather than written as 3 so reordering the columns cannot silently
+# start copying ETags into StorageClass.
+LIST_STORAGE_CLASS_COLUMN = LIST_COLUMNS.index("Storage class")
 LIST_OPTIONAL_COLUMNS = (3, 4)
 TICK_INTERVAL_MS = 600             # UI tick
 # How often the credential countdown is refreshed. A minute is fine: the

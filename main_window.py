@@ -62,7 +62,8 @@ from ui.window.usage import UsageMixin
 from ui.window.watch import WatchMixin
 from ui.constants import (
     CREDENTIAL_CHECK_INTERVAL_MS, LIST_COLUMNS, LIST_COLUMN_DEFAULT_WIDTHS,
-    LIST_OPTIONAL_COLUMNS, OS_FAMILY_MAP, TICK_INTERVAL_MS, UP_ENTRY_LABEL,
+    LIST_OPTIONAL_COLUMNS, LIST_STORAGE_CLASS_COLUMN, OS_FAMILY_MAP,
+    TICK_INTERVAL_MS, UP_ENTRY_LABEL,
 )
 from ui.dialogs.bookmarks import BookmarksDialog
 from ui.dialogs.bucket_settings import BucketSettingsDialog
@@ -872,6 +873,24 @@ class MainWindow(
         if primary_item is None:
             return None, None, None
         return primary_item, primary_item.text(), getattr(primary_item, "t", None)
+
+    def row_storage_class(self, any_index: QModelIndex) -> str:
+        """
+        The storage class the listing reported for that row, or "".
+
+        ListObjectsV2 named it when the listing was built, so a copy, move
+        or rename started from a selection already knows which tier to keep
+        the object in and never spends a HEAD asking. A hidden column still
+        holds its data, so this answers the same whether or not the user has
+        the column switched on.
+        """
+        if not any_index or not any_index.isValid():
+            return ""
+        ix_src = self.proxy.mapToSource(any_index)
+        model = ix_src.model()
+        item = model.itemFromIndex(
+            model.index(ix_src.row(), LIST_STORAGE_CLASS_COLUMN))
+        return item.text() if item is not None else ""
 
 
 
@@ -2037,13 +2056,15 @@ class MainWindow(
         except Exception as exc:
             QMessageBox.warning(self, "Public URL", str(exc))
 
-    def _collect_selected_targets(self):
-        """Return [(name, key, is_folder)] for the current selection, skipping
-        the [..] up-entry. Folder keys carry a trailing '/'."""
-        items = []
+    def _selected_rows(self):
+        """
+        Yield (name, key, is_folder, storage_class) for the current
+        selection, skipping the [..] up-entry. Folder keys carry a trailing
+        '/'; a folder has no class of its own.
+        """
         sm = self.listview.selectionModel()
         if sm is None:
-            return items
+            return
         for ix in sm.selectedIndexes():
             if ix.column() != 0:
                 continue
@@ -2054,8 +2075,27 @@ class MainWindow(
             is_folder = (t == FSObjectType.FOLDER)
             if is_folder:
                 key += "/"
-            items.append((name, key, is_folder))
-        return items
+            yield name, key, is_folder, self.row_storage_class(ix)
+
+    def _collect_selected_targets(self):
+        """Return [(name, key, is_folder)] for the current selection, skipping
+        the [..] up-entry. Folder keys carry a trailing '/'."""
+        return [(name, key, is_folder)
+                for name, key, is_folder, _storage_class
+                in self._selected_rows()]
+
+    def _selected_storage_classes(self) -> dict:
+        """
+        ``{key: storage_class}`` for the current selection.
+
+        Alongside the targets rather than inside them: a dozen callers, the
+        context menu and the search dialog all pass (name, key, is_folder)
+        around, and a copy is the only one of them that cares which tier the
+        object is in.
+        """
+        return {key: storage_class
+                for _name, key, _is_folder, storage_class
+                in self._selected_rows() if storage_class}
 
     def sync_to_profile(self):
         """Compare this prefix with one in another profile and run the plan."""
@@ -2156,6 +2196,9 @@ class MainWindow(
 
         job = []
         skipped = []
+        # What the listing already said each object's tier is, so the copy
+        # lands it there instead of in STANDARD.
+        classes = self._selected_storage_classes()
         for name, src_key, is_folder in items:
             if is_folder:
                 folder_name = src_key.rstrip("/").split("/")[-1]
@@ -2167,7 +2210,8 @@ class MainWindow(
             if not cross_bucket and _dest_inside_source(src_key, dst_key, is_folder):
                 skipped.append(name)
                 continue
-            job.append((src_key, dst_key, is_folder, dst_bucket))
+            job.append((src_key, dst_key, is_folder, dst_bucket,
+                        classes.get(src_key, "")))
 
         if skipped:
             self.log(
@@ -2564,7 +2608,8 @@ class MainWindow(
         # and the destination-inside-source guard are the proven ones.
         clip = {"mode": "cut" if move else "copy",
                 "bucket": self.data_model.bucket,
-                "items": list(items)}
+                "items": list(items),
+                "classes": self._selected_storage_classes()}
         job, skipped = build_paste_job(clip, bucket, prefix or "")
         if skipped:
             self.log("Skipped (destination inside source): "
@@ -2608,7 +2653,14 @@ class MainWindow(
             if not job:
                 self.statusBar().showMessage("Nothing to upload", 2000)
                 return
-            self.assign_thread_operation("upload", job)
+            # The same guard the dialog, the folder upload and a drag-in get.
+            # Without it F5 was the one upload route that replaced existing
+            # objects without asking.
+            job, if_none_match = self._guard_upload(job)
+            if not job:
+                return
+            self.assign_thread_operation("upload", job,
+                                         if_none_match=if_none_match)
             self.statusBar().showMessage(
                 f"Uploading {len(job)} file(s) to this prefix…", 4000)
             return
@@ -2922,6 +2974,9 @@ class MainWindow(
             "mode": "cut" if cut else "copy",
             "bucket": self.data_model.bucket,
             "items": items,
+            # Read now, while the listing that knows them is still on screen:
+            # a paste can happen in another bucket, after navigating away.
+            "classes": self._selected_storage_classes(),
         }
         bucket = self.data_model.bucket
         self.clip.setText(
@@ -3097,11 +3152,16 @@ class MainWindow(
 
         cur = self.data_model.current_folder or ""
         folder_of = {name: is_folder for name, is_folder in items}
+        classes = self._selected_storage_classes()
         job = []
         for old, new in plan:
             is_folder = folder_of.get(old, False)
             suffix = "/" if is_folder else ""
-            job.append((cur + old + suffix, cur + new + suffix, is_folder, None))
+            src_key = cur + old + suffix
+            # A rename is a copy; without the class it would quietly re-tier
+            # every IA object it touched.
+            job.append((src_key, cur + new + suffix, is_folder, None,
+                        classes.get(src_key, "")))
 
         conflicts = self._destination_conflicts([entry[1] for entry in job])
         if conflicts is None:
@@ -3192,13 +3252,13 @@ class MainWindow(
             primary_item, name, t = self.get_row_primary_item(ix)
             if primary_item is None or name == UP_ENTRY_LABEL:
                 continue
-            target = (name, t)
+            target = (name, t, self.row_storage_class(ix))
             break
         if target is None:
             self.statusBar().showMessage("Select a file or folder to rename", 2000)
             return
 
-        old_name, t = target
+        old_name, t, storage_class = target
         is_folder = (t == FSObjectType.FOLDER)
         new_name, ok = QInputDialog.getText(
             self, "Rename", "New name:", text=old_name
@@ -3230,5 +3290,6 @@ class MainWindow(
             ) != QMessageBox.StandardButton.Yes:
                 return
 
-        self.assign_thread_operation("move", [(src_key, dst_key, is_folder, None)])
+        self.assign_thread_operation(
+            "move", [(src_key, dst_key, is_folder, None, storage_class)])
         self.statusBar().showMessage(f"Renaming to '{new_name}'…", 3000)

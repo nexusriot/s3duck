@@ -1,10 +1,13 @@
 """s3/listing.py and the search that reads through it."""
 
+import botocore.exceptions
 import main_window
 import os
 import tempfile
 import unittest
+import unittest.mock
 from model import Model
+from s3.listing import expecting_region
 from tests.support import FakeS3Client, _dt, _ensure_qapp, make_model
 from utils import scan_local_tree
 
@@ -302,6 +305,110 @@ class IncrementalListingTests(unittest.TestCase):
         m._client = FakeS3Client(list_pages=self._pages(5))
         m.list("p/", max_items=10)
         self.assertFalse(m.last_listing_truncated)
+class _LazyPaginator:
+    """A paginator that behaves the way botocore's really does.
+
+    ``paginate()`` sends nothing — it hands back a lazy iterator — so a
+    failure, region hint and all, only surfaces on the first iteration. The
+    FakeS3Client paginator returns a plain list, which is eager, and that is
+    precisely why the bug this guards against lived through a green suite.
+    """
+
+    def __init__(self, pages=None, error=None):
+        self._pages = list(pages or [])
+        self._error = error
+        self.paginate_calls = 0
+
+    def paginate(self, **_kwargs):
+        self.paginate_calls += 1
+
+        def _walk():
+            if self._error is not None:
+                raise self._error
+            for page in self._pages:
+                yield page
+
+        return _walk()
+
+
+class _LazyClient:
+    def __init__(self, paginator):
+        self._paginator = paginator
+
+    def get_paginator(self, _name):
+        return self._paginator
+
+
+def _wrong_region_error(expecting="eu-north-1"):
+    return botocore.exceptions.ClientError(
+        {"Error": {
+            "Code": "AuthorizationHeaderMalformed",
+            "Message": ("The authorization header is malformed; the region "
+                        f"'us-east-1' is wrong; expecting '{expecting}'"),
+        }},
+        "ListObjectsV2")
+
+
+class RegionHintListingTests(unittest.TestCase):
+    """REGRESSION: a listing refused for the wrong signing region used to
+    fail outright.
+
+    The hint was read in the handler around ``paginator.paginate()``, which
+    performs no I/O at all — so the mismatch arrived one line further down,
+    where it was classified as a hard failure, and the retry in the region
+    the server had just named never ran. "Automatic region detection" was
+    therefore dead for every listing.
+    """
+
+    def test_the_hint_is_read_and_the_region_is_adopted(self):
+        m = make_model(bucket="b", region_name="us-east-1")
+        m._client = _LazyClient(_LazyPaginator(error=_wrong_region_error()))
+        good = _LazyClient(_LazyPaginator(pages=[{"Contents": [
+            {"Key": "p/a.txt", "Size": 1, "LastModified": _dt(1),
+             "ETag": '"x"'}]}]))
+        with unittest.mock.patch.object(
+                Model, "_make_client", lambda _s, **kw: good):
+            items = m.list("p/")
+        self.assertEqual([i.name for i in items], ["a.txt"])
+        # Promoted, so the next operation on this bucket starts there.
+        self.assertEqual(m.region_name, "eu-north-1")
+        self.assertIs(m._client, good)
+
+    def test_a_refusal_in_the_hinted_region_too_is_raised(self):
+        m = make_model(bucket="b", region_name="us-east-1")
+        m._client = _LazyClient(_LazyPaginator(error=_wrong_region_error()))
+        denied = botocore.exceptions.ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "nope"}},
+            "ListObjectsV2")
+        second = _LazyClient(_LazyPaginator(error=denied))
+        with unittest.mock.patch.object(
+                Model, "_make_client", lambda _s, **kw: second):
+            with self.assertRaises(botocore.exceptions.ClientError) as caught:
+                m.list("p/")
+        self.assertEqual(
+            caught.exception.response["Error"]["Code"], "AccessDenied")
+
+    def test_an_ordinary_failure_is_still_fatal(self):
+        """Only a named region is a retry; everything else keeps its own
+        message rather than becoming "cannot list with available regions"."""
+        m = make_model(bucket="b")
+        denied = botocore.exceptions.ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "nope"}},
+            "ListObjectsV2")
+        m._client = _LazyClient(_LazyPaginator(error=denied))
+        with self.assertRaises(botocore.exceptions.ClientError):
+            m.list("p/")
+
+    def test_expecting_region_reads_only_what_it_should(self):
+        self.assertEqual(expecting_region(_wrong_region_error("ap-south-1")),
+                         "ap-south-1")
+        self.assertEqual(expecting_region(
+            botocore.exceptions.ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "expecting 'x'"}},
+                "ListObjectsV2")), "")
+        self.assertEqual(expecting_region(RuntimeError("expecting 'x'")), "")
+
+
 class ListingFilterTests(unittest.TestCase):
     """The quick-find bar: a substring by default, a glob when it looks like
     one, and a count so an over-narrow filter is not mistaken for an empty

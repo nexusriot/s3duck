@@ -3,7 +3,7 @@
 
 import botocore.exceptions
 import threading
-from core.errors import TransferCancelled
+from core.errors import ArchivedObject, TransferCancelled
 from s3.common import (
     _BotoProgressAdapter, drop_unsendable_checksum_args, prefix_of,
     run_parallel,
@@ -32,6 +32,73 @@ class CopyMixin:
             extra["Metadata"] = dict(metadata)
         extra.update(upload_extra_args or {})
         return extra
+
+    def _storage_class_to_preserve(self, src_key, storage_class):
+        """
+        The class a copy of *src_key* must land in: what the caller already
+        knew, or what the source itself says.
+
+        ``None`` means "nobody told us", which is not the same as STANDARD.
+        Every listing already carries the class -- it comes in the same
+        element as the key and the size -- so the job rows built from one,
+        and the recursive copy that fans out from one, answer this for free.
+        The HEAD here is paid only by the routes with no listing behind them:
+        an object picked in the other pane, or a job replayed from a history
+        written before rows carried the class.
+
+        Best effort on purpose: a HEAD the credentials cannot make is a
+        reason to copy the object as STANDARD, never a reason to refuse the
+        copy the user asked for.
+        """
+        if storage_class is not None:
+            return str(storage_class or "STANDARD").upper()
+        try:
+            return self.current_storage_class(src_key)
+        except Exception:
+            return "STANDARD"
+
+    @staticmethod
+    def _preserved_class_args(storage_class) -> dict:
+        """
+        ``{"StorageClass": ...}`` when the class is worth naming, else ``{}``.
+
+        S3 has no "whatever the source was" directive: an unqualified
+        CopyObject creates the new object as STANDARD, which is how a rename
+        used to re-tier an IA object nobody asked to re-tier. STANDARD is
+        left unsaid because it is already what the service does, so the
+        overwhelmingly common copy goes out as exactly the request it always
+        was -- including to a backend that has never heard of storage
+        classes.
+        """
+        storage_class = str(storage_class or "").upper()
+        if not storage_class or storage_class == "STANDARD":
+            return {}
+        return {"StorageClass": storage_class}
+
+    def _raise_if_archived(self, exc, src_key, storage_class=""):
+        """
+        Re-raise a refusal to read an archived source as something that says
+        what to do about it.
+
+        The service is the only authority on this, so the class is never used
+        to refuse a copy in advance: a GLACIER object that has been restored
+        copies perfectly well, and no listing says whether a restore is in
+        effect. The copy is attempted and only the service's own answer is
+        translated -- "InvalidObjectState", which means nothing to anyone who
+        has not met it before.
+        """
+        response = getattr(exc, "response", None) or {}
+        code = (response.get("Error") or {}).get("Code", "")
+        if code not in self.ARCHIVED_SOURCE_CODES:
+            return
+        storage_class = str(storage_class or "").upper()
+        named = (f" ({storage_class})"
+                 if storage_class and storage_class != "STANDARD" else "")
+        raise ArchivedObject(
+            f"'{src_key}'{named} is archived and has not been restored, so "
+            f"it cannot be copied or moved. Restore it first "
+            f"(right-click → Restore from Glacier…), then try again."
+        ) from exc
 
     def copy_to_model(self, src_key: str, dst_model, dst_key: str,
                       progress_cb=None, cancel_event=None, log_fn=None):
@@ -91,7 +158,7 @@ class CopyMixin:
                 cancel_event=cancel_event, log_fn=log_fn)
 
     def _stream_copy(self, src_key: str, dst_key: str, dst_bucket: str,
-                     log_fn=None):
+                     log_fn=None, storage_class=""):
         """
         Copy by streaming the object through this process.
 
@@ -105,6 +172,13 @@ class CopyMixin:
         body = resp["Body"]
         extra = drop_unsendable_checksum_args(
             dst_client, self._carried_extra_args(resp, self.upload_extra_args))
+        # The source's class wins over the profile's upload policy, which the
+        # carried args brought along: this is a copy that happens to be
+        # routed through an upload, and a cross-region copy landing in a
+        # different class than the same copy made in-region would be a
+        # difference nobody asked for.
+        extra.pop("StorageClass", None)
+        extra.update(self._preserved_class_args(storage_class))
 
         dst_client.upload_fileobj(
             body, dst_bucket, dst_key,
@@ -230,30 +304,66 @@ class CopyMixin:
 
     def copy_object(self, src_key: str, dst_key: str, dst_bucket: str = None,
                     log_fn=None, allow_stream=True, size=None,
-                    cancel_event=None):
+                    cancel_event=None, storage_class=None):
         """
-        Copy one object, server-side when possible.
+        Copy one object, server-side when possible, into the class it is
+        already in.
 
-        Three routes, cheapest first. A single CopyObject handles almost
-        everything. A source over S3's 5 GiB copy limit is rebuilt from
-        UploadPartCopy ranges, which is still server-side. Only a
-        cross-region or cross-account destination — which the source's client
-        cannot reach at all — falls back to moving the bytes through this
-        process.
+        *storage_class* is what the caller already knows -- the listing the
+        job row was built from, or the one the recursive copy fanned out
+        from. ``None`` means nobody knows, and the source is asked; see
+        _storage_class_to_preserve. Either way the three routes below land
+        the object in the same class, which an unqualified CopyObject does
+        not: it creates the new object as STANDARD.
 
         *size*, when the caller already knows it, saves the round trip that
         would otherwise be spent discovering the limit by being refused.
+        """
+        # Before the class is looked up: a read-only profile must refuse the
+        # copy without spending a request discovering what it would have
+        # copied.
+        self._guard_write()
+        storage_class = self._storage_class_to_preserve(src_key, storage_class)
+        try:
+            return self._copy_object_routed(
+                src_key, dst_key, dst_bucket=dst_bucket, log_fn=log_fn,
+                allow_stream=allow_stream, size=size,
+                cancel_event=cancel_event, storage_class=storage_class)
+        except botocore.exceptions.ClientError as exc:
+            # One place for it: every route here reads the source, so every
+            # route refuses an archived one, and the raw code says nothing
+            # about the restore that would fix it.
+            self._raise_if_archived(exc, src_key, storage_class)
+            raise
+
+    def _copy_object_routed(self, src_key: str, dst_key: str,
+                            dst_bucket: str = None, log_fn=None,
+                            allow_stream=True, size=None, cancel_event=None,
+                            storage_class=""):
+        """
+        The three routes of a copy, cheapest first.
+
+        A single CopyObject handles almost everything. A source over S3's
+        5 GiB copy limit is rebuilt from UploadPartCopy ranges, which is
+        still server-side. Only a cross-region or cross-account destination
+        — which the source's client cannot reach at all — falls back to
+        moving the bytes through this process.
         """
         self._guard_write()
         dst_bucket = dst_bucket or self.bucket
         cross_bucket = dst_bucket != self.bucket
         copy_source = {"Bucket": self.bucket, "Key": src_key}
+        preserved = self._preserved_class_args(storage_class)
 
         def _multipart(known_size):
             try:
                 self._copy_multipart(
                     src_key, dst_key, size=known_size, dst_bucket=dst_bucket,
-                    create_args=self._copy_create_args(src_key),
+                    # The create args are read from the source's own HEAD,
+                    # which already names its class; passing it again only
+                    # matters when that HEAD is the one that failed.
+                    create_args=self._copy_create_args(
+                        src_key, extra=preserved),
                     log_fn=log_fn, cancel_event=cancel_event)
             except botocore.exceptions.ClientError as exc:
                 # The size route and the location route are independent: a
@@ -267,20 +377,40 @@ class CopyMixin:
                 if log_fn:
                     log_fn(f"Multipart copy refused ({code}); streaming "
                            f"'{src_key}' to bucket '{dst_bucket}' instead")
-                self._stream_copy(src_key, dst_key, dst_bucket, log_fn=log_fn)
+                self._stream_copy(src_key, dst_key, dst_bucket, log_fn=log_fn,
+                                  storage_class=storage_class)
 
         if size is not None and int(size) > self.MAX_SINGLE_COPY_BYTES:
             _multipart(int(size))
             return
 
         def _do():
-            self.client.copy_object(CopySource=copy_source, Bucket=dst_bucket, Key=dst_key)
+            # MetadataDirective is COPY by default and nothing here replaces
+            # metadata, but saying it is the belt and braces
+            # change_storage_class() wears for the same request.
+            self.client.copy_object(
+                CopySource=copy_source, Bucket=dst_bucket, Key=dst_key,
+                **(dict(preserved, MetadataDirective="COPY")
+                   if preserved else {}))
 
         try:
             _do()
             return
         except botocore.exceptions.ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
+            if preserved and code in self.UNSUPPORTED_STORAGE_CLASS_CODES:
+                # A backend that names a class in its own listing and then
+                # refuses it on a copy. Preserving the class is worth a
+                # request, never the copy itself, so the whole thing is
+                # retried as the plain copy it was before -- fallbacks and
+                # all, since this attempt never got far enough to use them.
+                if log_fn:
+                    log_fn(f"'{storage_class}' was refused ({code}); copying "
+                           f"'{src_key}' without preserving its class")
+                return self._copy_object_routed(
+                    src_key, dst_key, dst_bucket=dst_bucket, log_fn=log_fn,
+                    allow_stream=allow_stream, size=size,
+                    cancel_event=cancel_event, storage_class="STANDARD")
             oversized = self._oversized_copy_source(exc, src_key)
             if oversized:
                 if log_fn:
@@ -295,7 +425,8 @@ class CopyMixin:
                         f"Server-side copy refused ({code}); streaming "
                         f"'{src_key}' to bucket '{dst_bucket}' instead"
                     )
-                self._stream_copy(src_key, dst_key, dst_bucket, log_fn=log_fn)
+                self._stream_copy(src_key, dst_key, dst_bucket, log_fn=log_fn,
+                                  storage_class=storage_class)
                 return
             if not self._is_region_error(exc):
                 raise
@@ -327,18 +458,21 @@ class CopyMixin:
                     f"'{src_prefix}'; copying a folder into itself is not allowed"
                 )
         def _copy_one(item):
-            key, size = item
+            key, size, storage_class = item
             rel = key[len(src_prefix):]
             dst_key = dst_prefix + rel
             if log_fn:
                 log_fn(f"copying {key} -> {dst_key}")
-            # The listing already knows the size, so an object over the
-            # single-copy limit goes straight to the multipart route rather
-            # than spending a request to be told it is too big.
+            # The listing already knows the size and the class, so an object
+            # over the single-copy limit goes straight to the multipart route
+            # rather than spending a request to be told it is too big, and no
+            # object costs a HEAD to be told what tier it is already in.
             self.copy_object(key, dst_key, dst_bucket=dst_bucket,
                              log_fn=log_fn, size=size,
+                             storage_class=storage_class,
                              cancel_event=cancel_event)
 
-        keys = [(k, s) for k, s in self.get_keys(src_prefix, log_fn=log_fn) if k]
+        keys = [(k, s, c) for k, s, c
+                in self.get_keys_with_class(src_prefix, log_fn=log_fn) if k]
         run_parallel(keys, _copy_one, self.parallel_files,
                      cancel_event=cancel_event)

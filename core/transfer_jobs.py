@@ -46,11 +46,16 @@ def build_paste_job(clip, dst_bucket, dst_prefix):
     """
     Turn a clipboard payload into copy/move job entries.
 
-    clip is {"mode", "bucket", "items": [(name, key, is_folder)]}. Returns
-    ``(job, skipped)`` where job rows are
-    ``(src_key, dst_key, is_folder, dst_bucket_or_None)`` — dst_bucket is None
-    when the paste stays inside the source bucket, matching what the copy/move
-    workers expect.
+    clip is {"mode", "bucket", "items": [(name, key, is_folder)], "classes":
+    {key: storage_class}}. Returns ``(job, skipped)`` where job rows are
+    ``(src_key, dst_key, is_folder, dst_bucket_or_None, storage_class)`` —
+    dst_bucket is None when the paste stays inside the source bucket,
+    matching what the copy/move workers expect.
+
+    "classes" is what the listing the selection was made in already knew, so
+    the paste keeps each object in its own tier without a HEAD per key. It
+    is optional: a payload built somewhere that has no listing behind it
+    (the other pane) leaves the class empty, and the copy asks the source.
     """
     job = []
     skipped = []
@@ -59,6 +64,7 @@ def build_paste_job(clip, dst_bucket, dst_prefix):
     src_bucket = clip.get("bucket") or ""
     cross_bucket = bool(dst_bucket) and dst_bucket != src_bucket
     prefix = dst_prefix or ""
+    classes = clip.get("classes") or {}
 
     for name, src_key, is_folder in clip.get("items") or []:
         dst_key = prefix + name + ("/" if is_folder else "")
@@ -66,5 +72,6 @@ def build_paste_job(clip, dst_bucket, dst_prefix):
             skipped.append(name)
             continue
         job.append((src_key, dst_key, is_folder,
-                    dst_bucket if cross_bucket else None))
+                    dst_bucket if cross_bucket else None,
+                    classes.get(src_key, "")))
     return job, skipped

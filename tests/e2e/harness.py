@@ -132,6 +132,12 @@ class ServerCase(unittest.TestCase):
             out.extend(o["Key"] for o in (page.get("Contents") or []))
         return sorted(out)
 
+    def storage_class(self, key):
+        """What the server says the object's tier is. HeadObject omits the
+        field for a STANDARD object rather than naming it."""
+        head = self.model.client.head_object(Bucket=self.bucket, Key=key)
+        return head.get("StorageClass") or "STANDARD"
+
     def body(self, key):
         return self.model.client.get_object(
             Bucket=self.bucket, Key=key)["Body"].read()

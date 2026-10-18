@@ -66,16 +66,16 @@ pull request:
 - **Checksum verification** — optionally compare each downloaded file against the object's stored digest and fail the transfer on a mismatch, for every file of a whole-folder download as much as for a single object. A multipart object is settled by asking the service for its real part boundaries (`GetObjectAttributes`) and rebuilding the composite digest from them, so "multipart, not comparable" is now the exception rather than the rule; where a backend does not implement that call, verification still degrades to reporting the object as not comparable rather than failing it (MinIO does implement it — the end-to-end suite checks)
 - **Parallel transfers** — configurable number of files moving at once *and* multipart connections within each file; applies to uploads, downloads (including whole prefixes) and sync
 - **Transfer settings** — files in flight, connections per file, bandwidth limit, multipart part size and threshold, resumable uploads, automatic retry of transient failures, the per-listing entry limit, the session log file, Content-Type detection with its override table, the upload rules by destination, plus the storage class, checksum and server-side encryption (SSE-S3 / SSE-KMS) applied to uploads — all persisted across sessions
-- **Overwrite protection** — uploads (dialog, folder upload and drag-in), downloads (single files *and* whole folders), copies, moves, renames and pastes all detect existing destinations and offer Skip / Overwrite / Cancel. For uploads the answer is then *enforced by the service*: unless you chose Overwrite, every write carries an `If-None-Match` precondition, so an object that appears after the check — the gap a check-then-write always leaves — is refused and reported as skipped instead of being replaced. A backend without conditional writes — or an installed boto3 too old to send the header, which is what a distribution package often pins — degrades to the old check-then-write and says so in the log
+- **Overwrite protection** — uploads (dialog, folder upload, drag-in and the dual pane's `F5`), downloads (single files *and* whole folders), copies, moves, renames and pastes all detect existing destinations and offer Skip / Overwrite / Cancel. For uploads the answer is then *enforced by the service*: unless you chose Overwrite, every write carries an `If-None-Match` precondition, so an object that appears after the check — the gap a check-then-write always leaves — is refused and reported as skipped instead of being replaced. A backend without conditional writes — or an installed boto3 too old to send the header, which is what a distribution package often pins — degrades to the old check-then-write and says so in the log. The answer travels with the job, so a retry — an automatic one included — and a re-run from history keep it instead of overwriting on the second attempt
 - **Sync with a local folder** (`Ctrl+E`) — compare a directory against a prefix in either direction, review a dry-run plan (upload / download / delete / skip with a reason per file), then run it through the queue; supports exclude globs (`*.tmp`, `node_modules/`) and optionally deleting extras at the destination
 - **Transfer queue** — queued jobs with per-row progress, cancel, and retry for failed or cancelled entries; "Retry failed" re-queues every failure at once, and a job the service itself asked us to repeat (throttling, 5xx, a dropped connection) is retried once automatically
 - **Transfer history** — a persisted log of past jobs (when, what, bytes, outcome) with one-click re-run for small jobs, from the queue panel
 - **Bandwidth limit** — optional ceiling on total transfer throughput, shared across every parallel file and chunk
 - **Completion notifications** — a desktop notification when the queue drains while the window is in the background (toggle in Transfer settings)
-- **Delete** — objects and folder prefixes (recursive, batched 1000 keys per call); confirmation shows the scanned object count and total size; recursive bucket delete also purges noncurrent versions, delete markers and in-flight uploads
+- **Delete** — objects and folder prefixes (recursive, batched 1000 keys per call, and cancellable inside the walk rather than only between selected rows); confirmation shows the scanned object count and total size; recursive bucket delete also purges noncurrent versions, delete markers and in-flight uploads
 - **Undo delete** (`Ctrl+Z`) — on a versioning-enabled bucket a delete only writes a delete marker, so the last delete can be rolled back by removing those markers
 - **Clipboard** (`Ctrl+C` / `Ctrl+X` / `Ctrl+V`) — copy or cut a selection and paste it into any folder or bucket; copying also puts the `s3://` URIs on the system clipboard for use elsewhere
-- **Copy / Move** — server-side copy or move of a multi-selection, within a bucket or **across buckets**; when the destination lives in another region or account (where a server-side copy is impossible) the object is streamed through instead of failing
+- **Copy / Move** — server-side copy or move of a multi-selection, within a bucket or **across buckets**; when the destination lives in another region or account (where a server-side copy is impossible) the object is streamed through instead of failing. Copies, moves, renames and pastes keep each object in its **own storage class** — a plain `CopyObject` carries none and S3 would create the new object as STANDARD, re-tiering an IA or Glacier-IR object nobody asked to re-tier. The class comes from the listing, which already knows it, so nothing is spent discovering it; only a route with no listing behind it — an object picked in the other pane, a pane comparison, a job replayed from an older history entry — costs one `HeadObject`. It holds on all three routes — the single copy, the multipart rebuild past 5 GiB, and the cross-region stream — and metadata, content type and cache headers ride along as they always did. A backend that names a class in its own listing and then refuses it on a copy (`InvalidStorageClass`, `NotImplemented`) gets the plain copy it used to get, and the log says the class was not preserved: the tier is worth one request, never the copy itself. A source that is archived in GLACIER or DEEP_ARCHIVE and **not restored** cannot be copied at all: the service refuses to read it, and the failure now says so and points at Restore from Glacier instead of reporting `InvalidObjectState`
 - **Objects over 5 GiB** — S3 refuses a `CopyObject` whose source is larger than that, which used to be a hard failure for every copy onto itself: rename, bulk rename, paste, change storage class, edit metadata and "Fix Content-Type". Such an object is now rebuilt at the destination from `UploadPartCopy` ranges, which the service still performs itself — not the streaming fallback, and no part of it travels through this machine. Where the listing already knows the size, the doomed single copy is skipped rather than bought with a request
 - **Rename** — in-place rename of a file or folder (server-side copy + delete), on the context menu or `F2`
 - **Bulk rename** (`Shift+F2`) — rename a whole selection by find-and-replace (optionally regex, with backreferences) or a `{name}/{ext}/{n}` numbering template, with a live preview and duplicate/invalid-name checks
@@ -212,6 +212,9 @@ What the model suite covers, a module at a time (`tests/e2e/`):
 | `test_versions.py` | Fetching one version, promoting an old one, deleting a single version, delete markers |
 | `test_cross_profile.py` | Copying between two independent clients, and a read-only destination refusing before anything is written |
 | `test_discovery.py` | Deep search filters, the sync planner's tree, duplicate fingerprints, usage totals across pages, preview windows |
+| `test_profile_and_sdk.py` | The profile check's write-and-remove probe, and which parameters the *installed* SDK will actually send |
+| `test_transfer_tuning.py` | The transfer settings as requests: files in flight, threads per file, the bandwidth ceiling, part sizes |
+| `test_upload_policy.py` | What an upload carries besides the body — the per-destination rules' storage class and tags, as the service stores them |
 
 And the GUI suite (`tests/e2e_gui/`), which asks the same server what the
 window actually did:
@@ -220,6 +223,7 @@ window actually did:
 |---|---|
 | `test_navigation.py` | Prefix listings through the navigation worker, sibling prefixes, a refresh seeing a change made behind the app, a failed navigation re-enabling the list view |
 | `test_transfers.py` | Uploads, downloads and deletes driven through the window's own entry points, and the transfer queue draining them |
+| `test_queue_outcomes.py` | How a job *ends*: done, cancelled or failed, and whether the user is told — the dialog as much as the row |
 
 ## Requirements
 
@@ -365,7 +369,8 @@ s3duck/
 ├── utils.py             Shared helpers — Crypto and CredentialStore, Qt thread
 │                        plumbing, ~/.aws parsing, credential expiry, local tree scan
 │
-├── icons/               24 px SVG icons for toolbar and context menus
+├── icons/               24 px toolbar and menu icons — every SVG with a PNG
+│                        twin, for Qt builds that ship no SVG plugin
 ├── resources/           App icon (ico/icns/png), screenshots, .desktop file
 ├── DEBIAN/              Debian package metadata (control, postinst, prerm)
 ├── tests/               Three suites: offscreen unit, model e2e, GUI e2e
@@ -377,7 +382,6 @@ s3duck/
 │
 ├── Makefile             Front door: make test / e2e / e2e-gui / deb / bin / clean
 ├── requirements.txt     Python dependencies
-├── s3duck.spec          PyInstaller build spec
 ├── run_e2e.sh           End-to-end suites against a throwaway MinIO
 ├── build_deb.sh         Build .deb package
 ├── build_linux_bin.sh   Build Linux self-contained binary
@@ -516,6 +520,12 @@ rebind_bucket()             swap endpoint + region → enter_bucket() → valida
   ▼
 retry original operation    transparent to the caller
 ```
+
+A listing has a second, cheaper route: `AuthorizationHeaderMalformed` names
+the region it wanted in the message itself ("… expecting 'eu-north-1'"), so
+`list()` reads it out, retries there and promotes that client for the bucket
+— no HEAD, no re-probe. The hint arrives while the pages are being walked,
+because `paginate()` sends nothing on its own.
 
 ### Credential storage
 

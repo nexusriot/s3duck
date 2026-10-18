@@ -8,7 +8,8 @@ from core import lifecycle as _lifecycle
 from core import pricing as _pricing
 from core.checksums import _CrcDigest  # noqa: F401  (re-exported)
 from core.errors import (  # noqa: F401  (re-exported: model is the front door)
-    DeleteRefused, ObjectExists, ReadOnlyError, TransferCancelled,
+    ArchivedObject, DeleteRefused, ObjectExists, ReadOnlyError,
+    TransferCancelled,
 )
 from s3.common import (  # noqa: F401  (re-exported: model is the front door)
     CHECKSUM_ALGORITHMS, CHECKSUM_DIGESTS, KNOWN_CHECKSUM_ALGORITHMS,
@@ -411,6 +412,21 @@ class Model(
     # source gets measured rather than the message parsed.
     COPY_TOO_LARGE_CODES = (
         "InvalidRequest", "EntityTooLarge", "InvalidArgument",
+    )
+
+    # Codes a service answers when the SOURCE of a copy is archived and has
+    # not been restored. A server-side copy still has to read the object, so
+    # GLACIER and DEEP_ARCHIVE refuse it exactly as a download refuses it.
+    ARCHIVED_SOURCE_CODES = (
+        "InvalidObjectState", "ObjectNotInActiveTierError",
+        "ObjectNotInActiveTier",
+    )
+
+    # Codes a service answers when it will not accept a storage class at all
+    # -- including one it named in its own listing, which S3-compatible
+    # backends with a partial tier implementation do.
+    UNSUPPORTED_STORAGE_CLASS_CODES = (
+        "InvalidStorageClass", "NotImplemented",
     )
 
 

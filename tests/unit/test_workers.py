@@ -145,6 +145,118 @@ class WorkerBulkStorageTests(unittest.TestCase):
         keys = [k for k, _d, _t in model.restore_calls]
         self.assertEqual(set(keys), {"dir/a.txt", "dir/b.txt"})
         self.assertTrue(all((d, t) == (5, "Bulk") for _k, d, t in model.restore_calls))
+class CopyRowsCarryTheStorageClassTests(unittest.TestCase):
+    """
+    REGRESSION: the copy/move job rows carried only
+    (src, dst, is_folder, dst_bucket), so the class the listing already knew
+    never reached copy_object and every copy landed in STANDARD.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    class _Recorder:
+        def __init__(self):
+            self.copies = []
+            self.prefixes = []
+            self.deletes = []
+
+        def copy_object(self, src, dst, dst_bucket=None, log_fn=None,
+                        storage_class=None, cancel_event=None):
+            self.copies.append((src, dst, storage_class))
+
+        def copy_prefix(self, src, dst, dst_bucket=None, log_fn=None,
+                        cancel_event=None):
+            self.prefixes.append((src, dst))
+
+        def delete(self, key, log_fn=None, cancel_event=None):
+            self.deletes.append(key)
+
+    def test_a_copy_hands_the_class_down(self):
+        model = self._Recorder()
+        Worker(model, [("a.tif", "b.tif", False, None,
+                        "STANDARD_IA")]).copy()
+        self.assertEqual(model.copies, [("a.tif", "b.tif", "STANDARD_IA")])
+
+    def test_a_move_hands_it_down_too(self):
+        model = self._Recorder()
+        Worker(model, [("a.tif", "b.tif", False, None, "GLACIER_IR")]).move()
+        self.assertEqual(model.copies, [("a.tif", "b.tif", "GLACIER_IR")])
+        self.assertEqual(model.deletes, ["a.tif"])
+
+    def test_a_row_without_one_means_unknown_not_standard(self):
+        """A job replayed from a history written before rows carried the
+        class must still land in the class it finds, so the model asks the
+        source rather than being told STANDARD."""
+        model = self._Recorder()
+        Worker(model, [("a.tif", "b.tif", False, None)]).copy()
+        self.assertEqual(model.copies, [("a.tif", "b.tif", None)])
+
+    def test_an_empty_class_on_a_row_is_unknown_as_well(self):
+        """The other pane lists no class, so its rows carry ""."""
+        model = self._Recorder()
+        Worker(model, [("a.tif", "b.tif", False, None, "")]).copy()
+        self.assertEqual(model.copies, [("a.tif", "b.tif", None)])
+
+    def test_a_folder_row_leaves_it_to_the_recursive_copy(self):
+        model = self._Recorder()
+        Worker(model, [("d/", "e/", True, None, "")]).copy()
+        self.assertEqual(model.prefixes, [("d/", "e/")])
+        self.assertEqual(model.copies, [])
+class CancellableDeleteTests(unittest.TestCase):
+    """REGRESSION: Cancel did nothing inside one delete.
+
+    Deleting a prefix is one call per batch of a thousand keys, so a folder
+    holding a million objects is a single ``delete()`` that walks the whole
+    listing. The worker checked its own event only BETWEEN job rows and
+    passed no cancel_event down, so Cancel sat there doing nothing until the
+    folder had been walked to the end. The same held for the delete pass of
+    a move and for a sync's remote deletions.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    class _Recorder:
+        def __init__(self):
+            self.events = []
+
+        def delete(self, key, log_fn=None, cancel_event=None):
+            self.events.append((key, cancel_event))
+            return True
+
+        def copy_object(self, src, dst, dst_bucket=None, log_fn=None,
+                        storage_class=None, cancel_event=None):
+            self.events.append((f"copy:{src}", cancel_event))
+
+        def copy_prefix(self, *_a, **kw):
+            self.events.append(("copy_prefix", kw.get("cancel_event")))
+
+    def test_the_delete_job_hands_its_event_down(self):
+        model = self._Recorder()
+        worker = Worker(model, ["dir/"])
+        worker.delete()
+        self.assertEqual([k for k, _e in model.events], ["dir/"])
+        self.assertIs(model.events[0][1], worker._cancel_event)
+
+    def test_a_move_cancels_during_both_passes(self):
+        model = self._Recorder()
+        worker = Worker(model, [("a.txt", "b.txt", False, None)])
+        worker.move()
+        self.assertEqual([k for k, _e in model.events],
+                         ["copy:a.txt", "a.txt"])
+        for _key, event in model.events:
+            self.assertIs(event, worker._cancel_event)
+
+    def test_a_sync_deletion_is_cancellable(self):
+        model = self._Recorder()
+        worker = Worker(
+            model, [("delete_remote", "gone.txt", "", "p/gone.txt", 0)])
+        worker.sync()
+        self.assertEqual([k for k, _e in model.events], ["p/gone.txt"])
+        self.assertIs(model.events[0][1], worker._cancel_event)
 class DeleteBucketsWorkerTests(unittest.TestCase):
     """Bucket deletion runs through the transfer queue so the UI stays live."""
 
@@ -794,7 +906,10 @@ class SyncWorkerTests(unittest.TestCase):
                           cancel_event=None, log_fn=None):
             self.downloads.append((key, local))
 
-        def delete(self, key, log_fn=None):
+        # Model.delete takes a cancel_event, and the worker passes one so a
+        # remote deletion can be stopped part way; a narrower fake would fail
+        # the call rather than record it.
+        def delete(self, key, log_fn=None, cancel_event=None):
             self.deletes.append(key)
 
     def test_each_action_routes_to_the_right_call(self):

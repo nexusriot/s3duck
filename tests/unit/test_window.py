@@ -16,7 +16,9 @@ import ui.context_menu as context_menu
 import unittest
 import utils
 import workers.transfer as transfer_worker
-from PyQt6.QtCore import QEvent, QPoint, QSettings, QThread, QUrl, Qt
+from PyQt6.QtCore import (
+    QEvent, QItemSelectionModel, QPoint, QSettings, QThread, QUrl, Qt,
+)
 from PyQt6.QtGui import QAction, QKeyEvent, QKeySequence, QShortcut
 from PyQt6.QtWidgets import QApplication, QDialog, QMenu, QMessageBox
 from main_window import (
@@ -24,6 +26,7 @@ from main_window import (
     build_profile_sync_job, collect_shortcuts, location_entries,
     parse_location, serialize_location,
 )
+from core.entries import Item
 from model import FSObjectType, Model, ReadOnlyError, TransferCancelled
 from s3duck import SettingsItem, preselect_row
 from settings_store import SettingsStore
@@ -1373,8 +1376,8 @@ class MainWindowBatchTests(unittest.TestCase):
         self.assertEqual(method, "move")
         # folders keep their trailing slash on both sides; files do not
         self.assertEqual(job, [
-            ("pre/a.txt", "pre/b.txt", False, None),
-            ("pre/dir/", "pre/folder/", True, None),
+            ("pre/a.txt", "pre/b.txt", False, None, ""),
+            ("pre/dir/", "pre/folder/", True, None, ""),
         ])
 
     def test_bulk_rename_respects_overwrite_skip(self):
@@ -1638,6 +1641,31 @@ class TransferHistoryTests(unittest.TestCase):
         # JSON turned the tuples into lists; they come back as tuples
         self.assertEqual(started, [("upload", [("k", "/tmp/f")])])
 
+    def test_the_overwrite_answer_is_recorded_and_replayed(self):
+        """A job stored with the precondition has to keep it: re-running an
+        upload the user asked to skip existing objects for must still skip
+        them, however long afterwards it is replayed."""
+        entry = self._entry()
+        entry.if_none_match = True
+        self.win._record_history(entry)
+        stored = self.win.load_transfer_history()[0]
+        self.assertTrue(stored.get("if_none_match"))
+        started = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append(kw)):
+            self.win.rerun_history_entry(stored)
+        self.assertTrue(started[0]["if_none_match"])
+
+    def test_a_plain_job_replays_without_one(self):
+        self.win._record_history(self._entry())
+        stored = self.win.load_transfer_history()[0]
+        self.assertNotIn("if_none_match", stored)
+        started = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append(kw)):
+            self.win.rerun_history_entry(stored)
+        self.assertFalse(started[0]["if_none_match"])
+
     def test_rerun_ignores_entries_without_a_job(self):
         started = []
         with patch.object(main_window.MainWindow, "assign_thread_operation",
@@ -1688,6 +1716,152 @@ class TransferHistoryTests(unittest.TestCase):
         self.assertTrue(any("Download" in l for l in labels))
         # labels lose their "(Ctrl+D)" hint
         self.assertNotIn("Download (Ctrl+D)", labels)
+class CopyKeepsTheStorageClassTests(unittest.TestCase):
+    """
+    REGRESSION: a copy, move or rename re-tiered what it touched, because
+    the job rows it built carried no storage class and a plain CopyObject
+    creates the new object as STANDARD. The listing on screen already knows
+    the class -- ListObjectsV2 returns it and it is one of the optional
+    columns -- so the rows carry it from there and no object costs a HEAD.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def setUp(self):
+        self.settings = QSettings("s3duck-tests", "s3duck-tests")
+        self.settings.clear()
+        self.addCleanup(self.settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            self.win = make_main_window(PROJECT_ROOT, self.settings)
+        self.addCleanup(self.win.close)
+        deadline = time.monotonic() + 5
+        while not self.win.listview.isEnabled() and time.monotonic() < deadline:
+            self._app.processEvents()
+        self._app.processEvents()
+        self.win.data_model.bucket = "bkt"
+        self.win.data_model.current_folder = "pre/"
+        self.win.modelToListView([
+            Item("cold.tif", FSObjectType.FILE, "2026-01-01", 10,
+                 "STANDARD_IA"),
+            Item("warm.txt", FSObjectType.FILE, "2026-01-01", 10, "STANDARD"),
+            Item("dir", FSObjectType.FOLDER, "", 0),
+        ])
+
+    def _select(self, *names):
+        """Select rows by name in the real view, through the real proxy."""
+        sm = self.win.listview.selectionModel()
+        sm.clearSelection()
+        for row in range(self.win.proxy.rowCount()):
+            index = self.win.proxy.index(row, 0)
+            if index.data() in names:
+                sm.select(index,
+                          QItemSelectionModel.SelectionFlag.Select
+                          | QItemSelectionModel.SelectionFlag.Rows)
+
+    def _queued(self):
+        started = []
+        return started, patch.object(
+            main_window.MainWindow, "assign_thread_operation",
+            lambda _s, method, job, **kw: started.append((method, job)))
+
+    def test_the_class_is_read_off_the_listing_row(self):
+        self._select("cold.tif", "warm.txt")
+        self.assertEqual(self.win._selected_storage_classes(),
+                         {"pre/cold.tif": "STANDARD_IA",
+                          "pre/warm.txt": "STANDARD"})
+
+    def test_a_hidden_column_still_answers(self):
+        """The storage class column is off by default; a copy cannot depend
+        on the user having switched it on."""
+        self.win.listview.setColumnHidden(
+            main_window.LIST_STORAGE_CLASS_COLUMN, True)
+        self._select("cold.tif")
+        self.assertEqual(self.win._selected_storage_classes(),
+                         {"pre/cold.tif": "STANDARD_IA"})
+
+    def test_a_folder_row_claims_no_class_of_its_own(self):
+        """A prefix has no tier; the recursive copy reads one per object out
+        of its own listing instead."""
+        self._select("dir")
+        self.assertEqual(self.win._selected_storage_classes(), {})
+
+    def test_the_targets_every_other_caller_uses_are_unchanged(self):
+        self._select("cold.tif", "dir")
+        # Sorted: the view puts folders first, and the order a selection
+        # comes back in is not what this is about.
+        self.assertEqual(sorted(self.win._collect_selected_targets()),
+                         [("cold.tif", "pre/cold.tif", False),
+                          ("dir", "pre/dir/", True)])
+
+    def test_a_copy_job_carries_it(self):
+        self._select("cold.tif")
+        started, queued = self._queued()
+        with queued, \
+             patch.object(main_window, "CopyMoveDialog") as dlg_cls, \
+             patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: set()):
+            dlg = dlg_cls.return_value
+            dlg.exec.return_value = QDialog.DialogCode.Accepted
+            dlg.destination.return_value = "to/"
+            dlg.is_cross_bucket.return_value = False
+            dlg.is_move.return_value = False
+            self.win.copy_move()
+        self.assertEqual(started[0][1],
+                         [("pre/cold.tif", "to/cold.tif", False, None,
+                           "STANDARD_IA")])
+
+    def test_a_rename_carries_it(self):
+        """The narrowest case and the one that stings: renaming a file is
+        not a request to change what it costs to store."""
+        self._select("cold.tif")
+        started, queued = self._queued()
+        with queued, \
+             patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: set()), \
+             patch.object(main_window.QInputDialog, "getText",
+                          lambda *a, **kw: ("new.tif", True)):
+            self.win.rename_selected()
+        self.assertEqual(started[0][1],
+                         [("pre/cold.tif", "pre/new.tif", False, None,
+                           "STANDARD_IA")])
+
+    def test_a_bulk_rename_carries_it(self):
+        self._select("cold.tif")
+        started, queued = self._queued()
+        with queued, \
+             patch.object(main_window, "BulkRenameDialog") as dlg_cls, \
+             patch.object(main_window.MainWindow, "_destination_conflicts",
+                          lambda _s, keys, bucket=None: set()):
+            dlg = dlg_cls.return_value
+            dlg.exec.return_value = QDialog.DialogCode.Accepted
+            dlg.plan.return_value = [("cold.tif", "new.tif")]
+            self.win.bulk_rename()
+        self.assertEqual(started[0][1],
+                         [("pre/cold.tif", "pre/new.tif", False, None,
+                           "STANDARD_IA")])
+
+    def test_the_clipboard_remembers_it_for_a_later_paste(self):
+        """A paste can happen in another bucket, long after the listing that
+        knew the class has been navigated away from."""
+        self._select("cold.tif")
+        self.win.copy_to_clipboard()
+        self.assertEqual(self.win._clipboard["classes"],
+                         {"pre/cold.tif": "STANDARD_IA"})
+
+    def test_a_paste_carries_what_the_clipboard_remembered(self):
+        self._select("cold.tif")
+        self.win.copy_to_clipboard()
+        self.win.data_model.current_folder = "to/"
+        started, queued = self._queued()
+        with queued, patch.object(main_window.MainWindow,
+                                  "_destination_conflicts",
+                                  lambda _s, keys, bucket=None: set()):
+            self.win.paste_from_clipboard()
+        self.assertEqual(started[0][1],
+                         [("pre/cold.tif", "to/cold.tif", False, None,
+                           "STANDARD_IA")])
 class ClipboardTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1737,7 +1911,8 @@ class ClipboardTests(unittest.TestCase):
                           lambda _s, m, j, **kw: started.append((m, j))):
             self.win.paste_from_clipboard()
         self.assertEqual(started[0][0], "copy")
-        self.assertEqual(started[0][1], [("from/a.txt", "to/a.txt", False, None)])
+        self.assertEqual(started[0][1],
+                         [("from/a.txt", "to/a.txt", False, None, "")])
         # a copy stays on the clipboard for another paste
         self.assertIsNotNone(self.win._clipboard)
 
@@ -2472,7 +2647,8 @@ class DualPaneTests(unittest.TestCase):
             win.pane_transfer(move=False)
         method, job, _kw = calls[0]
         self.assertEqual(method, "copy")
-        self.assertEqual(job[0], ("here/a.txt", "dst/a.txt", False, "other"))
+        self.assertEqual(job[0],
+                         ("here/a.txt", "dst/a.txt", False, "other", ""))
 
     def test_bringing_a_remote_selection_here_binds_the_source_bucket(self):
         """copy/move resolve CopySource against their model's bucket, so the
@@ -2491,7 +2667,10 @@ class DualPaneTests(unittest.TestCase):
             win.pane_transfer(move=False)
         method, job, kw = calls[0]
         self.assertEqual(method, "copy")
-        self.assertEqual(job[0], ("src/a.txt", "here/a.txt", False, "bkt"))
+        # The other pane lists no storage class, so the row leaves it empty
+        # and the copy asks the source.
+        self.assertEqual(job[0],
+                         ("src/a.txt", "here/a.txt", False, "bkt", ""))
         self.assertEqual(kw.get("source_bucket"), "other")
 
     def test_uploading_a_local_selection_walks_folders(self):
@@ -2506,6 +2685,9 @@ class DualPaneTests(unittest.TestCase):
         win.second_pane.set_local(directory)
         calls, patcher = self._queued()
         with patcher, patch.object(
+                main_window.MainWindow, "_destination_conflicts",
+                lambda _s, keys, bucket=None: set()), \
+                patch.object(
                 main_window.SecondPane, "selected",
                 lambda _s: [("a.txt", False, 1), ("sub", True, 0)]), \
                 patch.object(win.second_pane.view, "hasFocus",
@@ -2516,6 +2698,38 @@ class DualPaneTests(unittest.TestCase):
         self.assertEqual(
             sorted(key for key, _path in job),
             ["here/a.txt", "here/sub/b.txt", "here/sub/deep/c.txt"])
+
+    def test_uploading_from_the_pane_asks_before_overwriting(self):
+        """REGRESSION: F5 was the one upload route with no overwrite check,
+        so it replaced existing objects without a word — while the dialog,
+        the folder upload and a drag-in all prompted."""
+        win = self._window()
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        for name in ("a.txt", "b.txt"):
+            with open(os.path.join(directory, name), "w") as handle:
+                handle.write("x")
+        win.toggle_dual_pane()
+        win.second_pane.set_local(directory)
+        calls, patcher = self._queued()
+        with patcher, patch.object(
+                main_window.MainWindow, "_destination_conflicts",
+                lambda _s, keys, bucket=None: {"here/a.txt"}), \
+                patch_app_wide("OverwriteDialog") as dlg_cls, \
+                patch.object(
+                main_window.SecondPane, "selected",
+                lambda _s: [("a.txt", False, 1), ("b.txt", False, 1)]), \
+                patch.object(win.second_pane.view, "hasFocus",
+                             lambda: True):
+            instance = dlg_cls.return_value
+            instance.exec.return_value = QDialog.DialogCode.Accepted
+            instance.choice.return_value = main_window.OverwriteDialog.SKIP
+            win.pane_transfer(move=False)
+        method, job, kw = calls[0]
+        self.assertEqual(method, "upload")
+        self.assertEqual([key for key, _path in job], ["here/b.txt"])
+        # Nothing was being overwritten, so the writes carry the precondition.
+        self.assertTrue(kw.get("if_none_match"))
 
     def test_a_read_only_profile_transfers_nothing(self):
         win = self._window(read_only=True)
@@ -3122,6 +3336,38 @@ class QueueRetryTests(unittest.TestCase):
         self.assertEqual(seen["source_bucket"], "other")
         self.assertIs(seen["dest_model"], entry.dest_model)
         self.assertIs(seen["source_model"], entry.source_model)
+
+    def test_the_retry_carries_the_overwrite_answer(self):
+        """REGRESSION: an upload the user asked to skip existing objects for
+        was re-queued without the precondition, so the retry overwrote
+        exactly what the first attempt had promised to leave alone."""
+        win = self._window()
+        entry = self._entry(win, 1, "error")
+        entry.if_none_match = True
+        seen = {}
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: seen.update(kw)):
+            win._requeue(entry)
+        self.assertTrue(seen["if_none_match"])
+
+    def test_the_queue_panel_retry_carries_it_too(self):
+        win = self._window()
+        entry = self._entry(win, 1, "error")
+        entry.if_none_match = True
+        seen = {}
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: seen.update(kw)):
+            win._on_queue_retry_requested(1)
+        self.assertTrue(seen["if_none_match"])
+
+    def test_an_ordinary_retry_does_not_invent_the_precondition(self):
+        win = self._window()
+        entry = self._entry(win, 1, "error")
+        seen = {}
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: seen.update(kw)):
+            win._requeue(entry)
+        self.assertFalse(seen["if_none_match"])
 class ProblemReportTests(unittest.TestCase):
     """Nobody reconstructs a Qt plugin list and the last failure's request id
     from memory."""

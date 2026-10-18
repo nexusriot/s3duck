@@ -11,9 +11,10 @@ import unittest
 import unittest.mock
 from main_window import Worker
 from model import (
-    DeleteRefused, MAX_LOCAL_NAME_BYTES, Model, ObjectExists, ReadOnlyError,
-    TransferCancelled, client_accepts, drop_unsendable_checksum_args,
-    local_name_is_writable, plan_prefix_download, prefix_of, safe_local_path,
+    ArchivedObject, DeleteRefused, MAX_LOCAL_NAME_BYTES, Model, ObjectExists,
+    ReadOnlyError, TransferCancelled, client_accepts,
+    drop_unsendable_checksum_args, local_name_is_writable,
+    plan_prefix_download, prefix_of, safe_local_path,
 )
 from tests.support import (
     FakeS3Client, _ConditionalPutClient, _CopyPartClient, _FakePaginator,
@@ -608,14 +609,268 @@ class MultipartServerSideCopyTests(unittest.TestCase):
         """REGRESSION GUARD: a folder copy that re-discovers every size by
         being refused pays a wasted request per large object."""
         sizes = {}
-        self.m.get_keys = lambda prefix, log_fn=None: [
-            ("src/big.bin", self.HUGE), ("src/small.bin", 10)]
+        self.m.get_keys_with_class = lambda prefix, log_fn=None: [
+            ("src/big.bin", self.HUGE, "STANDARD"),
+            ("src/small.bin", 10, "STANDARD")]
         self.m.copy_object = (
             lambda key, dst, dst_bucket=None, log_fn=None, size=None,
-            cancel_event=None: sizes.__setitem__(key, size))
+            storage_class=None, cancel_event=None:
+            sizes.__setitem__(key, size))
         self.m.copy_prefix("src/", "dst/")
         self.assertEqual(sizes, {"src/big.bin": self.HUGE,
                                  "src/small.bin": 10})
+class CopyKeepsTheStorageClassTests(unittest.TestCase):
+    """
+    REGRESSION: a copy, move or rename used to re-tier the object it
+    touched. A plain CopyObject carries no StorageClass and S3 creates the
+    new object as STANDARD, so renaming a STANDARD_IA object moved it to a
+    dearer tier, and renaming a GLACIER_IR one undid an archival decision --
+    silently, and with a lifecycle rule often standing behind it.
+    """
+
+    HUGE = Model.MAX_SINGLE_COPY_BYTES + 1
+
+    def setUp(self):
+        self.m = make_model(bucket="src")
+
+    class Client(FakeS3Client):
+        """Records copies and answers HEAD with a class, like a real one."""
+
+        def __init__(self, head_class=None, copy_error=None, **kw):
+            super().__init__(**kw)
+            self._head_class = head_class
+            self._copy_error = copy_error
+            self.copies = []
+            self.uploaded = []
+
+        def head_object(self, **kw):
+            self.calls.append(("head_object", kw))
+            return {"StorageClass": self._head_class} if self._head_class \
+                else {}
+
+        def copy_object(self, **kw):
+            self.calls.append(("copy_object", kw))
+            self.copies.append(kw)
+            if self._copy_error is not None:
+                error, self._copy_error = self._copy_error, None
+                raise error
+            return {}
+
+        def get_object(self, **kw):
+            self.calls.append(("get_object", kw))
+            return {"Body": io.BytesIO(b"payload")}
+
+        def upload_fileobj(self, body, bucket, key, **kw):
+            self.uploaded.append((bucket, key, kw.get("ExtraArgs") or {}))
+
+    def _heads(self, client):
+        return len(client.calls_of("head_object"))
+
+    def test_a_copy_lands_in_the_class_the_caller_already_knew(self):
+        c = self.Client()
+        self.m._client = c
+        self.m.copy_object("a.tif", "b.tif", storage_class="STANDARD_IA")
+        self.assertEqual(c.copies[0]["StorageClass"], "STANDARD_IA")
+        # COPY is the default, but a REPLACE here would drop the metadata
+        # the old behaviour did at least keep.
+        self.assertEqual(c.copies[0]["MetadataDirective"], "COPY")
+
+    def test_a_standard_object_is_copied_exactly_as_it_always_was(self):
+        """Naming STANDARD would be a new request shape for every ordinary
+        copy, including to a backend that has never heard of tiers."""
+        c = self.Client()
+        self.m._client = c
+        self.m.copy_object("a.txt", "b.txt", storage_class="STANDARD")
+        self.assertNotIn("StorageClass", c.copies[0])
+        self.assertNotIn("MetadataDirective", c.copies[0])
+
+    def test_a_class_the_caller_knows_costs_no_head(self):
+        """The whole point of carrying it on the job row: a thousand-object
+        copy must not become a thousand extra round trips."""
+        c = self.Client(head_class="GLACIER_IR")
+        self.m._client = c
+        self.m.copy_object("a.tif", "b.tif", storage_class="ONEZONE_IA")
+        self.assertEqual(self._heads(c), 0)
+        self.assertEqual(c.copies[0]["StorageClass"], "ONEZONE_IA")
+
+    def test_a_caller_that_knows_nothing_asks_the_source(self):
+        """The other pane lists no class, and a job replayed from an old
+        history has none on the row; neither is a reason to re-tier."""
+        c = self.Client(head_class="INTELLIGENT_TIERING")
+        self.m._client = c
+        self.m.copy_object("a.tif", "b.tif")
+        self.assertEqual(self._heads(c), 1)
+        self.assertEqual(c.copies[0]["StorageClass"], "INTELLIGENT_TIERING")
+
+    def test_an_empty_class_is_read_as_standard_not_as_unknown(self):
+        """A folder row carries "" because a folder has no class; asking the
+        source about a prefix that is not an object would only waste a
+        request on a 404."""
+        c = self.Client(head_class="GLACIER")
+        self.m._client = c
+        self.m.copy_object("a.txt", "b.txt", storage_class="")
+        self.assertEqual(self._heads(c), 0)
+        self.assertNotIn("StorageClass", c.copies[0])
+
+    def test_a_head_the_credentials_refuse_still_copies(self):
+        """Preserving the class is worth a request, never the copy itself."""
+        c = self.Client()
+        c.head_object = lambda **kw: (_ for _ in ()).throw(
+            _client_error("AccessDenied", op="HeadObject"))
+        self.m._client = c
+        self.m.copy_object("a.txt", "b.txt")
+        self.assertEqual(len(c.copies), 1)
+        self.assertNotIn("StorageClass", c.copies[0])
+
+    def test_a_folder_copy_reads_each_class_out_of_its_own_listing(self):
+        """ListObjectsV2 returns the class in the same element as the key,
+        so a recursive copy preserves every tier for no extra request."""
+        c = self.Client()
+        self.m._client = c
+        self.m.get_keys_with_class = lambda prefix, log_fn=None: [
+            ("src/cold.tif", 10, "GLACIER_IR"),
+            ("src/warm.txt", 10, "STANDARD"),
+        ]
+        self.m.copy_prefix("src/", "dst/")
+        landed = {kw["Key"]: kw.get("StorageClass") for kw in c.copies}
+        self.assertEqual(landed,
+                         {"dst/cold.tif": "GLACIER_IR", "dst/warm.txt": None})
+        self.assertEqual(self._heads(c), 0)
+
+    def test_a_huge_object_keeps_its_class_through_the_multipart_route(self):
+        """CreateMultipartUpload defines the new object outright, so a class
+        not passed there is a class lost -- on the one route where the
+        object is too big to re-tier cheaply afterwards."""
+        c = _CopyPartClient(source_size=self.HUGE,
+                            head={"StorageClass": "STANDARD_IA"})
+        self.m._client = c
+        self.m.copy_object("big.bin", "copy.bin", size=self.HUGE,
+                           storage_class="STANDARD_IA")
+        _bucket, _key, create_args = c.created[0]
+        self.assertEqual(create_args["StorageClass"], "STANDARD_IA")
+
+    def test_a_huge_object_keeps_it_even_when_the_head_comes_back_empty(self):
+        c = _CopyPartClient(source_size=self.HUGE)
+        self.m._client = c
+        self.m.copy_object("big.bin", "copy.bin", size=self.HUGE,
+                           storage_class="ONEZONE_IA")
+        _bucket, _key, create_args = c.created[0]
+        self.assertEqual(create_args["StorageClass"], "ONEZONE_IA")
+
+    def test_the_streamed_fallback_keeps_the_class_too(self):
+        """A cross-region copy must not land in a different tier than the
+        same copy made in-region."""
+        c = self.Client(copy_error=_client_error("PermanentRedirect",
+                                                 op="CopyObject"))
+        self.m._client = c
+        self.m._try_bind_bucket = lambda name: (c, "ep", "eu-north-1", True)
+        self.m.copy_object("a.tif", "a.tif", dst_bucket="other",
+                           storage_class="STANDARD_IA")
+        _bucket, _key, extra = c.uploaded[0]
+        self.assertEqual(extra["StorageClass"], "STANDARD_IA")
+
+    def test_the_upload_policy_does_not_re_tier_a_streamed_copy(self):
+        """The profile's upload class applies to uploads. A copy routed
+        through one is still a copy."""
+        c = self.Client(copy_error=_client_error("PermanentRedirect",
+                                                 op="CopyObject"))
+        self.m._client = c
+        self.m._try_bind_bucket = lambda name: (c, "ep", "eu-north-1", True)
+        self.m.set_upload_options(storage_class="ONEZONE_IA")
+        self.m.copy_object("a.txt", "a.txt", dst_bucket="other",
+                           storage_class="STANDARD")
+        _bucket, _key, extra = c.uploaded[0]
+        self.assertNotIn("StorageClass", extra)
+
+    def test_a_backend_that_refuses_the_class_still_makes_the_copy(self):
+        """Some S3-compatible servers name a class in a listing and then
+        reject it on a copy. Losing the tier is bad; losing the rename the
+        user asked for is worse."""
+        c = self.Client(copy_error=_client_error("InvalidStorageClass",
+                                                 op="CopyObject"))
+        self.m._client = c
+        logs = []
+        self.m.copy_object("a.tif", "b.tif", storage_class="GLACIER_IR",
+                           log_fn=logs.append)
+        self.assertEqual(len(c.copies), 2)
+        self.assertEqual(c.copies[0]["StorageClass"], "GLACIER_IR")
+        self.assertNotIn("StorageClass", c.copies[1])
+        self.assertTrue(any("without preserving" in line for line in logs))
+
+    def test_an_archived_source_is_reported_as_something_actionable(self):
+        """InvalidObjectState in a message box tells nobody that the object
+        has to be restored first."""
+        c = self.Client(copy_error=_client_error("InvalidObjectState",
+                                                 op="CopyObject"))
+        self.m._client = c
+        with self.assertRaises(ArchivedObject) as caught:
+            self.m.copy_object("tape.tif", "b.tif", storage_class="GLACIER")
+        message = str(caught.exception)
+        self.assertIn("tape.tif", message)
+        self.assertIn("GLACIER", message)
+        self.assertIn("Restore", message)
+
+    def test_the_older_spelling_of_that_refusal_is_caught_too(self):
+        c = self.Client(copy_error=_client_error("ObjectNotInActiveTierError",
+                                                 op="CopyObject"))
+        self.m._client = c
+        with self.assertRaises(ArchivedObject):
+            self.m.copy_object("tape.tif", "b.tif", storage_class="GLACIER")
+
+    def test_a_restored_archived_object_is_copied_in_its_own_class(self):
+        """The service is the authority on restores, and no listing says
+        whether one is in effect -- so an archived class never refuses a
+        copy in advance, it only explains the refusal if one comes."""
+        c = self.Client()
+        self.m._client = c
+        self.m.copy_object("tape.tif", "b.tif", storage_class="GLACIER")
+        self.assertEqual(c.copies[0]["StorageClass"], "GLACIER")
+
+    def test_a_read_only_profile_refuses_before_it_asks_anything(self):
+        """Looking up the class is still a request; a profile that cannot
+        write must not spend one on a copy it is going to refuse."""
+        c = self.Client(head_class="STANDARD_IA")
+        self.m._client = c
+        self.m.read_only = True
+        with self.assertRaises(ReadOnlyError):
+            self.m.copy_object("a.tif", "b.tif")
+        self.assertEqual(c.calls, [])
+
+    def test_an_unrelated_failure_is_still_raised_as_itself(self):
+        c = self.Client(copy_error=_client_error("AccessDenied",
+                                                 op="CopyObject"))
+        self.m._client = c
+        with self.assertRaises(botocore.exceptions.ClientError):
+            self.m.copy_object("a.txt", "b.txt", storage_class="STANDARD_IA")
+class StorageClassInListingsTests(unittest.TestCase):
+    """get_keys_with_class is what lets a recursive copy keep every tier
+    without a HEAD per object."""
+
+    def setUp(self):
+        self.m = make_model(bucket="b")
+
+    def _listing(self, contents):
+        self.m._client = FakeS3Client(list_pages=[{"Contents": contents}])
+
+    def test_the_class_rides_along_with_the_key_and_the_size(self):
+        self._listing([{"Key": "a.tif", "Size": 7,
+                        "StorageClass": "STANDARD_IA"}])
+        self.assertEqual(self.m.get_keys_with_class(""),
+                         [("a.tif", 7, "STANDARD_IA")])
+
+    def test_a_listing_that_names_no_class_means_standard(self):
+        """S3 omits the field for a STANDARD object rather than naming it,
+        exactly as HeadObject does."""
+        self._listing([{"Key": "a.txt", "Size": 3}])
+        self.assertEqual(self.m.get_keys_with_class(""),
+                         [("a.txt", 3, "STANDARD")])
+
+    def test_the_narrow_view_still_answers_pairs(self):
+        """A dozen callers measure, delete and download with it and would
+        have had to be touched to buy nothing."""
+        self._listing([{"Key": "a.txt", "Size": 3,
+                        "StorageClass": "GLACIER"}])
+        self.assertEqual(self.m.get_keys(""), [("a.txt", 3)])
 class ResumableDownloadTests(unittest.TestCase):
     """REGRESSION-proofing: a large download that dies part-way must resume
     from the bytes already on disk instead of starting over."""
@@ -672,6 +927,22 @@ class ResumableDownloadTests(unittest.TestCase):
             m.download_file("big.bin", out, tmp)
             starts = {start for start, _e in m._client.ranges}
             self.assertEqual(starts, {0, 1024, 2048, 3072})  # all re-fetched
+
+    def test_a_partial_without_its_sidecar_is_cut_back_to_size(self):
+        """REGRESSION: a .s3duckpart left behind with no sidecar was reused
+        as-is. Every chunk is re-fetched, so the first `size` bytes are
+        right — but one left by a LARGER object kept its tail past the end,
+        and os.replace then handed that over as the finished file."""
+        payload = os.urandom(2048)
+        m = self._model(payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "big.bin")
+            part = out + Model.PART_SUFFIX
+            with open(part, "wb") as handle:
+                handle.write(os.urandom(8192))      # a bigger, older object
+            m.download_file("big.bin", out, tmp)
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(), payload)
 
     def test_small_files_skip_the_ranged_path(self):
         m = make_model(bucket="b")
@@ -1051,14 +1322,18 @@ class CrossBucketCopyMoveTests(unittest.TestCase):
             self.prefixes = []
             self.deletes = []
 
-        def copy_object(self, src, dst, dst_bucket=None, log_fn=None):
+        # The signatures mirror Model's: both take a cancel_event, and a
+        # worker that passes one must not be answered with a TypeError the
+        # job runner then reports as a transfer failure.
+        def copy_object(self, src, dst, dst_bucket=None, log_fn=None,
+                        storage_class=None, cancel_event=None):
             self.copies.append((src, dst, dst_bucket))
 
         def copy_prefix(self, src, dst, dst_bucket=None, log_fn=None,
                         cancel_event=None):
             self.prefixes.append((src, dst, dst_bucket))
 
-        def delete(self, key, log_fn=None):
+        def delete(self, key, log_fn=None, cancel_event=None):
             self.deletes.append(key)
 
     def test_copy_forwards_dst_bucket(self):
@@ -1084,7 +1359,8 @@ class CrossBucketCopyMoveTests(unittest.TestCase):
     def test_move_failure_leaves_sources_intact(self):
         """A copy error must not fall through to deleting the originals."""
         class Failing(self.FakeModel):
-            def copy_object(self, src, dst, dst_bucket=None, log_fn=None):
+            def copy_object(self, src, dst, dst_bucket=None, log_fn=None,
+                            storage_class=None, cancel_event=None):
                 raise RuntimeError("access denied")
 
         model = Failing()
