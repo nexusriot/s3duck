@@ -54,8 +54,8 @@ jobs:
       # QT_QPA_PLATFORM is deliberately NOT set here: tests/__init__.py sets it
       # before any Qt import, and letting the suite do it keeps that covered.
       # -t . is what makes that happen: without it `tests` becomes the
-      # top-level directory, the module imports as `test_units` rather than
-      # `tests.test_units`, and the package init never runs.
+      # top-level directory, the modules import as `unit.test_window` rather
+      # than `tests.unit.test_window`, and the package init never runs.
       - name: Run the test suite
         run: python -m unittest discover -s tests -t .
 
@@ -100,7 +100,7 @@ jobs:
         run: python tools/icon_report.py
 
       - name: Icon fallback tests
-        run: python -m unittest tests.test_units.IconFallbackTests
+        run: python -m unittest tests.unit.test_widgets.IconFallbackTests
 
   package:
     name: .deb package
@@ -124,15 +124,22 @@ jobs:
   e2e:
     name: end-to-end (MinIO)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Raised from 15 when the GUI suite joined: this job now builds three
+    # images and runs the model suite twice (once per SDK) before the window
+    # leg starts.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      # Everything the suite needs is in the compose file: a throwaway MinIO
-      # and a runner image holding nothing but boto3. model.py imports no Qt,
-      # so this leg needs no display and no PyQt6 at all.
-      - name: Run the end-to-end suite against a real MinIO
-        run: make e2e
+      # Everything both suites need is in the compose file: a throwaway MinIO,
+      # a runner image holding nothing but boto3, and a second one with PyQt6
+      # for the window. `make e2e-all` is the same command that runs locally.
+      #
+      # The model leg needs no display and no PyQt6 at all — model.py imports
+      # no Qt — which is why it stays a separate image rather than sharing the
+      # GUI one.
+      - name: Run both end-to-end suites against a real MinIO
+        run: make e2e-all
 
       - name: Show the server logs when it fails
         if: failure()

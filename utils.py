@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
@@ -38,6 +38,7 @@ except Exception:
     keyring = None
 from PyQt6.QtGui import QCursor, QIcon, QTransform
 from PyQt6.QtWidgets import QApplication, QProgressDialog
+from settings_store import SettingsStore
 
 PROFILE_BUNDLE_VERSION = 1
 PROFILE_BUNDLE_ITERATIONS = 480000
@@ -315,18 +316,14 @@ class CredentialStore:
         self.ask_passphrase = ask_passphrase
 
     def _get(self, name, default=""):
-        self.settings.beginGroup("common")
-        value = self.settings.value(name, default)
-        self.settings.endGroup()
-        return value
+        return SettingsStore(self.settings).get(name, default)
 
     def _set(self, name, value):
-        self.settings.beginGroup("common")
+        store = SettingsStore(self.settings)
         if value is None:
-            self.settings.remove(name)
+            store.remove(name)
         else:
-            self.settings.setValue(name, value)
-        self.settings.endGroup()
+            store.set(name, value)
 
     def mode(self) -> str:
         stored = str(self._get("credential_store", CREDENTIAL_STORE_LOCAL) or "")
@@ -450,10 +447,8 @@ def resolve_credential_key(settings) -> str:
     session key is the fallback, which is what the keyring and passphrase
     modes leave behind (they store nothing in the settings file at all).
     """
-    settings.beginGroup("common")
-    key = settings.value("key", "")
-    settings.endGroup()
-    return str(key or "") or session_key()
+    key = SettingsStore(settings).get_str("key")
+    return key or session_key()
 
 
 # Preset accents offered per profile. Named rather than free-form so the

@@ -9,7 +9,7 @@ Simple cross-platform GUI client for S3-compatible object storage (AWS S3, MinIO
 
 ## Continuous integration
 
-GitHub Actions (`.github/workflows/ci.yml`) runs three jobs on every push and
+GitHub Actions (`.github/workflows/ci.yml`) runs four jobs on every push and
 pull request:
 
 - **tests** — the offscreen suite on Python 3.11 and 3.12, against both the
@@ -24,6 +24,10 @@ pull request:
   every control placeholder, that `Installed-Size` is measured rather than
   hardcoded, that the Qt SVG/PDF dependencies are declared, and that a PNG twin
   ships for every bundled SVG.
+- **end-to-end (MinIO)** — `make e2e-all`: `model.py` against a throwaway MinIO
+  on the pinned SDK and on the oldest supported one, then the real window,
+  headless, against the same server. Everything both suites need is a
+  container, so this is the same command that runs locally.
 
 ## Features
 
@@ -62,16 +66,16 @@ pull request:
 - **Checksum verification** — optionally compare each downloaded file against the object's stored digest and fail the transfer on a mismatch, for every file of a whole-folder download as much as for a single object. A multipart object is settled by asking the service for its real part boundaries (`GetObjectAttributes`) and rebuilding the composite digest from them, so "multipart, not comparable" is now the exception rather than the rule; where a backend does not implement that call, verification still degrades to reporting the object as not comparable rather than failing it (MinIO does implement it — the end-to-end suite checks)
 - **Parallel transfers** — configurable number of files moving at once *and* multipart connections within each file; applies to uploads, downloads (including whole prefixes) and sync
 - **Transfer settings** — files in flight, connections per file, bandwidth limit, multipart part size and threshold, resumable uploads, automatic retry of transient failures, the per-listing entry limit, the session log file, Content-Type detection with its override table, the upload rules by destination, plus the storage class, checksum and server-side encryption (SSE-S3 / SSE-KMS) applied to uploads — all persisted across sessions
-- **Overwrite protection** — uploads (dialog, folder upload and drag-in), downloads (single files *and* whole folders), copies, moves, renames and pastes all detect existing destinations and offer Skip / Overwrite / Cancel. For uploads the answer is then *enforced by the service*: unless you chose Overwrite, every write carries an `If-None-Match` precondition, so an object that appears after the check — the gap a check-then-write always leaves — is refused and reported as skipped instead of being replaced. A backend without conditional writes — or an installed boto3 too old to send the header, which is what a distribution package often pins — degrades to the old check-then-write and says so in the log
+- **Overwrite protection** — uploads (dialog, folder upload, drag-in and the dual pane's `F5`), downloads (single files *and* whole folders), copies, moves, renames and pastes all detect existing destinations and offer Skip / Overwrite / Cancel. For uploads the answer is then *enforced by the service*: unless you chose Overwrite, every write carries an `If-None-Match` precondition, so an object that appears after the check — the gap a check-then-write always leaves — is refused and reported as skipped instead of being replaced. A backend without conditional writes — or an installed boto3 too old to send the header, which is what a distribution package often pins — degrades to the old check-then-write and says so in the log. The answer travels with the job, so a retry — an automatic one included — and a re-run from history keep it instead of overwriting on the second attempt
 - **Sync with a local folder** (`Ctrl+E`) — compare a directory against a prefix in either direction, review a dry-run plan (upload / download / delete / skip with a reason per file), then run it through the queue; supports exclude globs (`*.tmp`, `node_modules/`) and optionally deleting extras at the destination
 - **Transfer queue** — queued jobs with per-row progress, cancel, and retry for failed or cancelled entries; "Retry failed" re-queues every failure at once, and a job the service itself asked us to repeat (throttling, 5xx, a dropped connection) is retried once automatically
 - **Transfer history** — a persisted log of past jobs (when, what, bytes, outcome) with one-click re-run for small jobs, from the queue panel
 - **Bandwidth limit** — optional ceiling on total transfer throughput, shared across every parallel file and chunk
 - **Completion notifications** — a desktop notification when the queue drains while the window is in the background (toggle in Transfer settings)
-- **Delete** — objects and folder prefixes (recursive, batched 1000 keys per call); confirmation shows the scanned object count and total size; recursive bucket delete also purges noncurrent versions, delete markers and in-flight uploads
+- **Delete** — objects and folder prefixes (recursive, batched 1000 keys per call, and cancellable inside the walk rather than only between selected rows); confirmation shows the scanned object count and total size; recursive bucket delete also purges noncurrent versions, delete markers and in-flight uploads
 - **Undo delete** (`Ctrl+Z`) — on a versioning-enabled bucket a delete only writes a delete marker, so the last delete can be rolled back by removing those markers
 - **Clipboard** (`Ctrl+C` / `Ctrl+X` / `Ctrl+V`) — copy or cut a selection and paste it into any folder or bucket; copying also puts the `s3://` URIs on the system clipboard for use elsewhere
-- **Copy / Move** — server-side copy or move of a multi-selection, within a bucket or **across buckets**; when the destination lives in another region or account (where a server-side copy is impossible) the object is streamed through instead of failing
+- **Copy / Move** — server-side copy or move of a multi-selection, within a bucket or **across buckets**; when the destination lives in another region or account (where a server-side copy is impossible) the object is streamed through instead of failing. Copies, moves, renames and pastes keep each object in its **own storage class** — a plain `CopyObject` carries none and S3 would create the new object as STANDARD, re-tiering an IA or Glacier-IR object nobody asked to re-tier. The class comes from the listing, which already knows it, so nothing is spent discovering it; only a route with no listing behind it — an object picked in the other pane, a pane comparison, a job replayed from an older history entry — costs one `HeadObject`. It holds on all three routes — the single copy, the multipart rebuild past 5 GiB, and the cross-region stream — and metadata, content type and cache headers ride along as they always did. A backend that names a class in its own listing and then refuses it on a copy (`InvalidStorageClass`, `NotImplemented`) gets the plain copy it used to get, and the log says the class was not preserved: the tier is worth one request, never the copy itself. A source that is archived in GLACIER or DEEP_ARCHIVE and **not restored** cannot be copied at all: the service refuses to read it, and the failure now says so and points at Restore from Glacier instead of reporting `InvalidObjectState`
 - **Objects over 5 GiB** — S3 refuses a `CopyObject` whose source is larger than that, which used to be a hard failure for every copy onto itself: rename, bulk rename, paste, change storage class, edit metadata and "Fix Content-Type". Such an object is now rebuilt at the destination from `UploadPartCopy` ranges, which the service still performs itself — not the streaming fallback, and no part of it travels through this machine. Where the listing already knows the size, the doomed single copy is skipped rather than bought with a request
 - **Rename** — in-place rename of a file or folder (server-side copy + delete), on the context menu or `F2`
 - **Bulk rename** (`Shift+F2`) — rename a whole selection by find-and-replace (optionally regex, with backreferences) or a `{name}/{ext}/{n}` numbering template, with a live preview and duplicate/invalid-name checks
@@ -125,9 +129,9 @@ Planned work and known limitations are tracked in [ROADMAP.md](ROADMAP.md).
 
 ## Testing
 
-`make` lists every target; `make check` runs both suites.
+`make` lists every target; `make check` runs all three suites.
 
-Two suites. The unit suite stubs boto3 and needs nothing but Python:
+Three suites. The unit suite stubs boto3 and needs nothing but Python:
 
 ```
 make test
@@ -155,6 +159,29 @@ S3DUCK_TEST_ACCESS_KEY=... S3DUCK_TEST_SECRET_KEY=... \
     python -m unittest discover -s tests/e2e -t .
 ```
 
+The third suite drives the **real GUI** against the same throwaway MinIO, on
+Qt's offscreen platform — no display, no window manager, real widgets:
+
+```
+make e2e-gui        # or: make e2e-all, for this and the model suite
+```
+
+It exists because the other two meet nowhere. The unit suite builds a real
+`MainWindow` but answers it with `FakeS3Client`; the model suite asks a real
+server but never involves Qt. Everything in between — the navigation worker,
+the transfer queue, the per-worker model clones, the queued signals that carry
+a result back onto the UI thread — was only ever exercised against a fake, and
+a background thread meeting a real network is where this kind of application
+breaks. These tests call the methods the menus call, pump the Qt event loop
+until the real workers finish, and then ask the bucket, through a separate
+boto3 client, what actually happened.
+
+The only things stubbed are `QFileDialog` and `QMessageBox`: those are the
+operating system asking the user something, and headless there is nobody to
+answer. Any *other* modal that opens fails the test by name rather than
+hanging it, which is what keeps an unanswerable dialog from turning into a
+silent timeout.
+
 MinIO archived its open-source server in 2025 — `quay.io/minio/minio` stopped
 granting anonymous pulls, the Docker Hub repository went away, and `dl.min.io`
 answers `410 Gone` for every community binary — so the compose file names the
@@ -164,11 +191,39 @@ half the limitations documented here are statements about how MinIO behaves,
 and a different backend would answer differently and quietly stop checking
 them. `S3DUCK_TEST_MINIO_IMAGE` overrides the image if you host your own.
 
-The runner image holds boto3 and nothing else: `model.py` imports no Qt, so
-this needs no display and no PyQt6. Alongside the round trips it records what
-the backend under test actually implements — `GetObjectAttributes`,
-conditional writes, ACLs, restore, Object Lock — so a documented limitation
-that stops being true shows up as a test result rather than as stale prose.
+The model suite's runner image holds boto3 and nothing else: `model.py`
+imports no Qt, so it needs no display and no PyQt6. The GUI runner is the one
+that pays for PyQt6, which is why they are separate images. Alongside the
+round trips, the model suite records what the backend under test actually
+implements — `GetObjectAttributes`, conditional writes, ACLs, restore, Object
+Lock — so a documented limitation that stops being true shows up as a test
+result rather than as stale prose.
+
+What the model suite covers, a module at a time (`tests/e2e/`):
+
+| Module | What only a server can settle |
+|---|---|
+| `test_roundtrip.py` | Listings, uploads, downloads, server-side copy, prefix delete |
+| `test_capabilities.py` | Multipart, checksums, conditional writes, presigned URLs, and which optional features this backend has |
+| `test_corner_cases.py` | Awkward keys, zero-byte and threshold-sized objects, local filesystem limits, storage classes |
+| `test_regressions.py` | The premises past fixes rest on: a `..` in a key, `DeleteObjects` refusing keys in a 200 |
+| `test_bucket_admin.py` | *Writing* lifecycle rules, policies and tags — and that CORS, website hosting and encryption are refused with something the dialog can show |
+| `test_object_lock.py` | Legal holds: that the server refuses the delete, and that a held version survives the delete marker written over it |
+| `test_versions.py` | Fetching one version, promoting an old one, deleting a single version, delete markers |
+| `test_cross_profile.py` | Copying between two independent clients, and a read-only destination refusing before anything is written |
+| `test_discovery.py` | Deep search filters, the sync planner's tree, duplicate fingerprints, usage totals across pages, preview windows |
+| `test_profile_and_sdk.py` | The profile check's write-and-remove probe, and which parameters the *installed* SDK will actually send |
+| `test_transfer_tuning.py` | The transfer settings as requests: files in flight, threads per file, the bandwidth ceiling, part sizes |
+| `test_upload_policy.py` | What an upload carries besides the body — the per-destination rules' storage class and tags, as the service stores them |
+
+And the GUI suite (`tests/e2e_gui/`), which asks the same server what the
+window actually did:
+
+| Module | What only the real window can settle |
+|---|---|
+| `test_navigation.py` | Prefix listings through the navigation worker, sibling prefixes, a refresh seeing a change made behind the app, a failed navigation re-enabling the list view |
+| `test_transfers.py` | Uploads, downloads and deletes driven through the window's own entry points, and the transfer queue draining them |
+| `test_queue_outcomes.py` | How a job *ends*: done, cancelled or failed, and whether the user is told — the dialog as much as the row |
 
 ## Requirements
 
@@ -206,7 +261,7 @@ python3 s3duck.py
 
 `make` on its own lists every target. Each one delegates to the script below
 it, so the two never disagree about how something is built; the version is
-read from `__VERSION__` in `main_window.py` rather than repeated anywhere.
+read from `__VERSION__` in `version.py` rather than repeated anywhere.
 
 ```bash
 make deb          # this machine's architecture
@@ -251,27 +306,83 @@ Pre-built releases are available on the [GitHub releases page](https://github.co
 ```
 s3duck/
 ├── s3duck.py            Entry point — QApplication bootstrap, Profiles dialog
-├── main_window.py       Main window — file browser, toolbar, async workers
-├── model.py             S3/data layer — all boto3 operations, region retry logic
+├── main_window.py       MainWindow itself — assembly, actions, the operations
+│                        that are not any one mixin's
+├── model.py             The S3 front door — a facade over the s3/ mixins
 ├── settings.py          Profile create/edit dialog
 ├── properties_window.py Object properties dialog
 ├── profile_switcher.py  Runtime profile-switch dialog
 ├── theme.py             Light / Dark / system palette switching
+├── settings_store.py    Typed QSettings access — groups, coercions, per-profile keys
+├── version.py           The app version — read by the Makefile and build_deb.sh
+│
+├── core/                Pure domain logic — no Qt, no boto3, no client
+│   ├── naming.py        File categories, human sizes, epoch coercion
+│   ├── errors.py        The failures the S3 layer raises by name
+│   ├── checksums.py     Block-at-a-time digest primitives
+│   ├── integrity.py     ETags, checksums, fingerprint comparison
+│   ├── parts.py         Multipart and server-side-copy part sizing
+│   ├── endpoints.py     Endpoint URL reading, region swap, redirect conflicts
+│   ├── objects.py       Restore state, tag merging, delete results
+│   ├── search.py        Search form → one predicate over listing rows
+│   ├── pricing.py       Storage cost estimate, colder-class options
+│   ├── lifecycle.py     Lifecycle rule read / summarise / build
+│   ├── upload_rules.py  Per-pattern upload settings, content-type overrides
+│   ├── sync_plan.py     Tree comparison and the plan it produces
+│   ├── manifest.py      Manifest write, parse and verify
+│   ├── dedup.py         Duplicate grouping and redundant-key selection
+│   ├── bulk_rename.py   Bulk rename planning
+│   ├── bookmarks.py     Saved places and their storage form
+│   ├── locations.py     bucket/prefix strings, quick-open rows
+│   ├── commands.py      Command palette ranking, shortcut sheet rows
+│   ├── transfer_jobs.py Drag/paste → transfer rows
+│   ├── treemap.py       Squarified treemap layout and prefix tree
+│   ├── formatting.py    Number and byte rendering
+│   ├── entries.py       Item, FSObjectType, PrefixDownloadPlan
+│   └── profile.py       ProfileSettings — one connection, by name not position
+│
+├── s3/                  The boto3 layer — Model's mixins
+│   ├── common.py        What the pieces share: checksum table, progress, limiter
+│   ├── binding.py       Client, addressing style, region probing and re-binding
+│   ├── listing.py       Reading a bucket or a prefix
+│   ├── upload.py        Multipart, resume, and the rules that shape a PUT
+│   ├── download.py      Getting bytes out, and proving they arrived intact
+│   ├── copy.py          Server-side copy and the stream-through fallback
+│   ├── delete.py        Objects, versions, prefixes and whole buckets
+│   ├── bucket_admin.py  Policy, CORS, lifecycle, encryption, locking
+│   └── object_admin.py  Metadata, tags, class, versions, integrity
+│
+├── workers/             QObjects that run on a QThread, talking by signal only
+│   ├── navigation.py    NavigationWorker, BucketEnterWorker
+│   ├── transfer.py      Worker — upload, download, copy, move, sync, zip, tags
+│   └── usage.py         UsageWorker — bucket size by category and class
+│
+├── ui/                  The Qt layer
+│   ├── constants.py     Values the window and its dialogs both rely on
+│   ├── context_menu.py  The listing's right-click menu, entry + handler as one
+│   ├── window/          MainWindow's mixins — one per cluster of its state
+│   │                    navigation, history, tabs, transfers, quickfind,
+│   │                    bookmarks, watch, usage, credentials
+│   ├── widgets/         Listing view, charts, breadcrumb, panes, queue panel
+│   └── dialogs/         Dialogs grouped by area (18 modules, 30 dialogs)
 ├── diagnostics.py       Qt plugin / icon / library report (Tools → Diagnostics)
 ├── utils.py             Shared helpers — Crypto and CredentialStore, Qt thread
 │                        plumbing, ~/.aws parsing, credential expiry, local tree scan
 │
-├── icons/               24 px SVG icons for toolbar and context menus
+├── icons/               24 px toolbar and menu icons — every SVG with a PNG
+│                        twin, for Qt builds that ship no SVG plugin
 ├── resources/           App icon (ico/icns/png), screenshots, .desktop file
 ├── DEBIAN/              Debian package metadata (control, postinst, prerm)
-├── tests/               Offscreen unit suite (test_units.py)
-│   └── e2e/             End-to-end suite + its MinIO compose harness
+├── tests/               Three suites: offscreen unit, model e2e, GUI e2e
+│   ├── support.py       Shared fakes, stubs and helpers
+│   ├── unit/            One module per area, mirroring the tree above
+│   ├── e2e/             Model end-to-end suite + its MinIO compose harness
+│   └── e2e_gui/         GUI end-to-end suite: the real window, headless
 ├── tools/               CI helpers and the icon report
 │
-├── Makefile             Front door: make test / e2e / deb / bin / clean
+├── Makefile             Front door: make test / e2e / e2e-gui / deb / bin / clean
 ├── requirements.txt     Python dependencies
-├── s3duck.spec          PyInstaller build spec
-├── run_e2e.sh           End-to-end suite against a throwaway MinIO
+├── run_e2e.sh           End-to-end suites against a throwaway MinIO
 ├── build_deb.sh         Build .deb package
 ├── build_linux_bin.sh   Build Linux self-contained binary
 ├── build_macos_bin.sh   Build macOS self-contained binary
@@ -290,20 +401,32 @@ s3duck/
 │  Crypto (Fernet), CredentialStore (settings / keyring /         │
 │  passphrase), credential_process, expiry_state                  │
 ├─────────────────────────────────────────────────────────────────┤
-│  UI layer                main_window.py                         │
-│  MainWindow, Tree, SecondPane, UpTopProxyModel, PieWidget,      │
-│  BucketUsageDialog, ListItem, tab bar                           │
+│  UI layer                main_window.py + ui/window/            │
+│  MainWindow, assembled from one mixin per cluster of its state: │
+│  navigation, history, tabs, transfers, quickfind, bookmarks,    │
+│  watch, usage, credentials                                      │
 ├─────────────────────────────────────────────────────────────────┤
-│  Worker / Threading layer   main_window.py                      │
+│  Widget layer            ui/widgets/                            │
+│  Tree, UpTopProxyModel, SecondPane, PieWidget, TreemapWidget,   │
+│  Breadcrumb, TransferQueuePanel, ProfilePicker                  │
+├─────────────────────────────────────────────────────────────────┤
+│  Dialog layer            ui/dialogs/                            │
+│  One module per feature — bucket settings, preview, versions,   │
+│  search, duplicates, compare, sync … plus SettingsWindow,       │
+│  PropertiesWindow and ProfileSwitchWindow at the top level      │
+├─────────────────────────────────────────────────────────────────┤
+│  Worker / Threading layer   workers/                            │
 │  NavigationWorker  BucketEnterWorker  Worker  UsageWorker       │
 │  (each runs in a QThread, communicates via pyqtSignal)          │
 ├─────────────────────────────────────────────────────────────────┤
-│  Dialog layer                                                   │
-│  SettingsWindow  PropertiesWindow  ProfileSwitchWindow          │
-│  BucketSettingsDialog  WatchFolderDialog  …                     │
+│  Data / S3 layer         model.py + s3/                         │
+│  Model — a facade; binding, listing, upload, download, copy,    │
+│  delete, bucket_admin and object_admin are its mixins           │
 ├─────────────────────────────────────────────────────────────────┤
-│  Data / S3 layer         model.py                               │
-│  Model — boto3 wrapper, adaptive region/endpoint probing        │
+│  Domain layer            core/                                  │
+│  Planning, parsing, comparison and pricing. No Qt, no boto3 —   │
+│  testable without a QApplication or a client, and guarded as    │
+│  such by CorePurityTests.                                       │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -316,43 +439,44 @@ s3duck/
 | `CredentialStore` | utils.py | Where the credential key lives — settings file, OS secret store, or sealed under a passphrase |
 | `run_credential_process` | utils.py | Mints a session from a profile's `credential_process`, the AWS SDKs' own SSO / assume-role refresh |
 | `MainWindow` | main_window.py | Root window — toolbar, splitter (tree + log), statusbar |
-| `Tree` | main_window.py | Drag-and-drop `QTreeView`; hands drops to upload worker |
-| `UpTopProxyModel` | main_window.py | Proxy that pins `[..]` to top and sorts BUCKET < FOLDER < FILE |
-| `NavigationWorker` | main_window.py | Off-thread bucket/prefix listing; uses a private `Model` clone to avoid client races |
-| `BucketEnterWorker` | main_window.py | Off-thread bucket entry with hints-based region/endpoint retry |
-| `Worker` | main_window.py | Off-thread upload / download / delete with byte-level progress and cancellation |
-| `UsageWorker` | main_window.py | Off-thread bucket size aggregation by file category, storage class and estimated cost |
-| `SecondPane` | main_window.py | The other half of the dual pane — a local folder or a remote prefix, listing only |
-| `PieWidget` | main_window.py | Custom `QPainter` pie chart for usage breakdown |
-| `Model` | model.py | All boto3 calls; `_try_bind_bucket` probes addressing styles; `rebind_bucket` auto-corrects region mid-session; `get_object_parts` supplies the boundaries that make a multipart object verifiable |
+| `Tree` | ui/widgets/listing.py | Drag-and-drop `QTreeView`; hands drops to upload worker |
+| `UpTopProxyModel` | ui/widgets/listing.py | Proxy that pins `[..]` to top and sorts BUCKET < FOLDER < FILE |
+| `NavigationWorker` | workers/navigation.py | Off-thread bucket/prefix listing; uses a private `Model` clone to avoid client races |
+| `BucketEnterWorker` | workers/navigation.py | Off-thread bucket entry with hints-based region/endpoint retry |
+| `Worker` | workers/transfer.py | Off-thread upload / download / delete with byte-level progress and cancellation |
+| `UsageWorker` | workers/usage.py | Off-thread bucket size aggregation by file category, storage class and estimated cost |
+| `SecondPane` | ui/widgets/second_pane.py | The other half of the dual pane — a local folder or a remote prefix, listing only |
+| `PieWidget` | ui/widgets/charts.py | Custom `QPainter` pie chart for usage breakdown |
+| `Model` | model.py + s3/ | The one front door to boto3. The class itself keeps only construction, the read-only write guard, the three throughput setters and `get_os_family`; every call that touches a bucket lives in an s3/ mixin — `binding.py` probes addressing styles and auto-corrects region mid-session, `object_admin.py` supplies the part boundaries that make a multipart object verifiable |
+| `job_runner` | workers/transfer.py | The contract every background operation shares: cancellation is not a failure, a real failure is reported three ways, and `finished` always fires — it is what releases the thread and re-enables the toolbar |
 | `describe_client_error` | utils.py | Error code, HTTP status, request id and host id from a botocore failure |
-| `PreviewDialog` | main_window.py | In-app image/text/PDF preview, in-place editing of whole text objects, "open with default app" via a temp download |
-| `VersionsDialog` | main_window.py | Per-object version manager (list / download / make-current / delete); lists off-thread |
-| `IncompleteUploadsDialog` | main_window.py | Find and abort orphaned multipart uploads still holding billed parts |
-| `TransferSettingsDialog` | main_window.py | Concurrency, upload storage class / encryption / checksum, Content-Type detection and the per-listing entry limit |
-| `BucketSettingsDialog` | main_window.py | Lifecycle, CORS, policy, encryption, tags, website, events and Object Lock, read in one background pass |
-| `PaneCompareDialog` | main_window.py | What differs between the two panes, and a copy either way |
-| `VersionDiffDialog` | main_window.py | Coloured unified diff between two versions of one object |
-| `SizeExplorerDialog` | main_window.py | Treemap of a bucket by prefix, drilling down on a click |
-| `TreemapWidget` | main_window.py | One level of a prefix tree as proportional rectangles |
+| `PreviewDialog` | ui/dialogs/preview.py | In-app image/text/PDF preview, in-place editing of whole text objects, "open with default app" via a temp download |
+| `VersionsDialog` | ui/dialogs/versions.py | Per-object version manager (list / download / make-current / delete); lists off-thread |
+| `IncompleteUploadsDialog` | ui/dialogs/incomplete_uploads.py | Find and abort orphaned multipart uploads still holding billed parts |
+| `TransferSettingsDialog` | ui/dialogs/transfer_settings.py | Concurrency, upload storage class / encryption / checksum, Content-Type detection and the per-listing entry limit |
+| `BucketSettingsDialog` | ui/dialogs/bucket_settings.py | Lifecycle, CORS, policy, encryption, tags, website, events and Object Lock, read in one background pass |
+| `PaneCompareDialog` | ui/dialogs/compare.py | What differs between the two panes, and a copy either way |
+| `VersionDiffDialog` | ui/dialogs/versions.py | Coloured unified diff between two versions of one object |
+| `SizeExplorerDialog` | ui/dialogs/usage.py | Treemap of a bucket by prefix, drilling down on a click |
+| `TreemapWidget` | ui/widgets/charts.py | One level of a prefix tree as proportional rectangles |
 | `LogFile` | utils.py | Rotating session log behind Tools → Report a problem |
 | `InstanceServer` | utils.py | Hands an `s3://` location to an already-running window |
-| `LifecycleRuleDialog` | main_window.py | One lifecycle rule — scope plus transition / expiration / noncurrent / abort actions |
-| `WatchFolderDialog` | main_window.py | Configures the interval mirror of a local folder up to a prefix |
-| `OverwriteDialog` | main_window.py | Skip / Overwrite prompt for existing destinations |
-| `ShortcutsDialog` | main_window.py | Keyboard reference derived from the live QActions |
-| `TransferHistoryDialog` | main_window.py | Past transfers with re-run |
-| `RateLimiter` | model.py | Shared token bucket capping total throughput |
-| `BulkTagsDialog` | main_window.py | Add / replace / remove tags across a selection |
-| `BookmarksDialog` | main_window.py | Rename / remove saved locations |
-| `DuplicateFinderDialog` | main_window.py | Size+ETag duplicate scan with guarded deletion |
-| `CodeHighlighter` | main_window.py | Language-agnostic syntax highlighting in previews |
-| `BulkRenameDialog` | main_window.py | Find-replace / template rename with live preview |
-| `SyncDialog` | main_window.py | Local↔remote comparison, dry-run plan, queued execution |
-| `MetadataDialog` | main_window.py | Edit Content-Type / caching headers and custom user metadata |
-| `SearchDialog` | main_window.py | Recursive key search over a bucket/prefix; results are multi-select and feed the transfer queue |
-| `PresignedLinkDialog` | main_window.py | Generate GET/PUT presigned links with a configurable expiry |
-| `Breadcrumb` | main_window.py | Clickable path bar for jumping to parent prefixes |
+| `LifecycleRuleDialog` | ui/dialogs/bucket_settings.py | One lifecycle rule — scope plus transition / expiration / noncurrent / abort actions |
+| `WatchFolderDialog` | ui/dialogs/compare.py | Configures the interval mirror of a local folder up to a prefix |
+| `OverwriteDialog` | ui/dialogs/history.py | Skip / Overwrite prompt for existing destinations |
+| `ShortcutsDialog` | ui/dialogs/shortcuts.py | Keyboard reference derived from the live QActions |
+| `TransferHistoryDialog` | ui/dialogs/history.py | Past transfers with re-run |
+| `RateLimiter` | s3/common.py | Shared token bucket capping total throughput |
+| `BulkTagsDialog` | ui/dialogs/bulk.py | Add / replace / remove tags across a selection |
+| `BookmarksDialog` | ui/dialogs/bookmarks.py | Rename / remove saved locations |
+| `DuplicateFinderDialog` | ui/dialogs/duplicates.py | Size+ETag duplicate scan with guarded deletion |
+| `CodeHighlighter` | ui/widgets/highlighters.py | Language-agnostic syntax highlighting in previews |
+| `BulkRenameDialog` | ui/dialogs/bulk.py | Find-replace / template rename with live preview |
+| `SyncDialog` | ui/dialogs/compare.py | Local↔remote comparison, dry-run plan, queued execution |
+| `MetadataDialog` | ui/dialogs/tags.py | Edit Content-Type / caching headers and custom user metadata |
+| `SearchDialog` | ui/dialogs/search.py | Recursive key search over a bucket/prefix; results are multi-select and feed the transfer queue |
+| `PresignedLinkDialog` | ui/dialogs/presigned.py | Generate GET/PUT presigned links with a configurable expiry |
+| `Breadcrumb` | ui/widgets/breadcrumb.py | Clickable path bar for jumping to parent prefixes |
 | `apply_theme` | theme.py | Light / Dark / system palette switching |
 | `SettingsWindow` | settings.py | Profile form — name, URL, region, bucket, keys, session expiry, credential process, public base URL, requester-pays, HTTP proxy, CA bundle and the safety flags |
 | `PropertiesWindow` | properties_window.py | Object metadata: key, size, ETag, storage class, restore status, Object Lock state (probed off-thread), public URL |
@@ -396,6 +520,12 @@ rebind_bucket()             swap endpoint + region → enter_bucket() → valida
   ▼
 retry original operation    transparent to the caller
 ```
+
+A listing has a second, cheaper route: `AuthorizationHeaderMalformed` names
+the region it wanted in the message itself ("… expecting 'eu-north-1'"), so
+`list()` reads it out, retries there and promotes that client for the bucket
+— no HEAD, no re-probe. The hint arrives while the pages are being walked,
+because `paginate()` sends nothing on its own.
 
 ### Credential storage
 

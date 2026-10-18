@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from PyQt6.QtCore import QSettings
+from settings_store import SettingsStore
 from PyQt6.QtWidgets import (
     QDialog, QListWidget, QPushButton, QHBoxLayout, QVBoxLayout,
     QMessageBox, QLabel
@@ -37,32 +38,31 @@ class Profile:
 
 def load_profiles(settings: QSettings) -> List[dict]:
     items = []
-    settings.beginGroup("profiles")
-    n = settings.beginReadArray("profiles")
-    for i in range(n):
-        settings.setArrayIndex(i)
-        items.append({
-            "name": settings.value("name", ""),
-            "url": settings.value("url", ""),
-            "region": settings.value("region", ""),
-            "bucket_name": settings.value("bucket_name", ""),
-            "access_key": settings.value("access_key", ""),
-            "secret_key": settings.value("secret_key", ""),
-            "no_ssl_check": settings.value("no_ssl_check", "false"),
-            "use_path": settings.value("use_path", "false"),
-            "session_token": settings.value("session_token", ""),
-            "read_only": settings.value("read_only", "false"),
-            "color": settings.value("color", ""),
-            "session_expires": settings.value("session_expires", ""),
-            "aws_profile": settings.value("aws_profile", ""),
-            "credential_process": settings.value("credential_process", ""),
-            "public_base_url": settings.value("public_base_url", ""),
-            "requester_pays": settings.value("requester_pays", "false"),
-            "proxy_url": settings.value("proxy_url", ""),
-            "ca_bundle": settings.value("ca_bundle", ""),
-        })
-    settings.endArray()
-    settings.endGroup()
+    with SettingsStore(settings).group("profiles"):
+        n = settings.beginReadArray("profiles")
+        for i in range(n):
+            settings.setArrayIndex(i)
+            items.append({
+                "name": settings.value("name", ""),
+                "url": settings.value("url", ""),
+                "region": settings.value("region", ""),
+                "bucket_name": settings.value("bucket_name", ""),
+                "access_key": settings.value("access_key", ""),
+                "secret_key": settings.value("secret_key", ""),
+                "no_ssl_check": settings.value("no_ssl_check", "false"),
+                "use_path": settings.value("use_path", "false"),
+                "session_token": settings.value("session_token", ""),
+                "read_only": settings.value("read_only", "false"),
+                "color": settings.value("color", ""),
+                "session_expires": settings.value("session_expires", ""),
+                "aws_profile": settings.value("aws_profile", ""),
+                "credential_process": settings.value("credential_process", ""),
+                "public_base_url": settings.value("public_base_url", ""),
+                "requester_pays": settings.value("requester_pays", "false"),
+                "proxy_url": settings.value("proxy_url", ""),
+                "ca_bundle": settings.value("ca_bundle", ""),
+            })
+        settings.endArray()
     return items
 
 

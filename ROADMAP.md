@@ -58,8 +58,8 @@ credential-storage choice in 0.18.0. What is left:
   pause that keeps partial state would round it out.
 - **Object Lock retention on a multipart copy** — a copy over 5 GiB is
   rebuilt by CreateMultipartUpload, which does not inherit the source's
-  retention the way CopyObject does; the carried fields stop at metadata and
-  encryption.
+  retention the way CopyObject does; the carried fields stop at the content
+  headers, user metadata, encryption and the storage class.
 - **Trash convention** — optional "move to `.trash/` prefix" instead of
   delete, with an empty-trash action (complements undo-delete, which needs
   versioning).
@@ -101,6 +101,20 @@ credential-storage choice in 0.18.0. What is left:
   against the whole and fail every ranged read — which is every download
   past the resume threshold. A whole-object GET is still validated.
 
+- A copy, move or rename keeps the object's storage class, but a **copy to
+  another profile** does not. That route cannot use `CopyObject` at all —
+  no server-side copy spans two sets of credentials — so the bytes are
+  written by the destination's client under the destination's own upload
+  policy. The two ends are routinely different providers, and a class one
+  of them has never heard of is a refused write rather than a preserved
+  tier.
+- An archived source — GLACIER or DEEP_ARCHIVE — cannot be copied, moved
+  or renamed until its restore has completed, because a server-side copy
+  still has to read the object. Nothing here can work around that, so the
+  class is never used to refuse a copy in advance: a restored object copies
+  normally (and lands back in the class it is archived in), and only the
+  service's own refusal is translated, into "restore it first" rather than
+  `InvalidObjectState`.
 - A multipart server-side copy gives the new object a multipart ETag, even
   when the source had a plain one. The bytes are identical; the ETag is a
   function of how the object was written, and a 5 GiB-plus object cannot be
@@ -138,6 +152,16 @@ credential-storage choice in 0.18.0. What is left:
 - Bundled PNG twins are a fixed 48px raster, so on a Qt build without the SVG
   plugin icons do not scale as crisply as the SVGs would. Installing
   `python3-pyqt6.qtsvg` restores vector icons; the .deb recommends it.
+- Bucket settings offers every document AWS does, and a backend is free to
+  implement only some of them. The MinIO the end-to-end suite runs against
+  stores lifecycle rules, a bucket policy and bucket tags, and refuses CORS
+  and default encryption with `NotImplemented` and website hosting with
+  `MalformedXML` — the last of which reads like a bad request from this app,
+  though raw boto3 is refused the same way for every shape the API allows.
+  The dialog reports whatever the server said rather than hiding the controls,
+  because which ones work is a property of the endpoint, not of the app, and
+  `tests/e2e/test_bucket_admin.py` asserts the refusal carries a code there is
+  something to show.
 - The command palette lists the toolbar and window-level actions. Context-menu
   entries are built on demand when the menu opens, so they are not in it.
 - Cancelling a background scan (destination check, drag-out measure, duplicate

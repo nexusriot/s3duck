@@ -9,7 +9,7 @@ import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-from model import FSObjectType, TransferCancelled     # noqa: F401
+from model import FSObjectType  # noqa: F401
 from tests.e2e.harness import ServerCase
 
 
@@ -101,6 +101,61 @@ class CopyMoveDeleteTests(ServerCase):
         with self.assertRaises(ValueError):
             self.model.copy_prefix("nest/", "nest/inner/")
         self.assertEqual(self.keys("nest/"), ["nest/a.txt"])
+
+    def test_a_copy_lands_in_the_class_the_source_was_in(self):
+        """REGRESSION: a plain CopyObject carries no StorageClass and the
+        service creates the new object as STANDARD, so a copy, move or
+        rename re-tiered what it touched. MinIO stores everything as
+        STANDARD, so what a real server proves here is the other half: that
+        the preserving request is still one it accepts.
+        """
+        self.put("sc/src.txt", b"payload")
+        source = self.storage_class("sc/src.txt")
+        self.model.copy_object("sc/src.txt", "sc/dst.txt",
+                               storage_class=source)
+        self.assertEqual(self.storage_class("sc/dst.txt"), source)
+        self.assertEqual(self.body("sc/dst.txt"), b"payload")
+
+    def test_the_listing_a_copy_reads_its_class_from_names_one(self):
+        """The whole scheme rests on ListObjectsV2 answering with a class
+        in the same element as the key, so nothing costs a HEAD."""
+        self.put("sc/listed.txt", b"x")
+        listed = {key: storage_class for key, _size, storage_class
+                  in self.model.get_keys_with_class("sc/listed")}
+        self.assertTrue(listed.get("sc/listed.txt"))
+
+    def test_a_prefix_copy_preserves_every_class_it_listed(self):
+        self.put("scdir/a.txt", b"a")
+        self.put("scdir/sub/b.txt", b"bb")
+        before = {key: storage_class for key, _size, storage_class
+                  in self.model.get_keys_with_class("scdir/")}
+        self.model.copy_prefix("scdir/", "scdone/")
+        after = {key.replace("scdone/", "scdir/", 1): storage_class
+                 for key, _size, storage_class
+                 in self.model.get_keys_with_class("scdone/")}
+        self.assertEqual(after, before)
+
+    def test_the_preserved_class_does_not_cost_the_metadata(self):
+        """MetadataDirective stays COPY; a REPLACE would reset the content
+        type to binary/octet-stream and drop the user metadata."""
+        self.put("sc/typed.txt", b"x", ContentType="text/plain",
+                 Metadata={"owner": "duck"})
+        self.model.copy_object(
+            "sc/typed.txt", "sc/typed-copy.txt",
+            storage_class=self.storage_class("sc/typed.txt"))
+        head = self.model.client.head_object(
+            Bucket=self.bucket, Key="sc/typed-copy.txt")
+        self.assertEqual(head["ContentType"], "text/plain")
+        self.assertEqual(head.get("Metadata"), {"owner": "duck"})
+
+    def test_a_class_the_server_will_not_take_still_makes_the_copy(self):
+        """A backend may name a class in its own listing and then refuse it
+        on a copy. Losing the tier is bad; losing the rename the user asked
+        for is worse."""
+        self.put("sc/odd.txt", b"payload")
+        self.model.copy_object("sc/odd.txt", "sc/odd-copy.txt",
+                               storage_class="GLACIER_IR")
+        self.assertEqual(self.body("sc/odd-copy.txt"), b"payload")
 
     def test_deleting_a_prefix_removes_every_object_under_it(self):
         for n in range(5):

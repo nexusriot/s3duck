@@ -6,7 +6,7 @@
 # of them here would give the project two answers to the same question, which
 # is how the packaged version drifted behind the app version once already.
 #
-# The version is never written here either — it is read from main_window.py,
+# The version is never written here either — it is read from version.py,
 # the single source of truth that build_deb.sh also seds.
 #
 #   make            list the targets
@@ -14,7 +14,7 @@
 #   make deb        a .deb for this machine's architecture
 
 APP        := s3duck
-VERSION    := $(shell sed -n 's/^__VERSION__ = "\(.*\)"$$/\1/p' main_window.py)
+VERSION    := $(shell sed -n 's/^__VERSION__ = "\(.*\)"$$/\1/p' version.py)
 BUILD_DIR  := build
 DIST_DIR   := dist
 
@@ -23,8 +23,9 @@ DIST_DIR   := dist
 PYTHON     ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
 # `-t .` is load-bearing. Without it `tests` becomes discovery's top-level
-# directory, the suite imports as `test_units` rather than `tests.test_units`,
-# and tests/__init__.py never runs — see its docstring.
+# directory, the suite modules import as `unit.test_window` rather than
+# `tests.unit.test_window`, and tests/__init__.py never runs — see its
+# docstring.
 UNITTEST   := $(PYTHON) -m unittest discover -s tests -t .
 
 .DEFAULT_GOAL := help
@@ -37,10 +38,12 @@ help:
 	@echo ""
 	@echo "  Testing"
 	@echo "    test          offscreen unit suite (no network, no server)"
-	@echo "    e2e           end-to-end suite against a throwaway MinIO in Docker"
-	@echo "    check         test + e2e — what to run before pushing"
+	@echo "    e2e           model suite against a throwaway MinIO in Docker"
+	@echo "    e2e-gui       GUI suite: the real window, headless, same MinIO"
+	@echo "    e2e-all       both end-to-end suites"
+	@echo "    check         test + both e2e suites — what to run before pushing"
 	@echo "    test-v        unit suite, verbose"
-	@echo "    test-one T=x  one test, class or module (e.g. T=tests.test_units.SyncPlanTests)"
+	@echo "    test-one T=x  one test, class or module (e.g. T=tests.unit.test_core_planning)"
 	@echo ""
 	@echo "  Packaging"
 	@echo "    deb           .deb for this machine's architecture"
@@ -73,21 +76,32 @@ test:
 test-v:
 	$(UNITTEST) -v
 
-# make test-one T=tests.test_units.BatchDeleteTests
+# make test-one T=tests.unit.test_s3_transfer.BatchDeleteTests
 .PHONY: test-one
 test-one:
-	@test -n "$(T)" || { echo "usage: make test-one T=tests.test_units.SomeTests"; exit 2; }
+	@test -n "$(T)" || { echo "usage: make test-one T=tests.unit.test_window.SomeTests"; exit 2; }
 	$(PYTHON) -m unittest -v $(T)
 
 # Brings up its own MinIO and removes it again; needs Docker and nothing else.
-# The suite skips itself when no endpoint is configured, which is why `test`
-# stays offline even though it discovers tests/e2e too.
+# Both suites skip themselves when no endpoint is configured, which is why
+# `test` stays offline even though it discovers tests/e2e and tests/e2e_gui.
 .PHONY: e2e
 e2e:
 	./run_e2e.sh
 
+# The GUI suite: the real MainWindow against the same throwaway MinIO, on Qt's
+# offscreen platform. Separate target because it costs a PyQt6 image to build
+# and runs slower than the model suite it complements.
+.PHONY: e2e-gui
+e2e-gui:
+	./run_e2e.sh gui
+
+.PHONY: e2e-all
+e2e-all:
+	./run_e2e.sh all
+
 .PHONY: check
-check: test e2e
+check: test e2e-all
 
 # ---- packaging -------------------------------------------------------------
 

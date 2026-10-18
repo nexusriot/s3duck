@@ -1,7 +1,10 @@
 from PyQt6 import QtCore
-from PyQt6.QtCore import *
-from PyQt6.QtWidgets import *
-from PyQt6.QtGui import *
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QFormLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+    QMessageBox, QPushButton, QVBoxLayout,
+)
 
 from utils import (
     str_to_bool, center_on_screen, load_aws_profiles, PROFILE_ACCENTS,

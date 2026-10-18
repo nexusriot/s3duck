@@ -304,6 +304,66 @@ class StorageClassSupportTests(ServerCase):
                 "sc/moving.txt", "REDUCED_REDUNDANCY"),
             False, "the second attempt should be a no-op")
 
+    def _second_class(self, key):
+        """Put *key* in the one non-STANDARD class this backend accepts, or
+        skip. MinIO takes REDUCED_REDUNDANCY and nothing else, which makes
+        it the only way to watch a copy preserve a tier for real rather
+        than watch it preserve STANDARD."""
+        try:
+            self.put(key, b"payload", StorageClass="REDUCED_REDUNDANCY")
+        except botocore.exceptions.ClientError as exc:
+            self.skipTest(
+                "this backend has no second storage class: "
+                f"{exc.response.get('Error', {}).get('Code')}")
+        if self.model.current_storage_class(key) != "REDUCED_REDUNDANCY":
+            self.skipTest("this backend does not report a second class back")
+        return "REDUCED_REDUNDANCY"
+
+    def test_a_copy_keeps_the_object_in_its_own_class(self):
+        """REGRESSION: an unqualified CopyObject carries no class and the
+        service creates the new object as STANDARD, so every copy, move and
+        rename quietly re-tiered what it touched."""
+        held = self._second_class("sc/kept-src.txt")
+        self.model.copy_object("sc/kept-src.txt", "sc/kept-dst.txt",
+                               storage_class=held)
+        self.assertEqual(
+            self.model.current_storage_class("sc/kept-dst.txt"), held)
+        self.assertEqual(self.body("sc/kept-dst.txt"), b"payload")
+
+    def test_a_copy_told_nothing_asks_the_source_rather_than_assuming(self):
+        """The routes with no listing behind them -- the other pane, a job
+        replayed from an old history -- must not fall back to STANDARD."""
+        held = self._second_class("sc/asked-src.txt")
+        self.model.copy_object("sc/asked-src.txt", "sc/asked-dst.txt")
+        self.assertEqual(
+            self.model.current_storage_class("sc/asked-dst.txt"), held)
+
+    def test_this_backend_keeps_the_class_without_being_asked(self):
+        """Why a run here cannot show the bug itself: MinIO's CopyObject
+        carries the source's class over on its own, where S3 creates the
+        new object as STANDARD unless told otherwise. So the end-to-end
+        value of the three tests above is that naming the class is a
+        request a real server accepts and honours -- the silent re-tiering
+        is AWS's to demonstrate. Pinned, so a backend that starts behaving
+        like S3 shows up as a changed fact rather than as a quietly weaker
+        suite."""
+        held = self._second_class("sc/control-src.txt")
+        self.model.copy_object("sc/control-src.txt", "sc/control-dst.txt",
+                               storage_class="STANDARD")
+        self.assertEqual(
+            self.model.current_storage_class("sc/control-dst.txt"), held)
+
+    def test_a_folder_copy_keeps_the_class_of_every_object_under_it(self):
+        """The recursive route reads one class per object out of its own
+        listing, so a thousand-object move costs no extra request."""
+        held = self._second_class("scmove/a.txt")
+        self.put("scmove/plain.txt", b"x")
+        self.model.copy_prefix("scmove/", "scmoved/")
+        self.assertEqual(
+            self.model.current_storage_class("scmoved/a.txt"), held)
+        self.assertEqual(
+            self.model.current_storage_class("scmoved/plain.txt"), "STANDARD")
+
     def test_a_refused_class_leaves_the_object_intact(self):
         """Whatever the answer, the body must survive the attempt — the
         change is a server-side copy onto itself."""
