@@ -86,4 +86,10 @@ def bulk_rename_plan(items, *, mode=BULK_RENAME_FIND, find="", replace="",
                 f"'{new}' would be produced by {len(olds)} items: "
                 + ", ".join(sorted(olds))
             )
+    sources = {old for old, _new in plan}
+    for old, new in plan:
+        if new in sources:
+            problems.append(
+                f"{old}: '{new}' is another source in this batch; "
+                "use a temporary name first")
     return plan, problems

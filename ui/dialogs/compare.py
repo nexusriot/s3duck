@@ -227,6 +227,24 @@ class PaneCompareDialog(DialogDismissMixin, QDialog):
                 f"{dropped} object(s) were skipped because their key would "
                 f"be written outside {target[1]}."
             )
+        if method == "upload":
+            job, if_none_match = self._mw._guard_upload(job, target[1])
+            kwargs.update(source_bucket=target[1], if_none_match=if_none_match)
+        elif method == "download":
+            conflicts = {row[1] for row in job if os.path.exists(row[1])}
+            job = self._mw._resolve_overwrites(
+                job, conflicts, what="file", index_of=lambda row: row[1])
+            kwargs["source_bucket"] = source[1]
+        else:
+            conflicts = self._mw._destination_conflicts(
+                [row[1] for row in job], target[1])
+            if conflicts is None:
+                return
+            job = self._mw._resolve_overwrites(
+                job, conflicts, what="destination", index_of=lambda row: row[1])
+            kwargs["source_bucket"] = source[1]
+        if not job:
+            return
         self.accept()
         self._mw.assign_thread_operation(method, job, **kwargs)
         self._mw.statusBar().showMessage(
@@ -430,6 +448,25 @@ class SyncDialog(DialogDismissMixin, QDialog):
         lay.addWidget(self._table, 1)
         lay.addLayout(row)
 
+        self._plan_inputs = None
+        self._scan_inputs = None
+        self._local.textChanged.connect(self.invalidate_plan)
+        self._up.toggled.connect(self.invalidate_plan)
+        self._exclude.textChanged.connect(self.invalidate_plan)
+        self._delete_extra.toggled.connect(self.invalidate_plan)
+
+    def inputs(self):
+        return (self._local.text().strip(), self.direction(),
+                self._exclude.text(), self._delete_extra.isChecked(),
+                self._model.bucket, self._prefix)
+
+    def invalidate_plan(self, *_args):
+        self._actions = []
+        self._plan_inputs = None
+        self._btn_run.setEnabled(False)
+        self._table.setRowCount(0)
+        self._info.setText("Inputs changed — preview the plan again.")
+
     def stop_threads(self):
         if self._cancel is not None:
             self._cancel.set()
@@ -465,13 +502,14 @@ class SyncDialog(DialogDismissMixin, QDialog):
         direction = self.direction()
         delete_extra = self._delete_extra.isChecked()
         exclude = self.exclude_patterns()
+        self._scan_inputs = self.inputs()
         clone = self._model.clone_for_worker()
         cancel = threading.Event()
         self._cancel = cancel
 
         def _scan(_w):
             remote = clone.list_tree(prefix, cancel_event=cancel)
-            local = scan_local_tree(local_dir)
+            local = scan_local_tree(local_dir, require_complete=True)
             return build_sync_plan(local, remote, direction=direction,
                                    delete_extra=delete_extra, exclude=exclude)
 
@@ -490,10 +528,14 @@ class SyncDialog(DialogDismissMixin, QDialog):
         self._cancel = None
         join_qthread(th)
         self._btn_preview.setEnabled(True)
+        if self._scan_inputs != self.inputs():
+            self.invalidate_plan()
+            return
         if exc is not None:
             self._info.setText(f"Could not build a plan: {exc}")
             return
         self._actions = result or []
+        self._plan_inputs = self._scan_inputs
         for entry in self._actions:
             r = self._table.rowCount()
             self._table.insertRow(r)
@@ -518,6 +560,9 @@ class SyncDialog(DialogDismissMixin, QDialog):
         return [a for a in self._actions if a.get("action") != "skip"]
 
     def _run(self):
+        if self._plan_inputs != self.inputs():
+            self.invalidate_plan()
+            return
         todo = self.actionable()
         if not todo:
             return
@@ -533,7 +578,11 @@ class SyncDialog(DialogDismissMixin, QDialog):
             self, "Run sync", message,
         ) != QMessageBox.StandardButton.Yes:
             return
+        # Re-check after the confirmation dialog's nested event loop too.
+        if self._plan_inputs != self.inputs():
+            self.invalidate_plan()
+            return
+        local_dir, direction, _exclude, _delete, bucket, prefix = self._plan_inputs
         self.accept()
         self._mw.start_sync(
-            todo, self._local.text().strip(), self._prefix, self.direction(),
-            bucket=self._model.bucket)
+            todo, local_dir, prefix, direction, bucket=bucket)

@@ -203,9 +203,43 @@ def safe_local_path(base_dir, rel) -> str:
     candidate = os.path.abspath(os.path.join(base, *text.split("/")))
     # Strictly below the base: landing *on* it ("." or "a/..") names the
     # directory, which is not somewhere an object can be written either.
-    if not candidate.startswith(base + os.sep):
+    if not local_destination_is_safe(base, candidate):
         return ""
     return candidate
+
+
+def local_destination_is_safe(base_dir, target) -> bool:
+    """Contain a local write and refuse symlinks below the chosen root.
+
+    The chosen root itself may be a symlink (as /tmp is on some platforms).
+    Links introduced by an object key, including the output file, are refused.
+    Call again immediately before creating or replacing a file.
+    """
+    base, target = os.path.abspath(base_dir), os.path.abspath(target)
+    try:
+        if target == base or os.path.commonpath((base, target)) != base:
+            return False
+        real_base, real_target = os.path.realpath(base), os.path.realpath(target)
+        if os.path.commonpath((real_base, real_target)) != real_base:
+            return False
+    except ValueError:
+        return False
+    current = base
+    for component in os.path.relpath(target, base).split(os.sep):
+        current = os.path.join(current, component)
+        if os.path.islink(current):
+            return False
+    return True
+
+
+def require_safe_local_destination(base_dir, target):
+    """Raise unless *target* is a contained, symlink-free local destination."""
+    if not local_destination_is_safe(base_dir, target):
+        raise ValueError(
+            f"Unsafe local destination (outside the chosen folder, or "
+            f"reached through a symlink): {target}")
+
+
 def plan_prefix_download(key, folder_path, entries) -> PrefixDownloadPlan:
     """
     Map the objects under a prefix to the local paths a download would write.
@@ -216,7 +250,6 @@ def plan_prefix_download(key, folder_path, entries) -> PrefixDownloadPlan:
     """
     prefix = prefix_of(key)
     base_dir = os.path.join(folder_path, os.path.basename(prefix.rstrip("/")))
-    root = os.path.abspath(base_dir) + os.sep
     dirs, files, unsafe = [], [], []
     for k, size in entries:
         if not k:
@@ -226,7 +259,7 @@ def plan_prefix_download(key, folder_path, entries) -> PrefixDownloadPlan:
             continue
         out_path = os.path.join(base_dir, rel)
         # Keys may contain ".." segments; never write outside base_dir.
-        if not os.path.abspath(out_path).startswith(root):
+        if not local_destination_is_safe(base_dir, out_path):
             unsafe.append(k)
             continue
         # A component over the filesystem's limit is an ENAMETOOLONG, not a

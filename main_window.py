@@ -40,6 +40,7 @@ from model import FSObjectType
 from model import safe_local_path
 from utils import (
     TempWorkspace, normalize_accent, reap_finished_workers, forward_icon,
+    join_qthread,
     LogFile, run_with_progress, themed_icon,
 )
 from properties_window import PropertiesWindow
@@ -275,6 +276,7 @@ class MainWindow(
         self._watch_config = {}
         self._watch_timer = None
         self._watch_thread = None
+        self._watch_scan_config = None
         self._watch_worker = None
         self.watch_status = QLabel("")
         self.watch_status.hide()
@@ -1996,13 +1998,12 @@ class MainWindow(
             if th is None or not self._thread_is_running(th):
                 continue
             try:
-                th.quit()
-                th.wait(3000)
+                join_qthread(th, timeout_ms=3000)
             except Exception:
                 pass
 
-        # Everything is joined; let the pinned workers go while the
-        # interpreter is still in an orderly state.
+        # Release finished workers. Slow workers remain pinned on detached
+        # threads, so destroying the window cannot destroy a running QThread.
         reap_finished_workers()
 
     def writeSettings(self):
@@ -2166,6 +2167,14 @@ class MainWindow(
             else:
                 job.append((src_key, prefix + name, False))
 
+        conflicts = self._destination_conflicts(
+            [row[1] for row in job], dest_model=dest_model)
+        if conflicts is None:
+            return
+        job = self._resolve_overwrites(
+            job, conflicts, what="destination", index_of=lambda row: row[1])
+        if not job:
+            return
         self.assign_thread_operation(
             "copy_to_profile", job, need_refresh=False, dest_model=dest_model)
         self.statusBar().showMessage(
@@ -2242,7 +2251,7 @@ class MainWindow(
             f"{len(job)} item(s){where}…", 3000
         )
 
-    def _guard_upload(self, job):
+    def _guard_upload(self, job, dst_bucket=None):
         """
         Apply overwrite protection to an upload job.
 
@@ -2260,7 +2269,7 @@ class MainWindow(
         if not job:
             return None, False
         keys = [key for key, local in job if local is not None]
-        conflicts = self._destination_conflicts(keys)
+        conflicts = self._destination_conflicts(keys, dst_bucket)
         if conflicts is None:
             return None, False
         job = self._resolve_overwrites(
@@ -2591,6 +2600,11 @@ class MainWindow(
                     job.append((key, os.path.join(folder, name), None, folder))
             conflicts = {entry[1] for entry in job
                          if entry[1] and os.path.exists(entry[1])}
+            folder_hits = self._folder_download_conflicts(
+                [entry for entry in job if not entry[1]])
+            if folder_hits is None:
+                return
+            conflicts |= folder_hits
             job = self._resolve_overwrites(
                 job, conflicts, what="file", index_of=self._download_target)
             if not job:
@@ -2616,6 +2630,13 @@ class MainWindow(
                      + ", ".join(skipped))
         if not job:
             self.statusBar().showMessage("Nothing to send", 2000)
+            return
+        conflicts = self._destination_conflicts([row[1] for row in job], bucket)
+        if conflicts is None:
+            return
+        job = self._resolve_overwrites(
+            job, conflicts, what="destination", index_of=lambda row: row[1])
+        if not job:
             return
         self.assign_thread_operation("move" if move else "copy", job)
         self.statusBar().showMessage(
@@ -2681,6 +2702,13 @@ class MainWindow(
                      + ", ".join(skipped))
         if not job:
             self.statusBar().showMessage("Nothing to bring here", 2000)
+            return
+        conflicts = self._destination_conflicts([row[1] for row in job])
+        if conflicts is None:
+            return
+        job = self._resolve_overwrites(
+            job, conflicts, what="destination", index_of=lambda row: row[1])
+        if not job:
             return
         # copy/move resolve CopySource against their model's bucket, so a
         # cross-bucket transfer must run on one bound to the SOURCE.

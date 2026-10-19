@@ -17,10 +17,12 @@ import unittest
 import utils
 import workers.transfer as transfer_worker
 from PyQt6.QtCore import (
-    QEvent, QItemSelectionModel, QPoint, QSettings, QThread, QUrl, Qt,
+    QEvent, QItemSelectionModel, QObject, QPoint, QSettings, QThread, QUrl, Qt,
 )
 from PyQt6.QtGui import QAction, QKeyEvent, QKeySequence, QShortcut
-from PyQt6.QtWidgets import QApplication, QDialog, QMenu, QMessageBox
+from PyQt6.QtWidgets import (
+    QApplication, QDialog, QMenu, QMessageBox, QWidget,
+)
 from main_window import (
     LIST_COLUMNS, LIST_OPTIONAL_COLUMNS, OverwriteDialog,
     build_profile_sync_job, collect_shortcuts, location_entries,
@@ -32,10 +34,10 @@ from s3duck import SettingsItem, preselect_row
 from settings_store import SettingsStore
 from tests.support import (
     MIN_APP_SOURCES, PROJECT_ROOT, _FakeRunningThread, _RecordingDest,
-    _StubModel, _ensure_qapp, make_main_window, patch_app_wide,
+    _StubModel, _ensure_qapp, make_main_window, make_model, patch_app_wide,
     read_app_sources,
 )
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 class SettingsAccessTests(unittest.TestCase):
@@ -306,6 +308,32 @@ class MainWindowGuardTests(unittest.TestCase):
 
         self.assertEqual(stale.quit_calls, 1)
         self.assertEqual(stale.wait_calls, [3000])
+
+    def test_a_thread_that_will_not_stop_is_cut_loose_not_destroyed(self):
+        """Shutdown cannot wait for a worker parked in a request. A thread
+        still running when its parent is destroyed aborts the process, so
+        one that outlasts the wait is detached from the window instead."""
+        stopped = threading.Event()
+
+        class SlowThread(QThread):
+            def run(self):
+                stopped.wait(10)
+
+        owner = QWidget()
+        thread = SlowThread(owner)
+        window = types.SimpleNamespace(
+            thread=thread, worker=None, _transfer_queue=[],
+            _retry_timer=Mock(),
+            _thread_is_running=lambda th: th.isRunning())
+        thread.start()
+        try:
+            main_window.MainWindow._shutdown_threads(window)
+            self.assertTrue(thread.isRunning())
+            self.assertIsNone(thread.parent())
+        finally:
+            stopped.set()
+            thread.wait(5000)
+            owner.close()
 
     def test_a_finished_navigation_thread_is_pruned(self):
         """The parking list must not grow for the lifetime of the window."""
@@ -1637,7 +1665,9 @@ class TransferHistoryTests(unittest.TestCase):
         with patch.object(main_window.MainWindow, "assign_thread_operation",
                           lambda _s, m, j, **kw: started.append((m, j))):
             self.win.rerun_history_entry(
-                {"method": "upload", "job": [["k", "/tmp/f"]]})
+                {"method": "upload", "job": [["k", "/tmp/f"]],
+                 "origin": self.win._transfer_origin(),
+                 "source_bucket": self.win.data_model.bucket})
         # JSON turned the tuples into lists; they come back as tuples
         self.assertEqual(started, [("upload", [("k", "/tmp/f")])])
 
@@ -2529,6 +2559,44 @@ class WatchModeTests(unittest.TestCase):
                           lambda _s: True):
             win._watch_tick()
         self.assertIsNone(win._watch_thread)
+
+class WatchSourceSafetyTests(unittest.TestCase):
+    """An unmounted or renamed watched folder scans as empty, and with
+    "delete objects that no longer exist locally" on, an empty scan means
+    "delete every object under the prefix". The comparison must fail
+    instead, however healthy the remote side is."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    class _Window(QObject, main_window.WatchMixin):
+        def __init__(self, local):
+            super().__init__()
+            self._watch = {"local": local, "bucket": "b", "prefix": "",
+                           "delete_extra": True}
+            self._watch_thread = None
+            self._watch_scan_config = None
+            remote = types.SimpleNamespace(
+                list_tree=lambda prefix: {"important": (4, 0.0)})
+            self.data_model = types.SimpleNamespace(
+                clone_for_worker=lambda: remote)
+            self.start_sync = Mock()
+            self.log = Mock()
+
+        def transfers_active(self):
+            return False
+
+    def test_a_missing_source_queues_no_remote_deletions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            win = self._Window(os.path.join(tmp, "missing"))
+            win._watch_tick()
+            deadline = time.monotonic() + 5
+            while win._watch_thread is not None and time.monotonic() < deadline:
+                self._app.processEvents()
+            self.assertIsNone(win._watch_thread)
+            win.start_sync.assert_not_called()
+            self.assertIn("could not compare", win.log.call_args[0][0])
 class DualPaneTests(unittest.TestCase):
     """Two listings side by side, with F5/F6 running through the same queue."""
 
@@ -2566,6 +2634,19 @@ class DualPaneTests(unittest.TestCase):
         self.assertTrue(win.dual_pane_active())
         win.toggle_dual_pane()
         self.assertFalse(win.dual_pane_active())
+
+    def test_a_remote_listing_is_read_through_the_item_it_returns(self):
+        """REGRESSION: the pane read ``item.t`` from the listing, an
+        attribute Item has never had, so every remote listing in the second
+        pane died with an AttributeError before it could be shown."""
+        pane = types.SimpleNamespace(_thread=None, _worker=None, _show=Mock())
+        main_window.SecondPane._on_listed(
+            pane,
+            [Item("folder", FSObjectType.FOLDER, "", 0),
+             Item("file", FSObjectType.FILE, "", 4)],
+            None)
+        pane._show.assert_called_once_with(
+            [("folder", True, 0), ("file", False, 4)])
 
     def test_a_local_pane_lists_a_real_directory(self):
         win = self._window()
@@ -3243,6 +3324,184 @@ class HistoryButtonStateTests(unittest.TestCase):
             [k.toString() for k in win.btnBack.shortcuts()], ["Alt+Left"])
         self.assertEqual(
             [k.toString() for k in win.btnForward.shortcuts()], ["Alt+Right"])
+class _QueueHarness(main_window.TransferQueueMixin):
+    """Just enough window for the queue: it records what it would start
+    instead of running a thread."""
+
+    HISTORY_JOB_LIMIT = 100
+
+    def __init__(self):
+        self.profile_name = "original"
+        self.data_model = make_model(bucket="first")
+        self._queue_next_id = 1
+        self._queue_entries = {}
+        self._queue_panel = types.SimpleNamespace(add_entry=lambda entry: None)
+        self.history = []
+        self.started = []
+
+    def log(self, message):
+        pass
+
+    def transfers_active(self):
+        return False
+
+    def _credentials_ok_for_transfer(self):
+        return True
+
+    def _start_transfer(self, entry):
+        self.started.append(entry)
+
+    def load_transfer_history(self):
+        return self.history
+
+    def _save_transfer_history(self, entries):
+        self.history = entries
+class QueueBindingTests(unittest.TestCase):
+    """A queued job belongs to the account and bucket it was queued against.
+    Retries and history replays used to re-read whatever the window happened
+    to show, so a profile switch or a navigation could point a delete at a
+    different bucket entirely."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def test_a_retry_keeps_the_original_account_and_bucket(self):
+        win = _QueueHarness()
+        win.assign_thread_operation("delete", ["important"])
+        original = win.started[-1]
+
+        win.data_model.bucket = "second"
+        win.data_model.access_key = "another-account"
+        win.profile_name = "other"
+        win._requeue(original)
+
+        retried = win._worker_model_for(win.started[-1])
+        self.assertEqual(retried.bucket, "first")
+        self.assertNotEqual(retried.access_key, "another-account")
+        self.assertEqual(win.started[-1].origin, original.origin)
+
+    def test_a_history_replay_restores_the_bucket_after_navigation(self):
+        win = _QueueHarness()
+        win.assign_thread_operation("delete", ["important"])
+        win._record_history(win.started[-1])
+
+        win.data_model.bucket = "second"
+        win.rerun_history_entry(win.history[0])
+        self.assertEqual(win._worker_model_for(win.started[-1]).bucket,
+                         "first")
+
+    def test_a_profile_switch_cannot_rebind_a_waiting_job(self):
+        """The binding cache is shared with the window so discoveries are
+        not lost; a queued job keeps its own copy of it."""
+        win = _QueueHarness()
+        win.data_model.binding_cache["first"] = ("https://original", "r1", True)
+        win.assign_thread_operation("delete", ["important"])
+        entry = win.started[-1]
+
+        win.data_model.binding_cache.clear()
+        win.data_model.binding_cache["first"] = ("https://other", "r2", False)
+        self.assertEqual(win._worker_model_for(entry).binding_cache["first"],
+                         ("https://original", "r1", True))
+
+    def test_history_refuses_a_changed_account_and_a_legacy_record(self):
+        win = _QueueHarness()
+        win.assign_thread_operation("delete", ["important"])
+        win._record_history(win.started[-1])
+        win.data_model.access_key = "another-account"
+
+        with patch("ui.window.transfers.QMessageBox.information") as inform:
+            win.rerun_history_entry(win.history[0])
+            win.rerun_history_entry({"method": "delete", "job": ["important"]})
+        self.assertEqual(len(win.started), 1)      # neither one was queued
+        self.assertEqual(inform.call_count, 2)
+class OverwriteRouteTests(unittest.TestCase):
+    """Every route that writes to a destination asks before replacing what is
+    already there, against the destination it will actually write to."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self):
+        """A window stub whose destination check reports a conflict and whose
+        overwrite prompt is cancelled, so a route that skips either one is
+        visible as a queued job."""
+        return types.SimpleNamespace(
+            data_model=types.SimpleNamespace(bucket="source",
+                                             current_folder="p/"),
+            _collect_selected_targets=lambda: [("file", "p/file", False)],
+            _selected_storage_classes=lambda: {},
+            statusBar=lambda: Mock(), log=Mock(),
+            _destination_conflicts=Mock(return_value={"p/file"}),
+            _resolve_overwrites=Mock(return_value=None),
+            assign_thread_operation=Mock())
+
+    def test_a_copy_to_the_remote_pane_honours_a_cancelled_prompt(self):
+        win = self._window()
+        win.second_pane = types.SimpleNamespace(
+            current_mode=lambda: main_window.SecondPane.REMOTE,
+            remote_target=lambda: ("dest", "p/"))
+        main_window.MainWindow._transfer_to_second_pane(win, False)
+        win._destination_conflicts.assert_called_once_with(["p/file"], "dest")
+        win._resolve_overwrites.assert_called_once()
+        win.assign_thread_operation.assert_not_called()
+
+    def test_a_pull_from_the_remote_pane_checks_this_prefix(self):
+        win = self._window()
+        win.in_bucket_list_mode = lambda: False
+        win.second_pane = types.SimpleNamespace(
+            current_mode=lambda: main_window.SecondPane.REMOTE,
+            selected=lambda: [("file", False, 4)],
+            remote_target=lambda: ("other", "elsewhere/"))
+        main_window.MainWindow._transfer_from_second_pane(win, True)
+        win._destination_conflicts.assert_called_once_with(["p/file"])
+        win.assign_thread_operation.assert_not_called()
+
+    def test_a_folder_download_to_the_pane_checks_what_is_under_it(self):
+        win = self._window()
+        win._collect_selected_targets = lambda: [("dir", "p/dir/", True)]
+        win._folder_download_conflicts = Mock(return_value={"/out/dir"})
+        win._download_target = main_window.TransferQueueMixin._download_target
+        win.second_pane = types.SimpleNamespace(
+            current_mode=lambda: main_window.SecondPane.LOCAL,
+            local_target=lambda: "/out")
+        main_window.MainWindow._transfer_to_second_pane(win, False)
+        self.assertEqual(win._resolve_overwrites.call_args.args[1],
+                         {"/out/dir"})
+        win.assign_thread_operation.assert_not_called()
+
+    def test_the_compare_dialog_checks_the_target_before_queueing(self):
+        win = self._window()
+        dlg = types.SimpleNamespace(
+            _left=("remote", "source", "p/"),
+            _right=("remote", "dest", "p/"),
+            selected_rows=lambda: [{"rel": "file", "status": "differs"}],
+            build_job=main_window.PaneCompareDialog.build_job,
+            _mw=win, accept=Mock())
+        main_window.PaneCompareDialog._copy(dlg, "right")
+        win._destination_conflicts.assert_called_once_with(["p/file"], "dest")
+        dlg.accept.assert_not_called()
+        win.assign_thread_operation.assert_not_called()
+
+    def test_a_cross_profile_copy_checks_the_other_profiles_bucket(self):
+        win = self._window()
+        win.in_bucket_list_mode = lambda: False
+        win.settings = None
+        win.profile_name = "source"
+        profile = types.SimpleNamespace(read_only=False, name="dest")
+        dlg = Mock()
+        dlg.exec.return_value = 1
+        dlg.destination_bucket.return_value = "dest"
+        dlg.destination_prefix.return_value = "p/"
+        dlg.selected_profile.return_value = profile
+        destination = object()
+        with patch("main_window.CrossProfileCopyDialog", return_value=dlg), \
+             patch("main_window.build_profile_model", return_value=destination):
+            main_window.MainWindow.copy_to_profile(win)
+        win._destination_conflicts.assert_called_once_with(
+            ["p/file"], dest_model=destination)
+        win.assign_thread_operation.assert_not_called()
 class QueueRetryTests(unittest.TestCase):
     """Retry-all, and one automatic retry for a failure the service asked us
     to repeat."""

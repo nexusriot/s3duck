@@ -195,6 +195,23 @@ class BulkRenamePlanTests(unittest.TestCase):
             template="{name}-{n}{ext}")
         self.assertEqual(plan, [("a.txt", "a-1.txt")])
         self.assertEqual(problems, [])
+
+    def test_a_new_name_that_is_another_source_is_a_problem(self):
+        """Renaming 1->2 while 2 is itself being renamed loses the second
+        file: the first copy lands on it before its own turn comes, and the
+        rename's delete pass then removes what is left."""
+        plan, problems = bulk_rename_plan(
+            [("1.txt", False), ("2.txt", False)], mode=BULK_RENAME_TEMPLATE,
+            template="{n}{ext}", start=2)
+        self.assertEqual(plan, [("1.txt", "2.txt"), ("2.txt", "3.txt")])
+        self.assertTrue(any("temporary name" in problem
+                            for problem in problems))
+
+    def test_a_batch_that_does_not_reuse_a_source_name_is_clean(self):
+        _plan, problems = bulk_rename_plan(
+            [("1.txt", False), ("2.txt", False)], mode=BULK_RENAME_TEMPLATE,
+            template="shot-{n}{ext}", start=1)
+        self.assertEqual(problems, [])
 class BuildSyncPlanTests(unittest.TestCase):
     def test_upload_direction(self):
         local = {"new.txt": (10, 100.0), "same.txt": (5, 100.0),

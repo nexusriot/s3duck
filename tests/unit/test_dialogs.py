@@ -7,20 +7,22 @@ import os
 import tempfile
 import threading
 import time
+import types
 import ui.dialogs.search as search_dialog_module
 import unittest
 import utils
 from PyQt6.QtCore import QEvent, QSettings, Qt
 from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QMenu,
-    QMessageBox,
+    QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QLabel, QMenu,
+    QMessageBox, QTableWidget,
 )
 from datetime import datetime, timedelta, timezone
 from main_window import (
-    BulkRenameDialog, CopyMoveDialog, IncompleteUploadsDialog,
-    MetadataDialog, OverwriteDialog, PresignedLinkDialog, SyncDialog,
-    TagsDialog, TransferSettingsDialog, VersionsDialog,
+    BulkRenameDialog, CopyMoveDialog, CrossProfileSyncDialog,
+    IncompleteUploadsDialog, MetadataDialog, OverwriteDialog,
+    PresignedLinkDialog, SyncDialog, TagsDialog, TransferSettingsDialog,
+    VersionsDialog,
 )
 from model import Model, TransferCancelled
 from properties_window import PropertiesWindow
@@ -30,7 +32,7 @@ from tests.support import (
     _FakeVersionsModel, _StubModel, _dt, _ensure_qapp, make_main_window,
     make_model, read_app_sources,
 )
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 class SearchRegexValidationTests(unittest.TestCase):
@@ -825,6 +827,59 @@ class SyncDialogTests(unittest.TestCase):
                               return_value=QMessageBox.StandardButton.No):
                 dlg._run()
             self.assertEqual(mw.started, [])
+
+    def _reviewed(self):
+        """A dialog showing a plan the user has read: one remote deletion."""
+        dlg, mw = self._dlg()
+        dlg._local.setText("/original")
+        dlg._scan_inputs = dlg.inputs()
+        dlg._on_plan([{"action": "delete_remote", "rel": "file",
+                       "size": 4, "reason": "extra"}], None)
+        return dlg, mw
+
+    def test_changing_an_input_invalidates_the_reviewed_plan(self):
+        """The plan on screen is what the user agreed to run. Edit a field
+        after previewing and it describes a comparison that was never made —
+        for a different folder, or with deletions the user never saw."""
+        changes = {
+            "folder": lambda d: d._local.setText("/different"),
+            "direction": lambda d: d._down.setChecked(True),
+            "exclude": lambda d: d._exclude.setText("*.txt"),
+            "delete_extra": lambda d: d._delete_extra.setChecked(True),
+        }
+        for name, change in changes.items():
+            with self.subTest(change=name):
+                dlg, mw = self._reviewed()
+                self.assertTrue(dlg._btn_run.isEnabled())
+                change(dlg)
+                self.assertFalse(dlg._btn_run.isEnabled())
+                dlg._run()
+                self.assertEqual(mw.started, [])
+
+    def test_a_plan_for_inputs_that_changed_during_the_scan_is_discarded(self):
+        dlg, _mw = self._reviewed()
+        dlg._local.setText("/different")
+        dlg._on_plan([{"action": "delete_remote", "rel": "file",
+                       "size": 4, "reason": "extra"}], None)
+        self.assertEqual(dlg.actionable(), [])
+class CrossProfileSyncDialogTests(unittest.TestCase):
+    """The cross-profile sync preview summarises its plan the same way the
+    in-profile one does."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def test_the_summary_is_rendered_as_text(self):
+        """summarize_sync_plan returns counts; handing the dict straight to
+        setText is a TypeError, so the preview could not be shown at all."""
+        fake = types.SimpleNamespace(
+            _table=QTableWidget(0, 4), _summary=QLabel(), _ok_enabled=Mock())
+        CrossProfileSyncDialog._render(
+            fake, [{"action": "upload", "rel": "file", "size": 4,
+                    "reason": "missing"}])
+        self.assertIn("upload: 1", fake._summary.text())
+        fake._ok_enabled.assert_called_once_with(True)
 class UsageDialogTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

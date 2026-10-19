@@ -478,6 +478,9 @@ class _StubModel(Model):
     def list(self, fld, page_cb=None, max_items=0):
         return []
 
+    def existing_keys(self, keys):
+        return set()
+
     def enter_bucket(self, bucket_name):
         self.bucket = bucket_name
         self.current_folder = ""

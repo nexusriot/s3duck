@@ -155,6 +155,56 @@ class ScanLocalTreeTests(unittest.TestCase):
 
     def test_missing_directory_is_empty(self):
         self.assertEqual(scan_local_tree("/nonexistent/path/xyz"), {})
+
+    def test_a_complete_scan_refuses_a_missing_root(self):
+        """Sync reads "no local files" as "every remote object is extra".
+        An unmounted or renamed source folder must stop the comparison, not
+        produce a plan that deletes the backup it was meant to feed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(OSError):
+                scan_local_tree(os.path.join(tmp, "missing"),
+                                require_complete=True)
+
+    def test_a_complete_scan_propagates_a_directory_error(self):
+        def failed_walk(_root, *, onerror):
+            onerror(PermissionError("unreadable subtree"))
+            return iter(())
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                unittest.mock.patch("utils.os.walk", failed_walk):
+            with self.assertRaises(PermissionError):
+                scan_local_tree(tmp, require_complete=True)
+
+    def test_a_complete_scan_propagates_a_file_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "file")
+            with open(path, "w") as handle:
+                handle.write("x")
+            real_stat = os.stat
+
+            def stat(name, *args, **kwargs):
+                if name == path:
+                    raise PermissionError("unreadable file")
+                return real_stat(name, *args, **kwargs)
+
+            with unittest.mock.patch("utils.os.stat", stat):
+                with self.assertRaises(PermissionError):
+                    scan_local_tree(tmp, require_complete=True)
+
+    def test_an_ordinary_scan_still_skips_what_it_cannot_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "file")
+            with open(path, "w") as handle:
+                handle.write("x")
+            real_stat = os.stat
+
+            def stat(name, *args, **kwargs):
+                if name == path:
+                    raise PermissionError("unreadable file")
+                return real_stat(name, *args, **kwargs)
+
+            with unittest.mock.patch("utils.os.stat", stat):
+                self.assertEqual(scan_local_tree(tmp), {})
 class SearchMatcherTests(unittest.TestCase):
     def _match(self, **kw):
         return Model.build_search_matcher(**kw)

@@ -1,6 +1,8 @@
 """s3/upload.py, download.py, copy.py, delete.py."""
 
+import botocore.exceptions
 import botocore.session
+import hashlib
 import io
 import os
 import shutil
@@ -968,6 +970,131 @@ class ResumableDownloadTests(unittest.TestCase):
                 m.download_file("big.bin", out, tmp)
             self.assertIn("Checksum mismatch", str(ctx.exception))
         m._client.head_object = original_head
+class _RevisionClient:
+    """A ranged backend that answers only for the revision it currently
+    holds, the way IfMatch makes a real one behave."""
+
+    def __init__(self, payload=b"abcdefgh", *, short=False, mutate=False):
+        self.payload = payload
+        self.etag = hashlib.md5(payload).hexdigest()
+        self.short = short          # return one byte less than asked for
+        self.mutate = mutate        # the object changes after the first read
+        self.requests = []
+
+    def head_object(self, **_kwargs):
+        return {"ContentLength": len(self.payload), "ETag": f'"{self.etag}"'}
+
+    def get_object(self, **kwargs):
+        self.requests.append(kwargs)
+        if kwargs.get("IfMatch") != f'"{self.etag}"':
+            raise botocore.exceptions.ClientError(
+                {"Error": {"Code": "PreconditionFailed"}}, "GetObject")
+        start, end = map(int, kwargs["Range"][len("bytes="):].split("-"))
+        data = self.payload[start:end + 1]
+        if self.short:
+            data = data[:-1]
+        if self.mutate:
+            self.etag = "changed"
+        return {"Body": io.BytesIO(data),
+                "ContentRange": f"bytes {start}-{end}/{len(self.payload)}"}
+class DownloadRevisionTests(unittest.TestCase):
+    """A resumable download reads one object over many requests. Without
+    pinning the revision, an object replaced mid-download is assembled from
+    both versions and handed over as the finished file."""
+
+    def _model(self, client):
+        m = make_model(bucket="b")
+        m._client = client
+        m.resume_threshold = 1
+        m.resume_chunk_size = 4
+        m.parallel_files = 1
+        return m
+
+    def test_every_range_is_pinned_to_the_revision_that_was_headed(self):
+        client = _RevisionClient()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._model(client).download_file(
+                "k", os.path.join(tmp, "out"), tmp)
+        self.assertEqual(len(client.requests), 2)
+        self.assertTrue(all(r["IfMatch"] == f'"{client.etag}"'
+                            for r in client.requests))
+
+    def test_an_object_changed_mid_download_leaves_the_local_file_alone(self):
+        client = _RevisionClient(mutate=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            with open(out, "w") as handle:
+                handle.write("keep")
+            with self.assertRaises(botocore.exceptions.ClientError):
+                self._model(client).download_file("k", out, tmp)
+            with open(out) as handle:
+                self.assertEqual(handle.read(), "keep")
+
+    def test_a_short_range_is_not_recorded_as_a_finished_chunk(self):
+        client = _RevisionClient(short=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            with self.assertRaises(IOError):
+                self._model(client).download_file("k", out, tmp)
+            self.assertFalse(os.path.exists(out))
+
+    def test_the_checksum_is_taken_before_the_file_is_put_in_place(self):
+        client = _RevisionClient()
+        m = self._model(client)
+        m.verify_downloads = True
+        seen = []
+
+        def reject(path, _etag, **kwargs):
+            seen.append((path, kwargs["head"]))
+            return False
+
+        m.verify_download = reject
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            with open(out, "w") as handle:
+                handle.write("keep")
+            with self.assertRaisesRegex(Exception, "Checksum mismatch"):
+                m.download_file("k", out, tmp)
+            with open(out) as handle:
+                self.assertEqual(handle.read(), "keep")
+            self.assertFalse(os.path.exists(out + Model.PART_SUFFIX + ".meta"))
+        self.assertTrue(seen[0][0].endswith(Model.PART_SUFFIX))
+        self.assertEqual(seen[0][1]["ContentLength"], 8)
+
+    def test_a_symlinked_resume_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            victim = os.path.join(tmp, "victim")
+            with open(victim, "w") as handle:
+                handle.write("keep")
+            os.symlink(victim, out + Model.PART_SUFFIX)
+            with self.assertRaises(ValueError):
+                self._model(_RevisionClient()).download_file("k", out, tmp)
+            with open(victim) as handle:
+                self.assertEqual(handle.read(), "keep")
+
+    def test_a_verified_small_download_leaves_no_staged_file_behind(self):
+        """The staging file is where the bytes wait to be proven. One left
+        behind after a failure is junk beside the user's file -- and a stale
+        partial that a later ranged attempt would find in place of its own."""
+        class _WritingClient(FakeS3Client):
+            def head_object(self, **_kwargs):
+                return {"ContentLength": 4, "ETag": '"deadbeef"'}
+
+            def download_file(self, _bucket, _key, path, **_kwargs):
+                with open(path, "w") as handle:
+                    handle.write("body")
+
+        m = make_model(bucket="b")
+        m.verify_downloads = True
+        m.resume_threshold = 10 ** 9          # stay off the ranged path
+        m._client = _WritingClient()
+        m.verify_download = lambda *_a, **_kw: False
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            with self.assertRaisesRegex(Exception, "Checksum mismatch"):
+                m.download_file("k", out, tmp)
+            self.assertEqual(os.listdir(tmp), [])
 class RangedResponseChecksumTests(unittest.TestCase):
     """
     REGRESSION (every large download, on some backends): botocore 1.36 and
@@ -1066,6 +1193,37 @@ class DownloadTraversalGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             m.download_file("k.txt", os.path.join(tmp, "sub", "k.txt"), tmp)
             self.assertEqual(len(c.calls_of("download_file")), 1)
+
+    def test_a_symlinked_directory_is_not_a_download_destination(self):
+        """A key may not be written through a link out of the chosen folder:
+        containment by string prefix alone let "link/file" land wherever the
+        link pointed. The chosen folder itself may still be a link."""
+        with tempfile.TemporaryDirectory() as root:
+            base = os.path.join(root, "base")
+            outside = os.path.join(root, "outside")
+            os.mkdir(base)
+            os.mkdir(outside)
+            os.symlink(outside, os.path.join(base, "link"))
+            self.assertEqual(safe_local_path(base, "link/file"), "")
+
+            os.mkdir(os.path.join(base, "p"))
+            os.symlink(outside, os.path.join(base, "p", "link"))
+            plan = plan_prefix_download("p/", base, [("p/link/file", 1)])
+            self.assertEqual(plan.files, [])
+            self.assertEqual(plan.unsafe, ["p/link/file"])
+
+    def test_a_symlinked_prefix_root_is_refused_before_fetching(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = os.path.join(root, "base")
+            outside = os.path.join(root, "outside")
+            os.mkdir(base)
+            os.mkdir(outside)
+            os.symlink(outside, os.path.join(base, "p"))
+            m = make_model(bucket="b")
+            m.get_keys = lambda *a, **kw: [("p/file", 1)]
+            with self.assertRaises(ValueError):
+                m.download_file("p/", None, base)
+            self.assertEqual(os.listdir(outside), [])
 
     def test_no_folder_root_means_no_containment_check(self):
         """Callers that genuinely have no containing root (a bare path from

@@ -1176,17 +1176,25 @@ def str_to_bool(s):
     return str(s).lower() == "true"
 
 
-def scan_local_tree(root) -> dict:
+def scan_local_tree(root, *, require_complete=False) -> dict:
     """
     Map every file under *root* to ``{relative_posix_path: (size, mtime)}``
     for sync comparison. Unreadable entries and symlinked directories are
-    skipped rather than aborting the scan.
+    skipped rather than aborting the scan. With require_complete=True, a
+    missing root or an unreadable file/directory raises instead: sync must
+    never interpret an incomplete scan as source files being deleted.
     """
     out = {}
     root = os.path.abspath(root or "")
     if not os.path.isdir(root):
+        if require_complete:
+            raise OSError(f"Local source folder is unavailable: {root}")
         return out
-    for dirpath, dirnames, filenames in os.walk(root):
+    def onerror(exc):
+        if require_complete:
+            raise exc
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):
         dirnames[:] = [d for d in dirnames
                        if not os.path.islink(os.path.join(dirpath, d))]
         for filename in filenames:
@@ -1194,6 +1202,8 @@ def scan_local_tree(root) -> dict:
             try:
                 stat = os.stat(full)
             except OSError:
+                if require_complete:
+                    raise
                 continue
             rel = os.path.relpath(full, root).replace(os.sep, "/")
             out[rel] = (int(stat.st_size), float(stat.st_mtime))

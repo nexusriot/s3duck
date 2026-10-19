@@ -109,10 +109,11 @@ class UsageMixin:
             self._bucket_usage_worker = None
 
         def reenable():
-            self.btnBucketUsage.setEnabled(True)
+            if not self._closing:
+                self.btnBucketUsage.setEnabled(True)
 
         def apply_result(bname, pref, result):
-            if token != self._bucket_usage_token:
+            if self._closing or token != self._bucket_usage_token:
                 return
 
             if isinstance(result, Exception):

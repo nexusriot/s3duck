@@ -12,6 +12,7 @@ import time
 import zipfile
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 from model import ObjectExists, TransferCancelled, run_parallel
+from s3.common import require_safe_local_destination
 from utils import describe_client_error, is_transient_error
 
 
@@ -386,6 +387,23 @@ class Worker(QObject):
     def move(self):
         # job = [(src_key, dst_key, is_folder, dst_bucket_or_None,
         #         storage_class)]
+        # Validate the entire batch before the first write. A copy into any
+        # other source destroys data that a later row still needs, and the
+        # final delete pass would remove that destination too.
+        rows = [self._copy_row(row) for row in self.job]
+        sources = {row[0] for row in rows}
+        folders = [row[0] for row in rows if row[2]]
+        for src, dst, folder, bucket, _storage in rows:
+            if bucket and bucket != getattr(self.data_model, "bucket", ""):
+                continue
+            overlap = dst if dst in sources else next(
+                (key for key in folders if dst.startswith(key)), None)
+            if overlap is None and folder:
+                overlap = next((key for key in sources if key.startswith(dst)), None)
+            if overlap is not None:
+                raise ValueError(
+                    f"Move destination '{dst}' overlaps source "
+                    f"'{overlap}'. Use a temporary name first.")
         for row in self.job:
             (src_key, dst_key, is_folder, dst_bucket,
              storage_class) = self._copy_row(row)
@@ -491,6 +509,14 @@ class Worker(QObject):
 
         def _sync_one(item):
             action, rel, local_path, key, _size = item
+            # Recover the chosen root from the relative path carried in the
+            # job, rather than trusting a parent that may now be a symlink.
+            if action in ("download", "delete_local"):
+                local_root = local_path
+                relative = os.path.normpath(rel.replace("\\", "/").lstrip("/"))
+                for _component in relative.split(os.sep):
+                    local_root = os.path.dirname(local_root)
+                require_safe_local_destination(local_root, local_path)
             if action == "upload":
                 self.progress.emit(f"sync upload {rel}")
                 self.data_model.upload_file(
@@ -504,7 +530,7 @@ class Worker(QObject):
                 if parent:
                     os.makedirs(parent, exist_ok=True)
                 self.data_model.download_file(
-                    key, local_path, parent, progress_cb=_make_cb(),
+                    key, local_path, local_root, progress_cb=_make_cb(),
                     cancel_event=self._cancel_event,
                     log_fn=self.progress.emit,
                 )

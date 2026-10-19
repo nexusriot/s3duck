@@ -6,4 +6,4 @@ packaging scripts can read it without caring how the UI is laid out. Both
 window code can no longer strand them.
 """
 
-__VERSION__ = "0.25.0"
+__VERSION__ = "0.26.0"

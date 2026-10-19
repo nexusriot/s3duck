@@ -313,6 +313,8 @@ class NavigationMixin:
         wk.log_msg.connect(self.log)
 
         def _on_enter_success(bucket_name: str):
+            if self._closing:
+                return
             self._last_selected_bucket = bucket_name
             self._clear_undo_delete()
             self.listview.setEnabled(True)
@@ -323,6 +325,8 @@ class NavigationMixin:
             self.navigate(select_up_entry=True, force=True)
 
         def _on_enter_failure(bucket_name: str, err_msg: str):
+            if self._closing:
+                return
             self.listview.setEnabled(True)
             QMessageBox.critical(
                 self,
@@ -481,6 +485,8 @@ class NavigationMixin:
 
     @pyqtSlot(int, object, str)
     def _on_navigation_finished(self, seq: int, payload: object, err_str: str):
+        if self._closing:
+            return
         if seq != self._nav_seq:
             return
 

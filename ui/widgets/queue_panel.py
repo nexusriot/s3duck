@@ -12,22 +12,22 @@ from core.formatting import _scaled_bar_values
 class _QEntry:
     def __init__(self, entry_id, method, job, need_refresh=True, label="",
                  source_bucket="", dest_model=None, source_model=None,
-                 if_none_match=False):
+                 if_none_match=False, origin=None):
         self.entry_id = entry_id
         self.method = method
         self.job = job
         self.need_refresh = need_refresh
         self.label = label
-        # Set when the job's SOURCE keys live in a different bucket than the
-        # one being viewed (cross-bucket paste); the worker's model is bound
-        # to it before the transfer starts.
+        # Keep the source bucket even for ordinary jobs: history replay and
+        # retries must not inherit the bucket the window happens to show.
         self.source_bucket = source_bucket or ""
         # Set for a cross-profile copy: a second model, built from another
         # profile's credentials, that the worker writes through.
         self.dest_model = dest_model
-        # Set when the job reads from a model other than the window's — a pull
-        # from another profile.
+        # The source connection snapshot. Cross-profile pulls supply their
+        # own model; ordinary jobs capture a private clone when queued.
         self.source_model = source_model
+        self.origin = dict(origin or {})
         # An upload that must not overwrite: the user chose to skip what was
         # already there, so every write carries a precondition.
         self.if_none_match = bool(if_none_match)

@@ -1,6 +1,7 @@
 """The transfer queue: what is running, what is waiting, what failed."""
 
 import diagnostics
+import hashlib
 import json
 import os
 import time
@@ -29,6 +30,14 @@ except ImportError:
 
 class TransferQueueMixin:
     """The transfer queue: what is running, what is waiting, what failed."""
+
+    def _transfer_origin(self):
+        model = self.data_model
+        return {"profile": self.profile_name,
+                "endpoint": model.profile_endpoint_url,
+                "region": model.profile_region,
+                "credential_id": hashlib.sha256(
+                    str(model.access_key or "").encode()).hexdigest()}
 
     def transfers_active(self) -> bool:
         if self.thread is None:
@@ -142,12 +151,32 @@ class TransferQueueMixin:
 
     def assign_thread_operation(self, method, job, need_refresh=True,
                                 source_bucket="", dest_model=None,
-                                source_model=None, if_none_match=False):
+                                source_model=None, if_none_match=False,
+                                origin=None):
         if not job:
             return
         if not self._credentials_ok_for_transfer():
             self.log(f"{method} not started: credentials")
             return
+
+        # Capture the account and bucket when the user queues the work, not
+        # when a later retry happens to start it.
+        source_bucket = source_bucket or (
+            source_model.bucket if source_model is not None
+            else self.data_model.bucket)
+        if source_model is None:
+            source_model = self.data_model.clone_for_worker()
+            if source_bucket != self.data_model.bucket:
+                source_model.bucket = source_bucket
+                source_model.current_folder = ""
+                source_model.prev_folder = ""
+                source_model.endpoint_url = source_model.profile_endpoint_url
+                source_model.use_path = source_model.profile_use_path
+                source_model.region_name = source_model.profile_region
+                source_model._client = None
+        # Navigation clones normally share discoveries, but a transfer can
+        # be retried after a profile switch replaces that shared cache.
+        source_model.binding_cache = dict(getattr(source_model, "binding_cache", {}))
 
         label = self._queue_build_label(method, job)
         entry = _QEntry(
@@ -160,6 +189,7 @@ class TransferQueueMixin:
             dest_model=dest_model,
             source_model=source_model,
             if_none_match=if_none_match,
+            origin=origin or self._transfer_origin(),
         )
         self._queue_next_id += 1
         # Kept so a failed/cancelled row can be re-run from the queue panel.
@@ -249,6 +279,8 @@ class TransferQueueMixin:
             self.worker.batch_progress.connect(self._on_batch_progress)
 
         def _transfer_ui_stop():
+            if self._closing:
+                return
             try:
                 self._on_tick()
             except Exception:
@@ -279,17 +311,22 @@ class TransferQueueMixin:
             eid = entry.entry_id
 
             def _on_queue_bytes(done, total, _eid=eid):
+                if self._closing:
+                    return
                 self._queue_panel.update_byte_progress(_eid, done, total)
 
             self.worker.batch_progress.connect(_on_queue_bytes)
 
         def _reenable_after_thread():
-            QTimer.singleShot(0, self.enable_action_buttons)
+            if not self._closing:
+                QTimer.singleShot(0, self.enable_action_buttons)
 
         def _clear_thread_refs():
             self.thread = None
             self.worker = None
             self._active_entry = None
+            if self._closing:
+                return
             try:
                 if getattr(self, "btnCancel", None) is not None:
                     self.btnCancel.setEnabled(False)
@@ -299,6 +336,8 @@ class TransferQueueMixin:
             _reenable_after_thread()
 
         def _on_worker_finished(cancelled: bool):
+            if self._closing:
+                return
             if cancelled:
                 self.log(f"{method} cancelled")
                 entry.status = "cancelled"
@@ -441,6 +480,10 @@ class TransferQueueMixin:
             "items": len(job),
             "bytes": int(done_bytes or 0),
             "status": entry.status,
+            # Both are what the job was queued against, so a replay cannot
+            # inherit whichever profile and bucket the window shows now.
+            "origin": entry.origin or self._transfer_origin(),
+            "source_bucket": entry.source_bucket or self.data_model.bucket,
         }
         # Big jobs would bloat the settings file; those simply are not re-runnable.
         if len(job) <= self.HISTORY_JOB_LIMIT:
@@ -449,8 +492,6 @@ class TransferQueueMixin:
             except (TypeError, ValueError):
                 pass
             else:
-                if entry.source_bucket:
-                    record["source_bucket"] = entry.source_bucket
                 if entry.if_none_match:
                     # Stored with the job: re-running an upload the user
                     # asked to skip existing objects for must still skip
@@ -481,6 +522,13 @@ class TransferQueueMixin:
                 "the other profile's connection. Start it again from the "
                 "Tools menu.")
             return
+        if (not entry.get("origin") or "source_bucket" not in entry
+                or entry["origin"] != self._transfer_origin()):
+            QMessageBox.information(
+                self, "Transfer history",
+                "This job's original connection cannot be verified. "
+                "Open its original profile and start the operation again.")
+            return
         # JSON turned the tuples into lists; the workers unpack either.
         self.log(f"re-running {method} from history ({len(job)} item(s))")
         self.assign_thread_operation(
@@ -488,6 +536,7 @@ class TransferQueueMixin:
             [tuple(i) if isinstance(i, list) else i for i in job],
             source_bucket=entry.get("source_bucket") or "",
             if_none_match=bool(entry.get("if_none_match")),
+            origin=entry["origin"],
         )
 
     def auto_retry_enabled(self) -> bool:
@@ -536,7 +585,7 @@ class TransferQueueMixin:
             entry.method, entry.job, need_refresh=entry.need_refresh,
             source_bucket=entry.source_bucket, dest_model=entry.dest_model,
             source_model=entry.source_model,
-            if_none_match=entry.if_none_match)
+            if_none_match=entry.if_none_match, origin=entry.origin)
 
     def failed_entries(self) -> list:
         """Every queued job that ended in an error, oldest first."""
@@ -651,7 +700,7 @@ class TransferQueueMixin:
             return None  # cancelled
         return set(result)
 
-    def _destination_conflicts(self, dst_keys, dst_bucket=None):
+    def _destination_conflicts(self, dst_keys, dst_bucket=None, dest_model=None):
         """
         Which of dst_keys already exist. Uses one listing per destination
         prefix (not a HEAD per key) on a worker thread.
@@ -662,9 +711,12 @@ class TransferQueueMixin:
         keys = [k for k in dst_keys if k]
         if not keys:
             return set()
-        clone = self.data_model.clone_for_worker()
+        clone = (dest_model or self.data_model).clone_for_worker()
         if dst_bucket:
             clone.bucket = dst_bucket
+            clone.endpoint_url = clone.profile_endpoint_url
+            clone.region_name = clone.profile_region
+            clone.use_path = clone.profile_use_path
             clone._client = None
 
         def _scan(_w):

@@ -9,7 +9,7 @@ import threading
 from core.errors import TransferCancelled
 from s3.common import (
     CHECKSUM_DIGESTS, _BotoProgressAdapter, plan_prefix_download, prefix_of,
-    run_parallel,
+    run_parallel, require_safe_local_destination,
 )
 
 
@@ -54,6 +54,8 @@ class DownloadMixin:
         def _download_one(bucket, k, out_path, size):
             """Download a single object, retrying once on region errors."""
             def _do():
+                require_safe_local_destination(
+                    folder_path or os.path.dirname(out_path), out_path)
                 self.client.download_file(
                     bucket,
                     k,
@@ -83,6 +85,8 @@ class DownloadMixin:
                 entries.append((k, size))
 
             plan = plan_prefix_download(key, folder_path, entries)
+            if os.path.abspath(plan.base_dir) != os.path.abspath(folder_path):
+                require_safe_local_destination(folder_path, plan.base_dir)
             os.makedirs(plan.base_dir, exist_ok=True)
             if log_fn:
                 for k in plan.unsafe:
@@ -90,8 +94,10 @@ class DownloadMixin:
                            f"directory, or is too long for this "
                            f"filesystem): {k}")
             for out_path in plan.dirs:
+                require_safe_local_destination(folder_path, out_path)
                 os.makedirs(out_path, exist_ok=True)
             for _k, out_path, _size in plan.files:
+                require_safe_local_destination(folder_path, out_path)
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
             # Whole-prefix downloads are one job entry, so without this the
@@ -101,7 +107,7 @@ class DownloadMixin:
                 lambda item: self._download_object(
                     item[0], item[1], size=item[2], progress_cb=progress_cb,
                     cancel_event=cancel_event, log_fn=log_fn,
-                    fetch=_download_one),
+                    fetch=_download_one, local_root=folder_path),
                 self.parallel_files,
                 cancel_event=cancel_event,
             )
@@ -112,20 +118,15 @@ class DownloadMixin:
         # same containment rule is enforced here rather than trusted to every
         # caller that builds one.
         if folder_path:
-            root = os.path.abspath(folder_path)
-            target = os.path.abspath(local_name)
-            if target != root and not target.startswith(root + os.sep):
-                raise ValueError(
-                    f"Refusing to download '{key}': the destination "
-                    f"'{local_name}' is outside '{folder_path}'"
-                )
+            require_safe_local_destination(folder_path, local_name)
 
         self._download_object(key, local_name, progress_cb=progress_cb,
                               cancel_event=cancel_event, log_fn=log_fn,
-                              fetch=_download_one)
+                              fetch=_download_one, local_root=folder_path)
 
     def _download_object(self, key, out_path, size=None, progress_cb=None,
-                         cancel_event=None, log_fn=None, fetch=None):
+                         cancel_event=None, log_fn=None, fetch=None,
+                         local_root=None):
         """
         Download one object the way every download should behave: resumable
         when it is large, verified when verification is on.
@@ -142,6 +143,8 @@ class DownloadMixin:
         paid for when something will actually use it.
         """
         etag = ""
+        local_root = local_root or os.path.dirname(out_path) or "."
+        require_safe_local_destination(local_root, out_path)
         head = None
         ranged = size is None or int(size) >= int(self.resume_threshold)
 
@@ -176,22 +179,48 @@ class DownloadMixin:
 
         # Large downloads take the ranged path so an interruption can resume
         # instead of starting over; small ones stay on the managed transfer.
-        if size is not None and int(size) >= int(self.resume_threshold):
+        # Without an ETag or a version id there is nothing to pin the ranges
+        # to, so the object could change between chunks; such a download
+        # stays on the managed transfer and simply gives up resuming.
+        version_id = (head or {}).get("VersionId")
+        if (size is not None and int(size) >= int(self.resume_threshold)
+                and (etag or version_id not in (None, "", "null"))):
             self._download_ranged(
                 key, out_path, size, etag, progress_cb=progress_cb,
-                cancel_event=cancel_event, log_fn=log_fn,
+                cancel_event=cancel_event, log_fn=log_fn, head=head,
+                local_root=local_root,
             )
             return
 
-        fetch(self.bucket, key, out_path, size)
+        # With verification on, the bytes land beside the destination and are
+        # only moved into place once they are proven: a failed or interrupted
+        # download must not replace a good local file with a bad one.
+        staged = (self._resume_paths(out_path)[0] if self.verify_downloads
+                  else out_path)
+        require_safe_local_destination(local_root, staged)
+        try:
+            fetch(self.bucket, key, staged, size)
 
-        if self.verify_downloads and (etag or head):
-            if not self.verify_download(out_path, etag, head=head,
-                                        log_fn=log_fn, key=key):
-                raise Exception(
-                    f"Checksum mismatch after downloading '{key}'; the local "
-                    "file does not match the object's stored digest"
-                )
+            if self.verify_downloads and (etag or head):
+                if not self.verify_download(staged, etag, head=head,
+                                            log_fn=log_fn, key=key):
+                    raise Exception(
+                        f"Checksum mismatch after downloading '{key}'; the "
+                        "local file does not match the object's stored digest"
+                    )
+        except BaseException:
+            # Nothing resumes this path, so a staged file left behind is junk
+            # next to the user's file -- and a stale one a later ranged
+            # attempt would find in place of its own partial download.
+            if staged != out_path:
+                try:
+                    os.remove(staged)
+                except OSError:
+                    pass
+            raise
+        if staged != out_path:
+            require_safe_local_destination(local_root, out_path)
+            os.replace(staged, out_path)
 
     @staticmethod
     def _digest_range(handle, length, algorithm) -> tuple:
@@ -275,7 +304,8 @@ class DownloadMixin:
         return True
 
     def _download_ranged(self, key, out_path, size, etag, progress_cb=None,
-                         cancel_event=None, log_fn=None):
+                         cancel_event=None, log_fn=None, head=None,
+                         local_root=None):
         """
         Download in fixed-size ranges into a '.s3duckpart' file, recording which
         chunks landed. An interrupted transfer resumes from the sidecar instead
@@ -289,16 +319,29 @@ class DownloadMixin:
         total_chunks = max(1, (size + chunk_size - 1) // chunk_size)
         part_path, meta_path = self._resume_paths(out_path)
         etag = self.normalize_etag(etag)
+        version = (head or {}).get("VersionId")
+        if version == "null":
+            version = None
+        if not etag and not version:
+            raise ValueError("A ranged download needs an ETag or version ID")
+        root = local_root or os.path.dirname(out_path) or "."
+        for path in (out_path, part_path, meta_path, meta_path + ".tmp"):
+            require_safe_local_destination(root, path)
+        identity = {"bucket": self.bucket, "key": key,
+                    "endpoint": self.profile_endpoint_url, "version": version}
 
         done = set()
         if os.path.exists(part_path) and os.path.exists(meta_path):
             try:
                 with open(meta_path) as handle:
                     saved = json.load(handle)
-                if (saved.get("etag") == etag
+                if (saved.get("identity") == identity
+                        and saved.get("etag") == etag
                         and int(saved.get("size", -1)) == size
-                        and int(saved.get("chunk_size", -1)) == chunk_size):
-                    done = {int(i) for i in saved.get("chunks", [])}
+                        and int(saved.get("chunk_size", -1)) == chunk_size
+                        and os.path.getsize(part_path) == size):
+                    done = {int(i) for i in saved.get("chunks", [])
+                            if 0 <= int(i) < total_chunks}
                     if log_fn and done:
                         log_fn(
                             f"resuming {key}: {len(done)}/{total_chunks} chunks "
@@ -328,12 +371,14 @@ class DownloadMixin:
                 pass
 
         state_lock = threading.Lock()
-        transferred = len(done) * chunk_size
+        transferred = sum(min(chunk_size, size - i * chunk_size) for i in done)
 
         def _save_meta():
             tmp = meta_path + ".tmp"
+            require_safe_local_destination(root, tmp)
             with open(tmp, "w") as handle:
                 json.dump({"etag": etag, "size": size,
+                           "identity": identity,
                            "chunk_size": chunk_size,
                            "chunks": sorted(done)}, handle)
             os.replace(tmp, meta_path)
@@ -346,12 +391,27 @@ class DownloadMixin:
                     raise TransferCancelled("cancelled")
                 start = index * chunk_size
                 end = min(size, start + chunk_size) - 1
-                resp = self.client.get_object(
-                    Bucket=self.bucket, Key=key, Range=f"bytes={start}-{end}")
-                data = resp["Body"].read()
+                params = dict(Bucket=self.bucket, Key=key,
+                              Range=f"bytes={start}-{end}")
+                if version:
+                    params["VersionId"] = version
+                if etag:
+                    params["IfMatch"] = f'"{etag}"'
+                resp = self.client.get_object(**params)
+                body = resp["Body"]
+                try:
+                    data = body.read()
+                finally:
+                    body.close()
+                if len(data) != end - start + 1:
+                    raise IOError(f"Incomplete range for '{key}': {start}-{end}")
+                content_range = resp.get("ContentRange")
+                if content_range and content_range != f"bytes {start}-{end}/{size}":
+                    raise IOError(f"Unexpected range for '{key}': {content_range}")
                 if self.rate_limiter is not None:
                     self.rate_limiter.consume(len(data))
                 with state_lock:
+                    require_safe_local_destination(root, part_path)
                     handle.seek(start)
                     handle.write(data)
                     handle.flush()
@@ -368,16 +428,20 @@ class DownloadMixin:
         finally:
             handle.close()
 
-        os.replace(part_path, out_path)
-        if os.path.exists(meta_path):
-            os.remove(meta_path)
-
         if self.verify_downloads and not self.verify_download(
-                out_path, etag, log_fn=log_fn, key=key):
+                part_path, etag, head=head, log_fn=log_fn, key=key):
+            if os.path.exists(meta_path):
+                os.remove(meta_path)
             raise Exception(
                 f"Checksum mismatch after downloading '{key}'; the local file "
                 "does not match the object's ETag"
             )
+        if cancel_event is not None and cancel_event.is_set():
+            raise TransferCancelled("cancelled")
+        require_safe_local_destination(root, out_path)
+        os.replace(part_path, out_path)
+        if os.path.exists(meta_path):
+            os.remove(meta_path)
 
     def download_object_version(self, key, version_id, local_path,
                                 progress_cb=None, cancel_event=None, log_fn=None):

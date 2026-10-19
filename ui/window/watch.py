@@ -43,6 +43,8 @@ class WatchMixin:
     def start_watch(self, config):
         """Begin the interval mirror described by *config*."""
         self._watch = dict(config)
+        if self._watch_thread is None:
+            self._watch_scan_config = dict(config)
         if self._watch_timer is None:
             self._watch_timer = QTimer(self)
             self._watch_timer.timeout.connect(self._watch_tick)
@@ -86,11 +88,12 @@ class WatchMixin:
         if self.transfers_active():
             return
         config = dict(self._watch)
+        self._watch_scan_config = config
         clone = self.data_model.clone_for_worker()
         clone.bucket = config["bucket"]
 
         def _scan(_w):
-            local = scan_local_tree(config["local"])
+            local = scan_local_tree(config["local"], require_complete=True)
             remote = clone.list_tree(config["prefix"])
             return build_sync_plan(
                 local, remote, direction="upload",
@@ -112,6 +115,8 @@ class WatchMixin:
         self._watch_worker = None
         join_qthread(thread)
         if not self._watch:
+            return
+        if self._watch != self._watch_scan_config:
             return
         if exc is not None:
             self.log(f"watch: could not compare ({exc})")

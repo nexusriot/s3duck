@@ -229,7 +229,7 @@ class SecondPane(QWidget):
             self.status.setText(f"Could not list: {exc}")
             self._show([])
             return
-        rows = [(item.name, item.t == FSObjectType.FOLDER, int(item.size or 0))
+        rows = [(item.name, item.type_ == FSObjectType.FOLDER, int(item.size or 0))
                 for item in (result or [])]
         rows.sort(key=lambda row: (not row[1], row[0].lower()))
         self._show(rows)

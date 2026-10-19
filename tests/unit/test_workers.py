@@ -8,6 +8,7 @@ import shutil
 import tempfile
 import threading
 import time
+import types
 import unittest
 import utils
 import weakref
@@ -20,7 +21,7 @@ from tests.support import (
     MIN_APP_SOURCES, PROJECT_ROOT, _StubModel, _ensure_qapp,
     make_main_window, read_app_sources,
 )
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 class WorkerBulkStorageTests(unittest.TestCase):
@@ -887,6 +888,66 @@ class ConditionalUploadWorkerTests(unittest.TestCase):
         self._run(model, [("a.txt", self._file("a.txt", 10))],
                   if_none_match=False)
         self.assertEqual(model.flags, [False])
+class MoveOverlapSafetyTests(unittest.TestCase):
+    """A move whose destination is another row's source destroys data: the
+    copy lands on an object still waiting its turn, and the delete pass that
+    follows removes what was written over it. The whole batch is checked
+    before the first write rather than row by row."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _worker(self, job, **calls):
+        model = types.SimpleNamespace(bucket="b", **calls)
+        worker = Worker(model, job)
+        errors = []
+        worker.error.connect(errors.append)
+        return worker, model, errors
+
+    def test_an_overlapping_file_batch_touches_neither_source(self):
+        worker, model, errors = self._worker(
+            [("1.txt", "2.txt", False, None),
+             ("2.txt", "3.txt", False, None)],
+            copy_object=Mock(), delete=Mock())
+        worker.move()
+        self.assertIn("overlaps source", errors[0])
+        model.copy_object.assert_not_called()
+        model.delete.assert_not_called()
+
+    def test_an_overlapping_folder_batch_is_refused_before_copying(self):
+        worker, model, errors = self._worker(
+            [("a/", "b/", True, None), ("b/", "c/", True, None)],
+            copy_prefix=Mock(), delete=Mock())
+        worker.move()
+        self.assertIn("overlaps source", errors[0])
+        model.copy_prefix.assert_not_called()
+
+    def test_a_destination_under_a_moving_folder_is_refused(self):
+        worker, model, errors = self._worker(
+            [("a/", "z/", True, None), ("f.txt", "a/f.txt", False, None)],
+            copy_prefix=Mock(), copy_object=Mock(), delete=Mock())
+        worker.move()
+        self.assertIn("overlaps source", errors[0])
+        model.copy_object.assert_not_called()
+
+    def test_a_batch_that_does_not_overlap_still_runs(self):
+        worker, model, errors = self._worker(
+            [("1.txt", "x/1.txt", False, None),
+             ("2.txt", "x/2.txt", False, None)],
+            copy_object=Mock(), delete=Mock())
+        worker.move()
+        self.assertEqual(errors, [])
+        self.assertEqual(model.copy_object.call_count, 2)
+        self.assertEqual(model.delete.call_count, 2)
+
+    def test_a_cross_bucket_destination_is_not_compared_to_local_sources(self):
+        worker, model, errors = self._worker(
+            [("1.txt", "1.txt", False, "other")],
+            copy_object=Mock(), delete=Mock())
+        worker.move()
+        self.assertEqual(errors, [])
+        model.copy_object.assert_called_once()
 class SyncWorkerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -959,6 +1020,31 @@ class SyncWorkerTests(unittest.TestCase):
         worker.error.connect(errors.append)
         worker.sync()
         self.assertEqual(errors, ["nope"])
+
+    def test_a_symlink_that_appeared_after_planning_is_refused(self):
+        """The plan was built against the tree as it was; by the time the
+        job runs a component may have become a link out of the chosen root.
+        Each local action re-derives the root from the relative path the job
+        carries and re-checks it, so a delete cannot follow the link out."""
+        with tempfile.TemporaryDirectory() as root:
+            base = os.path.join(root, "base")
+            outside = os.path.join(root, "outside")
+            os.mkdir(base)
+            os.mkdir(outside)
+            victim = os.path.join(outside, "file")
+            with open(victim, "w") as handle:
+                handle.write("keep")
+            os.symlink(outside, os.path.join(base, "link"))
+            worker = Worker(
+                types.SimpleNamespace(parallel_files=1),
+                [("delete_local", "link/file",
+                  os.path.join(base, "link", "file"), "k", 4)])
+            errors = []
+            worker.error.connect(errors.append)
+            worker.sync()
+            self.assertTrue(errors)
+            with open(victim) as handle:
+                self.assertEqual(handle.read(), "keep")
 class ZipDownloadWorkerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

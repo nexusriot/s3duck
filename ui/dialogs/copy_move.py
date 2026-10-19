@@ -341,7 +341,10 @@ class CrossProfileSyncDialog(QDialog):
             self._table.setItem(
                 row, 2, QTableWidgetItem(_human_bytes(action.get("size") or 0)))
             self._table.setItem(row, 3, QTableWidgetItem(action.get("reason", "")))
-        self._summary.setText(summarize_sync_plan(actions))
+        summary = summarize_sync_plan(actions)
+        self._summary.setText("  ".join(
+            f"{kind}: {_human_bytes(count) if kind == 'bytes' else count}"
+            for kind, count in sorted(summary.items())))
         self._ok_enabled(any(a["action"] != "skip" for a in actions))
 
     def plan(self) -> tuple:

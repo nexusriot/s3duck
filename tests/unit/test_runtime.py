@@ -354,7 +354,9 @@ class ReviewRegressionTests(unittest.TestCase):
         with patch.object(main_window.MainWindow, "assign_thread_operation",
                           lambda _s, method, job, **kw: started.append(method)):
             win.rerun_history_entry(
-                {"method": "upload", "job": [["k", "/tmp/f"]]})
+                {"method": "upload", "job": [["k", "/tmp/f"]],
+                 "origin": win._transfer_origin(),
+                 "source_bucket": win.data_model.bucket})
         self.assertEqual(started, ["upload"])
 
     def test_switching_profiles_saves_where_the_old_one_was(self):
