@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import time
-from PyQt6.QtCore import QThread, QTimer, pyqtSlot
+from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSlot
 from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox, QSystemTrayIcon
 from core.formatting import format_completion_notification
 from core.locations import CROSS_PROFILE_METHODS
@@ -152,12 +152,24 @@ class TransferQueueMixin:
     def assign_thread_operation(self, method, job, need_refresh=True,
                                 source_bucket="", dest_model=None,
                                 source_model=None, if_none_match=False,
-                                origin=None):
+                                origin=None, bucket=None, auto_retries=0):
+        """
+        Queue *job* and return its entry, or None when nothing was queued.
+
+        *bucket* is the bucket the job's keys belong to. A new job leaves it
+        out and gets the one that is open now -- the job was just built from
+        it. A retry or a history replay passes the bucket the job was made
+        in, because by then the user may be looking at another one.
+
+        *origin* is the connection the job was queued against (profile,
+        endpoint, region and a hash of the key). A replay carries the
+        recorded one so it can be checked against the connection open now.
+        """
         if not job:
-            return
+            return None
         if not self._credentials_ok_for_transfer():
             self.log(f"{method} not started: credentials")
-            return
+            return None
 
         # Capture the account and bucket when the user queues the work, not
         # when a later retry happens to start it.
@@ -190,19 +202,42 @@ class TransferQueueMixin:
             source_model=source_model,
             if_none_match=if_none_match,
             origin=origin or self._transfer_origin(),
+            bucket=((self.data_model.bucket or "") if bucket is None
+                    else bucket),
+            profile=self.profile_name,
         )
+        entry.auto_retries = int(auto_retries or 0)
         self._queue_next_id += 1
         # Kept so a failed/cancelled row can be re-run from the queue panel.
         self._queue_entries[entry.entry_id] = entry
 
+        self._wire_queue_panel()
         self._queue_panel.add_entry(entry)
 
         if self.transfers_active():
             self._transfer_queue.append(entry)
             self.log(f"queued {method}: {label}")
-            return
+            return entry
 
         self._start_transfer(entry)
+        return entry
+
+    def _wire_queue_panel(self):
+        """
+        Forget the jobs whose rows "Clear done" removes.
+
+        Connected on first use rather than where the panel is built: a row
+        can only be cleared after one was added, and add_entry is reached
+        from assign_thread_operation alone, so this runs before it matters.
+        """
+        if getattr(self, "_queue_panel_wired", False):
+            return
+        self._queue_panel.rows_cleared.connect(self._on_queue_rows_cleared)
+        self._queue_panel_wired = True
+
+    def _on_queue_rows_cleared(self, entry_ids):
+        for entry_id in entry_ids:
+            self._queue_entries.pop(entry_id, None)
 
     def _queue_build_label(self, method: str, job) -> str:
         n = len(job)
@@ -227,6 +262,8 @@ class TransferQueueMixin:
         need_refresh = entry.need_refresh
 
         self.log(f"starting {method}")
+        if entry.started_at is None:
+            entry.started_at = time.time()
         entry.status = "running"
         self._queue_panel.update_status(entry)
         self._active_entry = entry
@@ -364,7 +401,8 @@ class TransferQueueMixin:
                 self._record_history(entry)
 
             if method == "delete" and entry.status == "done":
-                self._record_undoable_delete(entry.job)
+                self._record_undoable_delete(
+                    entry.job, since=entry.started_at, bucket=entry.bucket)
 
             if need_refresh:
                 QTimer.singleShot(0, lambda: self.navigate(force=True))
@@ -389,12 +427,19 @@ class TransferQueueMixin:
         bucket's endpoint binding (possibly a virtual-host of the wrong
         bucket), so navigation and connection state are reset to the profile
         root and the usual probing rebinds the source on first use.
+
+        Every other job is bound to the bucket it was MADE in, the same way.
+        Binding to the open bucket was only right while the job ran straight
+        away: a retry, "Retry failed" or a history replay starts after the
+        user may have browsed elsewhere, and job rows are bare keys.
         """
         if entry.source_model is not None:
             return entry.source_model
         model = self.data_model.clone_for_worker()
-        if entry.source_bucket:
-            model.bucket = entry.source_bucket
+        current = self.data_model.bucket or ""
+        target = entry.source_bucket or entry.bucket
+        if entry.source_bucket or (target is not None and target != current):
+            model.bucket = target
             model.current_folder = ""
             model.prev_folder = ""
             model.endpoint_url = model.profile_endpoint_url
@@ -485,6 +530,13 @@ class TransferQueueMixin:
             "origin": entry.origin or self._transfer_origin(),
             "source_bucket": entry.source_bucket or self.data_model.bucket,
         }
+        # Recorded for "Run again": the rows are bare keys, and a replay
+        # against whatever bucket and profile are open by then would act on
+        # the wrong objects.
+        if entry.bucket is not None:
+            record["bucket"] = entry.bucket
+        if entry.profile is not None:
+            record["profile"] = entry.profile
         # Big jobs would bloat the settings file; those simply are not re-runnable.
         if len(job) <= self.HISTORY_JOB_LIMIT:
             try:
@@ -522,10 +574,38 @@ class TransferQueueMixin:
                 "the other profile's connection. Start it again from the "
                 "Tools menu.")
             return
-        if (not entry.get("origin") or "source_bucket" not in entry
-                or entry["origin"] != self._transfer_origin()):
-            QMessageBox.information(
-                self, "Transfer history",
+        if method == "sync":
+            # A sync job is a plan: what to send, fetch and DELETE, decided by
+            # comparing the two sides when it was made. Replayed later it
+            # deletes whatever has appeared under those names since, and
+            # overwrites edits made since, without anything being compared.
+            self._refuse_history_rerun(
+                "A sync cannot be re-run from history: its plan was worked "
+                "out from both sides as they were then, and replaying it now "
+                "could delete or overwrite files changed since. Open Sync "
+                "again to compare and review a fresh plan.")
+            return
+        if entry.get("profile") not in (None, self.profile_name):
+            # The clearer half of the origin check below, worth its own
+            # message: the name alone already says where this belongs.
+            self._refuse_history_rerun(
+                f"This entry belongs to profile '{entry.get('profile')}'. "
+                "Switch to that profile to re-run it.")
+            return
+        if ("bucket" not in entry or "source_bucket" not in entry
+                or not entry.get("origin")):
+            # Recorded before history kept them. Guessing "the bucket that is
+            # open now" is exactly how a replay deleted the wrong objects.
+            self._refuse_history_rerun(
+                "This entry was recorded without its bucket and connection, "
+                "so it cannot be re-run safely. Start the operation again "
+                "from where it belongs.")
+            return
+        if entry["origin"] != self._transfer_origin():
+            # Same profile name, different connection behind it -- the
+            # endpoint, region or access key was edited since. The job's bare
+            # keys would resolve against an account it was never meant for.
+            self._refuse_history_rerun(
                 "This job's original connection cannot be verified. "
                 "Open its original profile and start the operation again.")
             return
@@ -537,7 +617,22 @@ class TransferQueueMixin:
             source_bucket=entry.get("source_bucket") or "",
             if_none_match=bool(entry.get("if_none_match")),
             origin=entry["origin"],
+            bucket=entry.get("bucket") or "",
         )
+
+    def _refuse_history_rerun(self, text):
+        """
+        Say why "Run again" did nothing.
+
+        Opened rather than exec'd: the history dialog has already closed and
+        nothing waits on the answer, so there is no reason to block in a
+        nested event loop while it is read.
+        """
+        self.log(f"history: {text}")
+        box = QMessageBox(QMessageBox.Icon.Information, "Transfer history",
+                          text, QMessageBox.StandardButton.Ok, self)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box.open()
 
     def auto_retry_enabled(self) -> bool:
         raw = self.store.get("auto_retry", "true")
@@ -559,6 +654,9 @@ class TransferQueueMixin:
         self.log(
             f"{entry.method} hit a transient failure; retrying once in "
             f"{AUTO_RETRY_DELAY_MS // 1000}s")
+        # Already spoken for: "Retry failed" or the row's own button pressed
+        # during the wait would otherwise queue the same job a second time.
+        self._set_retried(entry, True)
         # An owned timer, not QTimer.singleShot: a static one keeps firing
         # after the window is gone, and its callback would then start a
         # transfer against a torn-down model. A parented QTimer dies with us.
@@ -572,27 +670,56 @@ class TransferQueueMixin:
         if self._closing:
             return
         for entry in pending:
-            self._requeue(entry, automatic=True)
+            if self._requeue(entry, automatic=True) is None:
+                # Nothing was queued (refused credentials, another profile):
+                # the row is the user's to retry again.
+                self._set_retried(entry, False)
+
+    def _set_retried(self, entry, retried):
+        entry.retried = bool(retried)
+        self._queue_panel.set_retried(entry.entry_id, entry.retried)
 
     def _requeue(self, entry, automatic=False):
-        """Queue the same job again as a fresh entry."""
+        """
+        Queue the same job again as a fresh entry, and return it.
+
+        Returns None when nothing was queued. The job goes back to the bucket
+        it was made in, and is refused outright when it was made under
+        another profile: its keys mean nothing -- or something else -- in
+        that account.
+        """
+        if entry.profile is not None and entry.profile != self.profile_name:
+            self.log(
+                f"not retrying {entry.method}: it belongs to profile "
+                f"'{entry.profile}'")
+            self.statusBar().showMessage(
+                f"That job belongs to profile '{entry.profile}'", 4000)
+            return None
         if automatic:
             self.log(f"retrying {entry.method}: {entry.label}")
         # if_none_match travels with the job: it is the user's answer to the
         # overwrite prompt, and a retry that drops it is a retry that quietly
-        # overwrites what they asked to skip.
-        self.assign_thread_operation(
+        # overwrites what they asked to skip. An automatic retry also hands
+        # on its count, so the retry of a retry is not "the first" again.
+        fresh = self.assign_thread_operation(
             entry.method, entry.job, need_refresh=entry.need_refresh,
             source_bucket=entry.source_bucket, dest_model=entry.dest_model,
             source_model=entry.source_model,
-            if_none_match=entry.if_none_match, origin=entry.origin)
+            if_none_match=entry.if_none_match, origin=entry.origin,
+            bucket=entry.bucket,
+            auto_retries=entry.auto_retries if automatic else 0)
+        if fresh is not None:
+            self._set_retried(entry, True)
+            # A partial first attempt left markers too; undo must cover them.
+            fresh.started_at = entry.started_at
+        return fresh
 
     def failed_entries(self) -> list:
-        """Every queued job that ended in an error, oldest first."""
+        """Every failed job not yet queued again, oldest first."""
         return [entry for entry in
                 sorted(self._queue_entries.values(),
                        key=lambda e: e.entry_id)
-                if entry.status == "error"]
+                if entry.status == "error" and not entry.retried]
 
     def retry_failed_transfers(self):
         """Re-queue every failed job in one go."""
@@ -611,6 +738,10 @@ class TransferQueueMixin:
         entry = self._queue_entries.get(entry_id)
         if entry is None or entry.status not in ("cancelled", "error"):
             return
+        if entry.retried:
+            # Its retry is queued, running or done already; a second press
+            # would run the same job twice.
+            return
         self.log(f"retrying {entry.method}: {entry.label}")
         # Through _requeue, so the cross-profile models and the overwrite
         # answer travel with the job exactly as they do on an auto-retry.
@@ -627,6 +758,18 @@ class TransferQueueMixin:
             e.status = "cancelled"
             self._queue_panel.update_status(e)
         self._transfer_queue.clear()
+
+        # An automatic retry waiting on its timer is queued work too, just not
+        # in the queue yet. Left armed, the job the user had just cancelled
+        # with everything else started again a few seconds later. Before the
+        # early return below: the wait is exactly when nothing is running.
+        dropped, self._pending_retries = self._pending_retries, []
+        self._retry_timer.stop()
+        for e in dropped:
+            # Still a failure, and still theirs to retry by hand.
+            self._set_retried(e, False)
+        if dropped:
+            self.log(f"dropped {len(dropped)} pending automatic retry(ies)")
 
         if not self.transfers_active() or self.worker is None:
             return
@@ -711,12 +854,22 @@ class TransferQueueMixin:
         keys = [k for k in dst_keys if k]
         if not keys:
             return set()
+        # A cross-profile paste writes through the other profile's model, so
+        # the check has to be made on that connection, not the open one.
         clone = (dest_model or self.data_model).clone_for_worker()
-        if dst_bucket:
+        # Compared against the clone's own bucket, not the open one, so a
+        # cross-profile destination is judged on the connection it will
+        # actually be listed through. Same bucket: the binding it already
+        # carries is the right one and is left alone.
+        if dst_bucket and dst_bucket != (clone.bucket or ""):
+            # Back to the profile root, as _worker_model_for does: the clone
+            # carries the open bucket's endpoint, which may be a virtual host
+            # of THAT bucket, and listing through it answered for the wrong
+            # bucket -- "nothing exists there" -- and the copy overwrote.
             clone.bucket = dst_bucket
             clone.endpoint_url = clone.profile_endpoint_url
-            clone.region_name = clone.profile_region
             clone.use_path = clone.profile_use_path
+            clone.region_name = clone.profile_region
             clone._client = None
 
         def _scan(_w):

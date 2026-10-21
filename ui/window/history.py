@@ -39,15 +39,31 @@ class HistoryMixin:
         if not entry:
             return
         history = entry.get("history") or []
-        position = int(entry.get("pos", 0)) + int(delta)
+        old_position = int(entry.get("pos", 0))
+        position = old_position + int(delta)
         if not (0 <= position < len(history)):
+            return
+        # Asked before anything moves: a refused step used to leave the
+        # position moved and the flag below set, so the NEXT real move went
+        # unrecorded and Back from a/b/c/ landed at the bucket root.
+        if self._refuse_navigation():
             return
         entry["pos"] = position
         bucket, prefix = history[position]
         # The move itself must not be recorded, or back would bounce between
-        # two entries forever.
-        self._history_navigating = True
+        # two entries forever. It carries where it came from, so a step whose
+        # listing then fails can be taken back.
+        self._history_navigating = (entry, old_position)
         self.open_location(bucket, prefix)
+        self._update_history_buttons()
+
+    def _abandon_history_step(self):
+        """A Back/Forward whose location never loaded: undo its position."""
+        step = self._history_navigating
+        self._history_navigating = False
+        if isinstance(step, tuple):
+            entry, old_position = step
+            entry["pos"] = old_position
         self._update_history_buttons()
 
     def goBack(self):

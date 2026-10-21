@@ -8,8 +8,8 @@ from core import lifecycle as _lifecycle
 from core import pricing as _pricing
 from core.checksums import _CrcDigest  # noqa: F401  (re-exported)
 from core.errors import (  # noqa: F401  (re-exported: model is the front door)
-    ArchivedObject, DeleteRefused, ObjectExists, ReadOnlyError,
-    TransferCancelled,
+    ArchivedObject, DeleteRefused, DownloadIncomplete, ObjectExists,
+    ReadOnlyError, TransferCancelled,
 )
 from s3.common import (  # noqa: F401  (re-exported: model is the front door)
     CHECKSUM_ALGORITHMS, CHECKSUM_DIGESTS, KNOWN_CHECKSUM_ALGORITHMS,
@@ -33,31 +33,6 @@ from core import objects as _objects
 from core import parts as _parts
 from core import search as _search
 from core import upload_rules as _upload_rules
-
-
-# Checksums S3 can store, and how to recompute one here. An algorithm we
-# cannot recompute locally is worse than none at all, because verification
-# would then pass every download unchecked -- so what the UI offers is built
-# from what this machine can actually compute, not from what S3 accepts.
-#
-# CRC32, SHA1 and SHA256 come from the standard library. CRC32C and CRC64NVME
-# need awscrt, which is also the module botocore itself computes them with, so
-# the two halves -- sending the checksum and verifying it afterwards -- appear
-# and disappear together rather than one silently outliving the other.
-try:
-    from awscrt import checksums as _crt_checksums
-except Exception:  # pragma: no cover - depends on what is installed
-    _crt_checksums = None
-
-# Which algorithms the installed botocore can actually send. Asking it rather
-# than assuming keeps one out of the UI on an SDK that would reject the
-# parameter outright. The name is private, hence the guard and the fallback
-# to the set every supported botocore has had.
-try:
-    from botocore.httpchecksum import (
-        _SUPPORTED_CHECKSUM_ALGORITHMS as _BOTOCORE_CHECKSUM_NAMES)
-except Exception:  # pragma: no cover - private name, guarded on purpose
-    _BOTOCORE_CHECKSUM_NAMES = ("crc32", "sha1", "sha256")
 
 
 class Model(
@@ -196,8 +171,9 @@ class Model(
         # being billed for it, so without this such a bucket is unusable.
         self.requester_pays = bool(requester_pays)
 
-        # A CDN or custom domain in front of this bucket. Public and presigned
-        # links are shown against it instead of the raw endpoint.
+        # A CDN or custom domain in front of this bucket. Public links (never
+        # presigned ones, whose signature is bound to the endpoint) are shown
+        # against it instead of the raw endpoint.
         self.public_base_url = str(public_base_url or "").rstrip("/")
 
         # An outbound HTTP proxy, and a CA bundle to trust. The bundle is the

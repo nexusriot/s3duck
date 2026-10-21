@@ -643,6 +643,45 @@ class _FakeSyncModel:
 
     def list_tree(self, prefix="", cancel_event=None, log_fn=None):
         return dict(self._remote)
+class _FakeCompareModel:
+    """
+    The data model behind the pane comparison: a listing per bucket and a
+    HEAD per key. ``trees`` is ``{bucket: {key: (size, mtime, etag)}}`` and
+    ``heads`` is ``{(bucket, key): head-dict-or-exception}``.
+    """
+
+    DEFAULT_MULTIPART_CHUNKSIZE_MB = Model.DEFAULT_MULTIPART_CHUNKSIZE_MB
+
+    def __init__(self, trees=None, heads=None, part_size=8 * 1024 * 1024):
+        self.bucket = ""
+        self.trees = trees or {}
+        self.heads = heads or {}
+        self.multipart_chunksize_bytes = part_size
+        self.head_calls = []
+        self.client = self
+
+    def clone_for_worker(self):
+        clone = _FakeCompareModel(self.trees, self.heads,
+                                  self.multipart_chunksize_bytes)
+        clone.bucket = self.bucket
+        clone.head_calls = self.head_calls
+        return clone
+
+    def list_tree(self, prefix="", cancel_event=None, log_fn=None,
+                  with_etag=False):
+        out = {}
+        for key, (size, mtime, etag) in self.trees.get(self.bucket, {}).items():
+            if key.startswith(prefix or ""):
+                entry = (size, mtime, etag) if with_etag else (size, mtime)
+                out[key[len(prefix or ""):]] = entry
+        return out
+
+    def head_object(self, Bucket, Key, **_kw):
+        self.head_calls.append((Bucket, Key))
+        answer = self.heads.get((Bucket, Key), {})
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 class _FakeDuplicateModel:
     bucket = "bkt"
 

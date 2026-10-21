@@ -125,6 +125,82 @@ class NavigationMixin:
     def in_bucket_list_mode(self) -> bool:
         return not bool(self.data_model.bucket)
 
+    def _navigation_refusal(self) -> str:
+        """Why a navigation cannot start right now, or "" when it can.
+
+        Asked BEFORE a move commits its target to the model. Committing first
+        and letting navigate() refuse afterwards left the model on the new
+        prefix while the listing still showed the old one -- and every
+        selection-based action then resolved the rows on screen under the
+        wrong prefix: Delete on a visible "report.csv" removed
+        "archive/report.csv".
+        """
+        if self.transfers_active():
+            return "Transfers active — navigation is disabled"
+        if self.bucket_enter_active():
+            return "Opening bucket — please wait…"
+        return ""
+
+    def _refuse_navigation(self) -> bool:
+        """Show why a navigation cannot start; True when it cannot."""
+        reason = self._navigation_refusal()
+        if reason:
+            self.statusBar().showMessage(reason, 2000)
+            return True
+        return False
+
+    def _go_to_prefix(self, prefix, **navigate_kwargs) -> bool:
+        """Move inside the open bucket: check, then commit, then list."""
+        if self._refuse_navigation():
+            return False
+        self.change_current_folder(prefix or "")
+        self.navigate(**navigate_kwargs)
+        return True
+
+    def listing_settled(self) -> bool:
+        """True when the rows on screen are the listing of the model's
+        location, so a selected row resolves to the key it shows.
+
+        False while a listing or a bucket entry is in flight: the model has
+        already moved, and the old rows -- still selected -- would resolve
+        under the new prefix.
+        """
+        if getattr(self, "_nav_in_flight", False) or self.bucket_enter_active():
+            return False
+        shown = getattr(self, "_listing_location", None)
+        here = (self.data_model.bucket or "",
+                self.data_model.current_folder or "")
+        return shown is None or shown == here
+
+    def _refuse_unsettled_listing(self) -> bool:
+        """Refuse a selection-based action while the listing is moving."""
+        if self.listing_settled():
+            return False
+        self.statusBar().showMessage(
+            "The listing is still loading — try again once it has", 3000)
+        return True
+
+    def _recover_from_failed_listing(self) -> bool:
+        """
+        A listing failed: make the model describe the rows on screen again.
+
+        Within one bucket the old listing is still true, so the model goes
+        back to its prefix (True). Rows from another bucket (or a bucket
+        list) have nothing they resolve under any more, so they are dropped
+        instead (False) -- the view has genuinely moved.
+        """
+        shown = getattr(self, "_listing_location", None)
+        bucket = self.data_model.bucket or ""
+        if shown is not None and shown[0] == bucket:
+            self.data_model.current_folder = shown[1]
+            return True
+        if bucket:
+            self.modelToListView([])
+        else:
+            self.modelToListView_bucket_mode([])
+        self.update_s3_path_label()
+        return False
+
     def _return_to_bucket_list_mode(self):
         """
         Leave the current bucket and go back to bucket list safely:
@@ -171,6 +247,7 @@ class NavigationMixin:
                 )
         finally:
             self._end_model_reset_ui()
+        self._listing_location = ("", "")
 
     def modelToListView(self, model_result):
         """
@@ -232,6 +309,10 @@ class NavigationMixin:
 
         finally:
             self._end_model_reset_ui()
+        # What the rows now on screen are a listing OF. A failed navigation
+        # puts the model back here, and listing_settled() compares against it.
+        self._listing_location = (self.data_model.bucket or "",
+                                  self.data_model.current_folder or "")
 
     def change_current_folder(self, new_folder):
         self.data_model.prev_folder = self.data_model.current_folder
@@ -273,6 +354,8 @@ class NavigationMixin:
                 self.goUp()
             else:
                 # root of bucket -> go back to bucket list
+                if self._refuse_navigation():
+                    return
                 self._return_to_bucket_list_mode()
                 self.navigate(restore_name=self._last_selected_bucket)
             return
@@ -280,9 +363,8 @@ class NavigationMixin:
         # Normal folder navigation
         if t == FSObjectType.FOLDER:
             self._last_selected_in_prefix[(self.data_model.bucket or '', self.data_model.current_folder or '')] = name
-            self.change_current_folder(
-                self.data_model.current_folder + f"{name}/")
-            self.navigate(select_up_entry=True)
+            self._go_to_prefix(self.data_model.current_folder + f"{name}/",
+                               select_up_entry=True)
             return
 
         # File -> open the in-app preview
@@ -297,7 +379,10 @@ class NavigationMixin:
         then navigate into it — optionally straight to target_prefix.
         """
         if self.bucket_enter_active():
-            return  # already entering a bucket
+            # Already entering a bucket. Said rather than swallowed: a jump
+            # dropped here without a word reads as the app ignoring the click.
+            self.statusBar().showMessage("Opening bucket — please wait…", 2000)
+            return
         if self.transfers_active():
             self.statusBar().showMessage(
                 "Transfers active — navigation is disabled", 2000)
@@ -333,6 +418,11 @@ class NavigationMixin:
                 "Open bucket failed",
                 f"Cannot open bucket '{bucket_name}': {err_msg}",
             )
+            # A Back/Forward into this bucket never arrived; its trail
+            # position must not claim it did -- and a reopen that failed is
+            # no longer what the tab restore should wait for.
+            self._abandon_history_step()
+            self._tab_restore_target = None
             self._return_to_bucket_list_mode()
             # navigate() is async — the model is still empty here, so the
             # selection must be restored by the navigation-finished handler.
@@ -406,6 +496,9 @@ class NavigationMixin:
         prefix = self.data_model.current_folder or ""
 
         self.listview.setEnabled(False)
+        # Until this listing lands, the rows on screen belong to where the
+        # model WAS; listing_settled() refuses selection actions meanwhile.
+        self._nav_in_flight = True
         if show_loading:
             self._show_loading("Loading", "Loading…")
         else:
@@ -443,17 +536,14 @@ class NavigationMixin:
 
     def open_location(self, bucket, prefix):
         """Go to a bucket/prefix, entering the bucket first when it differs."""
-        if self.transfers_active():
-            self.statusBar().showMessage(
-                "Transfers active — navigation is disabled", 2000)
+        if self._refuse_navigation():
             return
         if not bucket:
             self._return_to_bucket_list_mode()
             self.navigate()
             return
         if bucket == (self.data_model.bucket or ""):
-            self.change_current_folder(prefix or "")
-            self.navigate(select_up_entry=True)
+            self._go_to_prefix(prefix or "", select_up_entry=True)
             return
         self.enter_bucket_async(bucket, target_prefix=prefix or "")
 
@@ -490,6 +580,7 @@ class NavigationMixin:
         if seq != self._nav_seq:
             return
 
+        self._nav_in_flight = False
         self._hide_loading()
         self.listview.setEnabled(True)
 
@@ -504,6 +595,15 @@ class NavigationMixin:
             pass
 
         if err_str:
+            # REGRESSION (critical): this used to return with the model on
+            # the prefix that failed and the previous rows re-enabled, so
+            # Delete on a visible root "report.csv" removed
+            # "private/report.csv" and a double-click descended from the
+            # wrong place. The model goes back to what is on screen.
+            stayed = self._recover_from_failed_listing()
+            self._abandon_history_step()
+            if stayed:
+                self._revert_tab_to_view()
             self.statusBar().showMessage(f"Navigation error: {err_str}", 8000)
             self.log(f"Navigation error: {err_str}")
             return
@@ -558,6 +658,10 @@ class NavigationMixin:
 
         if mode == "bucket_items":
             items = payload.get("items") or []
+            # The rows are the listing of the payload's prefix, whatever the
+            # model was nudged to since; key resolution follows the rows.
+            if payload.get("bucket") == (self.data_model.bucket or ""):
+                self.data_model.current_folder = payload.get("prefix") or ""
             hdr = self.listview.header()
             sort_col = hdr.sortIndicatorSection()
             sort_order = hdr.sortIndicatorOrder()
@@ -604,8 +708,7 @@ class NavigationMixin:
         if not self.data_model.bucket:
             return
 
-        if self.transfers_active():
-            self.statusBar().showMessage("Transfers active — navigation is disabled", 2000)
+        if self._refuse_navigation():
             return
 
         self._clear_selection()
@@ -646,8 +749,7 @@ class NavigationMixin:
             self.listview.setSortingEnabled(was_sorting)
 
     def goHome(self):
-        if self.transfers_active():
-            self.statusBar().showMessage("Transfers active — navigation is disabled", 2000)
+        if self._refuse_navigation():
             return
         self._return_to_bucket_list_mode()
         self.navigate()
@@ -669,13 +771,7 @@ class NavigationMixin:
     def _breadcrumb_go(self, prefix: str):
         if self.in_bucket_list_mode():
             return
-        if self.transfers_active():
-            self.statusBar().showMessage(
-                "Transfers active — navigation is disabled", 2000
-            )
-            return
-        self.change_current_folder(prefix or "")
-        self.navigate(select_up_entry=(not prefix))
+        self._go_to_prefix(prefix or "", select_up_entry=(not prefix))
 
     def _last_location_key(self) -> str:
         return self.store.profile_key("last_location")
@@ -703,6 +799,9 @@ class NavigationMixin:
         if not bucket:
             return ""
         self.log(f"reopening {serialize_location(bucket, prefix)}")
+        # The tab restore waits for this landing rather than settling on the
+        # bucket list that usually arrives first (see _restore_tab_for).
+        self._tab_restore_target = (bucket, prefix)
         self.enter_bucket_async(bucket, target_prefix=prefix)
         return bucket
 
@@ -721,8 +820,7 @@ class NavigationMixin:
             self.statusBar().showMessage("Nothing to go to", 2000)
             return
         if bucket == self.data_model.bucket:
-            self.change_current_folder(prefix)
-            self.navigate(select_up_entry=True)
+            self._go_to_prefix(prefix, select_up_entry=True)
             return
         self.enter_bucket_async(bucket, target_prefix=prefix)
 
@@ -736,5 +834,4 @@ class NavigationMixin:
             parent += "/"
         else:
             parent, name = "", k
-        self.change_current_folder(parent)
-        self.navigate(restore_name=name)
+        self._go_to_prefix(parent, restore_name=name)

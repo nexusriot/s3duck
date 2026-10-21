@@ -1,4 +1,5 @@
-"""Copy and move, within a bucket and across profiles.
+"""Copy and move within one profile (across buckets too), and copy or sync
+into another profile.
 """
 
 from PyQt6.QtCore import QThread, Qt
@@ -341,10 +342,16 @@ class CrossProfileSyncDialog(QDialog):
             self._table.setItem(
                 row, 2, QTableWidgetItem(_human_bytes(action.get("size") or 0)))
             self._table.setItem(row, 3, QTableWidgetItem(action.get("reason", "")))
+        # summarize_sync_plan returns counts, not text. Handing the dict
+        # straight to setText raised TypeError inside the Compare slot, which
+        # PyQt6 turns into a process abort -- every successful compare took
+        # the app down. Spelled out the way the local sync dialog does it.
         summary = summarize_sync_plan(actions)
-        self._summary.setText("  ".join(
-            f"{kind}: {_human_bytes(count) if kind == 'bytes' else count}"
-            for kind, count in sorted(summary.items())))
+        bits = [f"{kind}: {count}" for kind, count in sorted(summary.items())
+                if kind != "bytes" and count]
+        self._summary.setText(
+            ("  ".join(bits) or "Nothing to compare")
+            + f"   ({_human_bytes(summary['bytes'])} to transfer)")
         self._ok_enabled(any(a["action"] != "skip" for a in actions))
 
     def plan(self) -> tuple:

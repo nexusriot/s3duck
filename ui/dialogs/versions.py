@@ -1,6 +1,7 @@
 """Per-object version history, and the diff between two of them.
 """
 
+import codecs
 import difflib
 import os
 import threading
@@ -80,8 +81,8 @@ class VersionDiffDialog(DialogDismissMixin, QDialog):
         for payload in (older_bytes, newer_bytes):
             if b"\x00" in (payload or b"")[:8192]:
                 return "", "One of these versions is binary; there is nothing to diff."
-        older_text = (older_bytes or b"").decode("utf-8", errors="replace")
-        newer_text = (newer_bytes or b"").decode("utf-8", errors="replace")
+        older_text = VersionDiffDialog._decode(older_bytes, truncated)
+        newer_text = VersionDiffDialog._decode(newer_bytes, truncated)
         if "\ufffd" in older_text or "\ufffd" in newer_text:
             return "", "One of these versions is not UTF-8 text."
         if older_text == newer_text:
@@ -91,6 +92,24 @@ class VersionDiffDialog(DialogDismissMixin, QDialog):
             older_text.splitlines(), newer_text.splitlines(),
             fromfile=older_label, tofile=newer_label, lineterm="")
         return "\n".join(diff), ""
+
+    @staticmethod
+    def _decode(payload, truncated) -> str:
+        """
+        UTF-8 text from a body that may have been cut at MAX_BYTES.
+
+        The ranged read stops at a byte count, not at a character, so a cut
+        through a multi-byte character left one replacement character at the
+        end — and that alone made the diff call the version "not UTF-8 text"
+        (about half the time for Cyrillic, two thirds for CJK). An incremental
+        decoder that is not told the input is final holds back exactly that
+        incomplete tail; a bad byte anywhere else is still caught.
+        """
+        payload = payload or b""
+        if not truncated:
+            return payload.decode("utf-8", errors="replace")
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        return decoder.decode(payload, final=False)
 
     def _load(self):
         model = self._model

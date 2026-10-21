@@ -33,6 +33,11 @@ class SecondPane(QWidget):
         self._model = model
         self._thread = None
         self._worker = None
+        # Where the listing in flight was asked for; see _on_listed.
+        self._listing_for = None
+        # Set by shutdown(): a result still queued for delivery must not
+        # start a fresh listing on a pane that is being torn down.
+        self._closed = False
         self._entries = []
         self._bucket = model.bucket or ""
         self._prefix = model.current_folder or ""
@@ -109,6 +114,12 @@ class SecondPane(QWidget):
     def remote_target(self) -> tuple:
         return self._bucket, self._prefix
 
+    def _target(self) -> tuple:
+        """Where the pane is pointed now, as a listing would be tagged."""
+        if self.current_mode() == self.LOCAL:
+            return (self.LOCAL, self._local_dir)
+        return (self.REMOTE, self._bucket, self._prefix)
+
     def local_target(self) -> str:
         return self._local_dir
 
@@ -174,6 +185,8 @@ class SecondPane(QWidget):
             self.set_remote(self._bucket, (self._prefix or "") + name + "/")
 
     def refresh(self):
+        if self._closed:
+            return
         self.path.setText(
             self._local_dir if self.current_mode() == self.LOCAL
             else f"s3://{self._bucket}/{self._prefix}")
@@ -184,16 +197,23 @@ class SecondPane(QWidget):
             self._show([])
             self.status.setText("No bucket selected")
             return
+        # The rows on screen belong to the place being left. F5/F6 resolve a
+        # selected row as the pane's CURRENT prefix plus its name, so until
+        # the new listing lands there must be nothing to select.
+        self._show([])
+        self.status.setText("Loading…")
         if self._thread is not None:
+            # One listing at a time; the one in flight is for somewhere else
+            # now, and _on_listed re-issues this refresh when it returns.
             return
         clone = self._model.clone_for_worker()
         clone.bucket = self._bucket
         prefix = self._prefix
+        self._listing_for = self._target()
 
         def _list(_w):
             return clone.list(prefix)
 
-        self.status.setText("Loading…")
         self._thread = QThread(self)
         self._worker = FuncWorker(_list)
         self._worker.moveToThread(self._thread)
@@ -225,11 +245,25 @@ class SecondPane(QWidget):
     def _on_listed(self, result, exc):
         thread, self._thread, self._worker = self._thread, None, None
         join_qthread(thread)
+        if self._closed:
+            return
+        listed_for, self._listing_for = self._listing_for, None
+        if listed_for != self._target():
+            # The pane moved on (another folder, bucket, or local mode) while
+            # this was listing. Shown, these rows would be resolved under
+            # the new location -- keys that were never listed there.
+            self.refresh()
+            return
         if exc is not None:
             self.status.setText(f"Could not list: {exc}")
             self._show([])
             return
-        rows = [(item.name, item.type_ == FSObjectType.FOLDER, int(item.size or 0))
+        # REGRESSION (crash): this read item.t -- an attribute of the main
+        # listing's QStandardItem rows, not of the Items model.list()
+        # returns -- so F3 inside any non-empty bucket raised in this slot
+        # and PyQt aborted the process.
+        rows = [(item.name, item.type_ == FSObjectType.FOLDER,
+                 int(item.size or 0))
                 for item in (result or [])]
         rows.sort(key=lambda row: (not row[1], row[0].lower()))
         self._show(rows)
@@ -251,5 +285,6 @@ class SecondPane(QWidget):
             f"{folders} folder(s), {len(self._entries) - folders} file(s)")
 
     def shutdown(self):
+        self._closed = True
         thread, self._thread, self._worker = self._thread, None, None
         join_qthread(thread)

@@ -3,11 +3,23 @@
 
 import botocore.exceptions
 from core.errors import TransferCancelled
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 
 class DeleteMixin:
     """Deleting objects, versions, prefixes and whole buckets.
     """
+
+    # Codes a backend answers DeleteObjects with when it has no multi-object
+    # delete at all. Every caller falls back to one DeleteObject per key.
+    MULTI_DELETE_UNSUPPORTED_CODES = ("NotImplemented", "MethodNotAllowed")
+
+    # How far a delete marker may predate the recorded start of a delete and
+    # still be taken as that delete's own. LastModified and the Date header
+    # both have one-second resolution, and the request that wrote the marker
+    # was in flight for a moment after the start was recorded.
+    UNDO_SLACK = timedelta(seconds=5)
 
     def delete_bucket_recursive(self, bucket_name: str, *, batch_size: int = 1000,
                                 cancel_event=None, log_fn=None):
@@ -74,21 +86,44 @@ class DeleteMixin:
 
         pending = []
         deleted = 0
+        # Set once the backend has refused DeleteObjects outright, so every
+        # later batch goes straight to single deletes instead of being
+        # refused again first. Deleting a folder already fell back like this
+        # (_delete_batch); emptying the whole bucket did not, so on the same
+        # backend a folder could be deleted and its bucket could not.
+        one_by_one = False
 
         def flush():
-            nonlocal pending, deleted
+            nonlocal pending, deleted, one_by_one
             if not pending:
                 return
-            resp = bucket_client.delete_objects(
-                Bucket=bucket_name,
-                Delete={"Objects": pending, "Quiet": True},
-            )
+            batch, pending = pending, []
+            resp = None
+            if not one_by_one:
+                try:
+                    resp = bucket_client.delete_objects(
+                        Bucket=bucket_name,
+                        Delete={"Objects": batch, "Quiet": True},
+                    )
+                except botocore.exceptions.ClientError as exc:
+                    code = exc.response.get("Error", {}).get("Code", "")
+                    if code not in self.MULTI_DELETE_UNSUPPORTED_CODES:
+                        raise
+                    one_by_one = True
+                    if log_fn:
+                        log_fn(f"{bucket_name}: batch delete unsupported here; "
+                               "deleting one by one")
+            if one_by_one:
+                for entry in batch:
+                    _check_cancel()
+                    # entry is {"Key"} or {"Key", "VersionId"} -- exactly
+                    # DeleteObject's own arguments.
+                    bucket_client.delete_object(Bucket=bucket_name, **entry)
             # Counted before the check so the log says how far the purge got;
             # a refused key would otherwise be reported as deleted and the
             # DeleteBucket that follows would fail with an unexplained
             # BucketNotEmpty.
-            deleted += len(pending)
-            pending = []
+            deleted += len(batch)
             if log_fn:
                 log_fn(f"{bucket_name}: deleted {deleted} object(s)")
             self.raise_on_delete_errors(resp, log_fn=log_fn)
@@ -214,7 +249,7 @@ class DeleteMixin:
             return
         except botocore.exceptions.ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
-            if code in ("NotImplemented", "MethodNotAllowed"):
+            if code in self.MULTI_DELETE_UNSUPPORTED_CODES:
                 if log_fn:
                     log_fn("Batch delete unsupported here; deleting one by one")
                 for k in keys:
@@ -272,14 +307,54 @@ class DeleteMixin:
             self.rebind_bucket(log_fn=log_fn)
             _do()
 
-    def undelete(self, key: str, log_fn=None) -> int:
+    @classmethod
+    def _undo_cutoff(cls, since, page):
+        """
+        The oldest LastModified a marker may carry and still belong to a
+        delete that started at *since* (an aware datetime, a naive local one,
+        or epoch seconds), on the SERVER's clock.
+
+        *since* was read off this machine's clock and LastModified is the
+        service's. The page's Date header says how far apart the two are now,
+        which is what keeps a skewed clock from either missing the delete's
+        own markers or sweeping in older ones.
+        """
+        if isinstance(since, (int, float)):
+            since = datetime.fromtimestamp(since, timezone.utc)
+        else:
+            since = since.astimezone(timezone.utc)
+        skew = timedelta(0)
+        headers = ((page or {}).get("ResponseMetadata") or {}).get(
+            "HTTPHeaders") or {}
+        if headers.get("date"):
+            try:
+                skew = (parsedate_to_datetime(headers["date"])
+                        - datetime.now(timezone.utc))
+            except (TypeError, ValueError):
+                skew = timedelta(0)
+        return since + skew - cls.UNDO_SLACK
+
+    def undelete(self, key: str, log_fn=None, since=None) -> int:
         """
         Undo a delete on a versioning-enabled bucket by removing the delete
-        markers it left behind. For a prefix ('foo/') every marker underneath
-        is removed. Returns how many objects came back.
+        markers it left behind. Returns how many objects came back.
+
+        *since* is when the delete being undone started. Only markers written
+        at or after it are removed: for a prefix ('foo/') the newest marker
+        of EVERY key underneath used to go, so undoing today's folder delete
+        also resurrected whatever had been deliberately deleted from that
+        folder a year ago. Without *since* nothing tells the two apart and
+        every newest marker is still removed.
 
         On a bucket without versioning there are no markers and the delete was
         permanent, so this reports 0 rather than pretending to succeed.
+
+        A marker whose version id is "null" is left alone and not counted.
+        That is a delete made while versioning was suspended, and S3 removes
+        the object's unversioned copy outright when it writes one: dropping
+        the marker cannot bring that copy back, only promote whatever older
+        version happens to sit beneath it, under a "restored" that would not
+        be true.
         """
         self._guard_write()
         if not self.bucket:
@@ -289,8 +364,12 @@ class DeleteMixin:
 
         def _fetch_markers():
             markers = []
+            unrecoverable = []
+            cutoff = None
             paginator = self.client.get_paginator("list_object_versions")
             for page in paginator.paginate(Bucket=self.bucket, Prefix=key):
+                if since is not None and cutoff is None:
+                    cutoff = self._undo_cutoff(since, page)
                 for dm in (page.get("DeleteMarkers", []) or []):
                     marker_key = dm.get("Key")
                     version_id = dm.get("VersionId")
@@ -302,11 +381,23 @@ class DeleteMixin:
                         continue
                     if exact and marker_key != key:
                         continue
+                    if cutoff is not None:
+                        written = dm.get("LastModified")
+                        if written is None:
+                            # Cannot be shown to be this delete's.
+                            continue
+                        if written.tzinfo is None:
+                            written = written.replace(tzinfo=timezone.utc)
+                        if written < cutoff:
+                            continue
+                    if version_id == "null":
+                        unrecoverable.append(marker_key)
+                        continue
                     markers.append((marker_key, version_id))
-            return markers
+            return markers, unrecoverable
 
         try:
-            markers = _fetch_markers()
+            markers, unrecoverable = _fetch_markers()
         except botocore.exceptions.ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
             if code == "NotImplemented":
@@ -316,7 +407,16 @@ class DeleteMixin:
             if not self._is_region_error(exc):
                 raise
             self.rebind_bucket(log_fn=log_fn)
-            markers = _fetch_markers()
+            markers, unrecoverable = _fetch_markers()
+
+        if unrecoverable and log_fn:
+            shown = ", ".join(unrecoverable[:5])
+            if len(unrecoverable) > 5:
+                shown += f" and {len(unrecoverable) - 5} more"
+            log_fn(f"cannot restore {len(unrecoverable)} object(s): {shown} -- "
+                   "deleted while versioning was suspended, which removes the "
+                   "unversioned copy outright. Any older versions are listed "
+                   "under Versions.")
 
         restored = 0
         for marker_key, version_id in markers:

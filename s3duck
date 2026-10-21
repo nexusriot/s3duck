@@ -1,3 +1,5 @@
 #!/bin/env bash
 
-python3 /usr/lib/s3duck/s3duck.py
+# Forward every argument: the desktop entry passes an s3:// URL as %U, and
+# `s3duck -p NAME s3://bucket/` / `s3duck --help` are parsed by s3duck.py.
+exec python3 /usr/lib/s3duck/s3duck.py "$@"

@@ -2,12 +2,15 @@
 """
 
 import botocore.exceptions
+import copy
 import threading
+from boto3.s3.transfer import TransferConfig
 from core.errors import ArchivedObject, TransferCancelled
 from s3.common import (
-    _BotoProgressAdapter, drop_unsendable_checksum_args, prefix_of,
-    run_parallel,
+    _BotoProgressAdapter, drop_unsendable_checksum_args, precondition_failed,
+    prefix_of, run_parallel,
 )
+from urllib.parse import quote, urlencode
 
 
 class CopyMixin:
@@ -100,6 +103,38 @@ class CopyMixin:
             f"(right-click → Restore from Glacier…), then try again."
         ) from exc
 
+    # Codes a tag read answers when tags are simply not available here --
+    # not permitted, or not implemented by the backend. The copy goes ahead
+    # without them, exactly as it did before tags were carried at all.
+    TAG_READ_UNAVAILABLE_CODES = (
+        "AccessDenied", "NotImplemented", "XNotImplemented",
+        "MethodNotAllowed", "InvalidRequest", "UnsupportedOperation",
+        "NoSuchTagSet", "NoSuchTagSetError",
+    )
+
+    def _sized_transfer_config(self, config, size):
+        """
+        The upload TransferConfig for streaming *size* bytes, with a part
+        size large enough for S3's 10 000 parts.
+
+        A streamed copy hands s3transfer a response body, which cannot seek,
+        so s3transfer never learns the size and never raises the part size
+        to fit -- its ChunksizeAdjuster only does that for a size it knows.
+        At the default 8 MiB every object over 80 GiB was refused on part
+        10 001, after 80 GiB had already been moved. The GET that opened the
+        body already said how long it is, so the size is applied here.
+        """
+        if size is None:
+            return config
+        preferred = int(getattr(config, "multipart_chunksize", 0)
+                        or self.multipart_chunksize_bytes)
+        part = self.upload_part_size(int(size), preferred)
+        if config is not None and part == preferred:
+            return config
+        tuned = copy.copy(config) if config is not None else TransferConfig()
+        tuned.multipart_chunksize = part
+        return tuned
+
     def copy_to_model(self, src_key: str, dst_model, dst_key: str,
                       progress_cb=None, cancel_event=None, log_fn=None):
         """
@@ -127,7 +162,8 @@ class CopyMixin:
             body, dst_model.bucket, dst_key,
             ExtraArgs=extra or None,
             Callback=callback,
-            Config=dst_model.transfer_cfg_upload,
+            Config=self._sized_transfer_config(
+                dst_model.transfer_cfg_upload, resp.get("ContentLength")),
         )
         if log_fn:
             log_fn(f"copied {self.bucket}/{src_key} -> "
@@ -183,7 +219,8 @@ class CopyMixin:
         dst_client.upload_fileobj(
             body, dst_bucket, dst_key,
             ExtraArgs=extra or None,
-            Config=self.transfer_cfg_upload,
+            Config=self._sized_transfer_config(
+                self.transfer_cfg_upload, resp.get("ContentLength")),
         )
         if log_fn:
             log_fn(f"streamed {src_key} -> {dst_bucket}/{dst_key}")
@@ -208,7 +245,8 @@ class CopyMixin:
             return 0
         return size if size > self.MAX_SINGLE_COPY_BYTES else 0
 
-    def _copy_create_args(self, src_key, *, src_bucket="", extra=None) -> dict:
+    def _copy_create_args(self, src_key, *, src_bucket="", extra=None,
+                          head=None) -> dict:
         """
         What CreateMultipartUpload must be told so a multipart copy preserves
         what CopyObject would have preserved on its own.
@@ -216,30 +254,61 @@ class CopyMixin:
         CopyObject has MetadataDirective=COPY; a multipart upload has no such
         thing — it defines the new object outright, so anything not passed
         here is lost. *extra* is the caller's own intent (a new storage class,
-        replacement metadata) and wins over what the source carried.
+        replacement metadata) and wins over what the source carried. *head*
+        is a HEAD of the source the caller already made. The tags are not
+        read here: _copy_multipart carries them for every caller.
         """
-        args = {}
-        try:
+        if head is None:
+            # Raised, not swallowed. A HEAD that failed used to mean a copy
+            # with no Content-Type and no metadata at all -- a different
+            # object -- and on a move the original is deleted right after.
             head = self.client.head_object(
                 Bucket=src_bucket or self.bucket, Key=src_key)
-        except Exception:
-            head = {}
+        args = {}
         for field in ("ContentType", "CacheControl", "ContentDisposition",
-                      "ContentEncoding", "ContentLanguage", "StorageClass",
-                      "ServerSideEncryption", "SSEKMSKeyId",
+                      "ContentEncoding", "ContentLanguage", "Expires",
+                      "StorageClass", "ServerSideEncryption", "SSEKMSKeyId",
                       "WebsiteRedirectLocation"):
             value = head.get(field)
             if value:
                 args[field] = value
+        if head.get("BucketKeyEnabled"):
+            args["BucketKeyEnabled"] = True
         metadata = head.get("Metadata") or {}
         if metadata:
             args["Metadata"] = dict(metadata)
         args.update(extra or {})
         return args
 
+    def _source_tagging(self, src_bucket, src_key, log_fn=None) -> str:
+        """
+        The source's tags as the url-encoded string CreateMultipartUpload
+        takes, or "" when it has none or they cannot be read.
+
+        CopyObject copies the tag set by default (TaggingDirective=COPY); a
+        multipart upload starts with none, so a move of a tagged object over
+        5 GiB used to delete the only copy of its tags.
+        """
+        try:
+            resp = self.client.get_object_tagging(Bucket=src_bucket, Key=src_key)
+        except botocore.exceptions.ClientError as exc:
+            code = (exc.response.get("Error") or {}).get("Code", "")
+            if code not in self.TAG_READ_UNAVAILABLE_CODES:
+                raise
+            if log_fn:
+                log_fn(f"tags of '{src_key}' cannot be read ({code}); "
+                       "copying it without them")
+            return ""
+        pairs = [(str(tag.get("Key")), str(tag.get("Value") or ""))
+                 for tag in (resp.get("TagSet") or [])
+                 if tag.get("Key") is not None]
+        # %20 rather than '+' for a space: unambiguous however the service
+        # decodes the header.
+        return urlencode(pairs, quote_via=quote) if pairs else ""
+
     def _copy_multipart(self, src_key, dst_key, *, size, dst_bucket="",
                         src_bucket="", create_args=None, log_fn=None,
-                        cancel_event=None):
+                        cancel_event=None, source_etag=None):
         """
         Server-side copy of an object too large for a single CopyObject.
 
@@ -247,17 +316,38 @@ class CopyMixin:
         at the destination out of UploadPartCopy ranges, which the service
         still performs itself — this is not the streaming fallback, and no
         part of the object travels through this process.
+
+        Every range is pinned to one version of the source with
+        CopySourceIfMatch. *source_etag* (and *size*) are what the caller's
+        own HEAD saw; ``None`` means nobody looked, and the source is asked.
         """
         self._guard_write()
         dst_bucket = dst_bucket or self.bucket
         src_bucket = src_bucket or self.bucket
+        if source_etag is None:
+            head = self.client.head_object(Bucket=src_bucket, Key=src_key)
+            source_etag = head.get("ETag") or ""
+            # The ranges must describe the version being pinned, not the
+            # size some earlier listing reported for an older one.
+            if head.get("ContentLength") is not None:
+                size = head["ContentLength"]
         size = int(size)
         part = self.copy_part_size(size, self.multipart_chunksize_bytes)
         total_parts = max(1, (size + part - 1) // part)
         copy_source = {"Bucket": src_bucket, "Key": src_key}
 
+        create = dict(create_args or {})
+        if "Tagging" not in create:
+            tagging = self._source_tagging(src_bucket, src_key, log_fn=log_fn)
+            if tagging:
+                create["Tagging"] = tagging
+        # Without the pin, a source replaced while its parts were being
+        # copied came out as the old version's first parts followed by the
+        # new one's last -- and a move then deleted the source.
+        pin = {"CopySourceIfMatch": source_etag} if source_etag else {}
+
         upload_id = self.client.create_multipart_upload(
-            Bucket=dst_bucket, Key=dst_key, **(create_args or {})
+            Bucket=dst_bucket, Key=dst_key, **create
         )["UploadId"]
         parts = {}
         lock = threading.Lock()
@@ -270,7 +360,7 @@ class CopyMixin:
             resp = self.client.upload_part_copy(
                 Bucket=dst_bucket, Key=dst_key, UploadId=upload_id,
                 PartNumber=number, CopySource=copy_source,
-                CopySourceRange=f"bytes={start}-{end}",
+                CopySourceRange=f"bytes={start}-{end}", **pin,
             )
             result = resp.get("CopyPartResult") or {}
             entry = {"PartNumber": number, "ETag": result.get("ETag")}
@@ -287,7 +377,7 @@ class CopyMixin:
                 Bucket=dst_bucket, Key=dst_key, UploadId=upload_id,
                 MultipartUpload={"Parts": [parts[n] for n in sorted(parts)]},
             )
-        except Exception:
+        except Exception as exc:
             # Nothing here is resumable the way an upload is: the parts are
             # copies the service made, not bytes this machine still holds, so
             # leaving them behind would only bill for an upload that nobody
@@ -297,6 +387,11 @@ class CopyMixin:
                     Bucket=dst_bucket, Key=dst_key, UploadId=upload_id)
             except Exception:
                 pass
+            if source_etag and precondition_failed(exc):
+                raise Exception(
+                    f"'{src_key}' changed on the server while it was being "
+                    "copied; nothing was written. Copy it again to get the "
+                    "new version.") from exc
             raise
         if log_fn:
             log_fn(f"copied {src_key} -> {dst_bucket}/{dst_key} server-side "
@@ -357,13 +452,20 @@ class CopyMixin:
 
         def _multipart(known_size):
             try:
+                # One HEAD serves both ends: the attributes the new object
+                # must keep, and the version (and size) every part is pinned
+                # to -- a size from a listing may describe an older one.
+                head = self.client.head_object(Bucket=self.bucket, Key=src_key)
+                if head.get("ContentLength") is not None:
+                    known_size = int(head["ContentLength"])
                 self._copy_multipart(
                     src_key, dst_key, size=known_size, dst_bucket=dst_bucket,
                     # The create args are read from the source's own HEAD,
-                    # which already names its class; passing it again only
-                    # matters when that HEAD is the one that failed.
+                    # which already names its class; passing it again is
+                    # what holds when the copy was asked to preserve it.
                     create_args=self._copy_create_args(
-                        src_key, extra=preserved),
+                        src_key, extra=preserved, head=head),
+                    source_etag=head.get("ETag") or "",
                     log_fn=log_fn, cancel_event=cancel_event)
             except botocore.exceptions.ClientError as exc:
                 # The size route and the location route are independent: a

@@ -2,20 +2,87 @@
 """
 
 import botocore.exceptions
+import errno
 import hashlib
 import json
 import os
+import socket
+import ssl
 import threading
-from core.errors import TransferCancelled
+from core.errors import DownloadIncomplete, TransferCancelled
+from core.integrity import etag_is_opaque
 from s3.common import (
-    CHECKSUM_DIGESTS, _BotoProgressAdapter, plan_prefix_download, prefix_of,
-    run_parallel, require_safe_local_destination,
+    CHECKSUM_DIGESTS, _BotoProgressAdapter, plan_prefix_download,
+    precondition_failed, prefix_of, require_safe_local_destination,
+    run_parallel,
 )
+
+
+class ObjectChangedDuringDownload(Exception):
+    """The object was replaced while its ranges were being fetched."""
+
+
+# OSError is also what a dropped connection or a timeout is: the builtin
+# ConnectionError and TimeoutError derive from it, and so do botocore's
+# connect and read timeouts, through the requests exceptions they inherit.
+# None of those is about one key's local name -- the next file would meet
+# them too -- so they still end the job, as themselves, where the transient
+# retry can recognise them.
+_NOT_A_LOCAL_WRITE = (ConnectionError, TimeoutError, socket.gaierror,
+                      ssl.SSLError, botocore.exceptions.BotoCoreError)
+# A full or read-only disk refuses every file after this one too. Carrying
+# on would fetch each remaining object only to throw its bytes away.
+_DISK_WIDE_ERRNOS = {code for code in (errno.ENOSPC, errno.EROFS,
+                                       getattr(errno, "EDQUOT", None))
+                     if code is not None}
+
+
+def _is_per_file_write_error(exc) -> bool:
+    """True for a local write refused because of THIS file and nothing else."""
+    return (isinstance(exc, OSError)
+            and not isinstance(exc, _NOT_A_LOCAL_WRITE)
+            and exc.errno not in _DISK_WIDE_ERRNOS)
 
 
 class DownloadMixin:
     """Getting bytes out, and proving they arrived intact.
     """
+
+    @staticmethod
+    def _discard_files(*paths):
+        """Remove whatever of *paths* exists; a file already gone is fine."""
+        for path in paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _check_ranged_reply(key, resp, start, end, data):
+        """
+        Refuse a ranged reply that is not the range that was asked for.
+
+        The bytes are written at *start* whatever they are. A proxy or
+        backend that ignores Range and answers with the whole object, or a
+        reply that is short, was therefore written as if it were the chunk —
+        a 4 KiB object came out as a 7 KiB file — and the result reported as
+        a finished download.
+        """
+        wanted = end - start + 1
+        if len(data) != wanted:
+            raise Exception(
+                f"Ranged read of '{key}' returned {len(data)} bytes for "
+                f"bytes={start}-{end} ({wanted} expected); the server did "
+                "not honour the range, so nothing was written")
+        content_range = str((resp or {}).get("ContentRange") or "")
+        if content_range:
+            # "bytes 0-1023/4096"
+            spec = content_range.split(" ", 1)[-1].split("/", 1)[0]
+            first = spec.split("-", 1)[0].strip()
+            if first.isdigit() and int(first) != start:
+                raise Exception(
+                    f"Ranged read of '{key}' returned {content_range!r} for "
+                    f"bytes={start}-{end}; nothing was written")
 
     @staticmethod
     def _skip_range_response_checksum(params=None, context=None, **_kwargs):
@@ -88,29 +155,63 @@ class DownloadMixin:
             if os.path.abspath(plan.base_dir) != os.path.abspath(folder_path):
                 require_safe_local_destination(folder_path, plan.base_dir)
             os.makedirs(plan.base_dir, exist_ok=True)
+            # Everything that will not be on disk at the end, and why: the
+            # plan's refusals now, the filesystem's own as they happen.
+            failed = [(k, plan.reasons[k]) for k in plan.unsafe]
+            failed_lock = threading.Lock()
             if log_fn:
-                for k in plan.unsafe:
-                    log_fn("skipped unsafe key (escapes the target "
-                           f"directory, or is too long for this "
-                           f"filesystem): {k}")
+                for k, why in failed:
+                    log_fn(f"skipped unsafe key {k}: {why}")
+
+            def _record_failure(name, path, exc):
+                if log_fn:
+                    log_fn(f"could not write {name} to {path}: {exc}")
+                with failed_lock:
+                    failed.append((name, str(exc)))
+
             for out_path in plan.dirs:
+                # Re-checked here, not just in the plan: the check is only
+                # as old as the last listing, and a symlink can appear under
+                # the root in between.
                 require_safe_local_destination(folder_path, out_path)
-                os.makedirs(out_path, exist_ok=True)
-            for _k, out_path, _size in plan.files:
-                require_safe_local_destination(folder_path, out_path)
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                try:
+                    os.makedirs(out_path, exist_ok=True)
+                except OSError as exc:
+                    # A local FILE already in the way, from an earlier
+                    # download. An empty folder is not worth the rest.
+                    if not _is_per_file_write_error(exc):
+                        raise
+                    rel = os.path.relpath(out_path, plan.base_dir)
+                    _record_failure(
+                        prefix_of(key) + rel.replace(os.sep, "/") + "/",
+                        out_path, exc)
+
+            def _fetch_one(item):
+                k, out_path, size = item
+                # The plan rules out what it can see coming; this is for what
+                # it cannot -- a local folder or a read-only file already
+                # where this object goes, a case-only clash on macOS, a name
+                # an NTFS or FAT drive mounted on Linux refuses. Each costs
+                # its own object. The parent folder is made by
+                # _download_object, so a clash there lands here too.
+                try:
+                    self._download_object(
+                        k, out_path, size=size, progress_cb=progress_cb,
+                        cancel_event=cancel_event, log_fn=log_fn,
+                        fetch=_download_one, local_root=folder_path)
+                except OSError as exc:
+                    if not _is_per_file_write_error(exc):
+                        raise
+                    _record_failure(k, out_path, exc)
 
             # Whole-prefix downloads are one job entry, so without this the
             # parallel-files setting would do nothing for "download a folder".
-            run_parallel(
-                plan.files,
-                lambda item: self._download_object(
-                    item[0], item[1], size=item[2], progress_cb=progress_cb,
-                    cancel_event=cancel_event, log_fn=log_fn,
-                    fetch=_download_one, local_root=folder_path),
-                self.parallel_files,
-                cancel_event=cancel_event,
-            )
+            # Cancellation and every other error still stop it at once.
+            run_parallel(plan.files, _fetch_one, self.parallel_files,
+                         cancel_event=cancel_event)
+            if failed:
+                raise DownloadIncomplete(
+                    failed, total=len(plan.files) + len(plan.unsafe))
             return
 
         # A whole-prefix download is filtered by plan_prefix_download above;
@@ -179,9 +280,11 @@ class DownloadMixin:
 
         # Large downloads take the ranged path so an interruption can resume
         # instead of starting over; small ones stay on the managed transfer.
-        # Without an ETag or a version id there is nothing to pin the ranges
-        # to, so the object could change between chunks; such a download
-        # stays on the managed transfer and simply gives up resuming.
+        # Only with something to pin the ranges to, though: an ETag (sent as
+        # IfMatch) or a version id. A HEAD that failed leaves neither, and an
+        # unpinned ranged download could splice two versions together — the
+        # managed transfer, which does its own HEAD and pins its own ranges,
+        # is the safe route then.
         version_id = (head or {}).get("VersionId")
         if (size is not None and int(size) >= int(self.resume_threshold)
                 and (etag or version_id not in (None, "", "null"))):
@@ -201,22 +304,24 @@ class DownloadMixin:
         try:
             fetch(self.bucket, key, staged, size)
 
+            # Verified while it is still the staged file. A mismatch found
+            # after the file is under its final name leaves the bad bytes
+            # there, where the next sync — same size, newer mtime — calls
+            # them up to date and never repairs them.
             if self.verify_downloads and (etag or head):
                 if not self.verify_download(staged, etag, head=head,
                                             log_fn=log_fn, key=key):
                     raise Exception(
                         f"Checksum mismatch after downloading '{key}'; the "
-                        "local file does not match the object's stored digest"
+                        "local file did not match the object's stored digest "
+                        "and was discarded"
                     )
         except BaseException:
             # Nothing resumes this path, so a staged file left behind is junk
             # next to the user's file -- and a stale one a later ranged
             # attempt would find in place of its own partial download.
             if staged != out_path:
-                try:
-                    os.remove(staged)
-                except OSError:
-                    pass
+                self._discard_files(staged)
             raise
         if staged != out_path:
             require_safe_local_destination(local_root, out_path)
@@ -267,10 +372,16 @@ class DownloadMixin:
                 log_fn(f"checksum skipped ({algorithm} needs the awscrt "
                        f"module): {path}")
             algorithm, expected = "", ""
+        # Under SSE-KMS, DSSE-KMS and SSE-C the ETag is not a digest of the
+        # bytes at all, single-part or multipart. Comparing it reported every
+        # intact download of such an object as corrupt, so it takes no part
+        # in the verdict; a stored checksum still does.
+        opaque = etag_is_opaque(head)
+        comparable_etag = "" if opaque else etag
         if algorithm and expected:
             if self.checksum_is_composite(expected):
                 verdict = self._verify_by_parts(
-                    path, key, etag, algorithm, log_fn=log_fn)
+                    path, key, comparable_etag, algorithm, log_fn=log_fn)
                 if verdict is not None:
                     return verdict
                 if log_fn:
@@ -286,6 +397,11 @@ class DownloadMixin:
                     log_fn(f"checksum ok ({algorithm}): {path}")
                 return True
 
+        if opaque:
+            if log_fn:
+                log_fn(f"checksum skipped (the ETag of an encrypted object "
+                       f"is not an MD5): {path}")
+            return True
         if not self.etag_is_md5(etag):
             verdict = self._verify_by_parts(path, key, etag, "", log_fn=log_fn)
             if verdict is not None:
@@ -310,6 +426,11 @@ class DownloadMixin:
         Download in fixed-size ranges into a '.s3duckpart' file, recording which
         chunks landed. An interrupted transfer resumes from the sidecar instead
         of restarting, and the chunks still download in parallel.
+
+        Every range is pinned to *etag* with If-Match, so a part file only
+        ever holds bytes of one version of the object. *head* is the HEAD
+        that ETag came from: it carries the stored checksum, which is what
+        verifies a large multipart or encrypted object the ETag cannot.
         """
         size = int(size)
         # Follows the configured part size, so one setting governs how both
@@ -335,7 +456,12 @@ class DownloadMixin:
             try:
                 with open(meta_path) as handle:
                     saved = json.load(handle)
-                if (saved.get("identity") == identity
+                # An empty ETag matches nothing on its own: a record keyed
+                # on one would resume against whatever the key holds by the
+                # next attempt. The identity carries the version id, which
+                # pins a versioned object just as well, so either will do.
+                if ((etag or version)
+                        and saved.get("identity") == identity
                         and saved.get("etag") == etag
                         and int(saved.get("size", -1)) == size
                         and int(saved.get("chunk_size", -1)) == chunk_size
@@ -374,6 +500,8 @@ class DownloadMixin:
         transferred = sum(min(chunk_size, size - i * chunk_size) for i in done)
 
         def _save_meta():
+            if not etag:
+                return      # never a resumable record without a version
             tmp = meta_path + ".tmp"
             require_safe_local_destination(root, tmp)
             with open(tmp, "w") as handle:
@@ -383,6 +511,7 @@ class DownloadMixin:
                            "chunks": sorted(done)}, handle)
             os.replace(tmp, meta_path)
 
+        changed = None
         handle = open(part_path, "r+b")
         try:
             def _fetch(index):
@@ -393,21 +522,31 @@ class DownloadMixin:
                 end = min(size, start + chunk_size) - 1
                 params = dict(Bucket=self.bucket, Key=key,
                               Range=f"bytes={start}-{end}")
+                # Pinned to the version the HEAD described. Without a pin an
+                # object replaced mid-download came back as the old one's
+                # first chunks followed by the new one's last: the right
+                # size, a "success", and a file that never existed on the
+                # server. The managed transfer has always done this.
                 if version:
                     params["VersionId"] = version
                 if etag:
                     params["IfMatch"] = f'"{etag}"'
-                resp = self.client.get_object(**params)
+                try:
+                    resp = self.client.get_object(**params)
+                except botocore.exceptions.ClientError as exc:
+                    if etag and precondition_failed(exc):
+                        raise ObjectChangedDuringDownload(
+                            f"'{key}' changed on the server while it was "
+                            "being downloaded; the partial download was "
+                            "discarded. Download it again to get the new "
+                            "version.") from exc
+                    raise
                 body = resp["Body"]
                 try:
                     data = body.read()
                 finally:
                     body.close()
-                if len(data) != end - start + 1:
-                    raise IOError(f"Incomplete range for '{key}': {start}-{end}")
-                content_range = resp.get("ContentRange")
-                if content_range and content_range != f"bytes {start}-{end}/{size}":
-                    raise IOError(f"Unexpected range for '{key}': {content_range}")
+                self._check_ranged_reply(key, resp, start, end, data)
                 if self.rate_limiter is not None:
                     self.rate_limiter.consume(len(data))
                 with state_lock:
@@ -423,19 +562,32 @@ class DownloadMixin:
                     progress_cb(size, min(current, size), key)
 
             pending = [i for i in range(total_chunks) if i not in done]
-            run_parallel(pending, _fetch, self.parallel_files,
-                         cancel_event=cancel_event)
+            try:
+                run_parallel(pending, _fetch, self.parallel_files,
+                             cancel_event=cancel_event)
+            except ObjectChangedDuringDownload as exc:
+                changed = exc
         finally:
             handle.close()
 
+        if changed is not None:
+            # The chunks already on disk belong to a version that is gone, so
+            # resuming from them could only splice it with the new one.
+            self._discard_files(part_path, meta_path)
+            raise changed
+
+        # Verified while it is still the partial file. A mismatch found after
+        # os.replace left the bad bytes under the final name, where the next
+        # sync — same size, newer mtime — called them up to date. Every chunk
+        # is marked done, so the partial is useless too and goes with it.
         if self.verify_downloads and not self.verify_download(
                 part_path, etag, head=head, log_fn=log_fn, key=key):
-            if os.path.exists(meta_path):
-                os.remove(meta_path)
+            self._discard_files(part_path, meta_path)
             raise Exception(
-                f"Checksum mismatch after downloading '{key}'; the local file "
-                "does not match the object's ETag"
+                f"Checksum mismatch after downloading '{key}'; the download "
+                "did not match the object's stored digest and was discarded"
             )
+
         if cancel_event is not None and cancel_event.is_set():
             raise TransferCancelled("cancelled")
         require_safe_local_destination(root, out_path)

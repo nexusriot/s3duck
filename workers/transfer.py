@@ -11,7 +11,9 @@ import threading
 import time
 import zipfile
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
-from model import ObjectExists, TransferCancelled, run_parallel
+from model import (
+    DownloadIncomplete, ObjectExists, TransferCancelled, run_parallel,
+)
 from s3.common import require_safe_local_destination
 from utils import describe_client_error, is_transient_error
 
@@ -165,17 +167,34 @@ class Worker(QObject):
             else:
                 msg = "downloading directory: %s -> %s" % (key, folder_path)
             self.progress.emit(msg)
-            self.data_model.download_file(
-                key, local_name, folder_path,
-                progress_cb=make_cb(),
-                cancel_event=self._cancel_event,
-                log_fn=self.progress.emit,
-            )
+            try:
+                self.data_model.download_file(
+                    key, local_name, folder_path,
+                    progress_cb=make_cb(),
+                    cancel_event=self._cancel_event,
+                    log_fn=self.progress.emit,
+                )
+            except DownloadIncomplete as exc:
+                # The rest of that folder is already on disk; raising here
+                # would make run_parallel abandon the job's OTHER folders
+                # for one name this filesystem cannot hold. Reported with
+                # theirs at the end instead.
+                with incomplete_lock:
+                    incomplete.append(exc)
 
+        incomplete = []
+        incomplete_lock = threading.Lock()
         run_parallel(self.job, _download_one, self._file_workers,
                      cancel_event=self._cancel_event)
 
         self.batch_progress.emit(int(done_all), int(total_bytes_all))
+        if incomplete:
+            # Each folder counts only its own objects. With other entries in
+            # the job, "1 of 5" would describe the folders that came up
+            # short and read as the whole job, so the count is left out.
+            raise DownloadIncomplete(
+                [f for exc in incomplete for f in exc.failures],
+                total=incomplete[0].total if len(self.job) == 1 else 0)
 
     @job_runner("delete")
     def delete(self):
@@ -387,23 +406,25 @@ class Worker(QObject):
     def move(self):
         # job = [(src_key, dst_key, is_folder, dst_bucket_or_None,
         #         storage_class)]
-        # Validate the entire batch before the first write. A copy into any
-        # other source destroys data that a later row still needs, and the
-        # final delete pass would remove that destination too.
-        rows = [self._copy_row(row) for row in self.job]
-        sources = {row[0] for row in rows}
-        folders = [row[0] for row in rows if row[2]]
-        for src, dst, folder, bucket, _storage in rows:
-            if bucket and bucket != getattr(self.data_model, "bucket", ""):
-                continue
-            overlap = dst if dst in sources else next(
-                (key for key in folders if dst.startswith(key)), None)
-            if overlap is None and folder:
-                overlap = next((key for key in sources if key.startswith(dst)), None)
-            if overlap is not None:
-                raise ValueError(
-                    f"Move destination '{dst}' overlaps source "
-                    f"'{overlap}'. Use a temporary name first.")
+        clash = self._move_clash()
+        if clash:
+            # Checked before anything is copied. When one row writes onto
+            # another row's source -- renaming img1->img2 alongside
+            # img2->img3 -- the copy pass overwrites img2 before it has been
+            # moved, and the delete pass then removes the copies it just
+            # made: three objects in, one out. Refusing is the only order
+            # that loses nothing; the user can rename in two steps.
+            src_key, dst_key = clash
+            if src_key == dst_key:
+                what = (f"'{dst_key}' is both a source and a destination "
+                        f"of this move")
+            else:
+                what = (f"this move writes '{dst_key}', which overlaps "
+                        f"'{src_key}' that it still has to carry")
+            raise ValueError(
+                f"Nothing was moved: {what}, so copying onto it would "
+                f"destroy the original before it was moved. Move or rename "
+                f"in two steps (via temporary names) instead.")
         for row in self.job:
             (src_key, dst_key, is_folder, dst_bucket,
              storage_class) = self._copy_row(row)
@@ -434,6 +455,42 @@ class Worker(QObject):
             self.progress.emit(f"removing {src_key}")
             self.data_model.delete(src_key, log_fn=self.progress.emit,
                                    cancel_event=self._cancel_event)
+
+    def _move_clash(self):
+        """
+        ``(src_key, dst_key)`` when some row would write onto, or inside, a
+        source of this same move in the same bucket; else None.
+
+        A destination in another bucket is a different object even under the
+        same key, so only rows landing in the model's own bucket count.
+        """
+        here = getattr(self.data_model, "bucket", None)
+        written = []
+        for row in self.job:
+            _src, dst_key, _is_folder, dst_bucket, _cls = self._copy_row(row)
+            if not dst_bucket or dst_bucket == here:
+                written.append(dst_key)
+        for row in self.job:
+            for dst_key in written:
+                if self._keys_overlap(row[0], dst_key):
+                    return row[0], dst_key
+        return None
+
+    @staticmethod
+    def _keys_overlap(src_key, dst_key) -> bool:
+        """
+        True when writing *dst_key* can touch *src_key*'s data: the same key,
+        a folder source holding the destination, or a destination folder the
+        source sits inside.
+        """
+        src_key, dst_key = str(src_key or ""), str(dst_key or "")
+        if not src_key or not dst_key:
+            return False
+        if src_key == dst_key:
+            return True
+        if src_key.endswith("/") and dst_key.startswith(src_key):
+            return True
+        return dst_key.endswith("/") and src_key.startswith(dst_key)
 
     @job_runner("bucket delete")
     def delete_buckets(self):
@@ -542,13 +599,30 @@ class Worker(QObject):
                 self.progress.emit(f"sync delete local {rel}")
                 try:
                     os.remove(local_path)
+                except FileNotFoundError:
+                    # Already gone is what was asked for (a re-run, or the
+                    # user deleted it meanwhile).
+                    pass
                 except OSError as exc:
+                    # Anything else -- permission, a file held open on
+                    # Windows -- leaves the folder NOT matching the source.
+                    # It used to be logged and the job reported "done".
+                    # Collected rather than raised so one locked file does
+                    # not abandon the rest of the plan.
                     self.progress.emit(f"could not delete {local_path}: {exc}")
+                    with local_failures_lock:
+                        local_failures.append(f"{local_path}: {exc}")
 
+        local_failures = []
+        local_failures_lock = threading.Lock()
         run_parallel(self.job, _sync_one, self._file_workers,
                      cancel_event=self._cancel_event)
 
         self.batch_progress.emit(int(done_all), int(total_bytes_all))
+        if local_failures:
+            self.error.emit(
+                f"{len(local_failures)} local file(s) could not be "
+                "deleted:\n\n" + "\n".join(local_failures[:10]))
 
     @job_runner("tagging")
     def set_tags(self):
@@ -646,19 +720,23 @@ class Worker(QObject):
 
     @job_runner("undo")
     def undelete(self):
-        # job = [(key,)]
+        # job = [(key,)] or [(key, since)]: *since* is when the delete being
+        # undone started, so only the markers it wrote are removed.
         restored = 0
-        for (key,) in self.job:
+        for row in self.job:
+            key = row[0]
+            since = row[1] if len(row) > 1 else None
             if self._cancel_event.is_set():
                 raise TransferCancelled("cancelled")
             self.progress.emit(f"restoring {key}")
-            restored += self.data_model.undelete(key, log_fn=self.progress.emit)
+            restored += self.data_model.undelete(
+                key, log_fn=self.progress.emit, since=since)
         if restored:
             self.progress.emit(f"restored {restored} object(s)")
         else:
             self.progress.emit(
-                "nothing to restore — the bucket has no delete markers "
-                "(versioning was not enabled, so the delete was permanent)"
+                "nothing to restore — no delete markers from that delete were "
+                "found (without versioning a delete is permanent)"
             )
 
     @job_runner("empty bucket")

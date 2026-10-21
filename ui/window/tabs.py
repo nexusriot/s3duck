@@ -66,17 +66,8 @@ class TabsMixin:
             return
         here = (self.data_model.bucket or "",
                 self.data_model.current_folder or "")
-        if self._tab_restore_pending:
-            self._tab_restore_pending = False
-            for position, entry in enumerate(self._tabs):
-                if self._entry_location(entry) == here:
-                    self._tab_switching = True
-                    try:
-                        self.tabbar.setCurrentIndex(position)
-                    finally:
-                        self._tab_switching = False
-                    self._update_history_buttons()
-                    return
+        if self._tab_restore_pending and self._restore_tab_for(here):
+            return
         index = self.tabbar.currentIndex()
         if 0 <= index < len(self._tabs):
             entry = self._tabs[index]
@@ -85,22 +76,77 @@ class TabsMixin:
                 self._history_navigating = False
             else:
                 self.push_history(entry, here)
+            self._view_tab = entry
             self._sync_tab_bar()
             self._save_tabs()
+        self._update_history_buttons()
+
+    def _restore_tab_for(self, here) -> bool:
+        """
+        The first landing after the tabs were loaded: select the saved tab
+        that points here. True when that settled it; False when the landing
+        should be recorded on the current tab as usual.
+
+        REGRESSION: the bucket list every window and every profile switch
+        opens on routinely lands before the remembered location. Matching no
+        tab, it was recorded onto the current one -- a saved tab replaced by
+        "All buckets", and persisted that way. That landing now waits for
+        the one that means something instead.
+        """
+        awaited = getattr(self, "_tab_restore_target", None)
+        on_the_way = here == ("", "") and awaited not in (None, here)
+        if not on_the_way:
+            for position, entry in enumerate(self._tabs):
+                if self._entry_location(entry) == here:
+                    self._tab_restore_pending = False
+                    self._tab_restore_target = None
+                    self._select_tab_quietly(position)
+                    self._view_tab = entry
+                    self._update_history_buttons()
+                    return True
+        if here == ("", ""):
+            # The bucket list on the way to the remembered location -- even
+            # when a saved tab IS the bucket list, selecting it here would
+            # have the real landing written over it a moment later.
+            self._update_history_buttons()
+            return True
+        self._tab_restore_pending = False
+        self._tab_restore_target = None
+        return False
+
+    def _select_tab_quietly(self, position):
+        """Move the tab bar without it asking the view to follow."""
+        self._tab_switching = True
+        try:
+            self.tabbar.setCurrentIndex(position)
+        finally:
+            self._tab_switching = False
+
+    def _revert_tab_to_view(self):
+        """
+        Put the tab bar back on the tab whose location the view shows.
+
+        A tab click moves the bar before anyone asks whether the view can
+        follow. Left there after a refused or failed move, the next refresh
+        wrote this view's location over the tab that was clicked.
+        """
+        view = getattr(self, "_view_tab", None)
+        for position, entry in enumerate(self._tabs):
+            if entry is view:
+                if position != self.tabbar.currentIndex():
+                    self._select_tab_quietly(position)
+                break
         self._update_history_buttons()
 
     def new_tab(self):
         """Open another tab on the current location."""
         if not self._tabs:
             self._tabs = [self._current_location()]
-        self._tabs.insert(self.tabbar.currentIndex() + 1,
-                          self._current_location())
+        entry = self._current_location()
+        self._tabs.insert(self.tabbar.currentIndex() + 1, entry)
         self._sync_tab_bar()
-        self._tab_switching = True
-        try:
-            self.tabbar.setCurrentIndex(self.tabbar.currentIndex() + 1)
-        finally:
-            self._tab_switching = False
+        self._select_tab_quietly(self.tabbar.currentIndex() + 1)
+        self._view_tab = entry
         self._save_tabs()
         self.statusBar().showMessage("New tab", 2000)
 
@@ -111,6 +157,11 @@ class TabsMixin:
             return
         index = self.tabbar.currentIndex() if index is None else int(index)
         if not (0 <= index < len(self._tabs)):
+            return
+        # Closing the tab on screen means showing another, which is a
+        # navigation; refused, the view would stay where the closed tab was
+        # and the next refresh would write that over a surviving tab.
+        if index == self.tabbar.currentIndex() and self._refuse_navigation():
             return
         del self._tabs[index]
         self._tab_switching = True
@@ -126,7 +177,15 @@ class TabsMixin:
         index = self.tabbar.currentIndex() if index is None else int(index)
         if not (0 <= index < len(self._tabs)) or len(self._tabs) <= 1:
             return
-        self._tabs = [self._tabs[index]]
+        kept = self._tabs[index]
+        here = (self.data_model.bucket or "",
+                self.data_model.current_folder or "")
+        # REGRESSION: keeping a tab other than the one on screen left the
+        # view where it was, and the next refresh wrote that location over
+        # the very tab the user chose to keep. Keeping it means going there.
+        if self._entry_location(kept) != here and self._refuse_navigation():
+            return
+        self._tabs = [kept]
         self._tab_switching = True
         try:
             while self.tabbar.count() > 1:
@@ -136,6 +195,7 @@ class TabsMixin:
             self._tab_switching = False
         self._sync_tab_bar()
         self._save_tabs()
+        self._goto_tab(0)
 
     def open_in_new_tab(self, bucket, prefix):
         """Add a tab for another location and switch to it."""
@@ -206,11 +266,18 @@ class TabsMixin:
         """Navigate the shared view to what a tab remembers."""
         if not (0 <= index < len(self._tabs)):
             return
-        self._update_history_buttons()
         entry = self._tabs[index]
         if (entry["bucket"] == (self.data_model.bucket or "")
                 and entry["prefix"] == (self.data_model.current_folder or "")):
+            self._view_tab = entry
+            self._update_history_buttons()
             return
+        reason = self._navigation_refusal()
+        if reason:
+            self._revert_tab_to_view()
+            self.statusBar().showMessage(reason, 2000)
+            return
+        self._update_history_buttons()
         self.open_location(entry["bucket"], entry["prefix"])
 
     def _tabs_settings_key(self) -> str:
@@ -245,6 +312,10 @@ class TabsMixin:
         except (ValueError, TypeError):
             entries = []
         self._tabs = entries or [self._current_location()]
+        # Which of them the view is on is only known once it lands.
+        self._view_tab = None
+        # Set by restore_last_location() when a reopen is on its way.
+        self._tab_restore_target = None
         # The window opens wherever the remembered last location says, which
         # is not necessarily tab 0. The first navigation selects the matching
         # tab instead of overwriting whichever one happens to be current.

@@ -13,8 +13,8 @@ from PyQt6.QtWidgets import (
 )
 from core.naming import _human_bytes
 from core.sync_plan import (
-    build_compare_plan, build_sync_plan, summarize_compare_plan,
-    summarize_sync_plan,
+    build_compare_plan, build_sync_plan, make_content_check,
+    summarize_compare_plan, summarize_sync_plan,
 )
 from model import safe_local_path
 from utils import (
@@ -36,8 +36,15 @@ class PaneCompareDialog(DialogDismissMixin, QDialog):
         "only_left": "only on the left",
         "only_right": "only on the right",
         "differs": "differs",
+        "unverified": "same size, different time",
         "same": "same",
     }
+
+    UNVERIFIED_TIP = (
+        "Same size, but the modification times disagree and the contents "
+        "could not be compared: the remote ETag is not a digest of the bytes "
+        "(a multipart upload at an unknown part size, or SSE-KMS/SSE-C "
+        "encryption), or the file is too large to hash here.")
 
     def __init__(self, parent, main_window, left, right):
         super().__init__(parent)
@@ -59,6 +66,9 @@ class PaneCompareDialog(DialogDismissMixin, QDialog):
 
         self._hide_same = QCheckBox("Hide identical files")
         self._hide_same.setChecked(True)
+        self._hide_same.setToolTip(
+            "Hides files whose contents were confirmed identical. Same-size "
+            "files that could not be checked stay listed.")
         self._hide_same.toggled.connect(self._render)
 
         self._exclude = QLineEdit()
@@ -116,13 +126,36 @@ class PaneCompareDialog(DialogDismissMixin, QDialog):
         return f"s3://{side[1]}/{side[2]}"
 
     @staticmethod
-    def read_side(side, model):
-        """``{rel: (size, mtime)}`` for one side of the comparison."""
-        if side[0] == "local":
-            return scan_local_tree(side[1])
+    def side_model(side, model):
+        """A worker-owned model bound to a remote side's bucket; None for a
+        local side."""
+        if side[0] != "remote":
+            return None
         clone = model.clone_for_worker()
         clone.bucket = side[1]
-        return clone.list_tree(side[2])
+        return clone
+
+    @staticmethod
+    def read_side(side, clone, cancel=None):
+        """
+        ``{rel: (size, mtime)}`` for a local side, ``{rel: (size, mtime,
+        etag)}`` for a remote one -- the ETag is what lets build_compare_plan
+        judge a pair on content instead of on timestamps.
+        """
+        if side[0] == "local":
+            return scan_local_tree(side[1])
+        return clone.list_tree(side[2], cancel_event=cancel, with_etag=True)
+
+    @staticmethod
+    def upload_part_sizes(model) -> tuple:
+        """
+        The multipart chunk sizes a remote object may have been uploaded
+        with: this app's configured one, and the 8 MiB default boto3 and the
+        AWS CLI share. A multipart ETag can only be rebuilt at the right one,
+        and these two cover a file just sent across with "Copy selected".
+        """
+        default = model.DEFAULT_MULTIPART_CHUNKSIZE_MB * 1024 * 1024
+        return (model.multipart_chunksize_bytes, default)
 
     def _compare(self):
         if self._thread is not None:
@@ -130,13 +163,21 @@ class PaneCompareDialog(DialogDismissMixin, QDialog):
         left, right = self._left, self._right
         model = self._mw.data_model
         exclude = self._exclude.text()
+        cancel = threading.Event()
+        self._cancel = cancel
         self._summary.setText("Comparing…")
         self._btn_compare.setEnabled(False)
 
         def _run(_worker):
+            models = (self.side_model(left, model),
+                      self.side_model(right, model))
             return build_compare_plan(
-                self.read_side(left, model), self.read_side(right, model),
-                exclude=exclude)
+                self.read_side(left, models[0], cancel),
+                self.read_side(right, models[1], cancel),
+                exclude=exclude,
+                content_check=make_content_check(
+                    left, right, models,
+                    part_sizes=self.upload_part_sizes(model), cancel=cancel))
 
         self._thread = QThread(self)
         self._worker = FuncWorker(_run)
@@ -149,11 +190,17 @@ class PaneCompareDialog(DialogDismissMixin, QDialog):
         self._thread.start()
 
     def stop_threads(self):
+        # Hashing local files can take a while; let a closing dialog stop it
+        # between files instead of leaving it to run on, detached.
+        if self._cancel is not None:
+            self._cancel.set()
         th, self._thread, self._worker = self._thread, None, None
+        self._cancel = None
         join_qthread(th)
 
     def _on_compared(self, result, exc):
         thread, self._thread, self._worker = self._thread, None, None
+        self._cancel = None
         join_qthread(thread)
         self._btn_compare.setEnabled(True)
         if exc is not None:
@@ -181,11 +228,16 @@ class PaneCompareDialog(DialogDismissMixin, QDialog):
             )
             for column, text in enumerate(cells):
                 self._table.setItem(index, column, QTableWidgetItem(text))
+            if row["status"] == "unverified":
+                self._table.item(index, 3).setToolTip(self.UNVERIFIED_TIP)
         counts = summarize_compare_plan(self._rows)
+        unverified = (f"{counts['unverified']} same size but different time, "
+                      if counts["unverified"] else "")
         self._summary.setText(
             f"{counts['only_left']} only on the left, "
             f"{counts['only_right']} only on the right, "
-            f"{counts['differs']} differ, {counts['same']} identical")
+            f"{counts['differs']} differ, {unverified}"
+            f"{counts['same']} identical")
         self._update_buttons()
 
     def selected_rows(self) -> list:
@@ -448,24 +500,36 @@ class SyncDialog(DialogDismissMixin, QDialog):
         lay.addWidget(self._table, 1)
         lay.addLayout(row)
 
+        # A reviewed plan belongs to the inputs it was built from. Run used
+        # to read the folder box and the direction afresh, so a plan previewed
+        # against folder A — "delete_local old.html" — ran against whatever
+        # folder had been typed since, deleting files nobody reviewed.
         self._plan_inputs = None
         self._scan_inputs = None
         self._local.textChanged.connect(self.invalidate_plan)
         self._up.toggled.connect(self.invalidate_plan)
-        self._exclude.textChanged.connect(self.invalidate_plan)
         self._delete_extra.toggled.connect(self.invalidate_plan)
+        self._exclude.textChanged.connect(self.invalidate_plan)
 
-    def inputs(self):
+    def inputs(self) -> tuple:
+        """Everything a plan depends on, as it stands in the form now.
+
+        The bucket and prefix belong in here as much as the form fields do:
+        the plan's keys mean something else entirely under another one.
+        """
         return (self._local.text().strip(), self.direction(),
                 self._exclude.text(), self._delete_extra.isChecked(),
                 self._model.bucket, self._prefix)
 
     def invalidate_plan(self, *_args):
+        """Drop the reviewed plan once any input it was built from changes."""
+        if self._plan_inputs is None and not self._actions:
+            return
         self._actions = []
         self._plan_inputs = None
-        self._btn_run.setEnabled(False)
         self._table.setRowCount(0)
-        self._info.setText("Inputs changed — preview the plan again.")
+        self._btn_run.setEnabled(False)
+        self._info.setText("Inputs changed — preview again.")
 
     def stop_threads(self):
         if self._cancel is not None:
@@ -497,6 +561,7 @@ class SyncDialog(DialogDismissMixin, QDialog):
         self._info.setText("Scanning both sides…")
         self._table.setRowCount(0)
         self._actions = []
+        self._plan_inputs = None
 
         prefix = self._prefix
         direction = self.direction()
@@ -509,7 +574,11 @@ class SyncDialog(DialogDismissMixin, QDialog):
 
         def _scan(_w):
             remote = clone.list_tree(prefix, cancel_event=cancel)
-            local = scan_local_tree(local_dir, require_complete=True)
+            # Strict when the plan deletes on the remote side whatever the
+            # scan does not report: an unreadable subfolder must be an error,
+            # not a subtree that "no longer exists locally".
+            local = scan_local_tree(
+                local_dir, strict=(direction == "upload" and delete_extra))
             return build_sync_plan(local, remote, direction=direction,
                                    delete_extra=delete_extra, exclude=exclude)
 
@@ -529,7 +598,10 @@ class SyncDialog(DialogDismissMixin, QDialog):
         join_qthread(th)
         self._btn_preview.setEnabled(True)
         if self._scan_inputs != self.inputs():
+            # Edited while the scan ran: this plan answers a question that is
+            # no longer the one on the form.
             self.invalidate_plan()
+            self._info.setText("Inputs changed while scanning — preview again.")
             return
         if exc is not None:
             self._info.setText(f"Could not build a plan: {exc}")
@@ -564,7 +636,7 @@ class SyncDialog(DialogDismissMixin, QDialog):
             self.invalidate_plan()
             return
         todo = self.actionable()
-        if not todo:
+        if not todo or self._plan_inputs is None:
             return
         summary = summarize_sync_plan(todo)
         deletes = summary.get("delete_remote", 0) + summary.get("delete_local", 0)
@@ -582,7 +654,8 @@ class SyncDialog(DialogDismissMixin, QDialog):
         if self._plan_inputs != self.inputs():
             self.invalidate_plan()
             return
-        local_dir, direction, _exclude, _delete, bucket, prefix = self._plan_inputs
+        (local_dir, direction, _exclude, _delete,
+         bucket, prefix) = self._plan_inputs
         self.accept()
         self._mw.start_sync(
             todo, local_dir, prefix, direction, bucket=bucket)

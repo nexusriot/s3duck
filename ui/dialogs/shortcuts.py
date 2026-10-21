@@ -1,4 +1,5 @@
-"""The keyboard reference, built from the window's real actions.
+"""The keyboard reference, built from the window's real actions plus the
+hand-kept list of keys that have no action (core.commands.LISTVIEW_KEY_HELP).
 """
 
 from PyQt6.QtWidgets import (
@@ -9,7 +10,8 @@ from PyQt6.QtWidgets import (
 
 class ShortcutsDialog(QDialog):
     """Keyboard reference — plain letters are reserved for type-to-search, so
-    every real shortcut carries a modifier and none of them are obvious."""
+    the shortcuts are modifier, function or navigation keys, none of which
+    are obvious."""
 
     def __init__(self, parent, rows):
         super().__init__(parent)

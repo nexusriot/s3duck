@@ -19,7 +19,10 @@ import workers.transfer as transfer_worker
 from PyQt6.QtCore import (
     QEvent, QItemSelectionModel, QObject, QPoint, QSettings, QThread, QUrl, Qt,
 )
-from PyQt6.QtGui import QAction, QKeyEvent, QKeySequence, QShortcut
+from PyQt6.QtGui import (
+    QAction, QContextMenuEvent, QKeyEvent, QKeySequence, QShortcut,
+)
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QMenu, QMessageBox, QWidget,
 )
@@ -32,6 +35,7 @@ from core.entries import Item
 from model import FSObjectType, Model, ReadOnlyError, TransferCancelled
 from s3duck import SettingsItem, preselect_row
 from settings_store import SettingsStore
+from ui.window.watch import WatchSkipped, plan_watch_pass
 from tests.support import (
     MIN_APP_SOURCES, PROJECT_ROOT, _FakeRunningThread, _RecordingDest,
     _StubModel, _ensure_qapp, make_main_window, make_model, patch_app_wide,
@@ -196,6 +200,83 @@ class ContextMenuTests(unittest.TestCase):
         labels = self._entries(self._window(read_only=True), read_only=True)
         self.assertIn("Copy to another profile…", labels)
 
+    def _two_files_selected(self):
+        """a-private.pdf then b-public.png selected, b current."""
+        win = self._window()
+        win.resize(900, 600)
+        win.show()
+        # The menu is refused while a listing is in flight; let the window's
+        # opening one land.
+        deadline = time.monotonic() + 5
+        while win._nav_in_flight and time.monotonic() < deadline:
+            self._app.processEvents()
+        win.data_model.bucket = "bkt"
+        win.data_model.current_folder = ""
+        win.modelToListView([
+            Item("a-private.pdf", FSObjectType.FILE, "2026-01-01", 1),
+            Item("b-public.png", FSObjectType.FILE, "2026-01-01", 1)])
+        self._app.processEvents()
+        sm = win.listview.selectionModel()
+        flags = (QItemSelectionModel.SelectionFlag.Select
+                 | QItemSelectionModel.SelectionFlag.Rows)
+        sm.select(win.ix_by_name("a-private.pdf"), flags)
+        sm.select(win.ix_by_name("b-public.png"), flags)
+        sm.setCurrentIndex(win.ix_by_name("b-public.png"),
+                           QItemSelectionModel.SelectionFlag.NoUpdate)
+        return win
+
+    def _choose(self, win, label, reason):
+        """Open the listing menu over b-public.png and pick ``label``."""
+        view = win.listview
+        pos = view.visualRect(win.ix_by_name("b-public.png")).center()
+        event = QContextMenuEvent(reason, pos, view.viewport().mapToGlobal(pos))
+
+        def _exec(menu, *_a, **_kw):
+            for action in menu.actions():
+                if action.text().startswith(label):
+                    return action
+            return None
+
+        with patch.object(QMenu, "exec", _exec):
+            win._listing_context_menu(event)
+
+    def test_single_object_entries_act_on_the_clicked_row(self):
+        """REGRESSION (critical): they acted on the FIRST SELECTED row. With
+        two files selected, right-click on b-public.png -> "Make public"
+        made a-private.pdf public-read, with no confirmation."""
+        win = self._two_files_selected()
+        made_public = []
+        with patch.object(main_window.MainWindow, "make_public_and_copy",
+                          lambda _s, key: made_public.append(key)):
+            self._choose(win, "Make public", QContextMenuEvent.Reason.Mouse)
+            self._choose(win, "Make public",
+                         QContextMenuEvent.Reason.Keyboard)
+        self.assertEqual(made_public, ["b-public.png", "b-public.png"])
+
+    def test_rename_from_the_menu_renames_the_clicked_row(self):
+        win = self._two_files_selected()
+        queued = []
+        with patch.object(main_window.QInputDialog, "getText",
+                          return_value=("c.png", True)), \
+                patch.object(main_window.MainWindow, "_destination_conflicts",
+                             lambda _s, keys, bucket=None: set()), \
+                patch.object(main_window.MainWindow, "assign_thread_operation",
+                             lambda _s, m, j, **kw: queued.append((m, j))):
+            self._choose(win, "Rename…", QContextMenuEvent.Reason.Mouse)
+        self.assertEqual(queued[0][1][0][:2], ("b-public.png", "c.png"))
+
+    def test_many_object_entries_still_take_the_whole_selection(self):
+        win = self._two_files_selected()
+        queued = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: queued.append((m, j))), \
+                patch_app_wide("QMessageBox") as box:
+            box.StandardButton = QMessageBox.StandardButton
+            box.question.return_value = QMessageBox.StandardButton.Yes
+            self._choose(win, "Delete", QContextMenuEvent.Reason.Mouse)
+        self.assertEqual(sorted(queued[0][1]),
+                         ["a-private.pdf", "b-public.png"])
+
     def test_the_bucket_list_menu_offers_bucket_operations(self):
         labels = self._entries(self._window(), bucket_mode=True,
                                kind=FSObjectType.BUCKET)
@@ -334,6 +415,33 @@ class MainWindowGuardTests(unittest.TestCase):
             stopped.set()
             thread.wait(5000)
             owner.close()
+
+    def test_closing_cuts_loose_a_thread_that_will_not_stop(self):
+        """A worker blocked inside an S3 call outlasts quit()+wait(). Left
+        parented to the window it is destroyed while running, which aborts
+        the process ("QThread: Destroyed while thread is still running")."""
+        class _Stuck(_FakeRunningThread):
+            def wait(self, msecs=None):
+                super().wait(msecs)
+                return False
+
+        stuck = _Stuck()
+        self.win._nav_orphan_threads = [stuck]
+        detached = []
+        with patch.object(utils, "detach_running_thread", detached.append):
+            self.win._shutdown_threads()
+        self.assertEqual(detached, [stuck])
+
+    def test_an_unhandled_key_in_the_listing_is_answered_with_a_bool(self):
+        """REGRESSION (crash): _listing_key fell off its end for every key it
+        does not handle, so eventFilter answered None -- and PyQt aborts the
+        app on a non-bool answer. The first arrow key in the listing did."""
+        for key in (Qt.Key.Key_Down, Qt.Key.Key_PageDown, Qt.Key.Key_Shift):
+            with self.subTest(key=key):
+                event = QKeyEvent(QEvent.Type.KeyPress, key,
+                                  Qt.KeyboardModifier.NoModifier)
+                self.assertIs(
+                    self.win.eventFilter(self.win.listview, event), False)
 
     def test_a_finished_navigation_thread_is_pruned(self):
         """The parking list must not grow for the lifetime of the window."""
@@ -1135,6 +1243,12 @@ class FolderDownloadOverwriteTests(unittest.TestCase):
         with patch.object(main_window, "DataModel", _StubModel):
             self.win = make_main_window(PROJECT_ROOT, self.settings)
         self.addCleanup(self.win.close)
+        # Selection actions are refused while a listing is in flight, so the
+        # window's opening listing has to land first.
+        deadline = time.monotonic() + 5
+        while not self.win.listview.isEnabled() and time.monotonic() < deadline:
+            self._app.processEvents()
+        self._app.processEvents()
 
     def test_download_target_resolves_folders_to_their_local_root(self):
         self.assertEqual(
@@ -1216,6 +1330,9 @@ class FolderDownloadOverwriteTests(unittest.TestCase):
                 fd.getExistingDirectory.return_value = tmp
                 self.win.data_model.bucket = "bkt"   # else download() no-ops
                 self.win.data_model.current_folder = ""
+                # The rows on screen are this bucket's, as after a listing
+                # (the selection model is faked, so nothing is rendered).
+                self.win._listing_location = ("bkt", "")
                 self.win.download()
         return started
 
@@ -1512,6 +1629,8 @@ class MainWindowBatchTests(unittest.TestCase):
 
         self.assertIsNotNone(self.win._undo_delete)
         self.assertEqual(self.win._undo_delete["keys"], ["a.txt", "dir/"])
+        # When the delete started, so undo touches only its own markers.
+        self.assertIsInstance(self.win._undo_delete["since"], float)
         self.assertTrue(self.win.btnUndoDelete.isEnabled())
 
     def test_delete_arms_undo_and_undo_queues_a_job(self):
@@ -1529,6 +1648,19 @@ class MainWindowBatchTests(unittest.TestCase):
         self.assertEqual(started, [("undelete", [("a.txt",), ("dir/",)])])
         # a one-shot action: it disarms once used
         self.assertFalse(self.win.btnUndoDelete.isEnabled())
+
+    def test_undo_hands_the_delete_start_to_the_worker(self):
+        """Without it every newest marker under the prefix went, resurrecting
+        what had been deleted from that folder long before."""
+        self.win.data_model.bucket = "bkt"
+        self.win._record_undoable_delete(["dir/"], since=1234.5)
+        started = []
+        with patch.object(main_window.QMessageBox, "question",
+                          return_value=QMessageBox.StandardButton.Yes), \
+             patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: started.append((m, j))):
+            self.win.undo_delete()
+        self.assertEqual(started, [("undelete", [("dir/", 1234.5)])])
 
     def test_undo_is_dropped_when_the_bucket_changes(self):
         self.win.data_model.bucket = "bkt"
@@ -1604,8 +1736,12 @@ class TransferHistoryTests(unittest.TestCase):
         self._app.processEvents()
 
     def _entry(self, method="upload", job=None, status="done"):
+        # Made where the window is, as assign_thread_operation makes them:
+        # a record without its bucket and profile is refused on replay.
         entry = main_window._QEntry(1, method, job or [("k", "/tmp/f")],
-                                    label="Upload 1 item(s)")
+                                    label="Upload 1 item(s)",
+                                    bucket=self.win.data_model.bucket or "",
+                                    profile=self.win.profile_name)
         entry.status = status
         return entry
 
@@ -1667,7 +1803,8 @@ class TransferHistoryTests(unittest.TestCase):
             self.win.rerun_history_entry(
                 {"method": "upload", "job": [["k", "/tmp/f"]],
                  "origin": self.win._transfer_origin(),
-                 "source_bucket": self.win.data_model.bucket})
+                 "source_bucket": self.win.data_model.bucket,
+                 "bucket": "bkt", "profile": self.win.profile_name})
         # JSON turned the tuples into lists; they come back as tuples
         self.assertEqual(started, [("upload", [("k", "/tmp/f")])])
 
@@ -2139,6 +2276,67 @@ class ClipboardTests(unittest.TestCase):
                           lambda _s, m, j, **kw: started.append((m, j))):
             self.win.paste_from_clipboard()
         self.assertEqual(started, [])
+class ManifestFileTests(unittest.TestCase):
+    """REGRESSION: the manifest was written and read in the platform's
+    default codec. On Windows (cp1252) a non-Latin key raised
+    UnicodeEncodeError out of the export slot -- an abort -- and reading back
+    turned keys into mojibake, reported missing AND added. Reading without
+    newline="" also rewrote a carriage return inside a quoted key."""
+
+    KEYS = ("ключ/отчёт.csv", "名前.txt", "line\rbreak.txt")
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def setUp(self):
+        settings = QSettings("s3duck-tests-manifest", "s3duck-tests-manifest")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            self.win = make_main_window(PROJECT_ROOT, settings)
+        self.addCleanup(self.win.close)
+        self.win.data_model.bucket = "bkt"
+        self.win.data_model.current_folder = ""
+        self.entries = [(key, 3, '"etag"', None) for key in self.KEYS]
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        self.path = os.path.join(folder, "m.csv")
+
+    def _opened(self):
+        """Run export then verify, recording how each open() was asked."""
+        calls = []
+        real_open = open
+
+        def _recording_open(path, mode="r", **kwargs):
+            calls.append((mode, kwargs.get("encoding"), kwargs.get("newline")))
+            return real_open(path, mode, **kwargs)
+
+        results = []
+        with patch.object(main_window, "open", _recording_open, create=True), \
+                patch.object(main_window, "run_with_progress",
+                             lambda *_a: (list(self.entries), None)), \
+                patch.object(main_window.QFileDialog, "getSaveFileName",
+                             return_value=(self.path, "")), \
+                patch.object(main_window.QFileDialog, "getOpenFileName",
+                             return_value=(self.path, "")), \
+                patch.object(main_window.MainWindow, "_show_manifest_result",
+                             lambda _s, meta, result: results.append(result)):
+            self.win.export_manifest()
+            self.win.verify_manifest()
+        return calls, results
+
+    def test_both_ends_are_utf8_and_newline_exact(self):
+        calls, _results = self._opened()
+        self.assertEqual(calls, [("w", "utf-8", ""), ("r", "utf-8", "")])
+
+    def test_unusual_keys_round_trip_unchanged(self):
+        _calls, results = self._opened()
+        result = results[0]
+        self.assertEqual(result["missing"], [])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["same"], len(self.KEYS))
 class KeyListActionTests(unittest.TestCase):
     """Main-window actions driven by an explicit key list rather than the
     listing selection."""
@@ -2480,6 +2678,75 @@ class WatchModeTests(unittest.TestCase):
         win._load_watch_config()
         self.assertEqual(win._watch_config, {})
 
+    REMOTE = {"a.txt": (1, 0.0), "deep/b.txt": (2, 0.0)}
+
+    def test_a_strict_scan_refuses_a_folder_that_is_not_there(self):
+        missing = os.path.join(tempfile.gettempdir(), "s3duck-no-such-dir-x")
+        self.assertEqual(utils.scan_local_tree(missing), {})
+        with self.assertRaises(OSError):
+            utils.scan_local_tree(missing, strict=True)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "root reads unreadable directories")
+    @unittest.skipIf(os.name == "nt", "POSIX permissions")
+    def test_a_strict_scan_refuses_an_unreadable_subfolder(self):
+        """A subtree that cannot be read is not an empty subtree: the
+        delete-extras plan would remove its remote copy."""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        locked = os.path.join(root, "locked")
+        os.mkdir(locked)
+        with open(os.path.join(locked, "x.txt"), "w") as handle:
+            handle.write("x")
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o700)
+        self.assertEqual(utils.scan_local_tree(root), {})
+        with self.assertRaises(OSError):
+            utils.scan_local_tree(root, strict=True)
+
+    def test_a_vanished_folder_plans_no_deletes(self):
+        """REGRESSION (critical, data loss): an unplugged drive or a renamed
+        folder scanned as EMPTY, and with delete extras on the next tick
+        deleted every remote object under the watched prefix."""
+        config = dict(self._config(), delete_extra=True)
+        missing = os.path.join(tempfile.gettempdir(), "s3duck-no-such-dir-y")
+        with self.assertRaises(WatchSkipped):
+            plan_watch_pass(missing, self.REMOTE, config)
+
+    def test_an_empty_folder_does_not_empty_a_full_prefix(self):
+        config = dict(self._config(), delete_extra=True)
+        empty = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
+        with self.assertRaises(WatchSkipped):
+            plan_watch_pass(empty, self.REMOTE, config)
+        # Without delete extras nothing is at stake, and the pass runs.
+        plan = plan_watch_pass(empty, self.REMOTE,
+                               dict(config, delete_extra=False))
+        self.assertFalse([a for a in plan if a["action"] != "skip"])
+
+    def test_a_skipped_pass_queues_nothing_and_says_so(self):
+        win, _ = self._window()
+        missing = os.path.join(tempfile.gettempdir(), "s3duck-no-such-dir-z")
+        with patch.object(main_window.MainWindow, "_watch_tick",
+                          lambda _s: None):
+            win.start_watch(dict(self._config(local=missing),
+                                 delete_extra=True))
+        self.addCleanup(win.stop_watch)
+        started = []
+        with patch.object(_StubModel, "list_tree",
+                          lambda _s, prefix="", **kw: dict(self.REMOTE)), \
+                patch.object(main_window.MainWindow, "start_sync",
+                             lambda _s, *a, **kw: started.append(a)):
+            win._watch_tick()
+            deadline = time.monotonic() + 5
+            while win._watch_thread is not None \
+                    and time.monotonic() < deadline:
+                self._app.processEvents()
+            self._app.processEvents()
+        self.assertEqual(started, [])
+        self.assertIn("skipped", win.watch_status.text())
+        self.assertIn(missing, win.watch_status.toolTip())
+
     def test_only_real_changes_are_queued(self):
         win, _ = self._window()
         with patch.object(main_window.MainWindow, "_watch_tick",
@@ -2583,6 +2850,14 @@ class WatchSourceSafetyTests(unittest.TestCase):
                 clone_for_worker=lambda: remote)
             self.start_sync = Mock()
             self.log = Mock()
+            # A skipped pass says so on the status strip as well as in the
+            # log: a watch that has stopped working must not keep looking
+            # like it is working.
+            self.watch_status = Mock()
+            self._watch_problem = ""
+
+        def statusBar(self):
+            return Mock()
 
         def transfers_active(self):
             return False
@@ -2596,7 +2871,9 @@ class WatchSourceSafetyTests(unittest.TestCase):
                 self._app.processEvents()
             self.assertIsNone(win._watch_thread)
             win.start_sync.assert_not_called()
-            self.assertIn("could not compare", win.log.call_args[0][0])
+            self.assertIn("skipped this pass", win.log.call_args[0][0])
+            self.assertIn("cannot read", win.log.call_args[0][0])
+            self.assertIn("skipped", win.watch_status.setText.call_args[0][0])
 class DualPaneTests(unittest.TestCase):
     """Two listings side by side, with F5/F6 running through the same queue."""
 
@@ -2627,6 +2904,16 @@ class DualPaneTests(unittest.TestCase):
             main_window.MainWindow, "assign_thread_operation",
             lambda _s, method, job, **kw: calls.append((method, job, kw)))
 
+    @staticmethod
+    def _no_conflicts(seen=None):
+        """The destination check, answered without a network round trip."""
+        def _check(_s, keys, bucket=None):
+            if seen is not None:
+                seen.append((list(keys), bucket))
+            return set()
+        return patch.object(main_window.MainWindow, "_destination_conflicts",
+                            _check)
+
     def test_the_pane_starts_hidden_and_toggles(self):
         win = self._window()
         self.assertFalse(win.dual_pane_active())
@@ -2639,7 +2926,9 @@ class DualPaneTests(unittest.TestCase):
         """REGRESSION: the pane read ``item.t`` from the listing, an
         attribute Item has never had, so every remote listing in the second
         pane died with an AttributeError before it could be shown."""
-        pane = types.SimpleNamespace(_thread=None, _worker=None, _show=Mock())
+        pane = types.SimpleNamespace(
+            _thread=None, _worker=None, _show=Mock(),
+            _closed=False, _listing_for="here", _target=lambda: "here")
         main_window.SecondPane._on_listed(
             pane,
             [Item("folder", FSObjectType.FOLDER, "", 0),
@@ -2722,7 +3011,7 @@ class DualPaneTests(unittest.TestCase):
         with patch.object(main_window.SecondPane, "refresh", lambda _s: None):
             win.second_pane.set_remote("other", "dst/")
         calls, patcher = self._queued()
-        with patcher, patch.object(
+        with patcher, self._no_conflicts(), patch.object(
                 main_window.MainWindow, "_collect_selected_targets",
                 lambda _s: [("a.txt", "here/a.txt", False)]):
             win.pane_transfer(move=False)
@@ -2740,7 +3029,7 @@ class DualPaneTests(unittest.TestCase):
             win.second_pane.set_remote("other", "src/")
         win.second_pane._entries = [("a.txt", False, 10)]
         calls, patcher = self._queued()
-        with patcher, patch.object(
+        with patcher, self._no_conflicts(), patch.object(
                 main_window.SecondPane, "selected",
                 lambda _s: [("a.txt", False, 10)]), \
                 patch.object(win.second_pane.view, "hasFocus",
@@ -2812,6 +3101,80 @@ class DualPaneTests(unittest.TestCase):
         # Nothing was being overwritten, so the writes carry the precondition.
         self.assertTrue(kw.get("if_none_match"))
 
+    def test_f6_to_a_remote_pane_asks_before_overwriting(self):
+        """REGRESSION (data loss): remote-to-remote F5/F6 skipped the check
+        paste and Copy/Move run, so a same-named object on the other side
+        was replaced silently -- and with F6 the source then deleted."""
+        win = self._window()
+        win.toggle_dual_pane()
+        with patch.object(main_window.SecondPane, "refresh", lambda _s: None):
+            win.second_pane.set_remote("other", "dst/")
+        calls, patcher = self._queued()
+        checked = []
+        with patcher, patch.object(
+                main_window.MainWindow, "_destination_conflicts",
+                lambda _s, keys, bucket=None: checked.append(
+                    (list(keys), bucket)) or {"dst/a.txt"}), \
+                patch_app_wide("OverwriteDialog") as dlg_cls, \
+                patch.object(
+                main_window.MainWindow, "_collect_selected_targets",
+                lambda _s: [("a.txt", "here/a.txt", False)]):
+            instance = dlg_cls.return_value
+            instance.exec.return_value = QDialog.DialogCode.Accepted
+            instance.choice.return_value = main_window.OverwriteDialog.SKIP
+            win.pane_transfer(move=True)
+        self.assertEqual(checked, [(["dst/a.txt"], "other")])
+        self.assertEqual(calls, [])
+
+    def test_bringing_a_remote_selection_here_asks_before_overwriting(self):
+        win = self._window()
+        win.toggle_dual_pane()
+        with patch.object(main_window.SecondPane, "refresh", lambda _s: None):
+            win.second_pane.set_remote("other", "src/")
+        calls, patcher = self._queued()
+        checked = []
+        with patcher, patch.object(
+                main_window.MainWindow, "_destination_conflicts",
+                lambda _s, keys, bucket=None: checked.append(
+                    (list(keys), bucket)) or {"here/a.txt"}), \
+                patch_app_wide("OverwriteDialog") as dlg_cls, \
+                patch.object(
+                main_window.SecondPane, "selected",
+                lambda _s: [("a.txt", False, 10)]), \
+                patch.object(win.second_pane.view, "hasFocus",
+                             lambda: True):
+            instance = dlg_cls.return_value
+            instance.exec.return_value = QDialog.DialogCode.Accepted
+            instance.choice.return_value = main_window.OverwriteDialog.SKIP
+            win.pane_transfer(move=False)
+        self.assertEqual(checked, [(["here/a.txt"], "bkt")])
+        self.assertEqual(calls, [])
+
+    def test_a_folder_sent_to_a_local_pane_is_checked(self):
+        """download() checks folder rows against the local tree; F5 to a
+        local pane did not, and overwrote it without a word."""
+        win = self._window()
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        win.toggle_dual_pane()
+        win.second_pane.set_local(directory)
+        calls, patcher = self._queued()
+        scanned = []
+        with patcher, patch.object(
+                main_window.MainWindow, "_folder_download_conflicts",
+                lambda _s, entries: scanned.append(entries) or {
+                    os.path.join(directory, "pics")}), \
+                patch_app_wide("OverwriteDialog") as dlg_cls, \
+                patch.object(
+                main_window.MainWindow, "_collect_selected_targets",
+                lambda _s: [("pics", "here/pics/", True)]):
+            instance = dlg_cls.return_value
+            instance.exec.return_value = QDialog.DialogCode.Accepted
+            instance.choice.return_value = main_window.OverwriteDialog.SKIP
+            win.pane_transfer(move=False)
+        self.assertEqual(scanned, [[("here/pics/", None, None, directory)]])
+        self.assertEqual(calls, [])
+
     def test_a_read_only_profile_transfers_nothing(self):
         win = self._window(read_only=True)
         win.toggle_dual_pane()
@@ -2879,6 +3242,69 @@ class TabRestoreOrderTests(unittest.TestCase):
         win.data_model.current_folder = "deep/"
         win._remember_current_tab()
         self.assertEqual(win.tab_locations()[1], ("b", "deep/"))
+
+    def test_the_bucket_list_landing_leaves_the_saved_tabs_alone(self):
+        """REGRESSION: the bucket list a window (or a profile switch) opens
+        on usually lands before the remembered location. Matching no tab, it
+        was written over the current one -- a saved tab lost, and persisted
+        that way."""
+        win = self._window()
+        win._tabs = [win._new_tab_entry("logs", "2026/"),
+                     win._new_tab_entry("photos", "")]
+        win._sync_tab_bar()
+        win._tab_restore_pending = True
+        win.data_model.bucket = ""
+        win.data_model.current_folder = ""
+
+        win._remember_current_tab()
+        self.assertEqual(win.tab_locations(),
+                         [("logs", "2026/"), ("photos", "")])
+
+        # ...and the remembered location, when it lands, still finds its tab
+        win.data_model.bucket = "photos"
+        win._remember_current_tab()
+        self.assertEqual(win.tabbar.currentIndex(), 1)
+        self.assertEqual(win.tab_locations(),
+                         [("logs", "2026/"), ("photos", "")])
+
+    def test_a_bucket_list_tab_is_not_taken_on_the_way_elsewhere(self):
+        """With a saved "All buckets" tab, the early bucket-list landing
+        selected it -- and the remembered location landing a moment later
+        was written over it."""
+        win = self._window()
+        win._tabs = [win._new_tab_entry("", ""),
+                     win._new_tab_entry("logs", "")]
+        win._sync_tab_bar()
+        win._tab_switching = True
+        win.tabbar.setCurrentIndex(0)
+        win._tab_switching = False
+        win._tab_restore_pending = True
+        win._tab_restore_target = ("logs", "")
+        win.data_model.bucket = ""
+        win._remember_current_tab()
+        win.data_model.bucket = "logs"
+        win._remember_current_tab()
+        self.assertEqual(win.tabbar.currentIndex(), 1)
+        self.assertEqual(win.tab_locations(), [("", ""), ("logs", "")])
+
+    def test_a_profile_switch_reopens_that_profiles_location(self):
+        """Its saved tabs are matched by that landing; without it the window
+        sat on the bucket list under a tab claiming somewhere else."""
+        win = self._window()
+        settings = win.settings
+        settings.beginGroup("common")
+        settings.setValue("last_location/dev", "photos/x/")
+        settings.endGroup()
+        entered = []
+        prof = types.SimpleNamespace(
+            name="dev", url="https://s3.amazonaws.com", region="us-east-1",
+            access_key="AK2", secret_key="SK2", no_ssl_check=False,
+            use_path=False, session_token="", read_only=False)
+        with patch.object(main_window.MainWindow, "enter_bucket_async",
+                          lambda _s, name, target_prefix=None:
+                          entered.append((name, target_prefix))):
+            win.apply_profile(prof)
+        self.assertEqual(entered, [("photos", "x/")])
 class PaneShortcutConflictTests(unittest.TestCase):
     """F5 was already Refresh. Two live bindings for one key make Qt call it
     ambiguous and fire neither, so the commander keys are armed only while
@@ -2925,6 +3351,55 @@ class PaneShortcutConflictTests(unittest.TestCase):
         self.assertIn("F5", self._keys(win.btnRefresh))
         self.assertFalse(win._pane_copy_shortcut.isEnabled())
         self.assertIn("F5", win.btnRefresh.text())
+
+    def test_listing_keys_do_not_reach_through_the_second_pane(self):
+        """REGRESSION: Ctrl+C/X/V, Shift+F2 and Ctrl+D were window-wide, so
+        Ctrl+X typed in the second pane cut the MAIN pane's selection and
+        the Ctrl+V after it moved the wrong objects."""
+        win = self._window()
+        win.resize(900, 600)
+        win.show()
+        win.activateWindow()
+        deadline = time.monotonic() + 5
+        while win._nav_in_flight and time.monotonic() < deadline:
+            self._app.processEvents()
+        win.data_model.bucket = "bkt"
+        win.modelToListView([Item("main.txt", FSObjectType.FILE, "", 1)])
+        win.enable_action_buttons()
+        win.listview.selectionModel().select(
+            win.ix_by_name("main.txt"),
+            QItemSelectionModel.SelectionFlag.Select
+            | QItemSelectionModel.SelectionFlag.Rows)
+        with patch.object(main_window.SecondPane, "refresh", lambda _s: None):
+            win.toggle_dual_pane()
+        downloads = []
+        win.btnDownload.triggered.connect(lambda *_a: downloads.append(1))
+        renames = []
+        with patch.object(main_window.QFileDialog, "getExistingDirectory",
+                          return_value=""), \
+                patch.object(main_window.MainWindow, "bulk_rename",
+                             lambda _s: renames.append(1)):
+            win.second_pane.view.setFocus()
+            self._app.processEvents()
+            for key, mods in ((Qt.Key.Key_X, Qt.KeyboardModifier.ControlModifier),
+                              (Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier),
+                              (Qt.Key.Key_D, Qt.KeyboardModifier.ControlModifier)):
+                QTest.keyClick(win.second_pane.view, key, mods)
+            self._app.processEvents()
+            self.assertIsNone(win._clipboard)
+            self.assertEqual(downloads, [])
+
+            # ...while in the listing they still work
+            win.listview.setFocus()
+            self._app.processEvents()
+            QTest.keyClick(win.listview, Qt.Key.Key_X,
+                           Qt.KeyboardModifier.ControlModifier)
+            QTest.keyClick(win.listview, Qt.Key.Key_D,
+                           Qt.KeyboardModifier.ControlModifier)
+            self._app.processEvents()
+        self.assertEqual(win._clipboard["mode"], "cut")
+        self.assertEqual(win._clipboard["items"][0][0], "main.txt")
+        self.assertEqual(downloads, [1])
 
     def test_no_two_window_shortcuts_claim_the_same_key(self):
         """A regression net for the whole keymap, not just F5."""
@@ -3083,6 +3558,204 @@ class NavigationHistoryTests(unittest.TestCase):
         entry = win._tabs[0]
         self.assertEqual(entry["history"], [("bkt", "a/")])
         self.assertFalse(win.can_go_back())
+class _ListingModel(_StubModel):
+    """A stub whose listings, failures and stalls a test spells out.
+
+    Class-level so the per-navigation clones (made with cls.__new__) answer
+    the same way the window's own model does.
+    """
+
+    LISTINGS = {}
+    FAILURES = {}
+    GATES = {}
+
+    def list_buckets(self):
+        return [Item(name, FSObjectType.BUCKET, "", 0)
+                for name in ("bkt", "logs")]
+
+    def list(self, fld, page_cb=None, max_items=0):
+        key = (self.bucket, fld or "")
+        gate = self.GATES.get(key)
+        if gate is not None:
+            gate.wait(5)
+        if key in self.FAILURES:
+            raise RuntimeError(self.FAILURES[key])
+        return [Item(name, kind, "2026-01-01 00:00:00", 5)
+                for name, kind in self.LISTINGS.get(key, [])]
+
+
+class ListingConsistencyTests(unittest.TestCase):
+    """
+    REGRESSION (critical): the model's prefix and the rows on screen came
+    apart, and every selection-based action resolved the visible rows under
+    the prefix the listing did NOT show. Three ways in: a jump (Ctrl+L, a
+    bookmark, Ctrl+P, a search hit) committed its prefix before navigate()
+    refused it because a transfer was running; a listing that failed left
+    the model on the failed prefix under the old, re-enabled rows; and while
+    any listing was in flight the toolbar and window keys stayed live on the
+    old selection. Delete on a visible root "report.csv" removed
+    "archive/report.csv".
+    """
+
+    ROOT = PROJECT_ROOT
+    F, D = FSObjectType.FILE, FSObjectType.FOLDER
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def setUp(self):
+        _ListingModel.LISTINGS = {
+            ("bkt", ""): [("archive", self.D), ("private", self.D),
+                          ("report.csv", self.F)],
+            ("bkt", "archive/"): [("report.csv", self.F)],
+            ("bkt", "archive/deep/"): [],
+        }
+        _ListingModel.FAILURES = {}
+        _ListingModel.GATES = {}
+        settings = QSettings("s3duck-tests-consistency",
+                             "s3duck-tests-consistency")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _ListingModel):
+            self.win = make_main_window(self.ROOT, settings,
+                                        profile_name="prod")
+        self.addCleanup(self.win.close)
+        self._settle()
+        self.win.enter_bucket_async("bkt")
+        self._settle()
+
+    def _settle(self, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self._app.processEvents()
+            if (self.win.listview.isEnabled()
+                    and not self.win.bucket_enter_active()
+                    and not self.win._nav_in_flight):
+                break
+        for _ in range(10):
+            self._app.processEvents()
+
+    def _rows(self):
+        return [self.win.proxy.index(r, 0).data()
+                for r in range(self.win.proxy.rowCount())]
+
+    def _select(self, *names):
+        sm = self.win.listview.selectionModel()
+        sm.clearSelection()
+        for row in range(self.win.proxy.rowCount()):
+            index = self.win.proxy.index(row, 0)
+            if index.data() in names:
+                sm.select(index,
+                          QItemSelectionModel.SelectionFlag.Select
+                          | QItemSelectionModel.SelectionFlag.Rows)
+
+    def _deleted(self):
+        """What Delete on the current selection would queue."""
+        queued = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: queued.append((m, j))), \
+                patch_app_wide("QMessageBox") as box:
+            box.StandardButton = QMessageBox.StandardButton
+            box.question.return_value = QMessageBox.StandardButton.Yes
+            self.win.on_toolbar_delete()
+        return queued
+
+    def _transfer_running(self):
+        self.win.thread = _FakeRunningThread()
+        self.addCleanup(setattr, self.win, "thread", None)
+
+    def test_a_jump_refused_during_a_transfer_keeps_the_prefix(self):
+        self._transfer_running()
+        with patch.object(main_window.QInputDialog, "getText",
+                          return_value=("s3://bkt/archive/", True)):
+            self.win.goto_location()
+        self.win.go_to_bookmark({"bucket": "bkt", "prefix": "archive/"})
+        self.win.goto_key("archive/report.csv")
+        self.assertEqual(self.win.data_model.current_folder, "")
+        self.win.thread = None
+        self._select("report.csv")
+        self.assertEqual(self._deleted(), [("delete", ["report.csv"])])
+
+    def test_a_failed_listing_puts_the_model_back_on_screen(self):
+        _ListingModel.FAILURES[("bkt", "private/")] = "AccessDenied"
+        self.win.list_doubleClicked(self.win.ix_by_name("private"))
+        self._settle()
+        self.assertEqual(self.win.data_model.current_folder, "")
+        self.assertIn("report.csv", self._rows())
+        self._select("report.csv")
+        self.assertEqual(self._deleted(), [("delete", ["report.csv"])])
+
+    def test_selection_actions_wait_for_a_listing_in_flight(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        _ListingModel.GATES[("bkt", "archive/")] = gate
+        self.win.list_doubleClicked(self.win.ix_by_name("archive"))
+        self._app.processEvents()
+        # The double-clicked row is still on screen and still selected.
+        self.assertIn("archive", self._rows())
+        self.assertFalse(self.win.listing_settled())
+        self.assertEqual(self._deleted(), [])
+        self.win.copy_to_clipboard(cut=True)
+        self.assertIsNone(self.win._clipboard)
+        gate.set()
+        self._settle()
+        self.assertTrue(self.win.listing_settled())
+        self.assertEqual(self._rows(), ["[..]", "report.csv"])
+
+    def test_a_refused_back_moves_nothing_and_the_next_move_counts(self):
+        self.win.list_doubleClicked(self.win.ix_by_name("archive"))
+        self._settle()
+        entry = self.win.current_tab_entry()
+        position = entry["pos"]
+        self._transfer_running()
+        self.win.goBack()
+        self.assertEqual(entry["pos"], position)
+        self.assertFalse(self.win._history_navigating)
+        self.win.thread = None
+        self.win.open_location("bkt", "archive/deep/")
+        self._settle()
+        self.win.goBack()
+        self._settle()
+        self.assertEqual(self.win.data_model.current_folder, "archive/")
+
+    def test_a_back_whose_listing_fails_is_taken_back(self):
+        self.win.list_doubleClicked(self.win.ix_by_name("archive"))
+        self._settle()
+        entry = self.win.current_tab_entry()
+        position = entry["pos"]
+        _ListingModel.FAILURES[("bkt", "")] = "SlowDown"
+        self.win.goBack()
+        self._settle()
+        self.assertEqual(self.win.data_model.current_folder, "archive/")
+        self.assertEqual(entry["pos"], position)
+        self.assertFalse(self.win._history_navigating)
+
+    def test_a_tab_click_refused_during_a_transfer_snaps_back(self):
+        self.win.open_in_new_tab("bkt", "archive/")
+        self._settle()
+        self.assertEqual(self.win.tabbar.currentIndex(), 1)
+        self._transfer_running()
+        self.win.tabbar.setCurrentIndex(0)
+        self.assertEqual(self.win.tabbar.currentIndex(), 1)
+        # What the finished transfer's refresh then does.
+        self.win.thread = None
+        self.win.navigate(force=True)
+        self._settle()
+        self.assertEqual(self.win.tab_locations(),
+                         [("bkt", ""), ("bkt", "archive/")])
+
+    def test_closing_the_other_tabs_goes_to_the_one_kept(self):
+        self.win.open_in_new_tab("bkt", "archive/")
+        self._settle()
+        self.win.tabbar.setCurrentIndex(0)
+        self._settle()
+        self.win.close_other_tabs(1)
+        self._settle()
+        self.assertEqual(self.win.data_model.current_folder, "archive/")
+        self.win.navigate()
+        self._settle()
+        self.assertEqual(self.win.tab_locations(), [("bkt", "archive/")])
 class FailureDetailTests(unittest.TestCase):
     """str(exc) throws away the request id, which is the first thing any
     provider's support desk asks for."""
@@ -3335,7 +4008,10 @@ class _QueueHarness(main_window.TransferQueueMixin):
         self.data_model = make_model(bucket="first")
         self._queue_next_id = 1
         self._queue_entries = {}
-        self._queue_panel = types.SimpleNamespace(add_entry=lambda entry: None)
+        self._queue_panel = types.SimpleNamespace(
+            add_entry=lambda entry: None,
+            set_retried=lambda entry_id, retried: None,
+            rows_cleared=types.SimpleNamespace(connect=lambda _slot: None))
         self.history = []
         self.started = []
 
@@ -3344,6 +4020,9 @@ class _QueueHarness(main_window.TransferQueueMixin):
 
     def transfers_active(self):
         return False
+
+    def statusBar(self):
+        return Mock()
 
     def _credentials_ok_for_transfer(self):
         return True
@@ -3373,13 +4052,23 @@ class QueueBindingTests(unittest.TestCase):
 
         win.data_model.bucket = "second"
         win.data_model.access_key = "another-account"
-        win.profile_name = "other"
         win._requeue(original)
 
         retried = win._worker_model_for(win.started[-1])
         self.assertEqual(retried.bucket, "first")
         self.assertNotEqual(retried.access_key, "another-account")
         self.assertEqual(win.started[-1].origin, original.origin)
+
+    def test_a_retry_under_another_profile_is_refused_not_rebound(self):
+        """The job's keys mean nothing -- or something else -- in another
+        account, so there is no binding that would make the retry correct."""
+        win = _QueueHarness()
+        win.assign_thread_operation("delete", ["important"])
+        original = win.started[-1]
+
+        win.profile_name = "other"
+        self.assertIsNone(win._requeue(original))
+        self.assertEqual(win.started, [original])
 
     def test_a_history_replay_restores_the_bucket_after_navigation(self):
         win = _QueueHarness()
@@ -3410,11 +4099,13 @@ class QueueBindingTests(unittest.TestCase):
         win._record_history(win.started[-1])
         win.data_model.access_key = "another-account"
 
-        with patch("ui.window.transfers.QMessageBox.information") as inform:
+        refused = []
+        with patch.object(_QueueHarness, "_refuse_history_rerun",
+                          lambda _s, text: refused.append(text)):
             win.rerun_history_entry(win.history[0])
             win.rerun_history_entry({"method": "delete", "job": ["important"]})
         self.assertEqual(len(win.started), 1)      # neither one was queued
-        self.assertEqual(inform.call_count, 2)
+        self.assertEqual(len(refused), 2)
 class OverwriteRouteTests(unittest.TestCase):
     """Every route that writes to a destination asks before replacing what is
     already there, against the destination it will actually write to."""
@@ -3427,7 +4118,7 @@ class OverwriteRouteTests(unittest.TestCase):
         """A window stub whose destination check reports a conflict and whose
         overwrite prompt is cancelled, so a route that skips either one is
         visible as a queued job."""
-        return types.SimpleNamespace(
+        win = types.SimpleNamespace(
             data_model=types.SimpleNamespace(bucket="source",
                                              current_folder="p/"),
             _collect_selected_targets=lambda: [("file", "p/file", False)],
@@ -3436,6 +4127,12 @@ class OverwriteRouteTests(unittest.TestCase):
             _destination_conflicts=Mock(return_value={"p/file"}),
             _resolve_overwrites=Mock(return_value=None),
             assign_thread_operation=Mock())
+        # Both pane routes share one overwrite check, and it is the helper
+        # that works the destination bucket out of the job rows -- so the
+        # real one runs here rather than a stub that cannot get that wrong.
+        win._resolve_pane_overwrites = types.MethodType(
+            main_window.MainWindow._resolve_pane_overwrites, win)
+        return win
 
     def test_a_copy_to_the_remote_pane_honours_a_cancelled_prompt(self):
         win = self._window()
@@ -3455,7 +4152,7 @@ class OverwriteRouteTests(unittest.TestCase):
             selected=lambda: [("file", False, 4)],
             remote_target=lambda: ("other", "elsewhere/"))
         main_window.MainWindow._transfer_from_second_pane(win, True)
-        win._destination_conflicts.assert_called_once_with(["p/file"])
+        win._destination_conflicts.assert_called_once_with(["p/file"], "source")
         win.assign_thread_operation.assert_not_called()
 
     def test_a_folder_download_to_the_pane_checks_what_is_under_it(self):

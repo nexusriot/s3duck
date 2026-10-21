@@ -12,14 +12,26 @@ from core.formatting import _scaled_bar_values
 class _QEntry:
     def __init__(self, entry_id, method, job, need_refresh=True, label="",
                  source_bucket="", dest_model=None, source_model=None,
-                 if_none_match=False, origin=None):
+                 if_none_match=False, origin=None, bucket=None,
+                 profile=None):
         self.entry_id = entry_id
         self.method = method
         self.job = job
         self.need_refresh = need_refresh
         self.label = label
-        # Keep the source bucket even for ordinary jobs: history replay and
-        # retries must not inherit the bucket the window happens to show.
+        # Where the job was made: the bucket that was open and the profile
+        # whose credentials it was meant for. Job rows hold bare keys, so
+        # without these a retry ran against whatever bucket happened to be
+        # open by then -- a failed delete of "logs/" retried after browsing
+        # elsewhere deleted the OTHER bucket's "logs/". None means unknown
+        # (an entry built by hand rather than through the queue).
+        self.bucket = bucket
+        self.profile = profile
+        # Set when the job's SOURCE keys live in a different bucket than the
+        # one being viewed (cross-bucket paste); the worker's model is bound
+        # to it before the transfer starts. Kept even for ordinary jobs:
+        # history replay and retries must not inherit the bucket the window
+        # happens to show.
         self.source_bucket = source_bucket or ""
         # Set for a cross-profile copy: a second model, built from another
         # profile's credentials, that the worker writes through.
@@ -39,8 +51,19 @@ class _QEntry:
         # so a finished job can still be reported accurately hours later.
         self.error_details = ""
         self.error_transient = False
-        # How many times this job has been re-queued automatically.
+        # How many times this job has been re-queued automatically. Handed on
+        # to the entry the retry creates: counted per entry, every retry
+        # started again from zero and "retry once" retried forever.
         self.auto_retries = 0
+        # Set once this job has been queued again (by hand or automatically).
+        # The row keeps its "error" -- that attempt did fail -- but it is no
+        # longer outstanding: "Retry failed" re-ran it every time otherwise,
+        # including after the retry had succeeded.
+        self.retried = False
+        # When the first attempt of this job started (epoch seconds), kept
+        # across retries. Undoing a delete removes only the markers written
+        # since then, not every marker that ever piled up under the prefix.
+        self.started_at = None
 
 
 class _QueueRow(QWidget):
@@ -62,6 +85,7 @@ class _QueueRow(QWidget):
     def __init__(self, entry, parent=None):
         super().__init__(parent)
         self._entry_id = entry.entry_id
+        self._retried = False
 
         icon = QLabel(self._OP_ICONS.get(entry.method, "?"))
         icon.setFixedWidth(20)
@@ -126,9 +150,17 @@ class _QueueRow(QWidget):
             self._bar.setRange(0, 1)
             self._bar.setValue(1 if status == "done" else 0)
             self._cancel_btn.setEnabled(False)
-        # Only an unfinished job is worth re-running.
-        self._retry_btn.setVisible(status in ("cancelled", "error"))
+        # Only an unfinished job is worth re-running, and only once: a job
+        # already queued again lives on in the row its retry created.
+        self._retry_btn.setVisible(
+            status in ("cancelled", "error") and not self._retried)
         self._details_btn.setVisible(status == "error")
+
+    def set_retried(self, retried: bool):
+        self._retried = bool(retried)
+        self._retry_btn.setToolTip(
+            "Already queued again" if self._retried else "Retry")
+        self.set_status(self._status.text())
 
     def set_byte_progress(self, done: int, total: int):
         range_max, value = _scaled_bar_values(done, total)
@@ -142,6 +174,10 @@ class TransferQueuePanel(QWidget):
     details_requested = pyqtSignal(int)
     retry_all_requested = pyqtSignal()
     history_requested = pyqtSignal()
+    # The entry ids whose rows "Clear done" removed, so the window can forget
+    # those jobs too -- otherwise "Retry failed" kept re-running rows the user
+    # had already dismissed and could no longer see.
+    rows_cleared = pyqtSignal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -213,6 +249,11 @@ class TransferQueuePanel(QWidget):
         if row is not None:
             row.set_byte_progress(done, total)
 
+    def set_retried(self, entry_id: int, retried: bool = True):
+        row = self._rows.get(entry_id)
+        if row is not None:
+            row.set_retried(retried)
+
     def _clear_done(self):
         to_remove = [
             eid for eid, row in list(self._rows.items())
@@ -224,3 +265,5 @@ class TransferQueuePanel(QWidget):
             row.deleteLater()
         if not self._rows:
             self.hide()
+        if to_remove:
+            self.rows_cleared.emit(to_remove)

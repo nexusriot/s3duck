@@ -99,6 +99,9 @@ class CredentialsMixin:
             self.stop_watch()
         self._load_watch_config()
         self.navigate(show_loading=True)
+        # As a fresh window does: the profile reopens where it was left, and
+        # that landing is what selects its saved tab (see _restore_tab_for).
+        self.restore_last_location()
         self.update_window_title()
 
         if old_profile and old_profile != self.profile_name:

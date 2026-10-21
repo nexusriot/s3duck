@@ -47,8 +47,9 @@ credential-storage choice in 0.18.0. What is left:
   handle in the UI.
 - **Filter box** — type to narrow the list once a user has more than a screen
   of profiles.
-- **Duplicate-name validation** — Add/Edit accept a name already in use, and
-  only import de-duplicates (`-imported` suffix).
+- **Duplicate-name validation** — Add/Edit accept a name already in use;
+  only import (`-imported` suffix) and Copy profile (`-copy`, `-copy-2`, …)
+  de-duplicate.
 - **Connection state per row** — show the result of the last probe (reachable
   / refused / never tried) so a broken profile is visible before Run.
 
@@ -128,6 +129,10 @@ credential-storage choice in 0.18.0. What is left:
 - A cross-profile copy or sync cannot be re-run from transfer history: the
   stored record is JSON and never held the other profile's connection. The
   history dialog says so rather than queueing a job that must fail.
+- No sync is re-run from history at all: its plan — including what to
+  delete — was worked out from both sides as they were then. A re-run is also
+  refused for a record made under another profile, and for one written before
+  history recorded the bucket, rather than guessing the bucket that is open.
 - Cancelling a resumable upload leaves its parts on the server on purpose,
   since that is what the next attempt resumes from. Abandoned ones are cleaned
   up from Tools -> Incomplete uploads.
@@ -136,22 +141,28 @@ credential-storage choice in 0.18.0. What is left:
   inside a string literal is coloured as a comment.
 - Editing in the preview is offered only for text that arrived whole and
   decoded cleanly as UTF-8: saving a truncated body would delete the tail, and
-  saving a replacement-charactered decode would corrupt the object.
+  saving a replacement-charactered decode would corrupt the object. Nor for
+  text the editor would not hand back byte-for-byte — CR or CRLF line endings,
+  a byte-order mark, non-breaking spaces, U+2028/U+2029 — since saving would
+  rewrite them throughout the file. A save carries the object's headers,
+  metadata, storage class, encryption and tags, but not its ACL or Object
+  Lock settings, which need calls of their own.
 - Drag-out must download the selection before the drag can start (Qt drags
   are synchronous); a large selection means a visible preparation dialog.
 - A whole-folder download inside a parallel batch multiplies workers
   (files-in-flight × chunk fan-out); concurrency is bounded but can exceed
   the configured file parallelism.
 - Verifying a multipart object needs its real part boundaries, which come
-  from `GetObjectAttributes`. AWS answers it and so does MinIO (the
-  end-to-end suite asserts this); on a backend that does not, the old
-  behaviour stands — verification reports the object as "not comparable" and
-  passes. Uploading with an additional CRC32 checksum (Transfer settings)
+  from `GetObjectAttributes`. AWS answers it; the end-to-end suite calls it
+  against MinIO and prints how many parts came back, but passes either way.
+  On a backend that does not answer it, the old behaviour stands —
+  verification reports the object as "not comparable" and passes. Uploading with an additional CRC32 checksum (Transfer settings)
   makes an object verifiable everywhere, since a full-object checksum needs
   no part boundaries at all.
 - Bundled PNG twins are a fixed 48px raster, so on a Qt build without the SVG
   plugin icons do not scale as crisply as the SVGs would. Installing
-  `python3-pyqt6.qtsvg` restores vector icons; the .deb recommends it.
+  `python3-pyqt6.qtsvg` restores vector icons; the .deb depends on it, so
+  this only affects source and pip installs on such a Qt.
 - Bucket settings offers every document AWS does, and a backend is free to
   implement only some of them. The MinIO the end-to-end suite runs against
   stores lifecycle rules, a bucket policy and bucket tags, and refuses CORS
@@ -205,6 +216,9 @@ credential-storage choice in 0.18.0. What is left:
   matches when the same part size was used again.
 - An upload rule matches the destination key and the first match wins;
   writing tags with one needs the same permission as tagging by hand.
+- Upload rules and the Content-Type override table are app-wide, not per
+  profile: both live in Transfer settings and apply to every profile, so a
+  rule written for one account's bucket layout also fires on another's.
 - A job is retried automatically at most once, and only when the service
   itself asked (throttling, 5xx, a dropped connection). The wait is held by a
   timer owned by the window, so closing it cancels a retry that has not fired
@@ -212,8 +226,11 @@ credential-storage choice in 0.18.0. What is left:
   refusal, and retrying a refusal on a timer is just a slower refusal.
 - Only a launch that names a location is handed to a running window; a bare
   `s3duck` still opens its own, because two profiles side by side is a thing
-  people legitimately want. Handover needs Qt's network module — where that
-  is missing, the second launch simply opens its own window too.
+  people legitimately want. A launch that also names a profile (`-p NAME`) is
+  never handed over either — the running window would open the location
+  under its own profile — so it starts its own launcher. Handover needs Qt's
+  network module — where that is missing, the second launch simply opens its
+  own window too.
 - A watch never resumes on its own at startup, even though its settings are
   remembered — a background uploader that restarts unasked is how a folder
   ends up mirrored somewhere its owner forgot about.

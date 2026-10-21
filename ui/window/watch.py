@@ -11,6 +11,35 @@ from utils import (
 )
 
 
+class WatchSkipped(Exception):
+    """A watch pass that would act on a local tree it could not trust."""
+
+
+def plan_watch_pass(local_root, remote, config):
+    """
+    The upload plan for one watch pass, or WatchSkipped.
+
+    REGRESSION (critical, data loss): the local scan reported a missing or
+    unreadable folder as an EMPTY one, and with "delete extras" on the plan
+    then deleted every remote object under the prefix -- an unplugged drive
+    or a renamed folder emptied the backup on the next tick, unasked.
+    """
+    try:
+        local = scan_local_tree(local_root, strict=True)
+    except OSError as exc:
+        raise WatchSkipped(f"cannot read {local_root}: {exc}") from exc
+    delete_extra = bool(config.get("delete_extra"))
+    if delete_extra and not local and remote:
+        # An empty folder that used to hold files looks exactly like a mount
+        # point whose drive is gone. Mirroring that is never worth guessing.
+        raise WatchSkipped(
+            f"{local_root} is empty but the remote prefix holds "
+            f"{len(remote)} object(s); not deleting them")
+    return build_sync_plan(
+        local, remote, direction="upload", delete_extra=delete_extra,
+        exclude=config.get("exclude") or "")
+
+
 class WatchMixin:
     """Watching a local folder and pushing what changes."""
 
@@ -45,6 +74,7 @@ class WatchMixin:
         self._watch = dict(config)
         if self._watch_thread is None:
             self._watch_scan_config = dict(config)
+        self._watch_problem = ""
         if self._watch_timer is None:
             self._watch_timer = QTimer(self)
             self._watch_timer.timeout.connect(self._watch_tick)
@@ -68,10 +98,16 @@ class WatchMixin:
         if not self._watch:
             self.watch_status.hide()
         else:
+            problem = getattr(self, "_watch_problem", "")
+            name = os.path.basename(self._watch['local'].rstrip(os.sep))
             self.watch_status.setText(
-                f"watching {os.path.basename(self._watch['local'].rstrip(os.sep))}")
+                f"watching {name} — skipped" if problem
+                else f"watching {name}")
+            self.watch_status.setStyleSheet(
+                "color: #c62828;" if problem else "")
             self.watch_status.setToolTip(
-                f"{self._watch['local']} -> s3://{self._watch['bucket']}/"
+                (f"Last pass skipped: {problem}\n" if problem else "")
+                + f"{self._watch['local']} -> s3://{self._watch['bucket']}/"
                 f"{self._watch['prefix']}  (Tools -> Watch folder to stop)")
             self.watch_status.show()
         if getattr(self, "actWatchFolder", None) is not None:
@@ -93,12 +129,8 @@ class WatchMixin:
         clone.bucket = config["bucket"]
 
         def _scan(_w):
-            local = scan_local_tree(config["local"], require_complete=True)
             remote = clone.list_tree(config["prefix"])
-            return build_sync_plan(
-                local, remote, direction="upload",
-                delete_extra=bool(config.get("delete_extra")),
-                exclude=config.get("exclude") or "")
+            return plan_watch_pass(config["local"], remote, config)
 
         self._watch_thread = QThread(self)
         self._watch_worker = FuncWorker(_scan)
@@ -119,8 +151,16 @@ class WatchMixin:
         if self._watch != self._watch_scan_config:
             return
         if exc is not None:
-            self.log(f"watch: could not compare ({exc})")
+            # Visible, not just logged: a watch that has stopped doing its
+            # job must not keep looking like it is doing it.
+            self._watch_problem = str(exc)
+            self._update_watch_status()
+            self.log(f"watch: skipped this pass ({exc})")
+            self.statusBar().showMessage(f"Watch skipped: {exc}", 8000)
             return
+        if getattr(self, "_watch_problem", ""):
+            self._watch_problem = ""
+            self._update_watch_status()
         actions = [entry for entry in (result or [])
                    if entry.get("action") != "skip"]
         if not actions:

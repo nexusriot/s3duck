@@ -12,7 +12,14 @@ import os
 import threading
 import uuid
 from boto3.s3.transfer import TransferConfig
+from core.endpoints import aws_endpoint_region, strip_bucket_label
 from urllib.parse import urlparse
+
+
+def _response_headers(response) -> dict:
+    """The HTTP headers botocore keeps on a parsed response (or error), or {}."""
+    meta = (response or {}).get("ResponseMetadata") or {}
+    return meta.get("HTTPHeaders") or {}
 
 
 class BindingMixin:
@@ -215,29 +222,37 @@ bucket is a probe rather than a constructor argument.
         return self._client
 
     @staticmethod
-    def _list_one_page(client_obj, bucket_name: str) -> bool:
+    def _list_one_page(client_obj, bucket_name: str) -> dict:
         """List a single page of *bucket_name*, letting the failure out.
 
         The cheapest proof that a client can read a bucket. _can_list_bucket
         wants the yes/no; check_profile wants the reason, so the raising form
         is the one that is written down.
+
+        Returns the page's HTTP response headers ({} when there are none):
+        AWS names the bucket's region in them, which is what tells a binding
+        that only works because botocore redirected it from one that is right.
         """
         paginator = client_obj.get_paginator("list_objects_v2")
-        for _page in paginator.paginate(
+        for page in paginator.paginate(
                 Bucket=bucket_name,
                 Prefix="",
                 Delimiter="/",
                 PaginationConfig={"MaxItems": 1},
         ):
-            break
-        return True
+            return _response_headers(page)
+        return {}
 
-    def _can_list_bucket(self, client_obj, bucket_name: str) -> bool:
-        """True if this client can list a single page of *bucket_name*."""
+    def _listing_headers(self, client_obj, bucket_name: str):
+        """Headers of one listed page of *bucket_name*, or None if it cannot be listed."""
         try:
             return self._list_one_page(client_obj, bucket_name)
         except Exception:
-            return False
+            return None
+
+    def _can_list_bucket(self, client_obj, bucket_name: str) -> bool:
+        """True if this client can list a single page of *bucket_name*."""
+        return self._listing_headers(client_obj, bucket_name) is not None
 
     def _try_bind_bucket(self, bucket_name: str):
         """
@@ -254,13 +269,100 @@ bucket is a probe rather than a constructor argument.
             client = self._make_client(
                 endpoint_url=endpoint, region=region, use_path=use_path
             )
-            if self._can_list_bucket(client, bucket_name):
-                return client, endpoint, region, use_path
+            headers = self._listing_headers(client, bucket_name)
+            if headers is not None:
+                # Settled here too, not just after a probe: entries persisted
+                # before regions were checked hold the profile's region for an
+                # off-region bucket, and they list fine for ever — botocore
+                # redirects every fresh client — so without this they would
+                # never heal. The header is on the listing just made, so a
+                # correct entry costs nothing extra.
+                result = self._settle_bucket_region(
+                    bucket_name, (client, endpoint, region, use_path), headers)
+                self.binding_cache[bucket_name] = tuple(result[1:])
+                return result
             self.binding_cache.pop(bucket_name, None)
 
         result = self._probe_bucket_binding(bucket_name)
         self.binding_cache[bucket_name] = (result[1], result[2], result[3])
         return result
+
+    def _bucket_region(self, client_obj, bucket_name: str, endpoint,
+                       headers=None) -> str:
+        """
+        The region *bucket_name* lives in, or "" when the server will not say.
+
+        The listing's own headers are tried first because they are free. A
+        HeadBucket is spent only on an AWS endpoint, where the answer is
+        documented to be there and where botocore's redirector is known to
+        hide a mismatch. A MinIO with a region configured puts the header on
+        every response anyway, and one without has nothing to report, so the
+        HEAD would be a wasted round trip on every bucket open.
+        """
+        region = (headers or {}).get("x-amz-bucket-region") or ""
+        if region:
+            return region
+        try:
+            host = (urlparse(endpoint or "").hostname or "").lower()
+        except Exception:
+            host = ""
+        if not host.endswith((".amazonaws.com", ".amazonaws.com.cn")):
+            return ""
+        try:
+            resp = client_obj.head_bucket(Bucket=bucket_name)
+        except botocore.exceptions.ClientError as exc:
+            # A refused HEAD still carries the header on AWS.
+            resp = exc.response
+        except Exception:
+            return ""
+        return _response_headers(resp).get("x-amz-bucket-region") or ""
+
+    def _settle_bucket_region(self, bucket_name: str, binding, headers=None):
+        """
+        *binding* re-pointed at the bucket's own region, when that is not
+        where it points already.
+
+        A working binding can still hold the wrong region. botocore's S3
+        redirector quietly re-signs a request refused for its region
+        (AuthorizationHeaderMalformed), so a probe signed for the profile's
+        us-east-1 "succeeds" against a bucket in eu-west-1 and the profile's
+        region is what gets bound. Every API call keeps working, because each
+        new client redirects again, but a presigned URL is signed with the
+        client's own region once, offline — no redirector stands between it
+        and the browser it is pasted into, and AWS refuses it. The direct link
+        fails the same way: a path-style URL on the global endpoint is a
+        PermanentRedirect for any bucket outside us-east-1.
+
+        So the region the server reports wins. On AWS the endpoint follows it
+        (s3.amazonaws.com -> s3.eu-west-1.amazonaws.com), since a link on the
+        global host is the broken one; the endpoint as it was is the fallback
+        for a host whose name cannot be rewritten. Each candidate must list
+        the bucket before it replaces a binding that is known to work.
+        """
+        client_obj, endpoint, region, use_path = binding
+        real = self._bucket_region(client_obj, bucket_name, endpoint, headers)
+        if not real:
+            return binding
+        # The region the client actually signs with: botocore fills in
+        # us-east-1 when the profile leaves it empty.
+        signing = (region or getattr(getattr(client_obj, "meta", None),
+                                     "region_name", None) or "us-east-1")
+        pinned = aws_endpoint_region(endpoint)
+        if real == signing and pinned in ("", real):
+            return binding
+
+        candidates = []
+        swapped = self.build_region_swapped_endpoint(endpoint, real)
+        if swapped:
+            candidates.append(swapped)
+        if endpoint not in candidates:
+            candidates.append(endpoint)
+        for candidate in candidates:
+            client = self._make_client(
+                endpoint_url=candidate, region=real, use_path=use_path)
+            if self._can_list_bucket(client, bucket_name):
+                return client, candidate, real, use_path
+        return binding
 
     def _probe_bucket_binding(self, bucket_name: str):
         """
@@ -275,12 +377,17 @@ bucket is a probe rather than a constructor argument.
         def can_list(c):
             """
             Try to list a single page to validate this client for this bucket.
-            Returns (ok:bool, permanent_redirect_endpoint:str|None, error:Exception|None)
+            Returns (ok:bool, permanent_redirect_endpoint:str|None,
+                     error:Exception|None, headers:dict)
 
             Logic:
             - If it lists fine: ok=True
             - If we get PermanentRedirect: ok=False + endpoint hint
             - Any other ClientError is treated as a real failure (ok=False + error)
+
+            headers are the HTTP response headers either way: on success they
+            say whether the region bound is the bucket's own, and on a
+            redirect they say which region the hinted endpoint belongs to.
             """
             paginator = c.get_paginator("list_objects_v2")
             try:
@@ -290,21 +397,28 @@ bucket is a probe rather than a constructor argument.
                     Delimiter="/",
                     PaginationConfig={"MaxItems": 1},
                 )
-                for _ in iterator:
-                    break
-                return True, None, None
+                for page in iterator:
+                    return True, None, None, _response_headers(page)
+                return True, None, None, {}
             except botocore.exceptions.ClientError as exc:
                 err_code = exc.response.get("Error", {}).get("Code", "")
+                headers = _response_headers(exc.response)
 
                 # Region/endpoint redirect from S3
                 if err_code == "PermanentRedirect":
                     ep = exc.response.get("Error", {}).get("Endpoint")
-                    return False, ep, exc
+                    return False, ep, exc, headers
 
-                return False, None, exc
+                return False, None, exc, headers
 
             except Exception as exc:
-                return False, None, exc
+                return False, None, exc, {}
+
+        def settled(client, endpoint, region, use_path, headers):
+            # Every strategy can be rescued by botocore's redirector, so each
+            # one's success is checked for the region it really reached.
+            return self._settle_bucket_region(
+                bucket_name, (client, endpoint, region, use_path), headers)
 
         last_err = None
 
@@ -314,10 +428,12 @@ bucket is a probe rather than a constructor argument.
             region=self.region_name,
             use_path=self.use_path,
         )
-        ok, ep_hint, err = can_list(cA)
+        ok, ep_hint, err, headers = can_list(cA)
         if ok:
-            return (cA, self.endpoint_url, self.region_name, self.use_path)
+            return settled(cA, self.endpoint_url, self.region_name,
+                           self.use_path, headers)
         last_err = err
+        hint_region = headers.get("x-amz-bucket-region") or ""
 
         # Strategy B: current endpoint + flipped style
         cB = self._make_client(
@@ -325,19 +441,22 @@ bucket is a probe rather than a constructor argument.
             region=self.region_name,
             use_path=(not self.use_path),
         )
-        ok, ep_hint2, err2 = can_list(cB)
+        ok, ep_hint2, err2, headers2 = can_list(cB)
         if ok:
-            return (cB, self.endpoint_url, self.region_name, not self.use_path)
+            return settled(cB, self.endpoint_url, self.region_name,
+                           not self.use_path, headers2)
         last_err = err2 or last_err
+        hint_region2 = headers2.get("x-amz-bucket-region") or ""
 
-        # Strategy C: endpoint hint(s) from PermanentRedirect
+        # Strategy C: endpoint hint(s) from PermanentRedirect, each with the
+        # region the redirect named alongside it
         endpoint_candidates = []
         if ep_hint:
-            endpoint_candidates.append(ep_hint)
-        if ep_hint2 and ep_hint2 not in endpoint_candidates:
-            endpoint_candidates.append(ep_hint2)
+            endpoint_candidates.append((ep_hint, hint_region))
+        if ep_hint2 and ep_hint2 not in [ep for ep, _r in endpoint_candidates]:
+            endpoint_candidates.append((ep_hint2, hint_region2))
 
-        for ep_raw in endpoint_candidates:
+        for ep_raw, redirect_region in endpoint_candidates:
             # If it's bare hostname, prepend scheme
             if "://" not in ep_raw:
                 endpoint_fixed = "https://" + ep_raw
@@ -355,21 +474,34 @@ bucket is a probe rather than a constructor argument.
                     f"Please verify endpoint and addressing style."
                 )
 
-            has_bucket_already = self._endpoint_has_bucket(endpoint_fixed, bucket_name)
+            # AWS hints with the bucket's own virtual host
+            # (mybucket.s3.eu-west-1.amazonaws.com). Bound as an endpoint in
+            # path style, that addressed https://mybucket.s3…/mybucket — the
+            # bucket named twice, which is a request for a KEY called
+            # "mybucket", not a listing. The bucket label comes off and
+            # virtual-host addressing puts it back where it belongs.
+            service_endpoint = strip_bucket_label(endpoint_fixed, bucket_name)
+            if service_endpoint != endpoint_fixed:
+                styles_to_try = [False, True]
+            else:
+                styles_to_try = [self.use_path, not self.use_path]
 
-            styles_to_try = (
-                [True] if has_bucket_already else [self.use_path, not self.use_path]
-            )
+            # Signed for the region the redirect pointed at, not the one that
+            # was just refused there.
+            region = (redirect_region
+                      or aws_endpoint_region(service_endpoint)
+                      or self.region_name)
 
             for style in styles_to_try:
                 cGuess = self._make_client(
-                    endpoint_url=endpoint_fixed,
-                    region=self.region_name,
+                    endpoint_url=service_endpoint,
+                    region=region,
                     use_path=style,
                 )
-                ok3, _ep_ignore, _err3 = can_list(cGuess)
+                ok3, _ep_ignore, _err3, headers3 = can_list(cGuess)
                 if ok3:
-                    return (cGuess, endpoint_fixed, self.region_name, style)
+                    return settled(cGuess, service_endpoint, region, style,
+                                   headers3)
                 last_err = _err3 or last_err
 
         # nothing worked
@@ -553,10 +685,14 @@ bucket is a probe rather than a constructor argument.
                 # This may succeed (rare) or throw ClientError (common on perms);
                 # both paths can give us headers.
                 try:
-                    c.head_bucket(Bucket=bucket_name)
-                    # If it actually succeeds, prefer the client's region
+                    resp = c.head_bucket(Bucket=bucket_name)
+                    # If it actually succeeds, the header still wins over the
+                    # client's region: botocore may have redirected this HEAD
+                    # to another region on the way, and the client's region
+                    # is then exactly the wrong answer.
                     region_hint = region_hint or (
-                                c.meta.region_name or self.region_name)
+                        _response_headers(resp).get("x-amz-bucket-region")
+                        or c.meta.region_name or self.region_name)
                     break
                 except botocore.exceptions.ClientError as e:
                     resp = e.response or {}

@@ -21,7 +21,7 @@ strip is derived rather than retyped.
 
 import os
 
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QContextMenuEvent
 
 from model import FSObjectType
 from ui.constants import UP_ENTRY_LABEL
@@ -105,8 +105,12 @@ def _bucket_list_menu(window, builder, ixs, entry, writable, position) -> bool:
 
 
 def _listing_menu(window, builder, ixs, entry, raw_name, upload_path, key,
-                  up_selected, writable, position) -> bool:
-    """The menu over the contents of a bucket."""
+                  up_selected, writable, position, target=None) -> bool:
+    """The menu over the contents of a bucket.
+
+    ``entry``/``key`` describe the row the menu was opened on (``target``);
+    ``ixs`` is the selection, which only the many-object entries use.
+    """
     model = window.data_model
     here = model.current_folder or "/"
 
@@ -177,7 +181,7 @@ def _listing_menu(window, builder, ixs, entry, raw_name, upload_path, key,
                     "Copy to another profile…", window.copy_to_profile,
                     mutates=False)
         builder.add("edit-rename", "edit_24px.svg", "Rename…",
-                    window.rename_selected)
+                    lambda: window.rename_selected(target))
         builder.add("edit-rename", "edit_24px.svg",
                     "Rename multiple… (Shift+F2)", window.bulk_rename)
         builder.add("drive-harddisk", "bucket_24px.svg",
@@ -210,11 +214,36 @@ def _listing_menu(window, builder, ixs, entry, raw_name, upload_path, key,
     return builder.run(position)
 
 
+def clicked_index(window, event):
+    """
+    The row the menu was opened on: under the pointer for a mouse click,
+    the current row for the keyboard's menu key.
+
+    REGRESSION (critical): the single-object entries used the FIRST SELECTED
+    row instead. With a.pdf and b.png selected, right-click on b.png ->
+    "Make public + copy URL" made a.pdf public, with no confirmation.
+    """
+    view = window.listview
+    if event.reason() == QContextMenuEvent.Reason.Mouse:
+        index = view.indexAt(view.viewport().mapFromGlobal(event.globalPos()))
+    else:
+        index = view.currentIndex()
+    return index if index.isValid() else None
+
+
 def show_listing_menu(window, event) -> bool:
     """Build, show and dispatch the listing's context menu."""
+    # The rows resolve under the current prefix; while a listing is in
+    # flight they belong to the folder being left.
+    if window._refuse_unsettled_listing():
+        return True
+    # The selection drives the entries that act on many objects; the row
+    # that was clicked drives the ones that act on one.
     ixs = window.listview.selectedIndexes()
+    target = clicked_index(window, event)
     # Row-primary rather than the raw clicked column.
-    entry, raw_name, raw_key = window.name_by_first_ix(ixs)
+    entry, raw_name, raw_key = window.name_by_first_ix(
+        [target] if target is not None else [])
     up_selected = bool(
         entry is not None and raw_name
         and raw_name.rstrip("/") == UP_ENTRY_LABEL)
@@ -235,4 +264,4 @@ def show_listing_menu(window, event) -> bool:
         return _bucket_list_menu(window, builder, ixs, entry, writable,
                                  position)
     return _listing_menu(window, builder, ixs, entry, raw_name, upload_path,
-                         key, up_selected, writable, position)
+                         key, up_selected, writable, position, target=target)

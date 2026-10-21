@@ -4,6 +4,12 @@ import main_window
 import unittest
 from PyQt6.QtCore import QEvent, QSettings, Qt
 from PyQt6.QtGui import QAction, QKeyEvent, QKeySequence
+from core.lifecycle import (
+    build_lifecycle_rule, lifecycle_form_problem, summarize_lifecycle_rule,
+)
+from core.upload_rules import (
+    format_tag_lines, parse_tag_lines, parse_upload_rules,
+)
 from datetime import datetime, timezone
 from main_window import (
     _human_bytes, _listing_summary, _scaled_bar_values, _to_epoch,
@@ -603,3 +609,123 @@ class StorageCostTests(unittest.TestCase):
         self.assertIn("storage only", html)
         self.assertIn("DEEP_ARCHIVE", html)
         self.assertIn("180-day minimum", html)
+class TagLineTests(unittest.TestCase):
+    """Bucket tags are edited as "key = value" lines. They were parsed with
+    the content-type override reader, which lowercases the key, strips a
+    leading "*" or "." and drops an empty value — so every save of the
+    bucket's settings renamed or deleted tags."""
+
+    def test_case_and_empty_values_survive(self):
+        self.assertEqual(
+            parse_tag_lines("CostCenter = 1234\nOwner = \n*tier = gold"),
+            {"CostCenter": "1234", "Owner": "", "*tier": "gold"})
+
+    def test_round_trip_through_text(self):
+        tags = {"CostCenter": "1234", "Owner": "", ".env": "prod",
+                "a=b": "c = d", "team:owner": "x"}
+        self.assertEqual(parse_tag_lines(format_tag_lines(tags)), tags)
+
+    def test_a_bare_key_and_blank_lines(self):
+        self.assertEqual(parse_tag_lines("\n  Archived  \n\n"),
+                         {"Archived": ""})
+        self.assertEqual(parse_tag_lines("k=v"), {"k": "v"})
+        self.assertEqual(parse_tag_lines(" = orphan"), {})
+
+
+class UploadRuleTagCaseTests(unittest.TestCase):
+    def test_a_rule_keeps_the_tag_key_as_written(self):
+        """FINDING: "tag:CostCenter=Eng" tagged uploads "costcenter", a key
+        no cost-allocation report was looking for. Only the field kind is
+        case-blind."""
+        rules = parse_upload_rules(
+            "logs/* -> Class=standard_ia, TAG:CostCenter=Eng42")
+        self.assertEqual(rules, [{"pattern": "logs/*",
+                                  "storage_class": "STANDARD_IA",
+                                  "tags": {"CostCenter": "Eng42"}}])
+
+
+class LifecycleEditTests(unittest.TestCase):
+    """Edit -> OK must change only what the form controls."""
+
+    RULE = {
+        "ID": "versions", "Status": "Enabled", "Filter": {"Prefix": "logs/"},
+        "Transitions": [{"Days": 30, "StorageClass": "STANDARD_IA"}],
+        "NoncurrentVersionTransitions": [
+            {"NoncurrentDays": 30, "StorageClass": "GLACIER"}],
+        "NoncurrentVersionExpiration": {
+            "NoncurrentDays": 90, "NewerNoncurrentVersions": 3},
+    }
+
+    def test_unrepresented_fields_survive_a_rebuild(self):
+        rule = build_lifecycle_rule(
+            "versions", prefix="logs/", transition_days=60,
+            transition_class="GLACIER_IR", noncurrent_days=120,
+            base=self.RULE)
+        self.assertEqual(rule["NoncurrentVersionTransitions"],
+                         self.RULE["NoncurrentVersionTransitions"])
+        self.assertEqual(rule["NoncurrentVersionExpiration"],
+                         {"NoncurrentDays": 120, "NewerNoncurrentVersions": 3})
+        self.assertEqual(rule["Transitions"],
+                         [{"Days": 60, "StorageClass": "GLACIER_IR"}])
+        # the base is copied, not edited in place
+        self.assertEqual(self.RULE["NoncurrentVersionExpiration"]["NoncurrentDays"],
+                         90)
+
+    def test_unticking_a_box_removes_that_action(self):
+        rule = build_lifecycle_rule(
+            "versions", prefix="logs/", abort_days=7, base=self.RULE)
+        self.assertNotIn("Transitions", rule)
+        self.assertNotIn("NoncurrentVersionExpiration", rule)
+        self.assertIn("NoncurrentVersionTransitions", rule)
+
+    def test_a_legacy_prefix_is_moved_into_the_filter(self):
+        rule = build_lifecycle_rule("r", prefix="old/", expire_days=5,
+                                    base={"ID": "r", "Prefix": "old/",
+                                          "Status": "Enabled"})
+        self.assertNotIn("Prefix", rule)
+        self.assertEqual(rule["Filter"], {"Prefix": "old/"})
+
+    def test_a_preserved_action_counts_as_an_action(self):
+        base = {"ID": "r", "NoncurrentVersionTransitions": [
+            {"NoncurrentDays": 30, "StorageClass": "GLACIER"}]}
+        self.assertIn("NoncurrentVersionTransitions",
+                      build_lifecycle_rule("r", base=base))
+
+    def test_two_expirations_are_refused_not_trimmed(self):
+        """The builder kept the days and dropped the delete-marker clean-up
+        without a word, though the box stayed ticked."""
+        with self.assertRaises(ValueError):
+            build_lifecycle_rule("r", expire_days=30,
+                                 expire_delete_markers=True)
+
+    def test_the_form_refuses_what_it_cannot_show(self):
+        cases = {
+            "two transitions": {"Transitions": [
+                {"Days": 30, "StorageClass": "STANDARD_IA"},
+                {"Days": 90, "StorageClass": "GLACIER"}]},
+            "day zero": {"Transitions": [
+                {"Days": 0, "StorageClass": "INTELLIGENT_TIERING"}]},
+            "dated transition": {"Transitions": [
+                {"Date": "2030-01-01T00:00:00Z", "StorageClass": "GLACIER"}]},
+            "unknown class": {"Transitions": [
+                {"Days": 30, "StorageClass": "EXPRESS_ONEZONE"}]},
+            "dated expiration": {"Expiration": {"Date": "2030-01-01"}},
+            "too long": {"AbortIncompleteMultipartUpload": {
+                "DaysAfterInitiation": 5000}},
+        }
+        for name, rule in cases.items():
+            with self.subTest(name=name):
+                self.assertTrue(lifecycle_form_problem(rule))
+        self.assertEqual(lifecycle_form_problem(self.RULE), "")
+        self.assertEqual(lifecycle_form_problem(
+            {"Expiration": {"ExpiredObjectDeleteMarker": True}}), "")
+
+    def test_the_summary_names_the_versions_it_keeps(self):
+        summary = summarize_lifecycle_rule(dict(
+            self.RULE, NoncurrentVersionTransitions=[
+                {"NoncurrentDays": 30, "StorageClass": "GLACIER",
+                 "NewerNoncurrentVersions": 2}]))
+        self.assertIn("delete old versions after 90d (keeping the newest 3)",
+                      summary)
+        self.assertIn("old versions to GLACIER after 30d (beyond the newest 2)",
+                      summary)

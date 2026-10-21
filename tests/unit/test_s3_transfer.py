@@ -1,29 +1,53 @@
 """s3/upload.py, download.py, copy.py, delete.py."""
 
+import base64
 import botocore.exceptions
 import botocore.session
+import errno
 import hashlib
 import io
+import json
 import os
 import shutil
+import struct
 import tempfile
 import threading
 import types
 import unittest
 import unittest.mock
+import zlib
 from main_window import Worker
 from model import (
-    ArchivedObject, DeleteRefused, MAX_LOCAL_NAME_BYTES, Model, ObjectExists,
-    ReadOnlyError, TransferCancelled, client_accepts,
+    ArchivedObject, DeleteRefused, DownloadIncomplete, MAX_LOCAL_NAME_BYTES,
+    Model, ObjectExists, ReadOnlyError, TransferCancelled, client_accepts,
     drop_unsendable_checksum_args, local_name_is_writable,
     plan_prefix_download, prefix_of, safe_local_path,
 )
+from s3.download import ObjectChangedDuringDownload
 from tests.support import (
     FakeS3Client, _ConditionalPutClient, _CopyPartClient, _FakePaginator,
     _MultipartClient, _PrefixDownloadClient, _RangedClient, _client_error,
     _dt, _ensure_qapp, make_model,
 )
 
+
+
+class _TaggedCopyPartClient(_CopyPartClient):
+    """_CopyPartClient that also answers GetObjectTagging, which a multipart
+    copy now reads so the new object keeps the source's tags. *tag_error*
+    makes the read fail instead."""
+
+    def __init__(self, *args, tags=None, tag_error=None, **kw):
+        super().__init__(*args, **kw)
+        self.tags = dict(tags or {})
+        self.tag_error = tag_error
+
+    def get_object_tagging(self, **kw):
+        self.calls.append(("get_object_tagging", kw))
+        if self.tag_error is not None:
+            raise self.tag_error
+        return {"TagSet": [{"Key": k, "Value": v}
+                           for k, v in self.tags.items()]}
 
 class DeleteBucketPurgesVersionsTests(unittest.TestCase):
     """REGRESSION: recursive bucket delete must also purge noncurrent
@@ -472,14 +496,14 @@ class MultipartServerSideCopyTests(unittest.TestCase):
     def test_a_known_oversized_source_skips_the_doomed_single_copy(self):
         """THE POINT: the listing already knew the size, so the 5 GiB refusal
         does not have to be bought with a request."""
-        c = _CopyPartClient(source_size=self.HUGE)
+        c = _TaggedCopyPartClient(source_size=self.HUGE)
         self.m._client = c
         self.m.copy_object("big.bin", "copy.bin", size=self.HUGE)
         self.assertEqual(c.calls_of("copy_object"), [])
         self.assertEqual(len(c.completed), 1)
 
     def test_an_oversized_source_is_copied_in_parts_server_side(self):
-        c = _CopyPartClient(source_size=self.HUGE, copy_error=self._too_big())
+        c = _TaggedCopyPartClient(source_size=self.HUGE, copy_error=self._too_big())
         self.m._client = c
         self.m.copy_object("big.bin", "copy.bin")
 
@@ -496,7 +520,7 @@ class MultipartServerSideCopyTests(unittest.TestCase):
     def test_the_parts_are_completed_in_order(self):
         """run_parallel finishes them in whatever order it likes; S3 rejects
         a completion whose part numbers are not ascending."""
-        c = _CopyPartClient(source_size=self.HUGE, copy_error=self._too_big())
+        c = _TaggedCopyPartClient(source_size=self.HUGE, copy_error=self._too_big())
         self.m._client = c
         self.m.transfer_concurrency = 4
         self.m.copy_object("big.bin", "copy.bin")
@@ -508,7 +532,7 @@ class MultipartServerSideCopyTests(unittest.TestCase):
     def test_no_bytes_pass_through_this_process(self):
         """The whole point of the multipart route: it is still server-side,
         so it must not reach for the streaming fallback."""
-        c = _CopyPartClient(source_size=self.HUGE, copy_error=self._too_big())
+        c = _TaggedCopyPartClient(source_size=self.HUGE, copy_error=self._too_big())
         self.m._client = c
         self.m.copy_object("big.bin", "copy.bin")
         self.assertEqual(c.calls_of("get_object"), [])
@@ -517,7 +541,7 @@ class MultipartServerSideCopyTests(unittest.TestCase):
         """Nothing here is resumable — the parts are copies the service made,
         not bytes this machine still holds — so leaving them would bill for
         an upload nobody is coming back to finish."""
-        c = _CopyPartClient(source_size=self.HUGE, copy_error=self._too_big(),
+        c = _TaggedCopyPartClient(source_size=self.HUGE, copy_error=self._too_big(),
                             fail_on_part=1)
         self.m._client = c
         with self.assertRaises(RuntimeError):
@@ -528,7 +552,7 @@ class MultipartServerSideCopyTests(unittest.TestCase):
     def test_the_source_metadata_is_carried_onto_the_new_object(self):
         """CopyObject preserves metadata by itself; a multipart upload defines
         the object outright, so anything not passed here is lost."""
-        c = _CopyPartClient(
+        c = _TaggedCopyPartClient(
             source_size=self.HUGE, copy_error=self._too_big(),
             head={"ContentType": "text/csv", "CacheControl": "max-age=60",
                   "Metadata": {"owner": "vlad"}})
@@ -543,14 +567,14 @@ class MultipartServerSideCopyTests(unittest.TestCase):
         """REGRESSION GUARD: InvalidRequest is also what a copy onto itself
         that changes nothing returns. Measuring the source is what tells the
         two apart; matching the code alone would reroute both."""
-        c = _CopyPartClient(source_size=1024, copy_error=self._too_big())
+        c = _TaggedCopyPartClient(source_size=1024, copy_error=self._too_big())
         self.m._client = c
         with self.assertRaises(botocore.exceptions.ClientError):
             self.m.copy_object("small.bin", "copy.bin", allow_stream=False)
         self.assertEqual(c.created, [])
 
     def test_storage_class_of_a_huge_object_is_changed_in_parts(self):
-        c = _CopyPartClient(source_size=self.HUGE, copy_error=self._too_big(),
+        c = _TaggedCopyPartClient(source_size=self.HUGE, copy_error=self._too_big(),
                             head={"ContentType": "text/csv",
                                   "StorageClass": "STANDARD_IA"})
         self.m._client = c
@@ -562,7 +586,7 @@ class MultipartServerSideCopyTests(unittest.TestCase):
         self.assertEqual(kw.get("ContentType"), "text/csv")
 
     def test_metadata_of_a_huge_object_is_replaced_in_parts(self):
-        c = _CopyPartClient(source_size=self.HUGE, copy_error=self._too_big())
+        c = _TaggedCopyPartClient(source_size=self.HUGE, copy_error=self._too_big())
         self.m._client = c
         self.m.set_object_metadata("big.csv", content_type="text/csv",
                                    metadata={"owner": "vlad"})
@@ -578,7 +602,7 @@ class MultipartServerSideCopyTests(unittest.TestCase):
         """REGRESSION GUARD: an object already in the requested class also
         answers InvalidRequest. Rewriting a 50 GiB object in parts to change
         nothing is an expensive way to say no-op."""
-        c = _CopyPartClient(source_size=self.HUGE, copy_error=self._too_big(),
+        c = _TaggedCopyPartClient(source_size=self.HUGE, copy_error=self._too_big(),
                             head={"StorageClass": "GLACIER"})
         self.m._client = c
         self.assertFalse(self.m.change_storage_class("big.csv", "GLACIER"))
@@ -588,7 +612,7 @@ class MultipartServerSideCopyTests(unittest.TestCase):
         """The size route and the location route are independent: a bucket
         this client cannot reach refuses the multipart copy exactly as it
         refuses the single one."""
-        c = _CopyPartClient(source_size=self.HUGE)
+        c = _TaggedCopyPartClient(source_size=self.HUGE)
 
         def _refuse(**kw):
             c.calls.append(("create_multipart_upload", kw))
@@ -621,6 +645,188 @@ class MultipartServerSideCopyTests(unittest.TestCase):
         self.m.copy_prefix("src/", "dst/")
         self.assertEqual(sizes, {"src/big.bin": self.HUGE,
                                  "src/small.bin": 10})
+class MultipartCopyFidelityTests(unittest.TestCase):
+    """
+    REGRESSION (metadata loss, and a race that loses data on a move): the
+    >5 GiB server-side copy dropped the source's tags — CopyObject keeps
+    them, a multipart upload starts with none — copied with no metadata at
+    all when the source HEAD failed, and copied its parts unpinned, so a
+    source replaced mid-copy came out spliced from two versions.
+    """
+
+    HUGE = Model.MAX_SINGLE_COPY_BYTES + 1
+
+    def setUp(self):
+        self.m = make_model(bucket="bkt")
+        self.m.transfer_concurrency = 1       # deterministic part order
+
+    def _client(self, **kw):
+        head = {"ETag": '"' + "e" * 32 + '-700"'}
+        head.update(kw.pop("head", {}) or {})
+        c = _TaggedCopyPartClient(source_size=kw.pop("size", self.HUGE),
+                                  head=head, **kw)
+        self.m._client = c
+        return c
+
+    def test_the_source_tags_are_carried(self):
+        c = self._client(tags={"project": "big data", "team": "a&b"})
+        self.m.copy_object("big.bin", "moved/big.bin", size=self.HUGE)
+        _bucket, _key, kw = c.created[0]
+        self.assertEqual(kw.get("Tagging"), "project=big%20data&team=a%26b")
+
+    def test_every_part_is_pinned_to_the_source_version(self):
+        c = self._client()
+        self.m.copy_object("big.bin", "copy.bin", size=self.HUGE)
+        pins = {kw.get("CopySourceIfMatch")
+                for kw in c.calls_of("upload_part_copy")}
+        self.assertEqual(pins, {'"' + "e" * 32 + '-700"'})
+
+    def test_a_source_replaced_mid_copy_fails_and_is_aborted(self):
+        c = self._client()
+        original = c.upload_part_copy
+
+        def _replaced_after_first(**kw):
+            if kw["PartNumber"] > 1:
+                raise _client_error("PreconditionFailed", status=412,
+                                    op="UploadPartCopy")
+            return original(**kw)
+
+        c.upload_part_copy = _replaced_after_first
+        with self.assertRaises(Exception) as caught:
+            self.m.copy_object("big.bin", "copy.bin", size=self.HUGE)
+        self.assertIn("changed on the server", str(caught.exception))
+        self.assertEqual([a["UploadId"] for a in c.aborted], ["mpu-1"])
+        self.assertEqual(c.completed, [])
+
+    def test_a_failed_source_head_refuses_the_copy(self):
+        """It used to go ahead with no Content-Type and no metadata — and a
+        move deletes the original right after."""
+        c = self._client()
+
+        def _head_fails(**kw):
+            raise _client_error("403", status=403, op="HeadObject")
+
+        c.head_object = _head_fails
+        with self.assertRaises(botocore.exceptions.ClientError):
+            self.m.copy_object("big.bin", "copy.bin", size=self.HUGE,
+                               allow_stream=False)
+        self.assertEqual(c.created, [], "copied without the source's metadata")
+        with self.assertRaises(botocore.exceptions.ClientError):
+            self.m._copy_create_args("big.bin")
+
+    def test_unreadable_tags_do_not_stop_the_copy(self):
+        logged = []
+        c = self._client(tags={"a": "b"},
+                         tag_error=_client_error("AccessDenied", status=403,
+                                                 op="GetObjectTagging"))
+        self.m.copy_object("big.bin", "copy.bin", size=self.HUGE,
+                           log_fn=logged.append)
+        self.assertEqual(len(c.completed), 1)
+        self.assertNotIn("Tagging", c.created[0][2])
+        self.assertTrue(any("cannot be read" in line for line in logged))
+
+    def test_an_unexpected_tag_read_failure_is_not_swallowed(self):
+        c = self._client(tag_error=_client_error("InternalError", status=500,
+                                                 op="GetObjectTagging"))
+        with self.assertRaises(botocore.exceptions.ClientError):
+            self.m.copy_object("big.bin", "copy.bin", size=self.HUGE)
+        self.assertEqual(c.created, [])
+
+    def test_expiry_and_bucket_key_are_carried(self):
+        expires = _dt(5)
+        c = self._client(head={"Expires": expires, "BucketKeyEnabled": True,
+                               "ServerSideEncryption": "aws:kms"})
+        self.m.copy_object("big.bin", "copy.bin", size=self.HUGE)
+        kw = c.created[0][2]
+        self.assertEqual(kw.get("Expires"), expires)
+        self.assertIs(kw.get("BucketKeyEnabled"), True)
+
+    def test_the_ranges_follow_the_pinned_version_not_a_stale_listing(self):
+        """A listing taken before the object grew would otherwise copy only
+        its old length out of the new version — a truncated copy pinned to
+        the right ETag."""
+        bigger = self.HUGE * 2
+        c = self._client(size=bigger)
+        self.m.copy_object("big.bin", "copy.bin", size=self.HUGE)
+        self.assertTrue(c.ranges[-1][1].endswith(f"-{bigger - 1}"),
+                        c.ranges[-1])
+
+    def test_the_other_multipart_callers_keep_tags_and_pin_too(self):
+        """change_storage_class and set_object_metadata reach the same
+        multipart copy; a CopyObject would have kept the tags for both."""
+        c = self._client(tags={"keep": "me"},
+                         head={"StorageClass": "STANDARD_IA"})
+        c._copy_error = MultipartServerSideCopyTests._too_big()
+        self.assertTrue(self.m.change_storage_class("big.bin", "GLACIER"))
+        kw = c.created[0][2]
+        self.assertEqual(kw.get("Tagging"), "keep=me")
+        self.assertEqual(kw.get("StorageClass"), "GLACIER")
+        self.assertTrue(all(call.get("CopySourceIfMatch")
+                            for call in c.calls_of("upload_part_copy")))
+class StreamedCopyPartSizeTests(unittest.TestCase):
+    """
+    REGRESSION: a streamed copy (cross-profile, or the cross-region
+    fallback) hands s3transfer a body it cannot seek, so s3transfer never
+    learnt the size and never raised the part size to fit 10 000 parts. At
+    the default 8 MiB every object over 80 GiB was refused on part 10 001,
+    after 80 GiB had already been moved.
+    """
+
+    HUNDRED_GIB = 100 * 1024 ** 3
+
+    class _Source:
+        def __init__(self, length):
+            self.length = length
+
+        def get_object(self, **kw):
+            return {"Body": io.BytesIO(b"x"), "ContentLength": self.length}
+
+    class _Dest:
+        def __init__(self):
+            self.configs = []
+
+        def upload_fileobj(self, body, bucket, key, ExtraArgs=None,
+                           Callback=None, Config=None):
+            self.configs.append(Config)
+
+    def _parts(self, config, length):
+        return -(-length // config.multipart_chunksize)
+
+    def test_a_cross_profile_copy_scales_its_part_size(self):
+        src = make_model(bucket="src")
+        src._client = self._Source(self.HUNDRED_GIB)
+        dst = make_model(bucket="dst")
+        dest_client = self._Dest()
+        dst._client = dest_client
+        src.copy_to_model("big.bin", dst, "big.bin")
+        config = dest_client.configs[0]
+        self.assertLessEqual(self._parts(config, self.HUNDRED_GIB),
+                             Model.MAX_MULTIPART_PARTS)
+        # the rest of the destination's tuning is kept
+        self.assertEqual(config.max_concurrency,
+                         dst.transfer_cfg_upload.max_concurrency)
+        # and the profile's own config object is not modified in place
+        self.assertEqual(dst.transfer_cfg_upload.multipart_chunksize,
+                         dst.multipart_chunksize_bytes)
+
+    def test_a_cross_region_stream_scales_its_part_size(self):
+        m = make_model(bucket="src")
+        m._client = self._Source(self.HUNDRED_GIB)
+        dest_client = self._Dest()
+        m._try_bind_bucket = lambda name: (dest_client, "ep", "r", True)
+        m._stream_copy("big.bin", "big.bin", "other")
+        self.assertLessEqual(
+            self._parts(dest_client.configs[0], self.HUNDRED_GIB),
+            Model.MAX_MULTIPART_PARTS)
+
+    def test_an_ordinary_object_keeps_the_configured_part_size(self):
+        src = make_model(bucket="src")
+        src._client = self._Source(64 * 1024 * 1024)
+        dst = make_model(bucket="dst")
+        dest_client = self._Dest()
+        dst._client = dest_client
+        src.copy_to_model("k", dst, "k")
+        self.assertIs(dest_client.configs[0], dst.transfer_cfg_upload)
 class CopyKeepsTheStorageClassTests(unittest.TestCase):
     """
     REGRESSION: a copy, move or rename used to re-tier the object it
@@ -743,7 +949,7 @@ class CopyKeepsTheStorageClassTests(unittest.TestCase):
         """CreateMultipartUpload defines the new object outright, so a class
         not passed there is a class lost -- on the one route where the
         object is too big to re-tier cheaply afterwards."""
-        c = _CopyPartClient(source_size=self.HUGE,
+        c = _TaggedCopyPartClient(source_size=self.HUGE,
                             head={"StorageClass": "STANDARD_IA"})
         self.m._client = c
         self.m.copy_object("big.bin", "copy.bin", size=self.HUGE,
@@ -752,7 +958,7 @@ class CopyKeepsTheStorageClassTests(unittest.TestCase):
         self.assertEqual(create_args["StorageClass"], "STANDARD_IA")
 
     def test_a_huge_object_keeps_it_even_when_the_head_comes_back_empty(self):
-        c = _CopyPartClient(source_size=self.HUGE)
+        c = _TaggedCopyPartClient(source_size=self.HUGE)
         self.m._client = c
         self.m.copy_object("big.bin", "copy.bin", size=self.HUGE,
                            storage_class="ONEZONE_IA")
@@ -1025,7 +1231,7 @@ class DownloadRevisionTests(unittest.TestCase):
             out = os.path.join(tmp, "out")
             with open(out, "w") as handle:
                 handle.write("keep")
-            with self.assertRaises(botocore.exceptions.ClientError):
+            with self.assertRaises(ObjectChangedDuringDownload):
                 self._model(client).download_file("k", out, tmp)
             with open(out) as handle:
                 self.assertEqual(handle.read(), "keep")
@@ -1034,7 +1240,7 @@ class DownloadRevisionTests(unittest.TestCase):
         client = _RevisionClient(short=True)
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "out")
-            with self.assertRaises(IOError):
+            with self.assertRaisesRegex(Exception, "did not honour the range"):
                 self._model(client).download_file("k", out, tmp)
             self.assertFalse(os.path.exists(out))
 
@@ -1095,6 +1301,296 @@ class DownloadRevisionTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "Checksum mismatch"):
                 m.download_file("k", out, tmp)
             self.assertEqual(os.listdir(tmp), [])
+
+
+class _PinnedRangedClient(_RangedClient):
+    """
+    _RangedClient that answers If-Match the way S3 does, can have the object
+    replaced part-way through, and can carry extra HEAD fields (encryption,
+    a stored checksum) and an ETag of the caller's choosing.
+    """
+
+    def __init__(self, payload, etag=None, head_extra=None, replace_at=None,
+                 replacement=None):
+        super().__init__(payload)
+        self.etag = etag or hashlib.md5(payload).hexdigest()
+        self.head_extra = dict(head_extra or {})
+        self.replace_at = replace_at
+        self.replacement = replacement
+        self.requests = []
+
+    def head_object(self, **kw):
+        return dict(self.head_extra, ContentLength=len(self.payload),
+                    ETag=f'"{self.etag}"')
+
+    def get_object(self, **kw):
+        self.requests.append(kw)
+        start = int(kw["Range"].split("=")[1].split("-")[0])
+        if self.replace_at is not None and start >= self.replace_at:
+            # someone re-uploaded the key, same size
+            self.payload = self.replacement
+            self.etag = hashlib.md5(self.replacement).hexdigest()
+            self.replace_at = None
+        wanted = kw.get("IfMatch")
+        if wanted is not None and wanted.strip('"') != self.etag:
+            raise _client_error("PreconditionFailed", status=412,
+                                op="GetObject")
+        return super().get_object(**kw)
+class RangedDownloadIntegrityTests(unittest.TestCase):
+    """
+    REGRESSION (silent corruption): the ranged path — every download of
+    16 MiB or more — fetched its chunks unpinned and wrote whatever came
+    back. An object replaced mid-download was assembled from two versions,
+    a backend ignoring Range produced an oversized file, and both were
+    reported as successful downloads.
+    """
+
+    def _model(self, client, verify=False):
+        m = make_model(bucket="b")
+        m.resume_chunk_size = 1024
+        m.resume_threshold = 1
+        m.parallel_files = 1            # deterministic chunk order
+        m.verify_downloads = verify
+        m._client = client
+        return m
+
+    @staticmethod
+    def _crc32(data):
+        return base64.b64encode(
+            struct.pack(">I", zlib.crc32(data) & 0xFFFFFFFF)).decode()
+
+    def test_every_range_is_pinned_to_the_version_the_head_saw(self):
+        payload = os.urandom(4096)
+        c = _PinnedRangedClient(payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            self._model(c).download_file(
+                "big.bin", os.path.join(tmp, "big.bin"), tmp)
+        self.assertEqual(len(c.requests), 4)
+        self.assertEqual({kw.get("IfMatch") for kw in c.requests},
+                         {f'"{hashlib.md5(payload).hexdigest()}"'})
+
+    def test_an_object_replaced_mid_download_is_refused_not_spliced(self):
+        """THE POINT: this used to finish "successfully" with the old
+        object's first half and the new one's second half."""
+        old, new = os.urandom(4096), os.urandom(4096)
+        c = _PinnedRangedClient(old, replace_at=2048, replacement=new)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "big.bin")
+            with self.assertRaises(ObjectChangedDuringDownload) as caught:
+                self._model(c).download_file("big.bin", out, tmp)
+            self.assertIn("changed on the server", str(caught.exception))
+            # nothing under the final name, and no partial left to resume
+            # the old version's chunks from
+            self.assertEqual(os.listdir(tmp), [])
+
+    def test_a_reply_that_ignores_the_range_is_never_written(self):
+        """A 4 KiB object used to come out as a 7 KiB file."""
+        payload = os.urandom(4096)
+
+        class _IgnoresRange(_PinnedRangedClient):
+            def get_object(self, **kw):
+                self.requests.append(kw)
+                return {"Body": io.BytesIO(self.payload)}
+
+        c = _IgnoresRange(payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "big.bin")
+            with self.assertRaises(Exception) as caught:
+                self._model(c).download_file("big.bin", out, tmp)
+            self.assertIn("did not honour the range", str(caught.exception))
+            self.assertFalse(os.path.exists(out))
+            meta = out + Model.PART_SUFFIX + ".meta"
+            if os.path.exists(meta):
+                with open(meta) as handle:
+                    self.assertEqual(json.load(handle)["chunks"], [])
+
+    def test_a_reply_for_another_offset_is_refused(self):
+        payload = os.urandom(4096)
+
+        class _WrongOffset(_PinnedRangedClient):
+            def get_object(self, **kw):
+                resp = super().get_object(**kw)
+                body = resp["Body"].read()
+                return {"Body": io.BytesIO(body),
+                        "ContentRange": f"bytes 0-{len(body) - 1}/4096"}
+
+        c = _WrongOffset(payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "big.bin")
+            with self.assertRaises(Exception) as caught:
+                self._model(c).download_file("big.bin", out, tmp)
+            self.assertIn("bytes 0-1023/4096", str(caught.exception))
+            self.assertFalse(os.path.exists(out))
+
+    def test_a_versioned_object_pins_its_ranges_without_an_etag(self):
+        """An ETag is not the only pin. On a versioned bucket -- or any
+        backend whose HEAD returns a VersionId but no usable ETag -- the
+        version id names one immutable object, so the ranged path is safe
+        and every range has to carry it."""
+        payload = os.urandom(4096)
+
+        class _Versioned(_PinnedRangedClient):
+            def head_object(self, **kw):
+                return {"ContentLength": len(self.payload), "ETag": "",
+                        "VersionId": "v7"}
+
+        c = _Versioned(payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "big.bin")
+            self._model(c).download_file("big.bin", out, tmp)
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(), payload)
+        self.assertEqual(len(c.requests), 4, "did not take the ranged path")
+        self.assertTrue(all(r.get("VersionId") == "v7" for r in c.requests),
+                        "a range went out unpinned")
+        self.assertFalse(any("IfMatch" in r for r in c.requests))
+
+    def test_a_version_pinned_resume_record_is_keyed_on_the_version(self):
+        """With an empty ETag the record is keyed on the identity, version
+        included. The matching one resumes; one written for another version
+        of the same key must not."""
+        payload = os.urandom(4096)
+
+        class _Versioned(_PinnedRangedClient):
+            version = "v7"
+
+            def head_object(self, **kw):
+                return {"ContentLength": len(self.payload), "ETag": "",
+                        "VersionId": self.version}
+
+        def _run(record_version):
+            c = _Versioned(payload)
+            tmp = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+            out = os.path.join(tmp, "big.bin")
+            part = out + Model.PART_SUFFIX
+            m = self._model(c)
+            with open(part, "wb") as handle:         # first half already local
+                handle.write(payload[:2048] + b"\0" * 2048)
+            with open(part + ".meta", "w") as handle:
+                json.dump({"etag": "", "size": 4096, "chunk_size": 1024,
+                           "chunks": [0, 1],
+                           "identity": {"bucket": "b", "key": "big.bin",
+                                        "endpoint": m.profile_endpoint_url,
+                                        "version": record_version}}, handle)
+            m.download_file("big.bin", out, tmp)
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(), payload)
+            return len(c.requests)
+
+        self.assertEqual(_run("v7"), 2, "did not resume the matching record")
+        self.assertEqual(_run("v6"), 4, "resumed another version's record")
+
+    def test_a_failed_head_never_takes_the_unpinned_ranged_path(self):
+        """With no ETag there is nothing to pin the ranges to and nothing to
+        key a resume record on, so the managed transfer — which pins its
+        own — does the work instead."""
+        bodies = {"docs/big.bin": os.urandom(4096)}
+        c = _PrefixDownloadClient(bodies)
+
+        def _head_fails(**kw):
+            c.calls.append(("head_object", kw))
+            raise _client_error("InternalError", status=500, op="HeadObject")
+
+        c.head_object = _head_fails
+        m = self._model(c)
+        with tempfile.TemporaryDirectory() as tmp:
+            m.download_file("docs/", None, tmp)
+            out = os.path.join(tmp, "docs", "big.bin")
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(), bodies["docs/big.bin"])
+            self.assertEqual(sorted(os.listdir(os.path.dirname(out))),
+                             ["big.bin"], "a resume record was written")
+        self.assertEqual(c.ranges, [])
+        self.assertEqual(len(c.calls_of("download_file")), 1)
+
+    def test_an_empty_etag_never_writes_or_resumes_a_record(self):
+        payload = os.urandom(4096)
+        c = _PinnedRangedClient(payload)
+        m = self._model(c)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "big.bin")
+            part, meta = out + Model.PART_SUFFIX, out + Model.PART_SUFFIX + ".meta"
+            # A record that claims every chunk, keyed on nothing, over junk.
+            with open(part, "wb") as handle:
+                handle.write(os.urandom(4096))
+            with open(meta, "w") as handle:
+                json.dump({"etag": "", "size": 4096, "chunk_size": 1024,
+                           "chunks": [0, 1, 2, 3]}, handle)
+            # Neither an ETag nor a version id: there is nothing to pin the
+            # ranges to, and nothing to key a resume record on either, so the
+            # ranged path refuses rather than trusting the record on disk.
+            # _download_object keeps such an object on the managed transfer --
+            # test_a_failed_head_never_takes_the_unpinned_ranged_path.
+            with self.assertRaises(ValueError):
+                m._download_ranged("big.bin", out, 4096, "")
+            self.assertFalse(os.path.exists(out))
+            self.assertEqual(c.requests, [], "resumed from the junk record")
+
+    def test_a_large_encrypted_object_is_verified_by_its_checksum(self):
+        """REGRESSION (false failure): the ranged path dropped the HEAD and
+        compared the ETag — which under SSE-KMS is not an MD5 — so an intact
+        large download failed even with a full-object CRC32 stored."""
+        payload = os.urandom(4096)
+        head = {"ServerSideEncryption": "aws:kms",
+                "ChecksumCRC32": self._crc32(payload)}
+        c = _PinnedRangedClient(payload, etag="f" * 32, head_extra=head)
+        logged = []
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "big.bin")
+            self._model(c, verify=True).download_file(
+                "big.bin", out, tmp, log_fn=logged.append)
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(), payload)
+        self.assertTrue(any("checksum ok (CRC32)" in line for line in logged),
+                        logged)
+
+    def test_the_stored_checksum_still_catches_a_bad_large_download(self):
+        payload = os.urandom(4096)
+        head = {"ChecksumCRC32": self._crc32(b"another object")}
+        c = _PinnedRangedClient(payload, etag="f" * 32 + "-4",
+                                head_extra=head)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(Exception) as caught:
+                self._model(c, verify=True).download_file(
+                    "big.bin", os.path.join(tmp, "big.bin"), tmp)
+            self.assertIn("Checksum mismatch", str(caught.exception))
+
+    def test_a_failed_verification_never_reaches_the_final_name(self):
+        """REGRESSION: the partial was renamed into place and THEN verified,
+        so a mismatch left the bad bytes there — and the next sync, seeing
+        the right size and a newer mtime, called the file up to date."""
+        good = os.urandom(4096)
+        bad = good[:100] + bytes([good[100] ^ 0xFF]) + good[101:]
+        # the HEAD describes the good object; the bytes served are not it
+        c = _PinnedRangedClient(bad, etag=hashlib.md5(good).hexdigest())
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "big.bin")
+            with open(out, "wb") as handle:
+                handle.write(b"the copy the user already had")
+            with self.assertRaises(Exception) as caught:
+                self._model(c, verify=True).download_file("big.bin", out, tmp)
+            self.assertIn("Checksum mismatch", str(caught.exception))
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(),
+                                 b"the copy the user already had")
+            # every chunk was marked done, so the partial could only
+            # reproduce the same bad file; it goes too
+            self.assertEqual(os.listdir(tmp), ["big.bin"])
+
+    def test_a_failed_managed_verification_removes_the_file(self):
+        bodies = {"small.txt": b"payload"}
+        c = _PrefixDownloadClient(bodies, corrupt={"small.txt"})
+        m = make_model(bucket="b")
+        m._client = c
+        m.verify_downloads = True
+        m.resume_threshold = 1 << 30
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "small.txt")
+            with self.assertRaises(Exception) as caught:
+                m.download_file("small.txt", out, tmp)
+            self.assertIn("Checksum mismatch", str(caught.exception))
+            self.assertFalse(os.path.exists(out))
 class RangedResponseChecksumTests(unittest.TestCase):
     """
     REGRESSION (every large download, on some backends): botocore 1.36 and
@@ -1151,6 +1647,8 @@ class DownloadTraversalGuardTests(unittest.TestCase):
     download target directory."""
 
     def test_unsafe_keys_are_skipped(self):
+        """Skipped, and SAID: the rest of the folder downloads, and the job
+        ends as an incomplete download rather than "done"."""
         m = make_model(bucket="b")
         c = FakeS3Client(list_pages=[{
             "Contents": [
@@ -1162,7 +1660,11 @@ class DownloadTraversalGuardTests(unittest.TestCase):
         m._client = c
         logs = []
         with tempfile.TemporaryDirectory() as tmp:
-            m.download_file("docs/", None, tmp, log_fn=logs.append)
+            with self.assertRaises(DownloadIncomplete) as caught:
+                m.download_file("docs/", None, tmp, log_fn=logs.append)
+            self.assertEqual(
+                [k for k, _why in caught.exception.failures],
+                ["docs/../../evil.txt", "docs/../evil2/"])
             base = os.path.abspath(os.path.join(tmp, "docs"))
             downloaded = [kw["args"][2] for kw in c.calls_of("download_file")]
             self.assertEqual(len(downloaded), 1)
@@ -1211,6 +1713,11 @@ class DownloadTraversalGuardTests(unittest.TestCase):
             plan = plan_prefix_download("p/", base, [("p/link/file", 1)])
             self.assertEqual(plan.files, [])
             self.assertEqual(plan.unsafe, ["p/link/file"])
+            # download_file reports every refusal by looking its key up in
+            # reasons, so one recorded without a reason is a KeyError that
+            # takes the whole folder down.
+            self.assertEqual(set(plan.reasons), set(plan.unsafe))
+            self.assertIn("symlink", plan.reasons["p/link/file"])
 
     def test_a_symlinked_prefix_root_is_refused_before_fetching(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1303,6 +1810,189 @@ class PrefixDownloadParityTests(unittest.TestCase):
         self.assertEqual(c.calls_of("download_file"), [],
                          "still used the managed, non-resumable transfer")
         self.assertTrue(c.ranges, "no ranged requests were made")
+class _ListingByPrefixClient(_PrefixDownloadClient):
+    """The same server, but listing only what is under the Prefix asked for
+    -- needed once one job downloads two different folders."""
+
+    def get_paginator(self, name):
+        if name != "list_objects_v2":
+            return super().get_paginator(name)
+        bodies = self.bodies
+
+        class _Paginator:
+            def paginate(self, **kw):
+                prefix = kw.get("Prefix") or ""
+                return [{"Contents": [{"Key": k, "Size": len(v)}
+                                      for k, v in bodies.items()
+                                      if k.startswith(prefix)]}]
+        return _Paginator()
+class FolderDownloadKeepsGoingTests(unittest.TestCase):
+    """
+    REGRESSION: one key the local filesystem cannot hold aborted the whole
+    folder. "docs/logs" and "docs/logs/2024.txt" are both legal S3 keys; on
+    disk the second needs "logs" to be a folder, so the first was an
+    IsADirectoryError -- and run_parallel re-raises the first error and skips
+    everything not yet started, so most of the folder was never fetched.
+    On Windows a ':' in a key (every ISO timestamp) did the same, or worse,
+    wrote silently into an NTFS alternate data stream.
+    """
+
+    BODIES = {"docs/a.txt": b"alpha",
+              "docs/logs": b"a file called logs",
+              "docs/logs/2024.txt": b"inside the folder called logs",
+              "docs/sub/c.txt": b"gamma",
+              "docs/z.txt": b"zulu"}
+
+    def _model(self, client, parallel=1):
+        m = make_model(bucket="b")
+        m._client = client
+        m.parallel_files = parallel
+        m.resume_threshold = 1 << 30    # the managed path, as most files take
+        return m
+
+    def _assert_landed(self, tmp, bodies):
+        for key, body in bodies.items():
+            with open(os.path.join(tmp, *key.split("/")), "rb") as handle:
+                self.assertEqual(handle.read(), body, key)
+
+    def test_a_file_folder_collision_costs_one_object_not_the_folder(self):
+        for parallel in (1, 4):
+            with self.subTest(parallel=parallel), \
+                    tempfile.TemporaryDirectory() as tmp:
+                c = _PrefixDownloadClient(self.BODIES)
+                logs = []
+                with self.assertRaises(DownloadIncomplete) as caught:
+                    self._model(c, parallel).download_file(
+                        "docs/", None, tmp, log_fn=logs.append)
+                self._assert_landed(
+                    tmp, {k: v for k, v in self.BODIES.items()
+                          if k != "docs/logs"})
+                # Refused by the plan, not attempted and failed.
+                fetched = [kw["args"][1] for kw in c.calls_of("download_file")]
+                self.assertNotIn("docs/logs", fetched)
+                [(key, why)] = caught.exception.failures
+                self.assertEqual(key, "docs/logs")
+                self.assertIn("folder of the same name", why)
+                self.assertIn("1 of 5 object(s)", str(caught.exception))
+                self.assertTrue(any("docs/logs" in ln and "unsafe" in ln
+                                    for ln in logs), logs)
+
+    def test_a_windows_illegal_name_is_skipped_and_the_rest_downloads(self):
+        bodies = {"docs/a.txt": b"alpha",
+                  "docs/2024-01-01T10:00:00.log": b"timestamped",
+                  "docs/CON.txt": b"device",
+                  "docs/z.txt": b"zulu"}
+        c = _PrefixDownloadClient(bodies)
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch(
+                "s3.common._local_names_follow_windows_rules",
+                return_value=True):
+            with self.assertRaises(DownloadIncomplete) as caught:
+                self._model(c).download_file("docs/", None, tmp)
+            self._assert_landed(tmp, {"docs/a.txt": b"alpha",
+                                      "docs/z.txt": b"zulu"})
+        fetched = [kw["args"][1] for kw in c.calls_of("download_file")]
+        self.assertEqual(sorted(fetched), ["docs/a.txt", "docs/z.txt"])
+        reasons = dict(caught.exception.failures)
+        self.assertIn("':'", reasons["docs/2024-01-01T10:00:00.log"])
+        self.assertIn("reserved", reasons["docs/CON.txt"])
+
+    def test_what_the_filesystem_refuses_at_write_time_is_per_file_too(self):
+        """What the plan cannot see coming -- a local folder already where a
+        file goes, a local file already where a folder goes -- costs those
+        objects and nothing else."""
+        bodies = {"docs/a.txt": b"alpha", "docs/b.txt": b"beta",
+                  "docs/sub/c.txt": b"gamma", "docs/empty/": b"",
+                  "docs/z.txt": b"zulu"}
+        for parallel in (1, 4):
+            with self.subTest(parallel=parallel), \
+                    tempfile.TemporaryDirectory() as tmp:
+                os.makedirs(os.path.join(tmp, "docs", "b.txt"))
+                for in_the_way in ("sub", "empty"):
+                    with open(os.path.join(tmp, "docs", in_the_way), "wb"):
+                        pass
+                c = _PrefixDownloadClient(bodies)
+                logs = []
+                with self.assertRaises(DownloadIncomplete) as caught:
+                    self._model(c, parallel).download_file(
+                        "docs/", None, tmp, log_fn=logs.append)
+                self._assert_landed(tmp, {"docs/a.txt": b"alpha",
+                                          "docs/z.txt": b"zulu"})
+                failed = sorted(k for k, _w in caught.exception.failures)
+                self.assertEqual(failed,
+                                 ["docs/b.txt", "docs/empty/", "docs/sub/c.txt"])
+                self.assertTrue(any("could not write docs/b.txt" in ln
+                                    for ln in logs), logs)
+
+    def test_a_network_error_still_ends_the_folder_as_itself(self):
+        """ConnectionError and botocore's timeouts are OSErrors too. They are
+        not about one key's name, and the job's transient retry has to see
+        them as what they are."""
+        class _Dropping(_PrefixDownloadClient):
+            def download_file(self, bucket, key, out_path, **kw):
+                if key == "docs/b.txt":
+                    raise ConnectionResetError(errno.ECONNRESET, "reset")
+                super().download_file(bucket, key, out_path, **kw)
+
+        c = _Dropping({"docs/a.txt": b"a", "docs/b.txt": b"b"})
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ConnectionResetError):
+                self._model(c).download_file("docs/", None, tmp)
+
+    def test_a_full_disk_stops_the_folder_at_once(self):
+        """Every later file would fail the same way; fetching each one only
+        to discard its bytes is not "keeping going"."""
+        class _Full(_PrefixDownloadClient):
+            def download_file(self, bucket, key, out_path, **kw):
+                self.calls.append(("download_file",
+                                   {"args": (bucket, key, out_path)}))
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        c = _Full({"docs/a.txt": b"a", "docs/b.txt": b"b"})
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(OSError) as caught:
+                self._model(c).download_file("docs/", None, tmp)
+        self.assertNotIsInstance(caught.exception, DownloadIncomplete)
+        self.assertEqual(caught.exception.errno, errno.ENOSPC)
+        self.assertEqual(len(c.calls_of("download_file")), 1)
+
+    def test_cancelling_is_still_a_cancellation(self):
+        """Not an incomplete download, though a refused key was pending."""
+        cancel = threading.Event()
+
+        class _Cancelling(_PrefixDownloadClient):
+            def download_file(self, bucket, key, out_path, **kw):
+                super().download_file(bucket, key, out_path, **kw)
+                cancel.set()
+
+        c = _Cancelling(self.BODIES)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(TransferCancelled):
+                self._model(c).download_file("docs/", None, tmp,
+                                             cancel_event=cancel)
+        self.assertEqual(len(c.calls_of("download_file")), 1)
+
+    def test_the_job_fails_with_a_summary_and_its_other_folders_still_run(self):
+        """What the queue row is built from: an error signal -- so the row
+        ends "error", not "done" -- naming what is missing, after the job's
+        other folders have downloaded."""
+        _ensure_qapp()
+        bodies = dict(self.BODIES)
+        bodies.update({"more/x.txt": b"x", "more/y.txt": b"y"})
+        c = _ListingByPrefixClient(bodies)
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = Worker(self._model(c),
+                            [("docs/", None, None, tmp),
+                             ("more/", None, None, tmp)])
+            errors, finished = [], []
+            worker.error.connect(errors.append)
+            worker.finished.connect(finished.append)
+            worker.download()
+            self._assert_landed(tmp, {"more/x.txt": b"x", "more/y.txt": b"y",
+                                      "docs/z.txt": b"zulu"})
+        self.assertEqual(finished, [False])     # failed, not cancelled
+        [message] = errors
+        self.assertIn("docs/logs", message)
+        self.assertIn("1 object(s) could not be written", message)
 class CopyPrefixGuardTests(unittest.TestCase):
     def setUp(self):
         self.m = make_model(bucket="b")
@@ -2441,6 +3131,110 @@ class PrefixDownloadPlanTests(unittest.TestCase):
     def test_blank_keys_are_ignored(self):
         plan = plan_prefix_download("p/", "/out", [("", 0), (None, 0)])
         self.assertEqual((plan.files, plan.dirs, plan.unsafe), ([], [], []))
+
+    def test_every_refusal_carries_a_reason(self):
+        plan = plan_prefix_download(
+            "p/", "/out", [("p/../../etc/passwd", 1),
+                           ("p/" + "L" * 300, 1), ("p/ok.txt", 1)])
+        self.assertEqual(set(plan.reasons), set(plan.unsafe))
+        self.assertIn("escapes", plan.reasons["p/../../etc/passwd"])
+        self.assertIn("255 bytes", plan.reasons["p/" + "L" * 300])
+
+    def test_a_file_and_a_folder_of_the_same_name_keep_the_folder(self):
+        """Both are legal S3 keys; on disk "logs" cannot be a file and a
+        folder at once. The folder wins -- it may hold thousands of objects
+        -- and it wins whichever the listing returns first."""
+        entries = [("docs/logs", 3), ("docs/logs/2024.txt", 5),
+                   ("docs/ok.txt", 1)]
+        for order in (entries, entries[::-1]):
+            with self.subTest(first=order[0][0]):
+                plan = plan_prefix_download("docs/", "/out", order)
+                self.assertEqual(
+                    sorted(k for k, _p, _s in plan.files),
+                    ["docs/logs/2024.txt", "docs/ok.txt"])
+                self.assertEqual(plan.unsafe, ["docs/logs"])
+                self.assertIn("folder", plan.reasons["docs/logs"])
+
+    def test_a_folder_marker_or_a_deeper_file_also_claims_the_name(self):
+        for other in ("d/a/", "d/a/b/", "d/a/b/c.txt"):
+            with self.subTest(other=other):
+                plan = plan_prefix_download("d/", "/out",
+                                            [("d/a", 1), (other, 0)])
+                self.assertEqual(plan.unsafe, ["d/a"])
+                self.assertNotIn("d/a", [k for k, _p, _s in plan.files])
+
+    def test_similar_names_are_not_collisions(self):
+        """"logs.txt" beside "logs/x" is two different paths."""
+        plan = plan_prefix_download(
+            "d/", "/out", [("d/logs.txt", 1), ("d/logs/x", 1),
+                           ("d/log", 1), ("d/logsx/y", 1)])
+        self.assertEqual(plan.unsafe, [])
+        self.assertEqual(len(plan.files), 4)
+
+    WINDOWS_ILLEGAL = {
+        "d/2024-01-01T10:00:00.log": "':'",
+        "d/what?.txt": "'?'",
+        "d/a*b": "'*'",
+        "d/pipe|name": "'|'",
+        "d/<angle>": "'<' '>'",
+        'd/say "hi"': "'\"'",
+        "d/tab\there": "'\\t'",
+        "d/CON": "reserved",
+        "d/nul.tar.gz": "reserved",
+        "d/com1.txt": "reserved",
+        "d/LPT9": "reserved",
+        "d/trailing.": "dot or a space",
+        "d/trailing ": "dot or a space",
+        "d/sub:dir/inside.txt": "':'",
+        "d/AUX/inside.txt": "reserved",
+    }
+
+    def _windows_rules(self, on):
+        return unittest.mock.patch(
+            "s3.common._local_names_follow_windows_rules", return_value=on)
+
+    def test_names_windows_cannot_hold_are_refused_there(self):
+        """A ':' is legal in a key and, on NTFS, silently an alternate data
+        stream; '?', '*', CON, NUL and a trailing dot are refused outright.
+        Each used to abort the whole folder on Windows."""
+        entries = [(k, 1) for k in self.WINDOWS_ILLEGAL] + [("d/ok.txt", 1)]
+        with self._windows_rules(True):
+            plan = plan_prefix_download("d/", "/out", entries)
+        self.assertEqual([k for k, _p, _s in plan.files], ["d/ok.txt"])
+        self.assertEqual(sorted(plan.unsafe), sorted(self.WINDOWS_ILLEGAL))
+        for key, expected in self.WINDOWS_ILLEGAL.items():
+            with self.subTest(key=key):
+                self.assertIn(expected, plan.reasons[key])
+
+    def test_the_same_names_download_normally_elsewhere(self):
+        """':' and '?' are ordinary on Linux and macOS; refusing them there
+        would skip files that download perfectly well."""
+        entries = [(k, 1) for k in self.WINDOWS_ILLEGAL]
+        with self._windows_rules(False):
+            plan = plan_prefix_download("d/", "/out", entries)
+        self.assertEqual(plan.unsafe, [])
+
+    def test_names_that_merely_look_reserved_are_fine_on_windows(self):
+        with self._windows_rules(True):
+            for name in ("CONFIG", "console.log", "nullable", "COM10",
+                         "LPT", "a.b.c", ".hidden", "x.CON"):
+                with self.subTest(name=name):
+                    self.assertTrue(local_name_is_writable("d/" + name))
+
+    def test_safe_local_path_shares_the_windows_rule(self):
+        """Sync, the second pane and search results map keys through it, and
+        a ':' there wrote into an alternate data stream just the same. A
+        '..' segment is still a containment question, not a bad name."""
+        base = os.path.join(os.sep, "out")
+        with self._windows_rules(True):
+            self.assertEqual(safe_local_path(base, "logs/12:00.txt"), "")
+            self.assertEqual(safe_local_path(base, "a/../b.txt"),
+                             os.path.join(base, "b.txt"))
+        with self._windows_rules(False):
+            self.assertTrue(safe_local_path(base, "logs/12:00.txt"))
+
+    def test_a_nul_character_is_refused_everywhere(self):
+        self.assertFalse(local_name_is_writable("d/a\0b"))
 
     def test_safe_local_path_refuses_escaping_keys(self):
         """Every other place a key becomes a local path (sync, the second

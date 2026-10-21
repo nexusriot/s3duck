@@ -1,6 +1,9 @@
 """ui/dialogs/."""
 
 import ast
+import botocore.exceptions
+import core.sync_plan as sync_plan_module
+import hashlib
 import io
 import main_window
 import os
@@ -8,6 +11,9 @@ import tempfile
 import threading
 import time
 import types
+import ui.dialogs.bucket_settings as bucket_settings_module
+import ui.dialogs.compare as compare_module
+import ui.dialogs.copy_move as copy_move_module
 import ui.dialogs.search as search_dialog_module
 import unittest
 import utils
@@ -27,7 +33,8 @@ from main_window import (
 from model import Model, TransferCancelled
 from properties_window import PropertiesWindow
 from tests.support import (
-    FakeS3Client, PROJECT_ROOT, _FakeDuplicateModel, _FakeMainWindow,
+    FakeS3Client, PROJECT_ROOT, _FakeCompareModel, _FakeDuplicateModel,
+    _FakeMainWindow,
     _FakePresignModel, _FakePropsModel, _FakeSyncModel, _FakeUploadsModel,
     _FakeVersionsModel, _StubModel, _dt, _ensure_qapp, make_main_window,
     make_model, read_app_sources,
@@ -697,6 +704,29 @@ class BulkRenameDialogTests(unittest.TestCase):
         self.assertFalse(self._ok(dlg).isEnabled())
         self.assertIn("Cannot apply", dlg._info.text())
 
+    def test_a_rename_chain_blocks_ok_and_hands_out_no_plan(self):
+        """FINDING (data loss): shifting a numbering (img1->img2->img3) was
+        accepted; executed as copy-all-then-delete it left one file of
+        three. The dialog must refuse it, and plan() must not hand it out
+        even if the dialog is accepted some other way."""
+        dlg = self._dlg([("img1.jpg", False), ("img2.jpg", False)])
+        dlg._mode_template.setChecked(True)
+        dlg._start.setValue(2)
+        dlg._template.setText("img{n}{ext}")
+        self.assertFalse(self._ok(dlg).isEnabled())
+        self.assertIn("being renamed", dlg._info.text())
+        self.assertEqual(dlg._table.rowCount(), 2)      # still previewed
+        self.assertEqual(dlg.plan(), [])
+
+    def test_a_field_access_template_does_not_abort(self):
+        """REGRESSION (crash): typing "{name.ext}" raised AttributeError out
+        of the textChanged slot, which PyQt6 turns into a process abort."""
+        dlg = self._dlg([("a.txt", False)])
+        dlg._mode_template.setChecked(True)
+        dlg._template.setText("{name.ext}")
+        self.assertIn("Invalid template", dlg._info.text())
+        self.assertFalse(self._ok(dlg).isEnabled())
+
     def test_invalid_regex_blocks_ok(self):
         dlg = self._dlg([("a.txt", False)])
         dlg._regex.setChecked(True)
@@ -762,6 +792,24 @@ class SyncDialogTests(unittest.TestCase):
                 [(a["action"], a["rel"]) for a in dlg.actionable()],
                 [("delete_remote", "gone.txt")],
             )
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "root reads a chmod 000 folder anyway")
+    def test_an_unreadable_subfolder_is_an_error_not_remote_deletes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            locked = os.path.join(tmp, "locked")
+            os.mkdir(locked)
+            os.chmod(locked, 0)
+            try:
+                dlg, _mw = self._dlg(remote={"locked/a.txt": (3, 10.0)})
+                dlg._local.setText(tmp)
+                dlg._delete_extra.setChecked(True)
+                dlg._preview()
+                self._settle(dlg)
+            finally:
+                os.chmod(locked, 0o700)
+            self.assertEqual(dlg.actionable(), [])
+            self.assertFalse(dlg._btn_run.isEnabled())
 
     def test_direction_switch(self):
         dlg, _mw = self._dlg()
@@ -862,9 +910,155 @@ class SyncDialogTests(unittest.TestCase):
         dlg._on_plan([{"action": "delete_remote", "rel": "file",
                        "size": 4, "reason": "extra"}], None)
         self.assertEqual(dlg.actionable(), [])
+
+    def test_a_plan_belongs_to_the_bucket_and_prefix_it_was_built_from(self):
+        """The form cannot show it and no signal announces it, but the window
+        can navigate while the dialog is open. The plan's rows are bare
+        relative paths: under another bucket or prefix they name different
+        objects, and "delete_remote old.html" would delete one of them."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "f.txt"), "w") as handle:
+                handle.write("x")
+            for moved in ("bucket", "prefix"):
+                with self.subTest(moved=moved):
+                    dlg, mw = self._dlg()
+                    dlg._local.setText(tmp)
+                    dlg._preview()
+                    self._settle(dlg)
+                    self.assertTrue(dlg._btn_run.isEnabled())
+
+                    if moved == "bucket":
+                        dlg._model.bucket = "somewhere-else"
+                    else:
+                        dlg._prefix = "other/"
+                    with patch.object(main_window.QMessageBox, "question",
+                                      return_value=QMessageBox.StandardButton.Yes):
+                        dlg._run()
+                    self.assertEqual(mw.started, [])
+                    self.assertEqual(dlg._actions, [])
+
+    def test_run_sends_the_bucket_and_prefix_that_were_reviewed(self):
+        """Not the ones the window shows by the time Run is pressed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "f.txt"), "w") as handle:
+                handle.write("x")
+            dlg, mw = self._dlg(prefix="reviewed/")
+            dlg._local.setText(tmp)
+            dlg._preview()
+            self._settle(dlg)
+            with patch.object(main_window.QMessageBox, "question",
+                              return_value=QMessageBox.StandardButton.Yes):
+                dlg._run()
+            self.assertEqual(mw.started[0][2], "reviewed/")
+            self.assertEqual(mw.started[0][-1]["bucket"], dlg._model.bucket)
+
+    def test_a_navigation_during_the_confirmation_still_stops_the_run(self):
+        """The confirmation runs a nested event loop, so the window is live
+        while it is up: the bucket can change between the check before the
+        prompt and the start after it. Checked again on the way out."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "f.txt"), "w") as handle:
+                handle.write("x")
+            dlg, mw = self._dlg()
+            dlg._local.setText(tmp)
+            dlg._preview()
+            self._settle(dlg)
+            self.assertTrue(dlg._btn_run.isEnabled())
+
+            def _navigate_then_confirm(*_args, **_kwargs):
+                dlg._model.bucket = "somewhere-else"
+                return QMessageBox.StandardButton.Yes
+
+            with patch.object(main_window.QMessageBox, "question",
+                              _navigate_then_confirm):
+                dlg._run()
+            self.assertEqual(mw.started, [])
+            self.assertEqual(dlg._actions, [])
+
+    def test_changing_the_folder_after_preview_invalidates_the_plan(self):
+        """FINDING (data loss): Run read the folder box afresh, so a plan
+        previewed against folder A ("delete_local old.html") ran against a
+        folder typed afterwards — deleting a file nobody had reviewed."""
+        with tempfile.TemporaryDirectory() as first, \
+                tempfile.TemporaryDirectory() as second:
+            for folder in (first, second):
+                with open(os.path.join(folder, "old.html"), "w") as handle:
+                    handle.write("x")
+            dlg, mw = self._dlg()
+            dlg._down.setChecked(True)
+            dlg._delete_extra.setChecked(True)
+            dlg._local.setText(first)
+            dlg._preview()
+            self._settle(dlg)
+            self.assertEqual([(a["action"], a["rel"]) for a in dlg.actionable()],
+                             [("delete_local", "old.html")])
+            self.assertTrue(dlg._btn_run.isEnabled())
+
+            dlg._local.setText(second)
+            self.assertFalse(dlg._btn_run.isEnabled())
+            self.assertEqual(dlg.actionable(), [])
+            self.assertIn("preview again", dlg._info.text())
+            with patch.object(main_window.QMessageBox, "question",
+                              return_value=QMessageBox.StandardButton.Yes):
+                dlg._run()
+            self.assertEqual(mw.started, [])
+
+    def test_every_plan_input_invalidates_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "f.txt"), "w") as handle:
+                handle.write("x")
+            for change in ("direction", "delete_extra", "exclude"):
+                with self.subTest(change=change):
+                    dlg, _mw = self._dlg()
+                    dlg._local.setText(tmp)
+                    dlg._preview()
+                    self._settle(dlg)
+                    self.assertTrue(dlg._btn_run.isEnabled())
+                    if change == "direction":
+                        dlg._down.setChecked(True)
+                    elif change == "delete_extra":
+                        dlg._delete_extra.setChecked(True)
+                    else:
+                        dlg._exclude.setText("*.tmp")
+                    self.assertFalse(dlg._btn_run.isEnabled(), change)
+                    self.assertEqual(dlg._actions, [], change)
+
+    def test_run_uses_the_inputs_the_plan_was_built_from(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "f.txt"), "w") as handle:
+                handle.write("x")
+            dlg, mw = self._dlg()
+            dlg._local.setText(tmp + os.sep + " ")   # stripped, same folder
+            dlg._preview()
+            self._settle(dlg)
+            with patch.object(main_window.QMessageBox, "question",
+                              return_value=QMessageBox.StandardButton.Yes):
+                dlg._run()
+            self.assertEqual(mw.started[0][1], tmp + os.sep)
+            self.assertEqual(mw.started[0][3], "upload")
+
+    def test_an_edit_during_the_scan_discards_its_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "f.txt"), "w") as handle:
+                handle.write("x")
+            dlg, _mw = self._dlg()
+            dlg._local.setText(tmp)
+            dlg._preview()
+            dlg._exclude.setText("*.txt")        # before the result lands
+            self._settle(dlg)
+            self.assertEqual(dlg._actions, [])
+            self.assertFalse(dlg._btn_run.isEnabled())
+            self.assertIn("preview again", dlg._info.text())
+
+
 class CrossProfileSyncDialogTests(unittest.TestCase):
-    """The cross-profile sync preview summarises its plan the same way the
-    in-profile one does."""
+    """The cross-profile sync preview summarises its plan the same way
+    the in-profile one does.
+
+    REGRESSION (crash): that summary was a dict handed to QLabel.setText,
+    so every successful Compare raised TypeError inside a Qt slot — a
+    process abort under PyQt6.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -880,6 +1074,252 @@ class CrossProfileSyncDialogTests(unittest.TestCase):
                     "reason": "missing"}])
         self.assertIn("upload: 1", fake._summary.text())
         fake._ok_enabled.assert_called_once_with(True)
+
+    def _dlg(self):
+        settings = QSettings("s3duck-tests", "s3duck-tests")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        model = Model("https://s3.amazonaws.com", "us-east-1", "AK", "SK",
+                      "bkt", False, False)
+        mw = _FakeMainWindow()
+        dlg = main_window.CrossProfileSyncDialog(
+            None, mw, model, "pre/", settings, current_profile="prof")
+        self.addCleanup(dlg.close)
+        return dlg, mw
+
+    def test_render_spells_the_summary_out(self):
+        dlg, _mw = self._dlg()
+        dlg._render([
+            {"action": "upload", "rel": "a.txt", "size": 2048,
+             "reason": "missing at destination"},
+            {"action": "skip", "rel": "b.txt", "size": 1, "reason": "up to date"},
+        ])
+        text = dlg._summary.text()
+        self.assertIn("upload: 1", text)
+        self.assertIn("skip: 1", text)
+        self.assertIn("2.0 KB to transfer", text)
+        self.assertTrue(dlg._buttons.button(
+            QDialogButtonBox.StandardButton.Ok).isEnabled())
+
+    def test_an_empty_plan_renders_too(self):
+        dlg, _mw = self._dlg()
+        dlg._render([])
+        self.assertIn("to transfer", dlg._summary.text())
+        self.assertFalse(dlg._buttons.button(
+            QDialogButtonBox.StandardButton.Ok).isEnabled())
+
+    def test_compare_reaches_the_summary_without_raising(self):
+        dlg, mw = self._dlg()
+        actions = [{"action": "upload", "rel": "a.txt", "size": 1,
+                    "reason": "missing at destination"}]
+        mw._run_with_progress = lambda _title, _fn: (actions, None)
+        with patch.object(dlg.picker, "destination_bucket",
+                          return_value="other"), \
+             patch.object(dlg.picker, "selected_profile",
+                          return_value=object()), \
+             patch.object(copy_move_module, "build_profile_model",
+                          return_value=object()):
+            dlg.compare()
+        self.assertIn("upload: 1", dlg._summary.text())
+class PaneCompareContentTests(unittest.TestCase):
+    """FINDING: the pane comparison called a same-size pair "same" only when
+    the mtimes agreed. S3's LastModified is the time of the write and a
+    download never sets the local mtime, so a folder compared with its own
+    uploaded copy -- even right after "Copy selected" -- and a prefix with its
+    server-side copy showed nearly every file as "differs". "Hide identical"
+    hid nothing, and copying again moved unchanged data."""
+
+    DATA = b"the same bytes on both sides"
+    LOCAL_MTIME = 1_000.0
+    REMOTE_MTIME = 2_000_000.0     # written long after the local file
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+
+    def _write(self, rel, data):
+        path = os.path.join(self.root, rel)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        os.utime(path, (self.LOCAL_MTIME, self.LOCAL_MTIME))
+        return path
+
+    @staticmethod
+    def _md5(data):
+        return hashlib.md5(data).hexdigest()
+
+    def _dialog(self, model, left, right):
+        mw = _FakeMainWindow()
+        mw.data_model = model
+        mw.is_read_only = lambda: False
+        dlg = main_window.PaneCompareDialog(None, mw, left, right)
+        self.addCleanup(dlg.close)
+        return dlg
+
+    def _compare(self, dlg, timeout=5.0):
+        dlg._compare()
+        deadline = time.monotonic() + timeout
+        while dlg._thread is not None and time.monotonic() < deadline:
+            self._app.processEvents()
+        self._app.processEvents()
+        return {row["rel"]: row["status"] for row in dlg._rows}
+
+    def _local_vs_remote(self, etag, heads=None, part_size=8 * 1024 * 1024,
+                         data=None):
+        self._write("a.txt", self.DATA if data is None else data)
+        model = _FakeCompareModel(
+            trees={"b": {"pre/a.txt": (len(self.DATA), self.REMOTE_MTIME,
+                                       etag)}},
+            heads=heads, part_size=part_size)
+        dlg = self._dialog(model, ("remote", "b", "pre/"),
+                           ("local", self.root))
+        return dlg, model
+
+    def test_a_copied_file_is_identical_whatever_its_mtime(self):
+        dlg, model = self._local_vs_remote(self._md5(self.DATA))
+        self.assertEqual(self._compare(dlg), {"a.txt": "same"})
+        self.assertEqual(dlg.visible_rows(), [])
+        self.assertIn("1 identical", dlg._summary.text())
+        # A match needs no confirmation.
+        self.assertEqual(model.head_calls, [])
+
+    def test_a_multipart_upload_is_rebuilt_at_the_configured_part_size(self):
+        """What this app's own multipart uploads produce."""
+        part = 8
+        pieces = [self.DATA[i:i + part]
+                  for i in range(0, len(self.DATA), part)]
+        etag = Model.composite_etag(
+            [hashlib.md5(piece).digest() for piece in pieces])
+        dlg, _model = self._local_vs_remote(etag, part_size=part)
+        self.assertEqual(self._compare(dlg), {"a.txt": "same"})
+
+    def test_a_multipart_etag_no_guess_reproduces_is_unverified(self):
+        dlg, model = self._local_vs_remote("f" * 32 + "-3")
+        self.assertEqual(self._compare(dlg), {"a.txt": "unverified"})
+        self.assertEqual(model.head_calls, [])
+
+    def test_different_bytes_of_the_same_size_differ(self):
+        changed = self.DATA.upper()
+        dlg, model = self._local_vs_remote(self._md5(changed))
+        self.assertEqual(self._compare(dlg), {"a.txt": "differs"})
+        # Confirmed with a HEAD that the ETag really is an MD5.
+        self.assertEqual(model.head_calls, [("b", "pre/a.txt")])
+
+    def test_an_encrypted_objects_etag_is_not_taken_as_a_difference(self):
+        """Under SSE-KMS or SSE-C the listed ETag is 32 hex characters and
+        no digest of the bytes; the listing cannot tell, the HEAD can."""
+        refused = botocore.exceptions.ClientError(
+            {"Error": {"Code": "400", "Message": "Bad Request"}},
+            "HeadObject")
+        for label, head in (
+                ("kms", {"ServerSideEncryption": "aws:kms"}),
+                ("sse-c", {"SSECustomerAlgorithm": "AES256"}),
+                ("sse-c, no key", refused)):
+            with self.subTest(label):
+                dlg, _model = self._local_vs_remote(
+                    "c" * 32, heads={("b", "pre/a.txt"): head})
+                self.assertEqual(self._compare(dlg), {"a.txt": "unverified"})
+
+    def test_an_unverified_pair_stays_listed_and_says_why(self):
+        dlg, _model = self._local_vs_remote(
+            "c" * 32, heads={("b", "pre/a.txt"):
+                             {"ServerSideEncryption": "aws:kms"}})
+        self._compare(dlg)
+        self.assertEqual([row["rel"] for row in dlg.visible_rows()],
+                         ["a.txt"])
+        self.assertEqual(dlg._table.item(0, 3).text(),
+                         "same size, different time")
+        self.assertTrue(dlg._table.item(0, 3).toolTip())
+        self.assertIn("1 same size but different time", dlg._summary.text())
+
+    def test_a_file_over_the_hash_limit_is_not_read(self):
+        dlg, _model = self._local_vs_remote(self._md5(self.DATA))
+        with patch.object(sync_plan_module, "COMPARE_HASH_LIMIT",
+                          len(self.DATA) - 1):
+            self.assertEqual(self._compare(dlg), {"a.txt": "unverified"})
+
+    def test_close_clocks_still_skip_the_hash(self):
+        """The old size-and-mtime rule holds where it can: an untouched file
+        is not read just to be told it is the same."""
+        self._write("a.txt", self.DATA)
+        model = _FakeCompareModel(trees={"b": {"pre/a.txt": (
+            len(self.DATA), self.LOCAL_MTIME + 1, "f" * 32 + "-2")}})
+        dlg = self._dialog(model, ("remote", "b", "pre/"),
+                           ("local", self.root))
+        with patch.object(sync_plan_module, "file_matches_etag",
+                          side_effect=AssertionError("hashed")):
+            self.assertEqual(self._compare(dlg), {"a.txt": "same"})
+
+    def _remote_vs_remote(self, left_etag, right_etag, heads=None):
+        size = len(self.DATA)
+        model = _FakeCompareModel(
+            trees={"src": {"a/f.bin": (size, 100.0, left_etag)},
+                   "dst": {"b/f.bin": (size, self.REMOTE_MTIME, right_etag)}},
+            heads=heads)
+        dlg = self._dialog(model, ("remote", "src", "a/"),
+                           ("remote", "dst", "b/"))
+        return dlg, model
+
+    def test_a_server_side_copy_is_identical_whatever_its_mtime(self):
+        etag = self._md5(self.DATA)
+        dlg, model = self._remote_vs_remote(etag, etag)
+        self.assertEqual(self._compare(dlg), {"f.bin": "same"})
+        self.assertEqual(dlg.visible_rows(), [])
+        self.assertEqual(model.head_calls, [])
+
+    def test_two_plain_md5s_that_disagree_differ(self):
+        dlg, model = self._remote_vs_remote("a" * 32, "b" * 32)
+        self.assertEqual(self._compare(dlg), {"f.bin": "differs"})
+        self.assertEqual(sorted(model.head_calls),
+                         [("dst", "b/f.bin"), ("src", "a/f.bin")])
+
+    def test_an_encrypted_copy_is_unverified_not_different(self):
+        dlg, _model = self._remote_vs_remote(
+            "a" * 32, "b" * 32,
+            heads={("dst", "b/f.bin"): {"ServerSideEncryption": "aws:kms"}})
+        self.assertEqual(self._compare(dlg), {"f.bin": "unverified"})
+
+    def test_multipart_etags_that_disagree_are_unverified(self):
+        dlg, model = self._remote_vs_remote("a" * 32 + "-2", "b" * 32)
+        self.assertEqual(self._compare(dlg), {"f.bin": "unverified"})
+        self.assertEqual(model.head_calls, [])
+
+    def test_unhiding_shows_the_identical_rows_again(self):
+        etag = self._md5(self.DATA)
+        dlg, _model = self._remote_vs_remote(etag, etag)
+        self._compare(dlg)
+        dlg._hide_same.setChecked(False)
+        self.assertEqual([row["status"] for row in dlg.visible_rows()],
+                         ["same"])
+        self.assertEqual(dlg._table.rowCount(), 1)
+
+    def test_closing_mid_compare_cancels_the_hashing(self):
+        """The event the check stops on between files is the one closing
+        the dialog sets."""
+        dlg, _model = self._local_vs_remote(self._md5(self.DATA))
+        hashing = threading.Event()
+        seen = []
+
+        def capture(left, right, models, part_sizes=(), cancel=None):
+            def check(*_args):
+                seen.append(cancel)
+                hashing.set()
+                cancel.wait(5)
+                raise TransferCancelled("cancelled")
+            return check
+
+        with patch.object(compare_module, "make_content_check", capture):
+            dlg._compare()
+            self.assertTrue(hashing.wait(5))
+            dlg.stop_threads()
+        self.assertTrue(seen[0].is_set())
+
+
 class UsageDialogTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1426,6 +1866,29 @@ class VersionDiffTests(unittest.TestCase):
         text, problem = self.build(b"", b"new\n", "v1", "v2")
         self.assertEqual(problem, "")
         self.assertIn("+new", text)
+
+    def test_a_read_cut_through_a_character_still_diffs(self):
+        """FINDING: the 512 KiB ranged read can end inside a multi-byte
+        character; its lone replacement character made a large Cyrillic or
+        CJK file "not UTF-8 text" about half the time."""
+        # each ends one byte into a two-byte "ж"
+        older = ("строка журнала\n" * 3 + "ж").encode("utf-8")[:-1]
+        newer = ("строка ЖУРНАЛА\n" * 3 + "ж").encode("utf-8")[:-1]
+        self.assertTrue(older.decode("utf-8", "replace").endswith("�"))
+        text, problem = self.build(older, newer, "v1", "v2", truncated=True)
+        self.assertEqual(problem, "")
+        self.assertIn("+строка ЖУРНАЛА", text)
+
+    def test_a_bad_byte_before_the_cut_is_still_refused(self):
+        _text, problem = self.build(
+            "héllo\nworld".encode("latin-1"), b"hello\nworld", "v1", "v2",
+            truncated=True)
+        self.assertIn("UTF-8", problem)
+
+    def test_an_untruncated_broken_tail_is_still_refused(self):
+        _text, problem = self.build(
+            "журнал".encode("utf-8")[:-1], b"x", "v1", "v2")
+        self.assertIn("UTF-8", problem)
 class VersionSelectionTests(unittest.TestCase):
     """Two rows mean a diff; anything else does not."""
 
@@ -1620,3 +2083,372 @@ class SavedSearchTests(unittest.TestCase):
         win.store_saved_searches([{"name": "prod-only", "filters": {}}])
         win.profile_name = "dev"
         self.assertEqual(win.load_saved_searches(), [])
+class BucketSettingsSaveTests(unittest.TestCase):
+    """The bucket settings dialog may only write what it read and what the
+    user changed. Each save used to rewrite whole documents from whatever
+    the form held — an empty editor after a failed read, a "(none)" for an
+    encryption mode it could not show, tag keys run through a file-extension
+    parser — and every one of those removed or renamed real configuration."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    class _Model:
+        bucket = "bkt"
+
+        def __init__(self, docs):
+            self.docs = dict(docs)
+            self.calls = []
+
+        def clone_for_worker(self):
+            return self
+
+        def __getattr__(self, name):
+            if name.startswith("get_"):
+                def _get(_doc=name[4:]):
+                    value = self.docs.get(_doc)
+                    if isinstance(value, Exception):
+                        raise value
+                    return value
+                return _get
+            if name.startswith(("put_", "set_")):
+                return lambda *a, **kw: self.calls.append((name, a, kw))
+            raise AttributeError(name)
+
+        def written(self):
+            return [name for name, _a, _kw in self.calls]
+
+    class _Window(_FakeMainWindow):
+        def is_read_only(self):
+            return False
+
+    DOCS = {
+        "bucket_lifecycle": [], "bucket_cors": [], "bucket_policy": "",
+        "object_lock_configuration": {}, "bucket_policy_status": "",
+        "bucket_encryption": {"sse": "aws:kms", "kms_key": "arn:k",
+                              "bucket_key": True},
+        "bucket_tags": {"CostCenter": "1234", "Owner": "", "*tier": "gold"},
+        "bucket_website": {}, "bucket_notifications": [],
+        "bucket_acceleration": "",
+    }
+
+    @staticmethod
+    def _sync(_parent, _title, fn, modality=None):
+        try:
+            return fn(None), None
+        except Exception as exc:
+            return None, exc
+
+    def _dlg(self, runner=None, **docs):
+        model = self._Model(dict(self.DOCS, **docs))
+        with patch.object(bucket_settings_module, "run_with_progress",
+                          runner or self._sync):
+            dlg = bucket_settings_module.BucketSettingsDialog(
+                None, self._Window(), model)
+        self.addCleanup(dlg.close)
+        # reload() after a save runs through the same stand-in.
+        patcher = patch.object(bucket_settings_module, "run_with_progress",
+                               runner or self._sync)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return dlg, model
+
+    def test_an_acceleration_toggle_writes_only_acceleration(self):
+        """FINDING: ticking acceleration also rewrote the tags with their
+        keys lowercased and empty-valued ones dropped."""
+        dlg, model = self._dlg()
+        dlg._acceleration.setChecked(True)
+        dlg._save_bucket()
+        self.assertEqual(model.written(), ["set_bucket_acceleration"])
+
+    def test_a_tag_edit_keeps_case_and_empty_values(self):
+        dlg, model = self._dlg()
+        dlg._bucket_tags.setPlainText(
+            dlg._bucket_tags.toPlainText() + "\nTeam = Infra")
+        dlg._save_bucket()
+        self.assertEqual(model.written(), ["put_bucket_tags"])
+        self.assertEqual(model.calls[0][1][0], {
+            "CostCenter": "1234", "Owner": "", "*tier": "gold",
+            "Team": "Infra"})
+
+    def test_saving_nothing_changed_writes_nothing(self):
+        dlg, model = self._dlg()
+        dlg._save_bucket()
+        self.assertEqual(model.calls, [])
+        self.assertIn("Nothing changed", dlg._bucket_status.text())
+
+    def test_an_encryption_change_writes_only_encryption(self):
+        dlg, model = self._dlg()
+        dlg._sse.setCurrentIndex(dlg._sse.findData("AES256"))
+        dlg._save_bucket()
+        self.assertEqual(model.written(), ["put_bucket_encryption"])
+        self.assertEqual(model.calls[0][2]["sse"], "AES256")
+
+    def test_an_encryption_mode_the_combo_lacks_is_never_written(self):
+        """FINDING: DSSE-KMS showed as "(none)", and a tags-only save then
+        called put_bucket_encryption(sse="") — removing it."""
+        dlg, model = self._dlg(bucket_encryption={
+            "sse": "aws:kms:dsse", "kms_key": "arn:k", "bucket_key": False})
+        self.assertFalse(dlg._sse.isEnabled())
+        self.assertIn("aws:kms:dsse", dlg._bucket_status.text())
+        dlg._bucket_tags.setPlainText("a = 1")
+        dlg._save_bucket()
+        self.assertEqual(model.written(), ["put_bucket_tags"])
+
+    def test_a_failed_encryption_or_tags_read_is_never_written(self):
+        dlg, model = self._dlg(bucket_encryption=RuntimeError("denied"),
+                               bucket_tags=RuntimeError("denied"))
+        self.assertFalse(dlg._sse.isEnabled())
+        self.assertFalse(dlg._bucket_tags.isEnabled())
+        dlg._acceleration.setChecked(True)
+        dlg._save_bucket()
+        self.assertEqual(model.written(), ["set_bucket_acceleration"])
+
+    def test_a_failed_lifecycle_read_cannot_replace_the_rules(self):
+        """FINDING: after a failed read the rule list was empty and
+        writable, so adding one rule and saving replaced every real one."""
+        dlg, model = self._dlg(bucket_lifecycle=RuntimeError("timeout"))
+        for button in (dlg._btn_add, dlg._btn_edit, dlg._btn_remove,
+                       dlg._btn_save):
+            self.assertFalse(button.isEnabled())
+        with patch.object(bucket_settings_module, "LifecycleRuleDialog") \
+                as rule_dlg, \
+             patch.object(bucket_settings_module.QMessageBox, "question",
+                          return_value=QMessageBox.StandardButton.Yes):
+            dlg._add_rule()
+            dlg._save_lifecycle()
+        rule_dlg.assert_not_called()
+        self.assertEqual(model.calls, [])
+
+    def test_a_cancelled_read_leaves_nothing_writable(self):
+        """Cancelling the first read returned early and left every tab empty
+        and writable — Save on Lifecycle then removed the configuration."""
+        dlg, model = self._dlg(runner=lambda *_a, **_kw: (None, None))
+        for button in (dlg._btn_add, dlg._btn_save, dlg._btn_cors_save,
+                       dlg._btn_policy_save, dlg._btn_bucket_save,
+                       dlg._btn_site_save):
+            self.assertFalse(button.isEnabled())
+        self.assertFalse(dlg._policy_edit.isEnabled())
+        self.assertTrue(dlg._cors_text.isReadOnly())
+        self.assertIn("cancelled", dlg._lifecycle_status.text())
+        with patch.object(bucket_settings_module.QMessageBox, "question",
+                          return_value=QMessageBox.StandardButton.Yes):
+            dlg._save_lifecycle()
+            dlg._save_cors()
+            dlg._save_policy()
+            dlg._save_website()
+        self.assertEqual(model.calls, [])
+
+    def test_a_failed_cors_or_policy_read_is_read_only(self):
+        dlg, _model = self._dlg(bucket_cors=RuntimeError("denied"),
+                                bucket_policy=RuntimeError("denied"))
+        self.assertTrue(dlg._cors_text.isReadOnly())
+        self.assertFalse(dlg._btn_cors_save.isEnabled())
+        self.assertFalse(dlg._policy_edit.isEnabled())
+        self.assertTrue(dlg._lifecycle_editable())
+
+    def _edit_first_rule(self, dlg):
+        dlg._rules_list.setCurrentRow(0)
+
+        def _exec(rule_dialog):
+            rule_dialog._accept()
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(bucket_settings_module.LifecycleRuleDialog, "exec",
+                          _exec):
+            dlg._edit_rule()
+
+    def test_editing_a_rule_keeps_what_the_form_has_no_box_for(self):
+        """FINDING: Edit -> OK rebuilt the rule from the form alone, dropping
+        NoncurrentVersionTransitions and NewerNoncurrentVersions — the latter
+        turns "keep the newest 3 old versions" into "delete them all"."""
+        rule = {
+            "ID": "versions", "Status": "Enabled",
+            "Filter": {"Prefix": "logs/"},
+            "Transitions": [{"Days": 30, "StorageClass": "STANDARD_IA"}],
+            "NoncurrentVersionTransitions": [
+                {"NoncurrentDays": 30, "StorageClass": "GLACIER",
+                 "NewerNoncurrentVersions": 2}],
+            "NoncurrentVersionExpiration": {
+                "NoncurrentDays": 90, "NewerNoncurrentVersions": 3},
+            "Expiration": {"Days": 365},
+        }
+        dlg, _model = self._dlg(bucket_lifecycle=[rule])
+        self._edit_first_rule(dlg)
+        self.assertEqual(dlg._rules[0], rule)
+
+    def test_a_rule_the_form_cannot_show_is_not_opened_for_editing(self):
+        rules = [
+            {"ID": "two", "Status": "Enabled", "Filter": {"Prefix": ""},
+             "Transitions": [{"Days": 30, "StorageClass": "STANDARD_IA"},
+                             {"Days": 90, "StorageClass": "GLACIER"}]},
+            {"ID": "zero", "Status": "Enabled", "Filter": {"Prefix": ""},
+             "Transitions": [{"Days": 0,
+                              "StorageClass": "INTELLIGENT_TIERING"}],
+             "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 7}},
+        ]
+        for index in range(len(rules)):
+            with self.subTest(rule=rules[index]["ID"]):
+                dlg, _model = self._dlg(bucket_lifecycle=list(rules))
+                dlg._rules_list.setCurrentRow(index)
+                with patch.object(bucket_settings_module.QMessageBox,
+                                  "information") as told, \
+                     patch.object(bucket_settings_module,
+                                  "LifecycleRuleDialog") as rule_dlg:
+                    dlg._edit_rule()
+                told.assert_called_once()
+                rule_dlg.assert_not_called()
+                self.assertEqual(dlg._rules, rules)
+
+    def test_both_expirations_ticked_is_refused_not_trimmed(self):
+        rule_dlg = bucket_settings_module.LifecycleRuleDialog(None)
+        self.addCleanup(rule_dlg.close)
+        rule_dlg._expire.setChecked(True)
+        rule_dlg._markers.setChecked(True)
+        with patch.object(bucket_settings_module.QMessageBox,
+                          "warning") as warned:
+            rule_dlg._accept()
+        warned.assert_called_once()
+        self.assertIsNone(rule_dlg.result_rule())
+class PreviewEditFidelityTests(unittest.TestCase):
+    """FINDING (data loss): Save from the in-place editor rewrote the whole
+    object — line endings, BOM and NBSPs normalised by the text widget, and a
+    bare PUT that reset its headers, metadata, class, encryption and tags."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    class _Body:
+        def __init__(self, data):
+            self._data = data
+
+        def read(self):
+            return self._data
+
+    class _Client(FakeS3Client):
+        HEAD = {
+            "ETag": '"abc"', "ContentType": "text/csv; charset=utf-8",
+            "CacheControl": "max-age=60", "ContentLanguage": "de",
+            "Metadata": {"owner": "finance"}, "StorageClass": "STANDARD_IA",
+            "ServerSideEncryption": "aws:kms", "SSEKMSKeyId": "arn:k",
+            "BucketKeyEnabled": True,
+        }
+
+        def __init__(self, body=b"id,name\n1,alpha\n", tags=None,
+                     tag_error=None, head=None):
+            super().__init__(head_object_resp=dict(head or self.HEAD))
+            self.body = body
+            self.tags = [{"Key": "Team", "Value": "Data"}] \
+                if tags is None else tags
+            self.tag_error = tag_error
+
+        def get_object(self, **kw):
+            self.calls.append(("get_object", kw))
+            return {"Body": PreviewEditFidelityTests._Body(self.body),
+                    "ContentType": "text/csv; charset=utf-8",
+                    "ContentLength": len(self.body), "ETag": '"abc"'}
+
+        def get_object_tagging(self, **kw):
+            self.calls.append(("get_object_tagging", kw))
+            if self.tag_error is not None:
+                raise self.tag_error
+            return {"TagSet": list(self.tags)}
+
+        def put_object(self, **kw):
+            self.calls.append(("put_object", kw))
+            return {"ETag": '"new"'}
+
+    def _model(self, client):
+        model = make_model(bucket="bkt")
+        model._client = client
+        return model
+
+    def _dlg(self, client, key="reports/q3.csv"):
+        model = self._model(client)
+        model.clone_for_worker = lambda: model
+        dlg = main_window.PreviewDialog(None, model, key)
+        self.addCleanup(dlg.close)
+        self._wait(dlg, "_thread")
+        return dlg
+
+    def _wait(self, dlg, attr):
+        deadline = time.monotonic() + 5
+        while getattr(dlg, attr) is not None and time.monotonic() < deadline:
+            self._app.processEvents()
+        self._app.processEvents()
+
+    def test_text_the_editor_would_rewrite_is_not_editable(self):
+        for body, why in ((b"a\r\nb\r\n", "line endings"),
+                          (b"\xef\xbb\xbfid,name\n", "byte-order mark"),
+                          ("a b".encode(), "non-breaking"),
+                          ("a b".encode(), "separators")):
+            with self.subTest(why=why):
+                dlg = self._dlg(self._Client(body=body))
+                self.assertFalse(dlg._editable)
+                self.assertTrue(dlg._edit_btn.isVisibleTo(dlg))
+                self.assertFalse(dlg._edit_btn.isEnabled())
+                self.assertIn(why, dlg._edit_btn.toolTip())
+                dlg._toggle_edit()
+                self.assertFalse(dlg._editing)
+
+    def test_plain_lf_text_stays_editable(self):
+        dlg = self._dlg(self._Client())
+        self.assertTrue(dlg._editable)
+        self.assertTrue(dlg._edit_btn.isEnabled())
+
+    def test_save_sends_the_objects_own_properties_back(self):
+        client = self._Client()
+        dlg = self._dlg(client)
+        dlg._toggle_edit()
+        dlg._text.setPlainText(dlg._text.toPlainText().replace(
+            "alpha", "ALPHA"))
+        dlg._save()
+        self._wait(dlg, "_save_thread")
+        put = client.calls_of("put_object")[0]
+        self.assertEqual(put["Body"], b"id,name\n1,ALPHA\n")
+        self.assertEqual(put["IfMatch"], "abc")
+        for field in ("ContentType", "CacheControl", "ContentLanguage",
+                      "StorageClass", "ServerSideEncryption", "SSEKMSKeyId",
+                      "BucketKeyEnabled", "Metadata"):
+            self.assertEqual(put[field], self._Client.HEAD[field], field)
+        self.assertEqual(put["Tagging"], "Team=Data")
+        dlg._editing = False
+
+    def test_unreadable_tags_refuse_the_save(self):
+        client = self._Client(tag_error=botocore.exceptions.ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "no"}},
+            "GetObjectTagging"))
+        with self.assertRaises(RuntimeError):
+            self._model(client).put_object_body(
+                "a.csv", b"x", if_match='"abc"', preserve_properties=True)
+        self.assertEqual(client.calls_of("put_object"), [])
+
+    def test_a_backend_without_tagging_still_saves(self):
+        client = self._Client(tag_error=botocore.exceptions.ClientError(
+            {"Error": {"Code": "NotImplemented", "Message": "no"}},
+            "GetObjectTagging"))
+        self._model(client).put_object_body(
+            "a.csv", b"x", if_match='"abc"', preserve_properties=True)
+        self.assertNotIn("Tagging", client.calls_of("put_object")[0])
+
+    def test_a_changed_object_is_refused_before_its_properties_are_copied(self):
+        client = self._Client(head=dict(self._Client.HEAD, ETag='"other"'))
+        with self.assertRaises(Model.PreconditionFailed):
+            self._model(client).put_object_body(
+                "a.csv", b"x", if_match='"abc"', preserve_properties=True)
+        self.assertEqual(client.calls_of("put_object"), [])
+
+    def test_the_profile_upload_defaults_do_not_retier_the_object(self):
+        """A STANDARD object (HEAD names no class) stays STANDARD even when
+        new uploads default to GLACIER."""
+        client = self._Client(head={"ETag": '"abc"', "ContentType": "text/plain"})
+        model = self._model(client)
+        model.set_upload_options(storage_class="GLACIER", sse="AES256")
+        model.put_object_body("a.txt", b"x", if_match='"abc"',
+                              preserve_properties=True)
+        put = client.calls_of("put_object")[0]
+        self.assertNotIn("StorageClass", put)
+        self.assertNotIn("ServerSideEncryption", put)
+        self.assertEqual(put["ContentType"], "text/plain")

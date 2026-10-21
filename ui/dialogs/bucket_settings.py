@@ -9,6 +9,11 @@ from PyQt6.QtWidgets import (
     QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTabWidget,
     QVBoxLayout, QWidget,
 )
+from core.lifecycle import (
+    LIFECYCLE_MAX_ABORT_DAYS, LIFECYCLE_MAX_DAYS, LIFECYCLE_TRANSITION_CLASSES,
+    lifecycle_form_problem,
+)
+from core.upload_rules import format_tag_lines, parse_tag_lines
 from model import Model as DataModel
 from utils import run_with_progress
 
@@ -20,6 +25,8 @@ class LifecycleRuleDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Lifecycle rule")
         self.setMinimumWidth(460)
+        # The rule as it was, so OK can rewrite only what the form controls.
+        self._base = dict(rule) if rule else None
         rule = dict(rule or {})
 
         self._id = QLineEdit(str(rule.get("ID") or ""))
@@ -32,22 +39,21 @@ class LifecycleRuleDialog(QDialog):
         transitions = (rule.get("Transitions") or [{}])[0]
         self._transition = QCheckBox("Move to another storage class after")
         self._transition_days = QSpinBox()
-        self._transition_days.setRange(1, 36500)
+        self._transition_days.setRange(1, LIFECYCLE_MAX_DAYS)
         self._transition_days.setSuffix(" days")
         self._transition_days.setValue(int(transitions.get("Days") or 30))
         self._transition_class = QComboBox()
-        for name in ("STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING",
-                     "GLACIER_IR", "GLACIER", "DEEP_ARCHIVE"):
+        for name in LIFECYCLE_TRANSITION_CLASSES:
             self._transition_class.addItem(name, name)
         index = self._transition_class.findData(
             transitions.get("StorageClass") or "STANDARD_IA")
         self._transition_class.setCurrentIndex(max(index, 0))
-        self._transition.setChecked(bool(transitions.get("Days")))
+        self._transition.setChecked(transitions.get("Days") is not None)
 
         expiration = rule.get("Expiration") or {}
         self._expire = QCheckBox("Delete objects after")
         self._expire_days = QSpinBox()
-        self._expire_days.setRange(1, 36500)
+        self._expire_days.setRange(1, LIFECYCLE_MAX_DAYS)
         self._expire_days.setSuffix(" days")
         self._expire_days.setValue(int(expiration.get("Days") or 365))
         self._expire.setChecked(expiration.get("Days") is not None)
@@ -55,7 +61,7 @@ class LifecycleRuleDialog(QDialog):
         noncurrent = rule.get("NoncurrentVersionExpiration") or {}
         self._noncurrent = QCheckBox("Delete noncurrent versions after")
         self._noncurrent_days = QSpinBox()
-        self._noncurrent_days.setRange(1, 36500)
+        self._noncurrent_days.setRange(1, LIFECYCLE_MAX_DAYS)
         self._noncurrent_days.setSuffix(" days")
         self._noncurrent_days.setValue(
             int(noncurrent.get("NoncurrentDays") or 30))
@@ -65,7 +71,7 @@ class LifecycleRuleDialog(QDialog):
         abort = rule.get("AbortIncompleteMultipartUpload") or {}
         self._abort = QCheckBox("Abort incomplete multipart uploads after")
         self._abort_days = QSpinBox()
-        self._abort_days.setRange(1, 3650)
+        self._abort_days.setRange(1, LIFECYCLE_MAX_ABORT_DAYS)
         self._abort_days.setSuffix(" days")
         self._abort_days.setValue(
             int(abort.get("DaysAfterInitiation") or 7))
@@ -138,6 +144,7 @@ class LifecycleRuleDialog(QDialog):
             abort_days=(self._abort_days.value()
                         if self._abort.isChecked() else None),
             expire_delete_markers=self._markers.isChecked(),
+            base=self._base,
         )
 
     def result_rule(self):
@@ -160,6 +167,16 @@ class BucketSettingsDialog(QDialog):
         self.resize(720, 520)
         self._writable = not main_window.is_read_only()
         self._acceleration_was = False
+        # Which documents were actually read. A tab whose document could not
+        # be read (or whose read was cancelled) shows an empty editor, and an
+        # empty editor saved is "remove the configuration" — so its mutating
+        # controls stay off until a read succeeds.
+        self._readable = {name: False for name in self.DOCUMENTS}
+        # What the "Encryption && tags" tab showed when it was loaded, so a
+        # save writes only the document that was changed. None = unknown,
+        # never written.
+        self._loaded_encryption = None
+        self._loaded_tags_text = None
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_lifecycle(), "Lifecycle")
@@ -373,20 +390,59 @@ class BucketSettingsDialog(QDialog):
 
     def _sync_sse_fields(self):
         mode = self._sse.currentData() or ""
-        self._sse_key.setEnabled(self._writable and mode == "aws:kms")
-        self._bucket_key.setEnabled(self._writable and mode == "aws:kms")
+        editable = self._writable and self._loaded_encryption is not None
+        self._sse.setEnabled(editable)
+        self._sse_key.setEnabled(editable and mode == "aws:kms")
+        self._bucket_key.setEnabled(editable and mode == "aws:kms")
+
+    @staticmethod
+    def _encryption_state(sse, kms_key, bucket_key) -> tuple:
+        """What put_bucket_encryption would actually write, for comparing."""
+        sse = str(sse or "")
+        if sse != "aws:kms":
+            return sse, "", False
+        return sse, str(kms_key or "").strip(), bool(bucket_key)
+
+    def _shown_encryption(self) -> tuple:
+        return self._encryption_state(
+            self._sse.currentData(), self._sse_key.text(),
+            self._bucket_key.isChecked())
 
     def _save_bucket(self):
-        tags = DataModel.parse_content_type_overrides(
-            self._bucket_tags.toPlainText())
+        """
+        Write whichever of encryption, tags and acceleration was changed.
+
+        It used to write all three every time. The tag box went through a
+        file-extension parser (keys lowercased, empty values dropped), and an
+        encryption mode the combo has no entry for — DSSE-KMS, or one whose
+        read failed — showed as "(none)" and was saved as "remove it". So
+        ticking "Transfer acceleration" renamed the bucket's tags and could
+        strip its default encryption.
+        """
+        encryption_changed = (
+            self._loaded_encryption is not None
+            and self._shown_encryption() != self._loaded_encryption)
+        tags_changed = (
+            self._loaded_tags_text is not None
+            and parse_tag_lines(self._bucket_tags.toPlainText())
+            != parse_tag_lines(self._loaded_tags_text))
+        acceleration_changed = (
+            self._readable.get("acceleration")
+            and self._acceleration.isChecked() != self._acceleration_was)
+        if not (encryption_changed or tags_changed or acceleration_changed):
+            self._bucket_status.setText("Nothing changed.")
+            return
         try:
-            self._model.put_bucket_encryption(
-                sse=self._sse.currentData() or "",
-                kms_key=self._sse_key.text().strip(),
-                bucket_key=self._bucket_key.isChecked(),
-                log_fn=self._mw.log)
-            self._model.put_bucket_tags(tags, log_fn=self._mw.log)
-            if self._acceleration.isChecked() != self._acceleration_was:
+            if encryption_changed:
+                sse, kms_key, bucket_key = self._shown_encryption()
+                self._model.put_bucket_encryption(
+                    sse=sse, kms_key=kms_key, bucket_key=bucket_key,
+                    log_fn=self._mw.log)
+            if tags_changed:
+                self._model.put_bucket_tags(
+                    parse_tag_lines(self._bucket_tags.toPlainText()),
+                    log_fn=self._mw.log)
+            if acceleration_changed:
                 self._model.set_bucket_acceleration(
                     self._acceleration.isChecked(), log_fn=self._mw.log)
         except Exception as exc:
@@ -396,6 +452,8 @@ class BucketSettingsDialog(QDialog):
         self.reload()
 
     def _save_website(self):
+        if not self._readable.get("website"):
+            return
         try:
             self._model.put_bucket_website(
                 index=self._site_index.text(),
@@ -418,6 +476,10 @@ class BucketSettingsDialog(QDialog):
         layout.addWidget(self._lock_status)
         layout.addStretch(1)
         return page
+
+    # Every document read_documents fetches, in the order it fetches them.
+    DOCUMENTS = ("lifecycle", "cors", "policy", "lock", "encryption", "tags",
+                 "website", "events", "acceleration")
 
     @staticmethod
     def read_documents(model) -> dict:
@@ -461,15 +523,24 @@ class BucketSettingsDialog(QDialog):
         payload, exc = run_with_progress(
             self, f"Reading settings for {self._model.bucket}…", _read)
         if payload is None and exc is None:
-            return  # cancelled
-        if exc is not None:
-            payload = {"lifecycle_error": str(exc), "cors_error": str(exc),
-                       "policy_error": str(exc), "lock_error": str(exc)}
+            # Cancelled. Returning here left every tab as it was — on first
+            # open, empty and writable, so Save on the Lifecycle tab removed
+            # rules the dialog had never read. Nothing read is nothing known.
+            payload = self.unread_payload("the read was cancelled")
+        elif exc is not None:
+            payload = self.unread_payload(str(exc))
         self.apply_documents(payload)
+
+    @classmethod
+    def unread_payload(cls, reason) -> dict:
+        """A read_documents result in which every document failed."""
+        return {f"{name}_error": str(reason) for name in cls.DOCUMENTS}
 
     def apply_documents(self, payload):
         """Render what read_documents returned."""
         payload = dict(payload or {})
+        self._readable = {name: not payload.get(f"{name}_error")
+                          for name in self.DOCUMENTS}
 
         if payload.get("lifecycle_error"):
             self._rules = []
@@ -480,8 +551,14 @@ class BucketSettingsDialog(QDialog):
             self._lifecycle_status.setText(
                 "" if self._rules else "No lifecycle rules on this bucket.")
         self._refresh_rules()
+        # An unread rule list is empty, not absent: adding one rule and
+        # saving would replace every real rule with it.
+        for button in (self._btn_add, self._btn_edit, self._btn_remove,
+                       self._btn_save):
+            button.setEnabled(self._writable and self._readable["lifecycle"])
 
         if payload.get("cors_error"):
+            self._cors_text.setPlainText("")
             self._cors_status.setText(
                 f"Could not read CORS: {payload['cors_error']}")
         else:
@@ -490,8 +567,16 @@ class BucketSettingsDialog(QDialog):
                 json.dumps(rules, indent=2) if rules else "")
             self._cors_status.setText(
                 "" if rules else "No CORS configuration on this bucket.")
+        cors_editable = self._writable and self._readable["cors"]
+        self._cors_text.setReadOnly(not cors_editable)
+        self._btn_cors_save.setEnabled(cors_editable)
 
+        if not self._readable["policy"]:
+            self._policy_edit.setChecked(False)
+        self._policy_edit.setEnabled(
+            self._writable and self._readable["policy"])
         if payload.get("policy_error"):
+            self._policy_text.setPlainText("")
             self._policy_status.setText(
                 f"Could not read the policy: {payload['policy_error']}")
         else:
@@ -536,25 +621,48 @@ class BucketSettingsDialog(QDialog):
 
     def _apply_bucket_documents(self, payload):
         """Render the encryption / tags / website / events tabs."""
+        problems = [payload[name] for name in
+                    ("encryption_error", "tags_error", "acceleration_error")
+                    if payload.get(name)]
+
         encryption = dict(payload.get("encryption") or {})
-        index = self._sse.findData(encryption.get("sse", ""))
+        sse = str(encryption.get("sse", "") or "")
+        index = self._sse.findData(sse)
+        # Known only when it was read AND the combo can show it. DSSE-KMS has
+        # no entry, and showing it as "(none)" invited a save that removed it.
+        if self._readable.get("encryption") and index >= 0:
+            self._loaded_encryption = self._encryption_state(
+                sse, encryption.get("kms_key", ""),
+                encryption.get("bucket_key"))
+        else:
+            self._loaded_encryption = None
+            if self._readable.get("encryption"):
+                problems.append(
+                    f"Default encryption is {sse}, which this dialog cannot "
+                    "edit; it is left as it is.")
         self._sse.setCurrentIndex(max(index, 0))
         self._sse_key.setText(encryption.get("kms_key", ""))
         self._bucket_key.setChecked(bool(encryption.get("bucket_key")))
         self._sync_sse_fields()
 
         tags = dict(payload.get("tags") or {})
-        self._bucket_tags.setPlainText(
-            "\n".join(f"{key} = {value}" for key, value in sorted(tags.items())))
+        text = format_tag_lines(tags)
+        self._bucket_tags.setPlainText(text)
+        tags_editable = self._writable and self._readable.get("tags")
+        self._loaded_tags_text = text if self._readable.get("tags") else None
+        self._bucket_tags.setReadOnly(not tags_editable)
+        self._bucket_tags.setEnabled(bool(tags_editable))
 
         status = str(payload.get("acceleration") or "")
         self._acceleration_was = status == "Enabled"
         self._acceleration.setChecked(self._acceleration_was)
-        self._acceleration.setEnabled(self._writable and bool(status is not None))
+        self._acceleration.setEnabled(
+            bool(self._writable and self._readable.get("acceleration")))
 
-        problems = [payload[name] for name in
-                    ("encryption_error", "tags_error", "acceleration_error")
-                    if payload.get(name)]
+        self._btn_bucket_save.setEnabled(bool(self._writable and (
+            self._loaded_encryption is not None
+            or self._loaded_tags_text is not None
+            or self._readable.get("acceleration"))))
         self._bucket_status.setText(
             "  ".join(problems) if problems else "")
 
@@ -562,6 +670,11 @@ class BucketSettingsDialog(QDialog):
         self._site_index.setText(website.get("index", ""))
         self._site_error.setText(website.get("error", ""))
         self._site_redirect.setText(website.get("redirect", ""))
+        site_editable = bool(self._writable and self._readable.get("website"))
+        for widget in (self._site_index, self._site_error,
+                       self._site_redirect):
+            widget.setReadOnly(not site_editable)
+        self._btn_site_save.setEnabled(site_editable)
         if payload.get("website_error"):
             self._site_status.setText(
                 f"Could not read it: {payload['website_error']}")
@@ -597,7 +710,12 @@ class BucketSettingsDialog(QDialog):
     def _selected_rule_index(self) -> int:
         return self._rules_list.currentRow()
 
+    def _lifecycle_editable(self) -> bool:
+        return bool(self._writable and self._readable.get("lifecycle"))
+
     def _add_rule(self):
+        if not self._lifecycle_editable():
+            return
         dlg = LifecycleRuleDialog(self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -607,7 +725,7 @@ class BucketSettingsDialog(QDialog):
 
     def _edit_rule(self):
         index = self._selected_rule_index()
-        if not (0 <= index < len(self._rules)):
+        if not self._lifecycle_editable() or not (0 <= index < len(self._rules)):
             return
         if not DataModel.lifecycle_filter_is_simple(self._rules[index]):
             # Rebuilding it from the prefix form would drop the tag or size
@@ -620,6 +738,18 @@ class BucketSettingsDialog(QDialog):
                 "it would silently widen it to the whole prefix — change it "
                 "in the provider's own console instead.")
             return
+        problem = lifecycle_form_problem(self._rules[index])
+        if problem:
+            # Shown in the form, the parts it has no box for would come back
+            # as the form's defaults — a second transition unticked, a day-0
+            # transition turned into 30 — and OK would write that back.
+            QMessageBox.information(
+                self, "Lifecycle rule",
+                f"{problem} This editor cannot show that faithfully, so "
+                "editing it here would change what it does. It can be "
+                "removed here; change it in the provider's own console "
+                "instead.")
+            return
         dlg = LifecycleRuleDialog(self, self._rules[index])
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -629,13 +759,15 @@ class BucketSettingsDialog(QDialog):
 
     def _remove_rule(self):
         index = self._selected_rule_index()
-        if not (0 <= index < len(self._rules)):
+        if not self._lifecycle_editable() or not (0 <= index < len(self._rules)):
             return
         del self._rules[index]
         self._refresh_rules()
         self._lifecycle_status.setText("Not saved yet.")
 
     def _save_lifecycle(self):
+        if not self._lifecycle_editable():
+            return
         summary = "\n".join(
             f"• {rule.get('ID')}: {DataModel.summarize_lifecycle_rule(rule)}"
             for rule in self._rules
@@ -659,6 +791,8 @@ class BucketSettingsDialog(QDialog):
         self.reload()
 
     def _save_cors(self):
+        if not (self._writable and self._readable.get("cors")):
+            return
         text = self._cors_text.toPlainText().strip()
         rules = []
         if text:
@@ -684,6 +818,8 @@ class BucketSettingsDialog(QDialog):
         self._btn_policy_save.setEnabled(bool(enabled))
 
     def _save_policy(self):
+        if not (self._writable and self._readable.get("policy")):
+            return
         text = self._policy_text.toPlainText().strip()
         answer = QMessageBox.question(
             self, "Bucket policy",

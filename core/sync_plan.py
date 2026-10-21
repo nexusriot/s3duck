@@ -1,18 +1,30 @@
 """Comparing two trees and deciding what has to move.
 
-One planner serves local-to-remote sync, remote-to-remote sync between two
-profiles, and the read-only pane comparison: they differ only in what is fed
-in as "left" and "right".
+Two planners over the same ``{rel: (size, mtime)}`` trees: build_sync_plan is
+directional (local sync either way, the watch folder, and sync to another
+profile), build_compare_plan is direction-free (the pane comparison).
 """
 
 import fnmatch
+import os
 import re
+from core.errors import TransferCancelled
+from core.integrity import (
+    etag_is_md5, etag_is_opaque, file_matches_etag, normalize_etag,
+)
+from core.parts import upload_part_size
 
 
 # Filesystem and S3 timestamps disagree by up to a couple of seconds
 # (second resolution remotely, 2s granularity on some local filesystems), so
 # only a larger difference counts as "newer".
 SYNC_MTIME_TOLERANCE_SEC = 2.0
+
+
+# Hashing a local file is the only way to put it against a remote ETag, and a
+# pane comparison should not sit reading one enormous file for minutes. A
+# file over this is reported "unverified" rather than guessed at either way.
+COMPARE_HASH_LIMIT = 512 * 1024 * 1024
 def build_exclude_matcher(patterns):
     """
     Compile sync exclude patterns into ``match(rel_path) -> bool``.
@@ -114,16 +126,56 @@ def build_sync_plan(local_entries, remote_entries, *, direction,
             actions.append({"action": "skip", "rel": rel, "size": size,
                             "reason": "extra at destination (kept)"})
     return actions
-def build_compare_plan(left, right, *, tolerance=SYNC_MTIME_TOLERANCE_SEC,
-                       exclude=None) -> list:
+def listed_etag(entry) -> str:
+    """The ETag a tree entry carries as its third element; "" for none."""
+    return normalize_etag(entry[2]) if len(entry) > 2 else ""
+def compare_listed_etags(first, second):
     """
-    Diff two ``{rel_path: (size, mtime)}`` maps without picking a direction.
+    What two listed ETags say about content: True (the same bytes), False
+    (different bytes) or None (they cannot tell).
+
+    Equal ETags of any form mean the same bytes -- a multipart one pins every
+    part's MD5, so two that match are the same content split the same way.
+    Unequal ones prove a difference only when both are plain MD5s: one file
+    uploaded twice at different part sizes gets two different multipart
+    ETags. A listing cannot see encryption, though, and under SSE-KMS or
+    SSE-C a 32-hex ETag is no digest of the bytes, so False here is still a
+    claim for whoever holds a client to confirm (see build_compare_plan).
+    """
+    first, second = normalize_etag(first), normalize_etag(second)
+    if not first or not second:
+        return None
+    if first == second:
+        return True
+    if etag_is_md5(first) and etag_is_md5(second):
+        return False
+    return None
+def build_compare_plan(left, right, *, tolerance=SYNC_MTIME_TOLERANCE_SEC,
+                       exclude=None, content_check=None) -> list:
+    """
+    Diff two ``{rel_path: (size, mtime[, etag])}`` maps without picking a
+    direction.
 
     Returns ``[{rel, status, left_size, right_size}]`` where status is
-    "only_left", "only_right", "differs" or "same". Direction-free on purpose:
-    the same comparison drives a copy either way, and calling one side "the
-    source" before the user has said so is how a compare turns into a sync
-    nobody asked for.
+    "only_left", "only_right", "differs", "unverified" or "same". Direction-
+    free on purpose: the same comparison drives a copy either way, and
+    calling one side "the source" before the user has said so is how a
+    compare turns into a sync nobody asked for.
+
+    Timestamps say little about a pair here. S3's LastModified is when the
+    object was written and a download does not set the local mtime, so a
+    folder compared with the prefix it was just copied to -- or a prefix
+    with its server-side copy -- disagrees in time on every file, and judging
+    by size and mtime called all of them "differs". A same-size pair is
+    settled on content wherever that is possible instead: by the ETags when
+    both entries carry one (a remote listing does), else by
+    ``content_check(rel, here, there)``, the caller's True/False/None --
+    hashing a local file against the remote ETag, or confirming with a HEAD
+    that a False from compare_listed_etags is not an encrypted object's
+    opaque ETag. Only when nothing can tell does time decide: "same" within
+    *tolerance* (the size-and-mtime rule build_sync_plan still uses), and
+    otherwise "unverified" -- same size, different time, content unknown --
+    rather than a "differs" nothing has shown.
     """
     is_excluded = exclude if callable(exclude) else build_exclude_matcher(exclude)
     rows = []
@@ -140,18 +192,109 @@ def build_compare_plan(left, right, *, tolerance=SYNC_MTIME_TOLERANCE_SEC,
             rows.append({"rel": rel, "status": "only_left",
                          "left_size": int(here[0]), "right_size": None})
             continue
-        same_size = int(here[0]) == int(there[0])
-        close_enough = abs(float(here[1]) - float(there[1])) <= tolerance
+        if int(here[0]) != int(there[0]):
+            status = "differs"
+        else:
+            status = _same_size_status(rel, here, there, tolerance,
+                                       content_check)
         rows.append({
             "rel": rel,
-            "status": "same" if (same_size and close_enough) else "differs",
+            "status": status,
             "left_size": int(here[0]),
             "right_size": int(there[0]),
         })
     return rows
+def _same_size_status(rel, here, there, tolerance, content_check) -> str:
+    """build_compare_plan's verdict on two entries of equal size."""
+    if int(here[0]) == 0:
+        return "same"           # every empty file holds the same bytes
+    close = abs(float(here[1]) - float(there[1])) <= tolerance
+    verdict = compare_listed_etags(listed_etag(here), listed_etag(there))
+    if verdict is None and close:
+        # Nothing cheap to compare and the clocks agree: the old rule, which
+        # spares hashing a local file that has not been touched since.
+        return "same"
+    if verdict is not True and content_check is not None:
+        verdict = content_check(rel, here, there)
+    if verdict is True:
+        return "same"
+    if verdict is False:
+        return "differs"
+    return "same" if close else "unverified"
+def make_content_check(left, right, models, *, part_sizes=(), cancel=None):
+    """
+    build_compare_plan's ``content_check`` for two pane sides, each
+    ``("local", path)`` or ``("remote", bucket, prefix)``.
+
+    Local against remote hashes the file against the listed ETag; remote
+    against remote has nothing to add to what the listing already said.
+    Either way a "they differ" resting on a plain-looking ETag is confirmed
+    with a HEAD of each remote object first: a listing cannot see
+    encryption, and under SSE-KMS or SSE-C that ETag is no digest of the
+    bytes, so every intact copy of such an object would otherwise be
+    reported changed.
+
+    *models* holds a model bound to each remote side's bucket (None for a
+    local side). *part_sizes* are the multipart chunk sizes uploads may have
+    used -- a multipart ETag can only be rebuilt at the right one. *cancel*
+    stops the check between files.
+    """
+    sides = (left, right)
+    remote = [index for index in (0, 1) if sides[index][0] == "remote"]
+
+    def _check(rel, here, there):
+        if cancel is not None and cancel.is_set():
+            raise TransferCancelled("cancelled")
+        entries = (here, there)
+        if len(remote) == 2:
+            verdict = compare_listed_etags(listed_etag(here),
+                                           listed_etag(there))
+        elif len(remote) == 1:
+            theirs = remote[0]
+            local_root = sides[1 - theirs][1]
+            verdict = _local_verdict(
+                os.path.join(local_root, rel.replace("/", os.sep)),
+                entries[theirs], part_sizes)
+        else:
+            return None
+        if verdict is False and not all(
+                _etag_is_digest(models[index], (sides[index][2] or "") + rel)
+                for index in remote):
+            return None
+        return verdict
+
+    return _check
+def _local_verdict(path, entry, part_sizes):
+    """
+    Whether the local file at *path* holds the bytes of the remote *entry*
+    ``(size, mtime, etag)``; None when that cannot be told cheaply.
+
+    Each chunk size is raised to fit S3's 10 000 parts the way uploads raise
+    it, so the guess is the part size the upload really used.
+    """
+    size = int(entry[0])
+    etag = listed_etag(entry)
+    if not etag or size > COMPARE_HASH_LIMIT:
+        return None
+    guesses = [upload_part_size(size, chunk) for chunk in part_sizes if chunk]
+    try:
+        return file_matches_etag(path, etag, guesses)
+    except OSError:
+        return None
+def _etag_is_digest(model, key) -> bool:
+    """Whether a HEAD shows *key*'s ETag is a digest of its bytes."""
+    try:
+        head = model.client.head_object(Bucket=model.bucket, Key=key)
+    except Exception:
+        # SSE-C refuses a HEAD without its key, and its ETag is opaque
+        # anyway; any other failure leaves the question open too, and an
+        # open question is not a "differs".
+        return False
+    return not etag_is_opaque(head)
 def summarize_compare_plan(rows) -> dict:
     """Count a compare plan by status."""
-    counts = {"only_left": 0, "only_right": 0, "differs": 0, "same": 0}
+    counts = {"only_left": 0, "only_right": 0, "differs": 0,
+              "unverified": 0, "same": 0}
     for row in rows or []:
         status = row.get("status", "same")
         counts[status] = counts.get(status, 0) + 1

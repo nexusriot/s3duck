@@ -37,7 +37,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtGui import QActionGroup
 from model import Model as DataModel
 from model import FSObjectType
-from model import safe_local_path
+from model import DownloadIncomplete, safe_local_path
 from utils import (
     TempWorkspace, normalize_accent, reap_finished_workers, forward_icon,
     join_qthread,
@@ -213,6 +213,10 @@ class MainWindow(
         self._build_central_widget(profile.accent)
 
         self._nav_seq = 0
+        # Set from navigate() until its listing lands; see listing_settled().
+        self._nav_in_flight = False
+        # The (bucket, prefix) the rows on screen were listed from.
+        self._listing_location = None
         self._nav_thread = None
         self._nav_worker = None
         self._nav_orphan_threads = []          # superseded, still running
@@ -274,6 +278,8 @@ class MainWindow(
         # _load_watch_config.
         self._watch = None
         self._watch_config = {}
+        # Why the last watch pass was skipped, shown on the indicator.
+        self._watch_problem = ""
         self._watch_timer = None
         self._watch_thread = None
         self._watch_scan_config = None
@@ -460,8 +466,12 @@ class MainWindow(
         self.tabbar.customContextMenuRequested.connect(self._tab_menu)
         self.tabbar.hide()
         self._tabs = []
+        # The tab whose location the view is showing (identity, not index:
+        # dragging tabs reorders indexes).
+        self._view_tab = None
         self._tab_switching = False
         self._tab_restore_pending = False
+        self._tab_restore_target = None
         # Set while a Back/Forward step is in flight, so the resulting
         # navigation is not recorded as a new move.
         self._history_navigating = False
@@ -579,13 +589,29 @@ class MainWindow(
         self._bookmark_shortcut = QShortcut(QKeySequence("Ctrl+B"), self)
         self._bookmark_shortcut.activated.connect(self.add_bookmark)
 
-        self._copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self)
+        # The keys below act on the MAIN listing's selection and folder, so
+        # they live on the listing's container and fire only while focus is
+        # inside it. Window-wide, Ctrl+X typed in the second pane cut the
+        # main pane's selection and the following Ctrl+V moved it -- the
+        # wrong objects. (The StandardKey forms also carry the alternates:
+        # Shift+Del, Ctrl+Ins, Shift+Ins.)
+        listing = self._list_container
+        scoped = Qt.ShortcutContext.WidgetWithChildrenShortcut
+        self._copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, listing)
+        self._copy_shortcut.setContext(scoped)
         self._copy_shortcut.activated.connect(lambda: self.copy_to_clipboard())
-        self._cut_shortcut = QShortcut(QKeySequence.StandardKey.Cut, self)
+        self._cut_shortcut = QShortcut(QKeySequence.StandardKey.Cut, listing)
+        self._cut_shortcut.setContext(scoped)
         self._cut_shortcut.activated.connect(
             lambda: self.copy_to_clipboard(cut=True))
-        self._paste_shortcut = QShortcut(QKeySequence.StandardKey.Paste, self)
+        self._paste_shortcut = QShortcut(QKeySequence.StandardKey.Paste,
+                                         listing)
+        self._paste_shortcut.setContext(scoped)
         self._paste_shortcut.activated.connect(self.paste_from_clipboard)
+        # Download is a toolbar action; a click on it still works from
+        # anywhere, only its key is scoped.
+        self.btnDownload.setShortcutContext(scoped)
+        listing.addAction(self.btnDownload)
 
         self._shortcuts_shortcut = QShortcut(QKeySequence("Ctrl+/"), self)
         self._shortcuts_shortcut.activated.connect(self.show_shortcuts)
@@ -593,7 +619,9 @@ class MainWindow(
         self._sync_shortcut = QShortcut(QKeySequence("Ctrl+E"), self)
         self._sync_shortcut.activated.connect(self.open_sync)
 
-        self._bulk_rename_shortcut = QShortcut(QKeySequence("Shift+F2"), self)
+        self._bulk_rename_shortcut = QShortcut(QKeySequence("Shift+F2"),
+                                               listing)
+        self._bulk_rename_shortcut.setContext(scoped)
         self._bulk_rename_shortcut.activated.connect(self.bulk_rename)
 
         self._dual_pane_shortcut = QShortcut(QKeySequence("F3"), self)
@@ -1007,6 +1035,12 @@ class MainWindow(
         ):
             self._open_search_with_text(text)
             return True
+        # Everything else (arrows, Page Up/Down, Ctrl+A, a bare Shift) is
+        # the view's own. Spelled out: falling off the end returned None,
+        # and PyQt aborts the whole app when an eventFilter override answers
+        # anything but a bool -- so the first arrow key in the listing
+        # killed it.
+        return False
 
     def eventFilter(self, obj, event):
         """Route to the three things this filter is actually for.
@@ -1146,6 +1180,8 @@ class MainWindow(
     def download(self):
         if self.in_bucket_list_mode():
             return
+        if self._refuse_unsettled_listing():
+            return
         job = []
         folder_path = QFileDialog.getExistingDirectory(self, "Select Folder")
         if not folder_path:
@@ -1252,7 +1288,7 @@ class MainWindow(
         if action is not None:
             action.trigger()
 
-    def _record_undoable_delete(self, keys):
+    def _record_undoable_delete(self, keys, since=None, bucket=None):
         """
         Remember what a delete removed so it can be undone.
 
@@ -1260,11 +1296,17 @@ class MainWindow(
         delete marker on top of them, and dropping that marker brings them
         back. Whether markers exist is only discovered when undo runs, so no
         extra request is made here.
+
+        *since* is when the delete started (epoch seconds) and *bucket* the
+        bucket it ran in. Undo removes only the markers written since then:
+        without it, undoing a folder delete also brought back everything that
+        had been deleted from that folder long before.
         """
         keys = [k for k in (keys or []) if k]
-        if not keys or not self.data_model.bucket:
+        bucket = bucket or self.data_model.bucket
+        if not keys or not bucket:
             return
-        self._undo_delete = {"bucket": self.data_model.bucket, "keys": keys}
+        self._undo_delete = {"bucket": bucket, "keys": keys, "since": since}
         self.btnUndoDelete.setEnabled(not self.is_read_only())
         self.statusBar().showMessage(
             f"Deleted {len(keys)} item(s) — Ctrl+Z undoes this on a "
@@ -1298,7 +1340,10 @@ class MainWindow(
         ) != QMessageBox.StandardButton.Yes:
             return
         self._clear_undo_delete()
-        self.assign_thread_operation("undelete", [(k,) for k in keys])
+        since = undo.get("since")
+        self.assign_thread_operation(
+            "undelete",
+            [(k,) if since is None else (k, since) for k in keys])
         self.statusBar().showMessage(f"Restoring {len(keys)} item(s)…", 4000)
 
 
@@ -1348,6 +1393,8 @@ class MainWindow(
 
     def delete_bucket_ui(self):
         if not self.in_bucket_list_mode():
+            return
+        if self._refuse_unsettled_listing():
             return
         bucket_names = []
         for ix in self.listview.selectionModel().selectedIndexes():
@@ -1401,6 +1448,8 @@ class MainWindow(
         """Delete everything inside the selected bucket(s), keeping the bucket."""
         if not self.in_bucket_list_mode():
             return
+        if self._refuse_unsettled_listing():
+            return
         bucket_names = []
         for ix in self.listview.selectionModel().selectedIndexes():
             if ix.column() != 0:
@@ -1429,6 +1478,12 @@ class MainWindow(
     def delete(self):
         if self.in_bucket_list_mode():
             self.delete_bucket_ui()
+            return
+        # The keys below are the current prefix plus the selected rows'
+        # names; while a listing is in flight those rows belong to the
+        # folder being left, and Delete on a still-selected "backup" row
+        # removed "backup/backup/".
+        if self._refuse_unsettled_listing():
             return
 
         names = []
@@ -1998,6 +2053,11 @@ class MainWindow(
             if th is None or not self._thread_is_running(th):
                 continue
             try:
+                # A thread blocked inside an S3 call that quit() cannot
+                # reach would, still parented to this window, be destroyed
+                # running and abort the process ("QThread: Destroyed while
+                # thread is still running"). join_qthread cuts such a thread
+                # loose and holds it until it returns.
                 join_qthread(th, timeout_ms=3000)
             except Exception:
                 pass
@@ -2065,6 +2125,10 @@ class MainWindow(
         """
         sm = self.listview.selectionModel()
         if sm is None:
+            return
+        # Every selection-based action resolves rows through here; rows from
+        # a listing that has not landed yet resolve under the wrong prefix.
+        if self._refuse_unsettled_listing():
             return
         for ix in sm.selectedIndexes():
             if ix.column() != 0:
@@ -2600,6 +2664,8 @@ class MainWindow(
                     job.append((key, os.path.join(folder, name), None, folder))
             conflicts = {entry[1] for entry in job
                          if entry[1] and os.path.exists(entry[1])}
+            # Folders as well, exactly as download() checks them: a folder
+            # row used to overwrite a local tree without a word.
             folder_hits = self._folder_download_conflicts(
                 [entry for entry in job if not entry[1]])
             if folder_hits is None:
@@ -2631,16 +2697,30 @@ class MainWindow(
         if not job:
             self.statusBar().showMessage("Nothing to send", 2000)
             return
-        conflicts = self._destination_conflicts([row[1] for row in job], bucket)
-        if conflicts is None:
-            return
-        job = self._resolve_overwrites(
-            job, conflicts, what="destination", index_of=lambda row: row[1])
+        job = self._resolve_pane_overwrites(job)
         if not job:
             return
         self.assign_thread_operation("move" if move else "copy", job)
         self.statusBar().showMessage(
             f"{'Moving' if move else 'Copying'} {len(job)} item(s)…", 4000)
+
+    def _resolve_pane_overwrites(self, job):
+        """
+        The paste's overwrite check, for a remote-to-remote F5/F6.
+
+        REGRESSION (data loss): these two routes skipped it, so a same-named
+        object on the other side was replaced silently -- and with F6 the
+        source then deleted -- while paste, Copy/Move, rename and every upload
+        route asked first. Rows are build_paste_job's: the destination key is
+        [1] and the destination bucket [3] (None when it is this one).
+        """
+        dst_bucket = job[0][3] if job else None
+        conflicts = self._destination_conflicts(
+            [entry[1] for entry in job], dst_bucket)
+        if conflicts is None:
+            return None
+        return self._resolve_overwrites(
+            job, conflicts, what="destination", index_of=lambda e: e[1])
 
     def _transfer_from_second_pane(self, move):
         """The other pane → the main listing (always remote)."""
@@ -2703,11 +2783,7 @@ class MainWindow(
         if not job:
             self.statusBar().showMessage("Nothing to bring here", 2000)
             return
-        conflicts = self._destination_conflicts([row[1] for row in job])
-        if conflicts is None:
-            return
-        job = self._resolve_overwrites(
-            job, conflicts, what="destination", index_of=lambda row: row[1])
+        job = self._resolve_pane_overwrites(job)
         if not job:
             return
         # copy/move resolve CopySource against their model's bucket, so a
@@ -2747,10 +2823,13 @@ class MainWindow(
             QMessageBox.critical(self, "Export manifest", str(exc))
             return
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # UTF-8 spelled out: the platform default (cp1252 on Windows) cannot
+        # encode most non-Latin keys, and the UnicodeEncodeError escaped this
+        # slot -- which aborts a PyQt app.
         try:
-            with open(path, "w", newline="") as handle:
+            with open(path, "w", encoding="utf-8", newline="") as handle:
                 handle.write(build_manifest(entries, bucket, prefix, stamp))
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             QMessageBox.critical(self, "Export manifest", str(exc))
             return
         self.log(f"manifest written: {len(entries)} object(s) -> {path}")
@@ -2767,10 +2846,13 @@ class MainWindow(
             "Manifest (*.csv);;All files (*)")
         if not path:
             return
+        # Read back exactly as written: UTF-8 (the default codec would turn
+        # every non-ASCII key into mojibake and report it missing AND added)
+        # and newline="" so a key holding a carriage return survives.
         try:
-            with open(path) as handle:
+            with open(path, encoding="utf-8", newline="") as handle:
                 meta, stored = parse_manifest(handle.read())
-        except (OSError, ValueError) as exc:
+        except (OSError, UnicodeError, ValueError) as exc:
             QMessageBox.critical(self, "Verify manifest", str(exc))
             return
 
@@ -3143,11 +3225,19 @@ class MainWindow(
 
         tmp_dir = self.temp_workspace.make(prefix="drag_")
 
+        incomplete = []
+
         def _fetch(_w):
             paths = []
             for name, key, is_folder in keys:
                 if is_folder:
-                    clone.download_file(key, None, tmp_dir)
+                    try:
+                        clone.download_file(key, None, tmp_dir)
+                    except DownloadIncomplete as exc:
+                        # The rest of the folder is there; dropping it is
+                        # still what the user asked for, minus a few names
+                        # this filesystem cannot hold. Said, not hidden.
+                        incomplete.append(exc)
                     paths.append(os.path.join(tmp_dir, name))
                 else:
                     out = os.path.join(tmp_dir, name)
@@ -3159,6 +3249,12 @@ class MainWindow(
         if exc is not None:
             QMessageBox.warning(self, "Drag out", f"Could not prepare files:\n{exc}")
             return []
+        if incomplete:
+            # Counted per folder, so only a lone folder's count is the
+            # selection's; the download worker merges them the same way.
+            QMessageBox.warning(self, "Drag out", str(DownloadIncomplete(
+                [f for missing in incomplete for f in missing.failures],
+                total=incomplete[0].total if len(keys) == 1 else 0)))
         return paths or []
 
     def bulk_rename(self):
@@ -3266,12 +3362,21 @@ class MainWindow(
             self, self, self.data_model, self.data_model.current_folder or ""
         ).exec()
 
-    def rename_selected(self):
-        """Rename the first selected file or folder in place (copy + delete)."""
+    def rename_selected(self, index=None):
+        """
+        Rename one file or folder in place (copy + delete).
+
+        ``index`` is the row the context menu was opened on; without one (F2)
+        it is the first selected row.
+        """
         if self.in_bucket_list_mode():
+            return
+        if self._refuse_unsettled_listing():
             return
         sm = self.listview.selectionModel()
         ixs = sm.selectedIndexes() if sm is not None else []
+        if isinstance(index, QModelIndex) and index.isValid():
+            ixs = [index.sibling(index.row(), 0)]
 
         target = None
         for ix in ixs:

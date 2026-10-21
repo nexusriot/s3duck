@@ -449,6 +449,13 @@ class Profiles(QDialog):
             return
         wanted = str(self.startup.get("profile") or "")
         row = self.profile_row_for(wanted)
+        if row < 0 and wanted:
+            # Never fall back to another profile when one was named: a typo in
+            # "-p prod-readonly" must not open the location read-write.
+            QMessageBox.warning(
+                self, "Open location",
+                f"There is no profile named '{wanted}'.")
+            return
         if row < 0 and self.listWidget.count():
             row = max(0, self.listWidget.currentRow())
         if row < 0:
@@ -459,7 +466,12 @@ class Profiles(QDialog):
         self.listWidget.setCurrentIndex(
             self.listWidget.model().index(row, 0))
         self.pending_location = location
-        self.onStart()
+        try:
+            self.onStart()
+        finally:
+            # A failed or cancelled start must not leave the location waiting
+            # for whichever profile the user runs next.
+            self.pending_location = ""
 
     def unlock_credentials(self):
         """
@@ -572,7 +584,15 @@ class Profiles(QDialog):
         if elem < 0:
             return
         item = deepcopy(self.items[elem])
-        item.name = "%s-copy" % item.name
+        # Names must stay unique: refreshed credentials, bookmarks and -p all
+        # find a profile by name, so a second "x-copy" would be written over.
+        taken = {str(other.name) for other in self.items}
+        name = "%s-copy" % item.name
+        suffix = 2
+        while name in taken:
+            name = "%s-copy-%d" % (item.name, suffix)
+            suffix += 1
+        item.name = name
         self.items.append(item)
         self.save_settings()
         self.populate_list()
@@ -1085,6 +1105,10 @@ class Profiles(QDialog):
 
     def save_settings(self):
         with SettingsStore(self.settings).group("profiles"):
+            # beginWriteArray only overwrites rows 1..n: without this a deleted
+            # profile's encrypted keys would stay in the file, next to the key
+            # that decrypts them.
+            self.settings.remove("profiles")
             self.settings.beginWriteArray("profiles")
             for index, item in enumerate(self.items):
                 self.settings.setArrayIndex(index)
@@ -1337,8 +1361,11 @@ def main():
         print(CLI_USAGE)
         return
     # Only a location is handed over: a bare launch still opens its own
-    # window, because two profiles side by side is a thing people want.
-    if args["location"] and send_to_running_instance(args["location"]):
+    # window, because two profiles side by side is a thing people want. A
+    # named profile is never handed over either — the running window would
+    # open the location under its own profile, not the one asked for.
+    if (args["location"] and not args["profile"]
+            and send_to_running_instance(args["location"])):
         return
 
     app = QApplication(sys.argv)
