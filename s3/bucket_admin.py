@@ -127,8 +127,34 @@ class BucketAdminMixin:
             raise
         return list(resp.get("Rules") or [])
 
+    def _lifecycle_minimum_object_size(self) -> str:
+        """
+        The configuration's TransitionDefaultMinimumObjectSize, or "".
+
+        It lives beside the rules rather than in them, and a PUT that omits it
+        resets it to the service default -- so saving the rules, even
+        unchanged, quietly re-enabled transitions the bucket owner had chosen
+        to apply to small objects too. "" when there is no configuration yet
+        or the backend (or the installed botocore) does not know the field;
+        any other failure to read is raised rather than written over blind.
+        """
+        try:
+            resp = self._optional_document(
+                self.client.get_bucket_lifecycle_configuration)
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code == "NoSuchLifecycleConfigurationError":
+                return ""
+            raise
+        return str((resp or {}).get("TransitionDefaultMinimumObjectSize") or "")
+
     def put_bucket_lifecycle(self, rules, log_fn=None):
-        """Replace the bucket's lifecycle rules; an empty list removes them."""
+        """
+        Replace the bucket's lifecycle rules; an empty list removes them.
+
+        The rules are replaced; the bucket-wide minimum object size stored
+        beside them is carried over (see _lifecycle_minimum_object_size).
+        """
         self._guard_write()
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
@@ -137,9 +163,12 @@ class BucketAdminMixin:
             if log_fn:
                 log_fn(f"removed the lifecycle configuration of {self.bucket}")
             return
-        self.client.put_bucket_lifecycle_configuration(
-            Bucket=self.bucket,
-            LifecycleConfiguration={"Rules": list(rules)})
+        params = {"Bucket": self.bucket,
+                  "LifecycleConfiguration": {"Rules": list(rules)}}
+        minimum = self._lifecycle_minimum_object_size()
+        if minimum:
+            params["TransitionDefaultMinimumObjectSize"] = minimum
+        self.client.put_bucket_lifecycle_configuration(**params)
         if log_fn:
             log_fn(f"wrote {len(rules)} lifecycle rule(s) to {self.bucket}")
 
@@ -350,6 +379,13 @@ class BucketAdminMixin:
         A redirect-everything host and an index document are mutually
         exclusive in the API, so the redirect wins when both are given rather
         than sending a document the service rejects.
+
+        Read-modify-write: the stored document is fetched first and only the
+        three fields edited here are replaced. PutBucketWebsite replaces the
+        whole document, and rebuilding it from those three fields deleted the
+        site's RoutingRules and turned an https redirect into one that follows
+        whatever protocol the visitor came in on. A read that fails is raised
+        rather than written over blind.
         """
         self._guard_write()
         if not self.bucket:
@@ -362,12 +398,19 @@ class BucketAdminMixin:
             if log_fn:
                 log_fn(f"removed website hosting from {self.bucket}")
             return
+        stored = self._optional_document(self.client.get_bucket_website) or {}
         if redirect:
-            config = {"RedirectAllRequestsTo": {"HostName": redirect}}
+            # Protocol is the one field beside HostName; the routing rules
+            # and documents cannot coexist with a redirect-everything host.
+            target = dict(stored.get("RedirectAllRequestsTo") or {})
+            target["HostName"] = redirect
+            config = {"RedirectAllRequestsTo": target}
         else:
             config = {"IndexDocument": {"Suffix": index}}
             if error:
                 config["ErrorDocument"] = {"Key": error}
+            if stored.get("RoutingRules"):
+                config["RoutingRules"] = list(stored["RoutingRules"])
         self.client.put_bucket_website(
             Bucket=self.bucket, WebsiteConfiguration=config)
         if log_fn:

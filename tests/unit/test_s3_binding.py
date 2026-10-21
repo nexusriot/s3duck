@@ -3,13 +3,20 @@
 import diagnostics
 import model as model_module
 import os
+import re
 import tempfile
 import threading
 import unittest
+from botocore.awsrequest import AWSResponse
+from botocore.compat import HTTPHeaders
+from core.endpoints import aws_endpoint_region, strip_bucket_label
 from model import (
     Model, RateLimiter, ReadOnlyError, TransferCancelled, run_parallel,
 )
-from tests.support import FakeS3Client, PROJECT_ROOT, _StubClient, make_model
+from tests.support import (
+    FakeS3Client, PROJECT_ROOT, _StubClient, _ensure_qapp, make_model,
+)
+from urllib.parse import parse_qs, urlparse
 from utils import load_aws_profiles
 
 
@@ -54,6 +61,54 @@ class EndpointHasBucketTests(unittest.TestCase):
         self.assertEqual(self.m._extract_leftmost_label("https://mybucket.s3.amazonaws.com"), "mybucket")
         self.assertEqual(self.m._extract_leftmost_label("https://s3.amazonaws.com"), "s3")
         self.assertEqual(self.m._extract_leftmost_label(""), "")
+class AwsEndpointRegionTests(unittest.TestCase):
+    def test_regional_hosts(self):
+        for url, region in (
+                ("https://s3.eu-west-1.amazonaws.com", "eu-west-1"),
+                ("https://mybucket.s3.eu-west-1.amazonaws.com", "eu-west-1"),
+                ("https://s3-eu-west-1.amazonaws.com", "eu-west-1"),
+                ("https://s3.dualstack.us-gov-west-1.amazonaws.com",
+                 "us-gov-west-1"),
+                ("https://s3.cn-north-1.amazonaws.com.cn", "cn-north-1")):
+            with self.subTest(url=url):
+                self.assertEqual(aws_endpoint_region(url), region)
+
+    def test_the_global_endpoint_is_us_east_1(self):
+        self.assertEqual(aws_endpoint_region("https://s3.amazonaws.com"),
+                         "us-east-1")
+        self.assertEqual(
+            aws_endpoint_region("https://mybucket.s3.amazonaws.com"),
+            "us-east-1")
+
+    def test_hosts_that_name_no_region(self):
+        for url in ("https://s3-accelerate.amazonaws.com",
+                    "https://s3-external-1.amazonaws.com",
+                    "https://minio.local:9000", ""):
+            with self.subTest(url=url):
+                self.assertEqual(aws_endpoint_region(url), "")
+
+
+class StripBucketLabelTests(unittest.TestCase):
+    def test_a_leading_bucket_label_comes_off(self):
+        self.assertEqual(
+            strip_bucket_label(
+                "https://mybucket.s3.eu-west-1.amazonaws.com", "mybucket"),
+            "https://s3.eu-west-1.amazonaws.com")
+
+    def test_scheme_and_port_survive(self):
+        self.assertEqual(
+            strip_bucket_label("http://MyBucket.minio.local:9000", "mybucket"),
+            "http://minio.local:9000")
+
+    def test_a_bucket_named_like_a_region_is_not_cut_from_the_middle(self):
+        url = "https://s3.eu-west-1.amazonaws.com"
+        self.assertEqual(strip_bucket_label(url, "eu-west-1"), url)
+
+    def test_a_service_host_is_left_alone(self):
+        url = "https://s3.eu-west-1.amazonaws.com"
+        self.assertEqual(strip_bucket_label(url, "mybucket"), url)
+
+
 class SessionTokenTests(unittest.TestCase):
     """Temporary credentials (STS / SSO / assumed role) need a session token;
     without one those credentials cannot be used at all."""
@@ -193,7 +248,7 @@ class BindingCacheTests(unittest.TestCase):
         self.m._probe_bucket_binding = _probe
         self.m.binding_cache["b1"] = ("https://stale", "eu-west-1", True)
         # a cached client that cannot list forces a re-probe
-        self.m._can_list_bucket = lambda client, bucket: False
+        self.m._listing_headers = lambda client, bucket: None
 
         result = self.m._try_bind_bucket("b1")
         self.assertEqual(result[1:], ("https://new", "us-east-1", False))
@@ -207,6 +262,267 @@ class BindingCacheTests(unittest.TestCase):
         clone.binding_cache["b2"] = ("https://ep2", "r2", False)
         # discoveries made by a worker are not lost
         self.assertIn("b2", self.m.binding_cache)
+class _Raw:
+    def __init__(self, body):
+        self._body = body
+
+    def stream(self, **_kwargs):
+        yield self._body
+
+
+class _FakeAws:
+    """
+    Just enough of AWS's region behaviour to meet botocore's own S3
+    redirector, which a FakeS3Client never does: the bug it hid is a request
+    that is refused for its region, re-signed by botocore, and then succeeds.
+
+    Hooked in at before-send, so every request goes through real signing and
+    real retry handling and stops just short of the network. Hosts outside
+    amazonaws.com behave like a MinIO with no region configured: any signing
+    region is accepted and none is ever named.
+    """
+
+    _REGIONAL = re.compile(r"(?:^|\.)s3\.([a-z0-9-]+)\.amazonaws\.com$")
+
+    def __init__(self, regions, *, listing_names_region=True,
+                 refuse_global_host=False):
+        self.regions = dict(regions)
+        self.listing_names_region = listing_names_region
+        # A brand-new bucket is not reachable through s3.amazonaws.com in
+        # either style until DNS catches up; the redirect hint is then the
+        # only way in.
+        self.refuse_global_host = refuse_global_host
+        self.requests = []          # (method, url, signing region)
+
+    def attach(self, model):
+        make = model._make_client
+
+        def _make_client(**kw):
+            client = make(**kw)
+            client.meta.events.register("before-send.s3", self._send)
+            return client
+
+        model._make_client = _make_client
+        return model
+
+    def urls(self):
+        return [url for _method, url, _region in self.requests]
+
+    @staticmethod
+    def _response(request, status, headers, body=b""):
+        h = HTTPHeaders()
+        for name, value in headers.items():
+            h[name] = value
+        if request.method == "HEAD":
+            body = b""
+        return AWSResponse(request.url, status, h, _Raw(body))
+
+    def _send(self, request, **_kwargs):
+        url = urlparse(request.url)
+        host = url.hostname
+        auth = request.headers.get("Authorization") or b""
+        auth = auth.decode() if isinstance(auth, bytes) else auth
+        signed = re.search(r"Credential=[^/]+/\d+/([^/]+)/", auth).group(1)
+        self.requests.append((request.method, request.url, signed))
+
+        bucket = next((b for b in self.regions if host.startswith(b + ".")),
+                      None)
+        virtual = bucket is not None
+        path = url.path.lstrip("/")
+        if not virtual:
+            bucket, _, path = path.partition("/")
+        region = self.regions[bucket]
+
+        if not host.endswith(".amazonaws.com"):
+            return self._listing(request, bucket, path, {})
+
+        named = {"x-amz-bucket-region": region}
+        is_global = host == "s3.amazonaws.com" or host.endswith(
+            ".s3.amazonaws.com")
+        match = self._REGIONAL.search(host)
+        wrong_host = (
+            (is_global and region != "us-east-1"
+             and (not virtual or self.refuse_global_host))
+            or (match is not None and match.group(1) != region))
+        if wrong_host:
+            return self._response(request, 301, named, (
+                "<Error><Code>PermanentRedirect</Code><Message>Use the "
+                "specified endpoint.</Message>"
+                f"<Endpoint>{bucket}.s3.{region}.amazonaws.com</Endpoint>"
+                f"<Bucket>{bucket}</Bucket></Error>").encode())
+        if signed != region:
+            return self._response(request, 400, named, (
+                "<Error><Code>AuthorizationHeaderMalformed</Code>"
+                f"<Message>the region '{signed}' is wrong; expecting "
+                f"'{region}'</Message><Region>{region}</Region>"
+                "</Error>").encode())
+        if request.method == "HEAD":
+            return self._response(request, 200, named)
+        return self._listing(
+            request, bucket, path,
+            named if self.listing_names_region else {})
+
+    def _listing(self, request, bucket, path, headers):
+        if path:
+            # On a virtual host anything in the path is a KEY: the bucket
+            # named twice is a GET of an object, not a listing.
+            return self._response(request, 404, headers, (
+                "<Error><Code>NoSuchKey</Code><Message>The specified key "
+                "does not exist.</Message></Error>").encode())
+        if request.method == "HEAD":
+            return self._response(request, 200, headers)
+        return self._response(
+            request, 200, dict(headers, **{"Content-Type": "application/xml"}),
+            (f"<ListBucketResult><Name>{bucket}</Name><Prefix></Prefix>"
+             "<KeyCount>0</KeyCount><MaxKeys>1</MaxKeys>"
+             "<Delimiter>/</Delimiter><IsTruncated>false</IsTruncated>"
+             "</ListBucketResult>").encode())
+
+
+def _credential_region(presigned_url):
+    """The region in a presigned URL's credential scope."""
+    query = parse_qs(urlparse(presigned_url).query)
+    return query["X-Amz-Credential"][0].split("/")[2]
+
+
+class OffRegionBucketTests(unittest.TestCase):
+    """A profile on the global endpoint (us-east-1) opening a bucket in
+    eu-west-1. botocore's redirector made the probe succeed with the
+    profile's region, so that region was bound and cached: listing kept
+    working, but every presigned link was signed for us-east-1 and AWS
+    refused it, and the direct link was a path-style URL on the global host,
+    which is a PermanentRedirect for that bucket."""
+
+    def setUp(self):
+        self.aws = _FakeAws({"eu-bucket": "eu-west-1",
+                             "us-bucket": "us-east-1"})
+        self.m = self.aws.attach(make_model())
+
+    def test_the_presigned_get_url_is_signed_for_the_buckets_region(self):
+        self.m.enter_bucket("eu-bucket")
+        url = self.m.presigned_get_url("report.pdf")
+        self.assertEqual(_credential_region(url), "eu-west-1")
+        self.assertEqual(urlparse(url).hostname,
+                         "eu-bucket.s3.eu-west-1.amazonaws.com")
+
+    def test_the_presigned_put_url_is_signed_for_the_buckets_region(self):
+        self.m.enter_bucket("eu-bucket")
+        url = self.m.presigned_put_url("incoming/upload.bin")
+        self.assertEqual(_credential_region(url), "eu-west-1")
+
+    def test_the_direct_link_is_on_the_buckets_regional_endpoint(self):
+        self.m.enter_bucket("eu-bucket")
+        self.assertEqual(self.m.direct_object_url("a b.txt"),
+                         "https://s3.eu-west-1.amazonaws.com/eu-bucket/a%20b.txt")
+
+    def test_the_cache_holds_the_buckets_region_and_does_not_flip_back(self):
+        self.m.enter_bucket("eu-bucket")
+        proven = ("https://s3.eu-west-1.amazonaws.com", "eu-west-1", False)
+        self.assertEqual(self.m.binding_cache["eu-bucket"], proven)
+
+        # Back to the bucket list (the profile's own endpoint and region, as
+        # the navigation code restores them) and in again.
+        self.m.endpoint_url = self.m.profile_endpoint_url
+        self.m.region_name = self.m.profile_region
+        self.m._client = None
+        del self.aws.requests[:]
+        self.m.enter_bucket("eu-bucket")
+
+        self.assertEqual(self.m.binding_cache["eu-bucket"], proven)
+        self.assertEqual(self.m.region_name, "eu-west-1")
+        # One listing, signed right first time: nothing re-probed, nothing
+        # redirected.
+        self.assertEqual(self.aws.requests, [(
+            "GET",
+            "https://eu-bucket.s3.eu-west-1.amazonaws.com/?list-type=2"
+            "&prefix=&delimiter=%2F&encoding-type=url",
+            "eu-west-1")])
+
+    def test_a_cached_entry_with_the_profiles_region_heals(self):
+        """What earlier versions persisted for such a bucket. It lists fine
+        for ever, so only reading the region off that listing can fix it."""
+        self.m.binding_cache["eu-bucket"] = (
+            "https://s3.amazonaws.com", "us-east-1", False)
+        self.m.enter_bucket("eu-bucket")
+        self.assertEqual(
+            self.m.binding_cache["eu-bucket"],
+            ("https://s3.eu-west-1.amazonaws.com", "eu-west-1", False))
+        self.assertEqual(
+            _credential_region(self.m.presigned_get_url("k")), "eu-west-1")
+
+    def test_a_path_style_profile_is_corrected_too(self):
+        # Path style on the global host is a PermanentRedirect botocore
+        # cannot follow; the flipped style is what gets redirected into
+        # "working" with the wrong region.
+        m = self.aws.attach(make_model(use_path=True))
+        m.enter_bucket("eu-bucket")
+        self.assertEqual(m.region_name, "eu-west-1")
+        self.assertEqual(m.endpoint_url, "https://s3.eu-west-1.amazonaws.com")
+        self.assertEqual(_credential_region(m.presigned_get_url("k")),
+                         "eu-west-1")
+
+    def test_a_bucket_in_the_profiles_region_costs_nothing_extra(self):
+        self.m.enter_bucket("us-bucket")
+        self.assertEqual(self.m.binding_cache["us-bucket"],
+                         ("https://s3.amazonaws.com", "us-east-1", False))
+        self.assertEqual(len(self.aws.requests), 1)
+
+    def test_head_bucket_answers_when_the_listing_does_not_name_a_region(self):
+        aws = _FakeAws({"eu-bucket": "eu-west-1"}, listing_names_region=False)
+        m = aws.attach(make_model())
+        m.enter_bucket("eu-bucket")
+        self.assertEqual(m.region_name, "eu-west-1")
+        self.assertIn("HEAD", [method for method, _u, _r in aws.requests])
+
+    def test_a_server_that_names_no_region_is_left_alone(self):
+        """A MinIO without a region: no header to read, and no HEAD spent
+        asking for one on every bucket open."""
+        m = self.aws.attach(make_model(
+            endpoint_url="http://minio.local:9000", use_path=True))
+        m.enter_bucket("eu-bucket")
+        self.assertEqual(m.binding_cache["eu-bucket"],
+                         ("http://minio.local:9000", "us-east-1", True))
+        self.assertEqual([method for method, _u, _r in self.aws.requests],
+                         ["GET"])
+
+    def test_a_redirect_hint_with_the_bucket_host_binds_virtual_host(self):
+        """AWS's PermanentRedirect names the bucket's own virtual host. It
+        was bound as an endpoint in path style, which addressed
+        https://eu-bucket.s3…/eu-bucket — a GET of a key, never a listing."""
+        aws = _FakeAws({"eu-bucket": "eu-west-1"}, refuse_global_host=True)
+        m = aws.attach(make_model(use_path=True))
+        m.enter_bucket("eu-bucket")
+        self.assertEqual(
+            m.binding_cache["eu-bucket"],
+            ("https://s3.eu-west-1.amazonaws.com", "eu-west-1", False))
+        self.assertEqual(_credential_region(m.presigned_get_url("k")),
+                         "eu-west-1")
+        for url in aws.urls():
+            self.assertNotRegex(url, r"//eu-bucket\.s3\.[^/]*/eu-bucket")
+
+    def test_a_redirect_from_a_regional_endpoint_signs_for_the_hint(self):
+        # The hinted endpoint is tried signed for the region the redirect
+        # named, not the one just refused.
+        aws = _FakeAws({"eu-bucket": "eu-west-1"})
+        m = aws.attach(make_model(
+            endpoint_url="https://s3.us-west-2.amazonaws.com",
+            region_name="us-west-2"))
+        m.enter_bucket("eu-bucket")
+        self.assertEqual(
+            m.binding_cache["eu-bucket"],
+            ("https://s3.eu-west-1.amazonaws.com", "eu-west-1", False))
+        method, url, signed = aws.requests[-1]
+        self.assertTrue(url.startswith(
+            "https://eu-bucket.s3.eu-west-1.amazonaws.com/"))
+        self.assertEqual(signed, "eu-west-1")
+
+    def test_bucket_hints_prefer_the_header_to_the_clients_region(self):
+        """The HEAD succeeds only because botocore redirected it, so the
+        client's own region is the one answer that is certainly wrong."""
+        region, _endpoint = self.m.get_bucket_hints("eu-bucket")
+        self.assertEqual(region, "eu-west-1")
+
+
 class RunParallelTests(unittest.TestCase):
     def test_sequential_when_single_worker(self):
         seen = []
@@ -653,6 +969,24 @@ class RedactUrlCredentialsTests(unittest.TestCase):
                 self.assertEqual(
                     diagnostics.redact_url_credentials(url), url)
 
+    def test_an_unencoded_delimiter_in_the_password_is_still_caught(self):
+        """The proxy that will not parse is exactly the one a user files a
+        report about: "/", "?" or "#" in the password ended the authority
+        early and the rest of the password went out in clear."""
+        for url in ("http://alice:p/ss@proxy.corp:3128",
+                    "http://alice:p?ss@proxy.corp:3128",
+                    "http://alice:p#ss@proxy.corp:3128",
+                    "http://alice:/ss@proxy.corp:3128"):
+            with self.subTest(url=url):
+                self.assertEqual(diagnostics.redact_url_credentials(url),
+                                 "http://***@proxy.corp:3128")
+
+    def test_an_at_sign_after_a_real_port_is_still_a_path(self):
+        self.assertEqual(
+            diagnostics.redact_url_credentials(
+                "http://proxy.corp:3128/go@home"),
+            "http://proxy.corp:3128/go@home")
+
     def test_the_path_is_kept_when_there_are_credentials(self):
         self.assertEqual(
             diagnostics.redact_url_credentials("http://a:b@proxy.corp/pac?x=1"),
@@ -667,6 +1001,12 @@ class RedactUrlCredentialsTests(unittest.TestCase):
 class ProxyAndCaBundleTests(unittest.TestCase):
     """The only TLS escape hatch used to be turning verification off; a
     private CA should be trusted by path instead."""
+
+    @classmethod
+    def setUpClass(cls):
+        # The diagnostics report draws icons, which needs an application;
+        # without one this module aborted when run on its own.
+        cls._app = _ensure_qapp()
 
     def test_no_proxy_by_default(self):
         self.assertEqual(make_model().proxy_settings(), {})

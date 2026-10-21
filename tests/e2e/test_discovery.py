@@ -11,7 +11,9 @@ import os
 import tempfile
 
 from core.dedup import find_duplicate_groups, summarize_duplicate_groups
-from core.sync_plan import build_sync_plan
+from core.sync_plan import (
+    build_compare_plan, build_sync_plan, make_content_check,
+)
 from tests.e2e.harness import ServerCase, make_model, purge_bucket, unique_bucket
 
 
@@ -113,6 +115,88 @@ class SyncTreeTests(ServerCase):
         # Present on both sides and identical: listed, so the dry-run shows
         # it, but as "skip" rather than as work.
         self.assertEqual(by_rel.get("here.txt"), "skip")
+
+
+class CompareContentTests(ServerCase):
+    """What the pane comparison settles a same-size pair on, read from real
+    listings. FINDING: it went by mtime alone, and a remote copy's
+    LastModified is when it was written while a download never sets the
+    local mtime -- so a folder compared with its own upload, or a prefix with
+    its server-side copy, called every file "differs"."""
+
+    OLD = 1_000_000.0       # a local mtime long before any upload
+
+    def setUp(self):
+        self.model.set_multipart_sizes(threshold_mb=5, chunksize_mb=5)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+
+    def _local(self, name, data):
+        path = os.path.join(self.root, name)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        os.utime(path, (self.OLD, self.OLD))
+        return path
+
+    def _local_tree(self):
+        tree = {}
+        for name in sorted(os.listdir(self.root)):
+            path = os.path.join(self.root, name)
+            tree[name] = (os.path.getsize(path), os.path.getmtime(path))
+        return tree
+
+    def _statuses(self, left, right, trees, **kw):
+        models = tuple(self.model if side[0] == "remote" else None
+                       for side in (left, right))
+        check = make_content_check(
+            left, right, models,
+            part_sizes=(self.model.multipart_chunksize_bytes,
+                        8 * 1024 * 1024))
+        rows = build_compare_plan(*trees, content_check=check, **kw)
+        return {row["rel"]: row["status"] for row in rows}
+
+    def test_an_uploaded_folder_compares_as_identical(self):
+        uploads = {
+            "small.txt": self._local("small.txt", b"one single-part file"),
+            # Three parts at 5 MiB: the ETag is rebuilt, not compared.
+            "big.bin": self._local("big.bin", os.urandom(11 * 1024 * 1024)),
+        }
+        for name, path in uploads.items():
+            self.model.upload_file(path, "up/" + name)
+        remote = self.model.list_tree("up/", with_etag=True)
+        self.assertTrue(remote["big.bin"][2].endswith("-3"), remote)
+        self.assertEqual(
+            self._statuses(("remote", self.bucket, "up/"),
+                           ("local", self.root),
+                           (remote, self._local_tree())),
+            {"small.txt": "same", "big.bin": "same"})
+
+    def test_a_same_size_edit_is_still_a_difference(self):
+        path = self._local("note.txt", b"version one")
+        self.model.upload_file(path, "edit/note.txt")
+        self._local("note.txt", b"version two")
+        self.assertEqual(
+            self._statuses(("remote", self.bucket, "edit/"),
+                           ("local", self.root),
+                           (self.model.list_tree("edit/", with_etag=True),
+                            self._local_tree())),
+            {"note.txt": "differs"})
+
+    def test_a_server_side_copy_compares_as_identical(self):
+        self.put("orig/f.txt", b"copied without leaving the server")
+        self.put("orig/g.txt", b"copied, then changed to other bytes")
+        self.model.copy_object("orig/f.txt", "dup/f.txt")
+        self.put("dup/g.txt", b"copied, then changed to OTHER bytes")
+        # No tolerance at all, so the clocks cannot call anything the same:
+        # only the content can.
+        self.assertEqual(
+            self._statuses(("remote", self.bucket, "orig/"),
+                           ("remote", self.bucket, "dup/"),
+                           (self.model.list_tree("orig/", with_etag=True),
+                            self.model.list_tree("dup/", with_etag=True)),
+                           tolerance=-1),
+            {"f.txt": "same", "g.txt": "differs"})
 
 
 class FingerprintTests(ServerCase):

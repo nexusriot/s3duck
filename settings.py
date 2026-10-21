@@ -156,8 +156,9 @@ class SettingsWindow(QDialog):
         self.secretKeyEdit.setText(entry.get("secret_key", ""))
         self.sessionTokenEdit.setText(entry.get("session_token", ""))
         self.sessionExpiresEdit.setText(entry.get("expires", ""))
-        if entry.get("credential_process"):
-            self.credentialProcessEdit.setText(entry["credential_process"])
+        # Always overwritten: a command left over from the profile this one
+        # used to point at would mint the old account's keys on next refresh.
+        self.credentialProcessEdit.setText(entry.get("credential_process", ""))
         # Remembered so "Refresh credentials" knows which profile to re-read
         # when this one's temporary keys lapse.
         self.aws_profile = chosen

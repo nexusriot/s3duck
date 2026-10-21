@@ -163,7 +163,7 @@ class ScanLocalTreeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(OSError):
                 scan_local_tree(os.path.join(tmp, "missing"),
-                                require_complete=True)
+                                strict=True)
 
     def test_a_complete_scan_propagates_a_directory_error(self):
         def failed_walk(_root, *, onerror):
@@ -173,7 +173,7 @@ class ScanLocalTreeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
                 unittest.mock.patch("utils.os.walk", failed_walk):
             with self.assertRaises(PermissionError):
-                scan_local_tree(tmp, require_complete=True)
+                scan_local_tree(tmp, strict=True)
 
     def test_a_complete_scan_propagates_a_file_error(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -189,7 +189,7 @@ class ScanLocalTreeTests(unittest.TestCase):
 
             with unittest.mock.patch("utils.os.stat", stat):
                 with self.assertRaises(PermissionError):
-                    scan_local_tree(tmp, require_complete=True)
+                    scan_local_tree(tmp, strict=True)
 
     def test_an_ordinary_scan_still_skips_what_it_cannot_read(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -293,6 +293,18 @@ class ListTreeTests(unittest.TestCase):
     def test_requires_a_bucket(self):
         with self.assertRaises(ValueError):
             make_model(bucket="").list_tree("x/")
+
+    def test_the_etag_rides_along_only_when_asked(self):
+        """The sync planners unpack two values; the pane comparison wants
+        the ETag to judge content by."""
+        m = make_model(bucket="b")
+        m._client = FakeS3Client(list_pages=[{"Contents": [
+            {"Key": "pre/a.txt", "Size": 3, "LastModified": _dt(1),
+             "ETag": '"' + "a" * 32 + '"'},
+        ]}])
+        self.assertEqual(len(m.list_tree("pre/")["a.txt"]), 2)
+        self.assertEqual(m.list_tree("pre/", with_etag=True)["a.txt"],
+                         (3, _dt(1).timestamp(), "a" * 32))
 class IncrementalListingTests(unittest.TestCase):
     """A prefix with a hundred thousand direct children used to be a silent
     minute and then one enormous model."""

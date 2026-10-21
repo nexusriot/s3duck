@@ -7,13 +7,16 @@ import main_window
 import os
 import profile_switcher
 import theme
+import threading
+import time
 import unittest
 import utils
 from PyQt6.QtCore import QEvent, QPointF, QSettings, Qt
 from PyQt6.QtGui import QColor, QIcon, QMouseEvent, QPalette, QPixmap
 from PyQt6.QtWidgets import QApplication, QToolButton, QWidgetAction
+from core.entries import FSObjectType, Item
 from cryptography.fernet import Fernet
-from main_window import Breadcrumb, command_entries
+from main_window import Breadcrumb, SecondPane, command_entries
 from model import Model
 from settings import SettingsWindow
 from tests.support import (
@@ -75,6 +78,104 @@ class BreadcrumbTests(unittest.TestCase):
         bc.home.connect(lambda: fired.append(True))
         self._segments(bc)[0].click()  # "Buckets"
         self.assertEqual(fired, [True])
+class _PaneModel:
+    """Just what SecondPane asks of a model: a bucket, and clones that list."""
+
+    def __init__(self, listings, gates=None):
+        self.bucket = "bkt"
+        self.current_folder = ""
+        self.listings = listings
+        self.gates = gates or {}
+
+    def clone_for_worker(self):
+        return _PaneClone(self)
+
+
+class _PaneClone:
+    def __init__(self, source):
+        self._source = source
+        self.bucket = source.bucket
+
+    def list(self, prefix):
+        gate = self._source.gates.get((self.bucket, prefix))
+        if gate is not None:
+            gate.wait(5)
+        return [Item(name, kind, "", size) for name, kind, size
+                in self._source.listings.get((self.bucket, prefix), [])]
+
+
+class SecondPaneListingTests(unittest.TestCase):
+    """The remote side of the dual pane, listed for real."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _pane(self, listings, gates=None):
+        pane = SecondPane(None, None, _PaneModel(listings, gates))
+        self.addCleanup(pane.shutdown)
+        return pane
+
+    def _wait(self, condition, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while not condition() and time.monotonic() < deadline:
+            self._app.processEvents()
+        self._app.processEvents()
+
+    def test_a_listing_with_entries_is_shown(self):
+        """REGRESSION (crash): _on_listed read item.t, which the Items
+        model.list() returns do not have. Raised inside a slot, so pressing
+        F3 in any non-empty bucket aborted the whole app."""
+        pane = self._pane({})
+        pane._bucket, pane._prefix = "bkt", ""
+        pane.mode.blockSignals(True)
+        pane.mode.setCurrentIndex(pane.mode.findData(SecondPane.REMOTE))
+        pane.mode.blockSignals(False)
+        pane._listing_for = pane._target()
+        pane._on_listed([Item("a.txt", FSObjectType.FILE, "", 5),
+                         Item("dir", FSObjectType.FOLDER, "", 0)], None)
+        self.assertEqual(pane.entries(),
+                         [("dir", True, 0), ("a.txt", False, 5)])
+
+    def test_a_remote_listing_runs_end_to_end(self):
+        pane = self._pane({("bkt", "p/"): [("a.txt", FSObjectType.FILE, 5),
+                                           ("d", FSObjectType.FOLDER, 0)]})
+        pane.set_remote("bkt", "p/")
+        self._wait(lambda: pane.entries())
+        self.assertEqual(pane.entries(), [("d", True, 0), ("a.txt", False, 5)])
+
+    def test_a_listing_for_a_place_the_pane_has_left_is_dropped(self):
+        """It used to be shown under the new prefix, and F5/F6 resolved its
+        rows there -- keys that were never listed in that folder."""
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        pane = self._pane(
+            {("bkt", "a/"): [("old.txt", FSObjectType.FILE, 1)],
+             ("bkt", "b/"): [("new.txt", FSObjectType.FILE, 2)]},
+            gates={("bkt", "a/"): gate})
+        pane.set_remote("bkt", "a/")
+        pane.set_remote("bkt", "b/")      # while a/ is still listing
+        # Nothing selectable from the place being left.
+        self.assertEqual(pane.entries(), [])
+        gate.set()
+        self._wait(lambda: pane.entries())
+        self.assertEqual(pane.entries(), [("new.txt", False, 2)])
+        self.assertEqual(pane.remote_target(), ("bkt", "b/"))
+
+    def test_switching_to_local_mid_listing_keeps_the_local_rows(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        pane = self._pane({("bkt", "a/"): [("remote.txt", FSObjectType.FILE, 1)]},
+                          gates={("bkt", "a/"): gate})
+        pane.set_remote("bkt", "a/")
+        directory = os.path.dirname(os.path.abspath(__file__))
+        pane.set_local(directory)
+        local = pane.entries()
+        gate.set()
+        self._wait(lambda: pane._thread is None)
+        self.assertEqual(pane.current_mode(), SecondPane.LOCAL)
+        self.assertEqual(pane.entries(), local)
+        self.assertNotIn("remote.txt", [name for name, _d, _s in pane.entries()])
 class DiagnosticsTests(unittest.TestCase):
     """Exists because a blank-icon report took three rounds to explain: the
     venv's PyQt6 wheel bundles QtSvg, the distribution package does not, and

@@ -456,11 +456,17 @@ class ListingMixin:
             self.rebind_bucket(log_fn=log_fn)
             return _fetch()
 
-    def list_tree(self, prefix: str = "", cancel_event=None, log_fn=None) -> dict:
+    def list_tree(self, prefix: str = "", cancel_event=None, log_fn=None,
+                  with_etag=False) -> dict:
         """
         Map every object under 'prefix' to ``{relative_path: (size, mtime)}``
         for sync comparison. Folder placeholders are skipped; mtime is epoch
         seconds.
+
+        ``with_etag`` appends the normalised ETag, ``(size, mtime, etag)``:
+        the pane comparison settles same-size pairs on content, and the
+        listing already carries it. Off by default because the sync planners
+        unpack exactly two values.
         """
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
@@ -483,6 +489,8 @@ class ListingMixin:
                         int(obj.get("Size") or 0),
                         as_epoch(obj.get("LastModified")),
                     )
+                    if with_etag:
+                        out[rel] += (self.normalize_etag(obj.get("ETag")),)
             return out
 
         try:

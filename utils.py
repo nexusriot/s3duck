@@ -4,14 +4,15 @@ import json
 import os
 import re
 import secrets
-import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from datetime import datetime
 
+from botocore.compat import compat_shell_split
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -213,7 +214,8 @@ def import_profile_bundle(blob, passphrase: str) -> list:
         profiles = json.loads(payload.decode())
     except Exception as exc:
         raise BundleError(f"Bundle contents are corrupt: {exc}") from exc
-    if not isinstance(profiles, list):
+    if not isinstance(profiles, list) or not all(
+            isinstance(entry, dict) for entry in profiles):
         raise BundleError("Bundle does not contain a list of profiles")
     return profiles
 
@@ -397,7 +399,15 @@ class CredentialStore:
             if not keyring_available():
                 raise CredentialError(
                     "No usable OS secret store was found.")
-            keyring.set_password(KEYRING_SERVICE, KEYRING_ENTRY, key)
+            try:
+                keyring.set_password(KEYRING_SERVICE, KEYRING_ENTRY, key)
+            except Exception as exc:
+                # A locked collection or a dismissed unlock prompt. Nothing has
+                # been changed yet, so refusing here is safe — and an exception
+                # escaping a Qt slot would abort the whole app.
+                raise CredentialError(
+                    f"The OS secret store could not be written: {exc}"
+                ) from exc
         elif mode == CREDENTIAL_STORE_PASSPHRASE:
             if not passphrase:
                 raise CredentialError("A passphrase is required.")
@@ -1176,33 +1186,42 @@ def str_to_bool(s):
     return str(s).lower() == "true"
 
 
-def scan_local_tree(root, *, require_complete=False) -> dict:
+def scan_local_tree(root, *, strict=False) -> dict:
     """
     Map every file under *root* to ``{relative_posix_path: (size, mtime)}``
-    for sync comparison. Unreadable entries and symlinked directories are
-    skipped rather than aborting the scan. With require_complete=True, a
-    missing root or an unreadable file/directory raises instead: sync must
-    never interpret an incomplete scan as source files being deleted.
+    for sync comparison. Symlinked directories are skipped.
+
+    Lenient by default: a missing root reads as empty and unreadable entries
+    are skipped. ``strict`` is for a caller that will DELETE whatever the scan
+    does not report -- an upload sync with "delete extras" -- and so cannot
+    tell "this folder is empty" from "this folder could not be read". Then a
+    missing root, an unreadable directory or an unreadable file raises
+    OSError instead of quietly shrinking the tree. (A file that vanished
+    between the listing and the stat is genuinely gone and stays skipped.)
     """
     out = {}
     root = os.path.abspath(root or "")
     if not os.path.isdir(root):
-        if require_complete:
-            raise OSError(f"Local source folder is unavailable: {root}")
+        if strict:
+            raise FileNotFoundError(
+                f"Local source folder is unavailable: {root}")
         return out
-    def onerror(exc):
-        if require_complete:
-            raise exc
 
-    for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):
+    def _walk_failed(exc):
+        raise exc
+
+    for dirpath, dirnames, filenames in os.walk(
+            root, onerror=_walk_failed if strict else None):
         dirnames[:] = [d for d in dirnames
                        if not os.path.islink(os.path.join(dirpath, d))]
         for filename in filenames:
             full = os.path.join(dirpath, filename)
             try:
                 stat = os.stat(full)
+            except FileNotFoundError:
+                continue
             except OSError:
-                if require_complete:
+                if strict:
                     raise
                 continue
             rel = os.path.relpath(full, root).replace(os.sep, "/")
@@ -1285,14 +1304,16 @@ def run_credential_process(command, timeout=60) -> dict:
     way to keep an SSO or assume-role session alive: the command prints a JSON
     document with AccessKeyId / SecretAccessKey / SessionToken / Expiration.
 
-    The command is split with shlex and run WITHOUT a shell, so a stored
-    profile cannot smuggle in a pipeline or a redirect.
+    The command is split as the AWS CLI splits it and run WITHOUT a shell, so
+    a stored profile cannot smuggle in a pipeline or a redirect.
     """
     text = str(command or "").strip()
     if not text:
         raise CredentialProcessError("No credential process is configured.")
     try:
-        argv = shlex.split(text)
+        # botocore's splitter, as the AWS CLI uses: plain shlex is POSIX-only
+        # and turns C:\path\creds.exe into C:pathcreds.exe on Windows.
+        argv = compat_shell_split(text, sys.platform)
     except ValueError as exc:
         raise CredentialProcessError(f"Unparseable command: {exc}") from exc
     if not argv:

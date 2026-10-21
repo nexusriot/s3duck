@@ -353,10 +353,13 @@ class ReviewRegressionTests(unittest.TestCase):
         started = []
         with patch.object(main_window.MainWindow, "assign_thread_operation",
                           lambda _s, method, job, **kw: started.append(method)):
+            # History records carry the bucket and profile they ran in; a
+            # replay is bound to those, never to whatever is open now.
             win.rerun_history_entry(
                 {"method": "upload", "job": [["k", "/tmp/f"]],
                  "origin": win._transfer_origin(),
-                 "source_bucket": win.data_model.bucket})
+                 "source_bucket": win.data_model.bucket,
+                 "bucket": "bkt", "profile": win.profile_name})
         self.assertEqual(started, ["upload"])
 
     def test_switching_profiles_saves_where_the_old_one_was(self):

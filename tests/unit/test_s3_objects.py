@@ -1,13 +1,17 @@
 """s3/object_admin.py and bucket_admin.py."""
 
+import botocore.exceptions
 import botocore.session
 import io
 import main_window
 import unittest
 from cryptography.fernet import Fernet
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from model import Model, ReadOnlyError
 from tests.support import (
-    FakeS3Client, _BucketAdminClient, _DocumentClient, _dt, make_model,
+    FakeS3Client, _BucketAdminClient, _CopyPartClient, _DocumentClient, _dt,
+    make_model,
 )
 from utils import CredentialError, Crypto
 
@@ -342,12 +346,21 @@ class StorageClassNoOpTests(unittest.TestCase):
             False)
         self.assertTrue(any("already STANDARD" in line for line in logs))
 
-    def test_a_real_change_returns_true_and_costs_one_request(self):
+    def test_a_real_change_returns_true_and_costs_a_head_and_a_copy(self):
+        """The HEAD is the price of keeping the object's own encryption (see
+        SelfCopyEncryptionTests); one, and only one, is paid."""
         c = self._Refusing(current="STANDARD")
         self.m._client = c
         self.assertIs(self.m.change_storage_class("a.txt", "GLACIER"), True)
-        self.assertEqual(len(c.calls_of("head_object")), 0,
-                         "the happy path must not pay for a HEAD")
+        self.assertEqual(len(c.calls_of("head_object")), 1)
+        self.assertEqual(len(c.calls_of("copy_object")), 1)
+
+    def test_the_no_op_reuses_the_head_the_copy_already_paid_for(self):
+        c = self._Refusing(current="GLACIER")
+        self.m._client = c
+        self.assertIs(self.m.change_storage_class("a.txt", "GLACIER"), False)
+        self.assertEqual(len(c.calls_of("head_object")), 1,
+                         "asked the class again after already reading it")
 
     def test_an_invalid_request_for_another_reason_still_raises(self):
         """Only "it is already there" is forgiven; anything else is a real
@@ -632,6 +645,53 @@ class LifecycleTests(unittest.TestCase):
         m.read_only = True
         with self.assertRaises(ReadOnlyError):
             m.put_bucket_lifecycle([{"ID": "r"}])
+
+    class _SizedLifecycle(_BucketAdminClient):
+        """Stores the bucket-wide minimum object size beside the rules."""
+
+        def __init__(self, minimum=None, read_error=None, **kw):
+            super().__init__(**kw)
+            self.minimum = minimum
+            self.read_error = read_error
+
+        def get_bucket_lifecycle_configuration(self, **kw):
+            if self.read_error is not None:
+                self.calls.append(("get_bucket_lifecycle_configuration", kw))
+                raise botocore.exceptions.ClientError(
+                    {"Error": {"Code": self.read_error, "Message": "no"}},
+                    "GetBucketLifecycleConfiguration")
+            resp = super().get_bucket_lifecycle_configuration(**kw)
+            if self.minimum:
+                resp["TransitionDefaultMinimumObjectSize"] = self.minimum
+            return resp
+
+    def test_saving_rules_keeps_the_minimum_object_size(self):
+        """A PUT without it resets it to the service default, so editing any
+        rule re-enabled transitions for small objects the owner had chosen."""
+        m = make_model(bucket="bkt")
+        m._client = client = self._SizedLifecycle(
+            minimum="varies_by_storage_class", lifecycle=[{"ID": "old"}])
+        self.assertEqual(m.get_bucket_lifecycle(), [{"ID": "old"}])
+        m.put_bucket_lifecycle([{"ID": "new", "Status": "Enabled"}])
+        sent = client.calls_of("put_bucket_lifecycle_configuration")[0]
+        self.assertEqual(sent["TransitionDefaultMinimumObjectSize"],
+                         "varies_by_storage_class")
+        self.assertEqual(sent["LifecycleConfiguration"],
+                         {"Rules": [{"ID": "new", "Status": "Enabled"}]})
+
+    def test_a_first_configuration_sends_no_minimum(self):
+        m, client = self._model()                  # NoSuchLifecycleConfiguration
+        m.put_bucket_lifecycle([{"ID": "r1", "Status": "Enabled"}])
+        sent = client.calls_of("put_bucket_lifecycle_configuration")[0]
+        self.assertNotIn("TransitionDefaultMinimumObjectSize", sent)
+
+    def test_an_unreadable_configuration_is_not_written_over_blind(self):
+        m = make_model(bucket="bkt")
+        m._client = client = self._SizedLifecycle(read_error="AccessDenied")
+        with self.assertRaises(botocore.exceptions.ClientError):
+            m.put_bucket_lifecycle([{"ID": "r1", "Status": "Enabled"}])
+        self.assertEqual(client.calls_of("put_bucket_lifecycle_configuration"),
+                         [])
 
     def test_scope_is_read_from_either_filter_shape(self):
         self.assertEqual(Model.lifecycle_rule_scope({"Prefix": "old/"}), "old/")
@@ -1021,3 +1081,282 @@ class BucketDocumentTests(unittest.TestCase):
                      lambda: m.set_bucket_acceleration(True)):
             with self.assertRaises(ReadOnlyError):
                 call()
+class SelfCopyEncryptionTests(unittest.TestCase):
+    """A copy onto itself names no encryption unless told to, and S3 then
+    encrypts the result with the bucket's DEFAULT: an object under its own
+    KMS key came back SSE-S3 after a storage-class change, a metadata edit or
+    a version restore, with nothing said."""
+
+    KEY_ARN = "arn:aws:kms:eu-west-1:111122223333:key/app"
+    KMS_HEAD = {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": KEY_ARN,
+                "BucketKeyEnabled": True, "StorageClass": "STANDARD"}
+    KMS_ARGS = {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": KEY_ARN,
+                "BucketKeyEnabled": True}
+
+    def _model(self, head):
+        m = make_model(bucket="b")
+        m._client = FakeS3Client(head_object_resp=head)
+        return m, m._client
+
+    @staticmethod
+    def _sse_of(call):
+        return {field: value for field, value in call.items()
+                if field in ("ServerSideEncryption", "SSEKMSKeyId",
+                             "BucketKeyEnabled")}
+
+    def test_a_storage_class_change_keeps_the_kms_key(self):
+        m, client = self._model(self.KMS_HEAD)
+        self.assertTrue(m.change_storage_class("a.bin", "STANDARD_IA"))
+        self.assertEqual(self._sse_of(client.calls_of("copy_object")[0]),
+                         self.KMS_ARGS)
+
+    def test_a_metadata_edit_keeps_the_kms_key(self):
+        m, client = self._model(self.KMS_HEAD)
+        m.set_object_metadata("a.bin", content_type="text/plain")
+        self.assertEqual(self._sse_of(client.calls_of("copy_object")[0]),
+                         self.KMS_ARGS)
+
+    def test_a_metadata_edit_uses_the_encryption_it_is_handed(self):
+        """What get_object_metadata already read is not read again."""
+        m, client = self._model(self.KMS_HEAD)
+        m.set_object_metadata("a.bin", content_type="text/plain",
+                              sse=dict(self.KMS_ARGS))
+        self.assertEqual(client.calls_of("head_object"), [])
+        self.assertEqual(self._sse_of(client.calls_of("copy_object")[0]),
+                         self.KMS_ARGS)
+
+    def test_retype_carries_the_key_from_its_one_head(self):
+        m, client = self._model(
+            dict(self.KMS_HEAD, ContentType="binary/octet-stream"))
+        changed, _content_type = m.retype_object("site/index.html")
+        self.assertTrue(changed)
+        self.assertEqual(len(client.calls_of("head_object")), 1)
+        self.assertEqual(self._sse_of(client.calls_of("copy_object")[0]),
+                         self.KMS_ARGS)
+
+    def test_a_restored_version_keeps_that_versions_key(self):
+        m, client = self._model(self.KMS_HEAD)
+        m.make_version_current("a.bin", "v1")
+        self.assertEqual(client.calls_of("head_object")[0].get("VersionId"),
+                         "v1", "read the current object, not the version")
+        self.assertEqual(self._sse_of(client.calls_of("copy_object")[0]),
+                         self.KMS_ARGS)
+
+    def test_sse_s3_is_restated_without_the_kms_only_fields(self):
+        self.assertEqual(
+            Model._sse_args({"ServerSideEncryption": "AES256",
+                             "SSEKMSKeyId": "stray", "BucketKeyEnabled": True}),
+            {"ServerSideEncryption": "AES256"})
+        self.assertEqual(Model._sse_args({}), {})
+
+    def test_an_unreadable_head_leaves_the_copy_as_it_was(self):
+        """Best effort: not being allowed to HEAD is no reason to refuse."""
+        class NoHead(FakeS3Client):
+            def head_object(self, **kw):
+                self.calls.append(("head_object", kw))
+                raise botocore.exceptions.ClientError(
+                    {"Error": {"Code": "403", "Message": "Forbidden"}},
+                    "HeadObject")
+
+        m = make_model(bucket="b")
+        m._client = client = NoHead()
+        self.assertTrue(m.change_storage_class("a.bin", "GLACIER"))
+        self.assertEqual(self._sse_of(client.calls_of("copy_object")[0]), {})
+
+    def test_a_huge_metadata_rewrite_keeps_the_key_in_parts(self):
+        too_big = botocore.exceptions.ClientError(
+            {"Error": {"Code": "InvalidRequest",
+                       "Message": "copy source is larger than the maximum"}},
+            "CopyObject")
+        class Untagged(_CopyPartClient):
+            # The in-parts route may read the source's tags; this one has none.
+            def get_object_tagging(self, **kw):
+                self.calls.append(("get_object_tagging", kw))
+                return {"TagSet": []}
+
+        m = make_model(bucket="b")
+        m._client = client = Untagged(
+            source_size=6 * 1024 ** 3, copy_error=too_big, head=self.KMS_HEAD)
+        m.set_object_metadata("big.bin", content_type="text/csv")
+        _bucket, _key, kw = client.created[0]
+        self.assertEqual(self._sse_of(kw), self.KMS_ARGS)
+class UndeleteSinceTests(unittest.TestCase):
+    """Undo removes the markers the delete being undone wrote, not every
+    newest marker under the prefix -- that also resurrected whatever had been
+    deleted from the folder on purpose long before."""
+
+    def setUp(self):
+        self.m = make_model(bucket="b")
+        self.start = datetime.now(timezone.utc)
+
+    def _client(self, markers, server_now=None):
+        page = {"DeleteMarkers": markers, "Versions": []}
+        if server_now is not None:
+            page["ResponseMetadata"] = {"HTTPHeaders": {
+                "date": format_datetime(server_now, usegmt=True)}}
+        self.m._client = FakeS3Client(versions_pages=[page])
+        return self.m._client
+
+    @staticmethod
+    def _marker(key, version_id, written):
+        return {"Key": key, "VersionId": version_id, "IsLatest": True,
+                "LastModified": written}
+
+    def test_a_folder_undo_leaves_older_deletes_deleted(self):
+        client = self._client([
+            self._marker("dir/old-secret.txt", "dm-old",
+                         self.start - timedelta(days=365)),
+            self._marker("dir/a.txt", "dm-now",
+                         self.start + timedelta(seconds=2)),
+        ])
+        self.assertEqual(self.m.undelete("dir/", since=self.start), 1)
+        self.assertEqual(
+            [kw["VersionId"] for kw in client.calls_of("delete_object")],
+            ["dm-now"])
+
+    def test_epoch_seconds_mean_the_same_moment(self):
+        client = self._client([
+            self._marker("dir/old.txt", "dm-old",
+                         self.start - timedelta(hours=1)),
+            self._marker("dir/a.txt", "dm-now", self.start),
+        ])
+        self.assertEqual(
+            self.m.undelete("dir/", since=self.start.timestamp()), 1)
+        self.assertEqual(client.calls_of("delete_object")[0]["Key"],
+                         "dir/a.txt")
+
+    def test_one_second_timestamps_do_not_lose_the_first_marker(self):
+        self._client([self._marker("a.txt", "dm",
+                                   self.start - timedelta(seconds=1))])
+        self.assertEqual(self.m.undelete("a.txt", since=self.start), 1)
+
+    def test_a_skewed_local_clock_is_measured_not_trusted(self):
+        """This machine runs ten minutes ahead of the service, so by its own
+        clock every marker the delete wrote predates the delete."""
+        ahead = timedelta(minutes=10)
+        server_start = self.start - ahead
+        client = self._client([
+            self._marker("dir/a.txt", "dm-now",
+                         server_start + timedelta(seconds=1)),
+            self._marker("dir/b.txt", "dm-earlier",
+                         server_start - timedelta(minutes=3)),
+        ], server_now=datetime.now(timezone.utc) - ahead)
+        self.assertEqual(self.m.undelete("dir/", since=self.start), 1)
+        self.assertEqual(
+            [kw["VersionId"] for kw in client.calls_of("delete_object")],
+            ["dm-now"])
+
+    def test_a_null_marker_is_neither_removed_nor_counted(self):
+        """Suspended versioning: the delete destroyed the unversioned copy,
+        and removing its marker would only promote an older version under a
+        "restored" that is not true."""
+        client = self._client([
+            self._marker("dir/a.txt", "null",
+                         self.start + timedelta(seconds=1)),
+            self._marker("dir/b.txt", "dm-b",
+                         self.start + timedelta(seconds=1)),
+        ])
+        logs = []
+        self.assertEqual(
+            self.m.undelete("dir/", log_fn=logs.append, since=self.start), 1)
+        self.assertEqual([kw["Key"] for kw in client.calls_of("delete_object")],
+                         ["dir/b.txt"])
+        self.assertTrue(any("dir/a.txt" in line and "suspended" in line
+                            for line in logs), logs)
+class WebsiteReadModifyWriteTests(unittest.TestCase):
+    """PutBucketWebsite replaces the whole document; the dialog edits three
+    fields of it. Everything else has to be carried over, or saving the
+    error page deletes the site's redirects."""
+
+    RULES = [{"Condition": {"KeyPrefixEquals": "docs/"},
+              "Redirect": {"ReplaceKeyPrefixWith": "documents/"}}]
+
+    def _model(self, stored=None):
+        m = make_model(bucket="bkt")
+        docs = {} if stored is None else {"get_bucket_website": stored}
+        m._client = _DocumentClient(docs=docs)
+        return m, m._client
+
+    def _written(self, client):
+        return client.calls_of("put_bucket_website")[0]["WebsiteConfiguration"]
+
+    def test_routing_rules_survive_an_edit_of_the_documents(self):
+        m, client = self._model({
+            "IndexDocument": {"Suffix": "index.html"},
+            "ErrorDocument": {"Key": "404.html"},
+            "RoutingRules": self.RULES,
+            "ResponseMetadata": {"HTTPStatusCode": 200},
+        })
+        m.put_bucket_website(index="index.html", error="oops.html")
+        self.assertEqual(self._written(client), {
+            "IndexDocument": {"Suffix": "index.html"},
+            "ErrorDocument": {"Key": "oops.html"},
+            "RoutingRules": self.RULES,
+        })
+
+    def test_an_https_redirect_stays_https(self):
+        m, client = self._model({"RedirectAllRequestsTo": {
+            "HostName": "old.example.com", "Protocol": "https"}})
+        m.put_bucket_website(redirect="www.example.com")
+        self.assertEqual(self._written(client), {"RedirectAllRequestsTo": {
+            "HostName": "www.example.com", "Protocol": "https"}})
+
+    def test_a_failed_read_is_not_written_over(self):
+        class Denied(_DocumentClient):
+            def get_bucket_website(self, **kw):
+                raise botocore.exceptions.ClientError(
+                    {"Error": {"Code": "AccessDenied", "Message": "no"}},
+                    "GetBucketWebsite")
+
+        m = make_model(bucket="bkt")
+        m._client = client = Denied()
+        with self.assertRaises(botocore.exceptions.ClientError):
+            m.put_bucket_website(index="index.html")
+        self.assertEqual(client.calls_of("put_bucket_website"), [])
+class PurgeWithoutMultiDeleteTests(unittest.TestCase):
+    """A folder delete already fell back to single deletes on a backend
+    without DeleteObjects; emptying the whole bucket did not."""
+
+    class _NoMultiDelete(FakeS3Client):
+        def __init__(self, code="NotImplemented", **kw):
+            super().__init__(**kw)
+            self._code = code
+
+        def delete_objects(self, **kw):
+            self.calls.append(("delete_objects", kw))
+            raise botocore.exceptions.ClientError(
+                {"Error": {"Code": self._code, "Message": "no"}},
+                "DeleteObjects")
+
+    def _model(self, client):
+        m = make_model(bucket="")
+        m._try_bind_bucket = lambda name: (client, "ep", "us-east-1", True)
+        return m
+
+    def test_emptying_falls_back_to_one_delete_per_key(self):
+        client = self._NoMultiDelete(
+            list_pages=[{"Contents": [{"Key": "a.txt"}, {"Key": "b.txt"}]}],
+            versions_pages=[{
+                "Versions": [{"Key": "old.txt", "VersionId": "v0"}],
+                "DeleteMarkers": [{"Key": "gone.txt", "VersionId": "dm0"}],
+            }],
+            mpu_pages=[{}])
+        self._model(client).empty_bucket("bkt", batch_size=1)
+        self.assertEqual(client.calls_of("delete_object"), [
+            {"Bucket": "bkt", "Key": "a.txt"},
+            {"Bucket": "bkt", "Key": "b.txt"},
+            {"Bucket": "bkt", "Key": "old.txt", "VersionId": "v0"},
+            {"Bucket": "bkt", "Key": "gone.txt", "VersionId": "dm0"},
+        ])
+        self.assertEqual(len(client.calls_of("delete_objects")), 1,
+                         "asked again after being told no")
+
+    def test_a_refusal_for_another_reason_still_fails(self):
+        client = self._NoMultiDelete(
+            code="AccessDenied",
+            list_pages=[{"Contents": [{"Key": "a.txt"}]}],
+            versions_pages=[{}], mpu_pages=[{}])
+        with self.assertRaises(botocore.exceptions.ClientError):
+            self._model(client).delete_bucket_recursive("bkt")
+        self.assertEqual(client.calls_of("delete_object"), [])
+        self.assertEqual(client.calls_of("delete_bucket"), [])

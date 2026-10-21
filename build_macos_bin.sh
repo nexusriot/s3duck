@@ -12,4 +12,4 @@ else
   echo "building s3duck for macOS ($(uname -m))"
 fi
 
-pyinstaller --windowed --no-confirm --add-data="icons:icons" --add-data="resources/ducky.icns:resources/." --onefile --icon=resources/ducky.icns $arch_flag s3duck.py
+pyinstaller --windowed --noconfirm --add-data="icons:icons" --add-data="resources/ducky.icns:resources/." --onefile --icon=resources/ducky.icns $arch_flag s3duck.py

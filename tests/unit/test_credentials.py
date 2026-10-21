@@ -7,6 +7,7 @@ import main_window
 import os
 import profile_switcher
 import s3duck
+import settings as settings_module
 import shutil
 import tempfile
 import time
@@ -1307,3 +1308,190 @@ class ResolveCredentialKeyTests(unittest.TestCase):
 
     def test_nothing_anywhere_is_an_empty_string(self):
         self.assertEqual(utils.resolve_credential_key(self.settings), "")
+class LauncherProfileWriteTests(unittest.TestCase):
+    """What the launcher writes back, and what it must leave out."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _launcher(self, items=()):
+        win = s3duck.Profiles()
+        win.settings = QSettings("s3duck-tests-write", "s3duck-tests-write")
+        win.settings.clear()
+        self.addCleanup(win.settings.clear)
+        win.items = list(items)
+        win.populate_list()
+        if win.items:
+            win.listWidget.setCurrentRow(0)
+        self.addCleanup(win.close)
+        return win
+
+    _item = staticmethod(LauncherListTests._item)
+
+    def test_a_deleted_profile_leaves_no_row_behind(self):
+        """beginWriteArray only overwrites rows 1..n: the deleted profile's
+        ciphertext used to stay in the file, beside the key that opens it."""
+        win = self._launcher([
+            self._item("keep"),
+            self._item("compromised", enc_secret_key=b"CIPHERTEXT")])
+        win.save_settings()
+        win.items.pop()
+        win.save_settings()
+        keys = win.settings.allKeys()
+        self.assertIn("profiles/profiles/1/name", keys)
+        self.assertFalse(
+            [key for key in keys if key.startswith("profiles/profiles/2/")])
+        self.assertNotIn("CIPHERTEXT", repr(
+            [win.settings.value(key) for key in keys]))
+
+    def test_rewriting_keeps_every_field_of_the_remaining_rows(self):
+        win = self._launcher([self._item(
+            "keep", credential_process="/bin/creds", proxy_url="http://p:1",
+            ca_bundle="/ca.pem", public_base_url="https://cdn")])
+        win.save_settings()
+        win.save_settings()
+        win.items = []
+        win.load()
+        self.assertEqual(
+            (win.items[0].credential_process, win.items[0].proxy_url,
+             win.items[0].ca_bundle, win.items[0].public_base_url),
+            ("/bin/creds", "http://p:1", "/ca.pem", "https://cdn"))
+
+    def test_copying_twice_never_duplicates_a_name(self):
+        """Refreshed credentials, bookmarks and -p find a profile by name; a
+        second "prod-copy" would have its keys written over by the first."""
+        win = self._launcher([self._item("prod")])
+        for _ in range(3):
+            win.listWidget.setCurrentRow(0)
+            win.copy_profile()
+        self.assertEqual([item.name for item in win.items],
+                         ["prod", "prod-copy", "prod-copy-2", "prod-copy-3"])
+
+    def test_an_unknown_named_profile_is_refused_not_substituted(self):
+        """A typo in "-p prod-readonly" must not open the location in the
+        profile that happens to be selected."""
+        win = self._launcher([self._item("prod-admin")])
+        win.startup = {"profile": "prod-readonly"}
+        started = []
+        win.onStart = lambda: started.append(win.pending_location)
+        with patch.object(s3duck.QMessageBox, "warning") as warned:
+            win.open_location_request("s3://prod/data/")
+        self.assertEqual(started, [])
+        warned.assert_called_once()
+        self.assertIn("prod-readonly", warned.call_args[0][2])
+
+    def test_a_failed_start_does_not_keep_the_location_for_later(self):
+        win = self._launcher([self._item("prod")])
+        started = []
+        win.onStart = lambda: started.append(win.pending_location)
+        win.open_location_request("s3://prod/data/")
+        self.assertEqual(started, ["s3://prod/data/"])
+        self.assertEqual(win.pending_location, "")
+
+    def test_a_named_profile_is_never_handed_to_a_running_window(self):
+        """The running window would open it under its own profile."""
+        class _Stop(Exception):
+            pass
+
+        sent = []
+
+        def _send(location, *a, **kw):
+            sent.append(location)
+            return True
+
+        with patch.object(s3duck, "send_to_running_instance", _send), \
+                patch.object(s3duck, "QApplication", side_effect=_Stop), \
+                patch.object(s3duck.sys, "argv",
+                             ["s3duck", "-p", "prod", "s3://bkt/x/"]):
+            with self.assertRaises(_Stop):
+                s3duck.main()
+        self.assertEqual(sent, [])
+
+        with patch.object(s3duck, "send_to_running_instance", _send), \
+                patch.object(s3duck, "QApplication", side_effect=_Stop), \
+                patch.object(s3duck.sys, "argv", ["s3duck", "s3://bkt/x/"]):
+            s3duck.main()
+        self.assertEqual(sent, ["s3://bkt/x/"])
+
+
+class CredentialWriteFailureTests(unittest.TestCase):
+    """Failures on the write side must be refusals, not crashes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def setUp(self):
+        self.settings = QSettings("s3duck-tests-store", "s3duck-tests-store")
+        self.settings.clear()
+        self.addCleanup(self.settings.clear)
+        utils.set_session_key("")
+        self.addCleanup(utils.set_session_key, "")
+
+    def test_a_locked_keyring_is_a_credential_error(self):
+        """An exception escaping a Qt slot aborts the app; a locked Secret
+        Service collection used to do exactly that."""
+        class _LockedKeyring:
+            @staticmethod
+            def get_keyring():
+                return _LockedKeyring()
+
+            @staticmethod
+            def get_password(service, entry):
+                return None
+
+            @staticmethod
+            def set_password(service, entry, value):
+                raise RuntimeError("collection is locked")
+
+        with patch.object(utils, "keyring", _LockedKeyring):
+            store = utils.CredentialStore(self.settings)
+            original = store.ensure_key()
+            with self.assertRaises(CredentialError) as caught:
+                store.set_mode(utils.CREDENTIAL_STORE_KEYRING)
+            self.assertIn("locked", str(caught.exception))
+            # Nothing moved: the key is still where it was.
+            self.assertEqual(store.mode(), utils.CREDENTIAL_STORE_LOCAL)
+            self.assertEqual(store.load_key(), original)
+
+    def test_a_bundle_entry_that_is_not_a_profile_is_refused(self):
+        blob = export_profile_bundle([{"name": "ok"}, "not a profile"], "pw")
+        with self.assertRaises(BundleError):
+            import_profile_bundle(blob, "pw")
+
+    def test_credential_process_paths_survive_on_windows(self):
+        """POSIX shlex ate the backslashes: C:\\bin\\creds.exe became
+        C:bincreds.exe and every refresh failed with "not found"."""
+        ran = []
+
+        class _Done:
+            returncode = 0
+            stdout = b'{"AccessKeyId": "AK", "SecretAccessKey": "SK"}'
+            stderr = b""
+
+        def _run(argv, **kw):
+            ran.append(argv)
+            return _Done()
+
+        with patch.object(utils.sys, "platform", "win32"), \
+                patch.object(utils.subprocess, "run", _run):
+            utils.run_credential_process(
+                r"C:\Users\me\bin\creds.exe --profile x")
+        self.assertEqual(
+            ran, [[r"C:\Users\me\bin\creds.exe", "--profile", "x"]])
+
+    def test_importing_from_aws_replaces_an_old_credential_process(self):
+        """A command left from the profile this one used to point at would
+        mint that account's keys on the next refresh."""
+        dlg = settings_module.SettingsWindow()
+        self.addCleanup(dlg.close)
+        dlg.credentialProcessEdit.setText("/bin/team-a-creds")
+        fresh = {"team-b": {"access_key": "AK", "secret_key": "SK"}}
+        with patch.object(settings_module, "load_aws_profiles",
+                          lambda: fresh), \
+                patch.object(settings_module.QInputDialog, "getItem",
+                             return_value=("team-b", True)):
+            dlg.import_from_aws()
+        self.assertEqual(dlg.credentialProcessEdit.text(), "")
+        self.assertEqual(dlg.accessKeyEdit.text(), "AK")

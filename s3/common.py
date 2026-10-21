@@ -168,19 +168,65 @@ def prefix_of(key) -> str:
 # such per-component rule, so a perfectly legal key can name a file the
 # local filesystem cannot create.
 MAX_LOCAL_NAME_BYTES = 255
-def local_name_is_writable(rel) -> bool:
+# Characters Windows refuses in a file or folder name ('/' and '\' already
+# split a key into components). ':' is the dangerous one: every ISO
+# timestamp in a key has two, and NTFS does not refuse "a:b" -- it writes
+# stream "b" of a file "a", so the download "succeeds" into a place nobody
+# will ever look.
+_WINDOWS_ILLEGAL_CHARS = frozenset('<>:"|?*') | frozenset(map(chr, range(32)))
+# DOS device names, reserved in any case and with any extension ("nul.txt"
+# is NUL). The list CPython's ntpath.isreserved uses, superscript digits
+# included.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {dev + n for dev in ("COM", "LPT") for n in "123456789¹²³"})
+def _local_names_follow_windows_rules() -> bool:
     """
-    True when every component of *rel* is short enough to exist locally.
+    Whether names must also pass Windows' rules to be created locally.
+
+    Only on Windows: ':' and '?' are ordinary characters on Linux and macOS,
+    and refusing them there would skip files that download perfectly well.
+    A function rather than a constant so a test can ask the question as a
+    Windows machine would.
+    """
+    return os.name == "nt"
+def local_name_problem(rel) -> str:
+    """
+    Why some component of *rel* cannot be created locally, or "" if none.
 
     A 300-character component is a legal S3 key and an ENAMETOOLONG on
     ext4. Checked in BYTES, not characters, because that is what the
     filesystem counts — 200 emoji are 800 bytes and would pass a character
-    test while failing the real one.
+    test while failing the real one. On Windows a key also has to be a legal
+    Windows name, which a great many legal keys are not.
     """
+    windows = _local_names_follow_windows_rules()
     for part in str(rel or "").replace("\\", "/").split("/"):
+        if part in ("", ".", ".."):
+            # Not names: an empty segment collapses, and whether a ".."
+            # escapes is the containment check's question, not this one's.
+            continue
         if len(part.encode("utf-8", "surrogatepass")) > MAX_LOCAL_NAME_BYTES:
-            return False
-    return True
+            return (f"'{part[:40]}…' is longer than {MAX_LOCAL_NAME_BYTES} "
+                    "bytes, the most one name can have on this filesystem")
+        if "\0" in part:
+            return "contains a NUL character, which no filesystem allows"
+        if not windows:
+            continue
+        illegal = sorted(set(part) & _WINDOWS_ILLEGAL_CHARS)
+        if illegal:
+            shown = " ".join(repr(c) for c in illegal)
+            return f"'{part}' contains {shown}, which Windows does not allow"
+        if part[-1] in ". ":
+            # Windows strips them, so the file would land under another
+            # name -- possibly one a different key also maps to.
+            return f"'{part}' ends in a dot or a space, which Windows strips"
+        if part.split(".", 1)[0].rstrip(" ").upper() in _WINDOWS_RESERVED_NAMES:
+            return f"'{part}' is a reserved device name on Windows"
+    return ""
+def local_name_is_writable(rel) -> bool:
+    """True when every component of *rel* can exist locally."""
+    return not local_name_problem(rel)
 def safe_local_path(base_dir, rel) -> str:
     """
     Where *rel* lands under *base_dir*, or "" when it cannot go there.
@@ -188,9 +234,10 @@ def safe_local_path(base_dir, rel) -> str:
     Two ways a key fails to be a local path, and both end in "". First,
     escape: "../../.bashrc" and "/etc/passwd" are legal keys that anyone
     who can write to the bucket can create, and joining one onto a download
-    folder writes outside the folder the user picked. Second, length: a
-    component over the filesystem's limit is an ENAMETOOLONG rather than a
-    file. plan_prefix_download has always refused the first for a
+    folder writes outside the folder the user picked. Second, a name the
+    filesystem cannot hold: a component over its length limit, or on Windows
+    a ':' (an alternate data stream, not a file), a '?' or a CON.
+    plan_prefix_download has always refused the first for a
     whole-folder download; this is the same rule for every other place a key
     becomes a local path (sync, the second pane, search results).
     """
@@ -250,7 +297,12 @@ def plan_prefix_download(key, folder_path, entries) -> PrefixDownloadPlan:
     """
     prefix = prefix_of(key)
     base_dir = os.path.join(folder_path, os.path.basename(prefix.rstrip("/")))
-    dirs, files, unsafe = [], [], []
+    dirs, wanted, unsafe, reasons = [], [], [], {}
+
+    def _refuse(k, why):
+        unsafe.append(k)
+        reasons[k] = why
+
     for k, size in entries:
         if not k:
             continue
@@ -259,22 +311,47 @@ def plan_prefix_download(key, folder_path, entries) -> PrefixDownloadPlan:
             continue
         out_path = os.path.join(base_dir, rel)
         # Keys may contain ".." segments; never write outside base_dir.
+        # Containment alone is not enough: a symlink anywhere below the
+        # chosen root sends the write wherever it points, so the planner
+        # uses the same check the writer re-runs just before it creates
+        # the file.
         if not local_destination_is_safe(base_dir, out_path):
-            unsafe.append(k)
+            _refuse(k, "escapes the folder being downloaded into, or is "
+                       "reached through a symlink")
             continue
-        # A component over the filesystem's limit is an ENAMETOOLONG, not a
-        # file — and because the whole-prefix download fans out through
-        # run_parallel, which re-raises the first error, ONE such key used to
-        # abort the entire folder. Skipping it costs that object and saves
-        # the other nine hundred.
-        if not local_name_is_writable(rel):
-            unsafe.append(k)
+        # A name the filesystem cannot hold is an error, not a file — and
+        # because the whole-prefix download fans out through run_parallel,
+        # which re-raises the first error, ONE such key used to abort the
+        # entire folder. Skipping it costs that object and saves the other
+        # nine hundred.
+        problem = local_name_problem(rel)
+        if problem:
+            _refuse(k, problem)
             continue
         if str(k).endswith("/"):
-            dirs.append(out_path)
+            dirs.append((rel, out_path))
         else:
-            files.append((k, out_path, size))
-    return PrefixDownloadPlan(base_dir, dirs, files, unsafe)
+            wanted.append((k, rel, out_path, size))
+
+    # S3 has no folders, only keys, so "logs" and "logs/2024.txt" are both
+    # legal at once; on disk one path cannot be a file and a folder. Writing
+    # both gave IsADirectoryError or NotADirectoryError depending on which
+    # came first. The folder wins whatever the listing order: it may hold
+    # thousands of objects and the file is one. normcase, because on Windows
+    # "Logs" and "logs" are the same folder.
+    folders = set()
+    for rel in [rel for rel, _p in dirs] + [os.path.dirname(w[1]) for w in wanted]:
+        while rel:
+            folders.add(os.path.normcase(rel))
+            rel = os.path.dirname(rel)
+    files = []
+    for k, rel, out_path, size in wanted:
+        if os.path.normcase(rel) in folders:
+            _refuse(k, "a folder of the same name is also being downloaded")
+            continue
+        files.append((k, out_path, size))
+    return PrefixDownloadPlan(
+        base_dir, [p for _r, p in dirs], files, unsafe, reasons)
 class RateLimiter:
     """
     Token bucket shared by every transfer so the ceiling is a *total*, not
@@ -394,6 +471,16 @@ class _ProgressReader:
 
     def seekable(self):
         return True
+def precondition_failed(exc) -> bool:
+    """
+    Whether a request was refused because its If-Match (or
+    x-amz-copy-source-if-match) no longer named the object: it was replaced
+    after the ETag being pinned to was read.
+    """
+    response = getattr(exc, "response", None) or {}
+    code = str((response.get("Error") or {}).get("Code", ""))
+    status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+    return code in ("PreconditionFailed", "412") or status == 412
 def client_accepts(client, operation: str, parameter: str) -> bool:
     """
     Whether this client's botocore knows ``parameter`` on ``operation``.

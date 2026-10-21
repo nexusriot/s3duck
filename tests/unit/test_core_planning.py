@@ -189,6 +189,64 @@ class BulkRenamePlanTests(unittest.TestCase):
                 self.assertEqual(len(problems), 1)
                 self.assertTrue(problems[0])
 
+    def test_field_access_in_a_template_is_reported_not_raised(self):
+        """REGRESSION (crash): "{name.ext}" raises AttributeError and
+        "{name[x]}" TypeError out of str.format; only ValueError was caught,
+        so typing either aborted the app from the preview slot."""
+        for template in ("{name.ext}", "{name[x]}", "{orig.upper.x}"):
+            with self.subTest(template=template):
+                plan, problems = bulk_rename_plan(
+                    [("a.txt", False)], mode=BULK_RENAME_TEMPLATE,
+                    template=template)
+                self.assertEqual(plan, [])
+                self.assertEqual(len(problems), 1)
+                self.assertIn("Invalid template", problems[0])
+
+    def test_a_renumbering_chain_is_refused(self):
+        """FINDING (data loss): img1->img2, img2->img3, img3->img4 passed the
+        planner. A rename is copy-all-then-delete-sources, so with Overwrite
+        chosen the bucket ended with img4 alone (holding img1's bytes)."""
+        items = [("img1.jpg", False), ("img2.jpg", False), ("img3.jpg", False)]
+        plan, problems = bulk_rename_plan(
+            items, mode=BULK_RENAME_TEMPLATE, template="img{n}{ext}", start=2)
+        self.assertEqual(plan, [("img1.jpg", "img2.jpg"),
+                                ("img2.jpg", "img3.jpg"),
+                                ("img3.jpg", "img4.jpg")])
+        self.assertEqual(len(problems), 2)
+        self.assertTrue(problems[0].startswith("img1.jpg:"))
+        self.assertIn("being renamed", problems[0])
+        self.assertTrue(problems[1].startswith("img2.jpg:"))
+
+    def test_a_swap_is_refused(self):
+        """Renumbering a selection listed as [2, 1] is 2->1 and 1->2."""
+        plan, problems = bulk_rename_plan(
+            [("2.txt", False), ("1.txt", False)], mode=BULK_RENAME_TEMPLATE,
+            template="{n}{ext}")
+        self.assertEqual(plan, [("2.txt", "1.txt"), ("1.txt", "2.txt")])
+        self.assertEqual(len(problems), 2)
+
+    def test_an_overwrite_of_an_unchanged_item_is_left_to_the_prompt(self):
+        """Only a target that is itself moving is a chain; overwriting an
+        object that stays put is the ordinary case the overwrite dialog asks
+        about."""
+        plan, problems = bulk_rename_plan(
+            [("ab.txt", False), ("b.txt", False)], find="a", replace="")
+        self.assertEqual(plan, [("ab.txt", "b.txt")])
+        self.assertEqual(problems, [])
+
+    def test_a_file_and_a_folder_of_one_name_are_not_a_chain(self):
+        """Folder '2' is the key '2/', so the file 1 -> 2 does not land on
+        it; the same shift among two files is a chain."""
+        plan, problems = bulk_rename_plan(
+            [("1", False), ("2", True)], mode=BULK_RENAME_TEMPLATE,
+            template="{n}", start=2)
+        self.assertEqual(plan, [("1", "2"), ("2", "3")])
+        self.assertEqual(problems, [])
+        plan, problems = bulk_rename_plan(
+            [("1", False), ("2", False)], mode=BULK_RENAME_TEMPLATE,
+            template="{n}", start=2)
+        self.assertEqual(len(problems), 1)
+
     def test_a_valid_template_still_works_after_the_guard(self):
         plan, problems = bulk_rename_plan(
             [("a.txt", False)], mode=BULK_RENAME_TEMPLATE,
@@ -596,10 +654,13 @@ class ComparePlanTests(unittest.TestCase):
             {"a": (10, 100.0)}, {"a": (10, 101.0)})
         self.assertEqual(rows[0]["status"], "same")
 
-    def test_a_far_mtime_counts_as_a_difference(self):
+    def test_a_far_mtime_alone_is_not_a_difference(self):
+        """FINDING: a far mtime was reported as "differs". S3's LastModified
+        is the time of the write and downloads never set the local mtime, so
+        that called nearly every file of a freshly copied folder changed."""
         rows = main_window.build_compare_plan(
             {"a": (10, 100.0)}, {"a": (10, 900.0)})
-        self.assertEqual(rows[0]["status"], "differs")
+        self.assertEqual(rows[0]["status"], "unverified")
 
     def test_excludes_are_honoured(self):
         rows = main_window.build_compare_plan(
@@ -611,12 +672,142 @@ class ComparePlanTests(unittest.TestCase):
             {"a": (1, 1), "b": (1, 1)}, {"a": (1, 1)})
         self.assertEqual(main_window.summarize_compare_plan(rows),
                          {"only_left": 1, "only_right": 0, "differs": 0,
-                          "same": 1})
+                          "unverified": 0, "same": 1})
+
+    def test_the_summary_counts_unverified_pairs_apart(self):
+        rows = main_window.build_compare_plan(
+            {"a": (1, 100), "b": (1, 100)}, {"a": (1, 900), "b": (2, 100)})
+        counts = main_window.summarize_compare_plan(rows)
+        self.assertEqual((counts["unverified"], counts["differs"]), (1, 1))
 
     def test_sizes_are_reported_for_both_sides(self):
         rows = main_window.build_compare_plan({"a": (10, 1)}, {"a": (20, 1)})
         self.assertEqual((rows[0]["left_size"], rows[0]["right_size"]),
                          (10, 20))
+
+
+class CompareContentTests(unittest.TestCase):
+    """FINDING: the pane comparison judged a same-size pair by mtime alone.
+    A remote copy's LastModified is when it was written and a download never
+    sets the local mtime, so a folder compared with its own uploaded copy --
+    or a prefix with its server-side copy -- showed every file as "differs",
+    "Hide identical" hid nothing, and re-copying moved unchanged data."""
+
+    MD5_A = "a" * 32
+    MD5_B = "b" * 32
+
+    def _status(self, here, there, content_check=None):
+        rows = main_window.build_compare_plan(
+            {"f": here}, {"f": there}, content_check=content_check)
+        return rows[0]["status"]
+
+    def test_remote_pair_with_equal_etags_is_the_same_whatever_the_time(self):
+        """After a server-side copy: same bytes, a new LastModified."""
+        self.assertEqual(
+            self._status((10, 100.0, self.MD5_A), (10, 9000.0, self.MD5_A)),
+            "same")
+
+    def test_equal_multipart_etags_are_the_same_too(self):
+        """Equal multipart ETags pin every part's digest."""
+        self.assertEqual(
+            self._status((10, 100.0, '"abc-3"'), (10, 9000.0, "abc-3")),
+            "same")
+
+    def test_unequal_plain_md5_etags_differ_even_at_the_same_time(self):
+        self.assertEqual(
+            self._status((10, 100.0, self.MD5_A), (10, 100.0, self.MD5_B)),
+            "differs")
+
+    def test_unequal_multipart_etags_cannot_tell(self):
+        """The same bytes uploaded at another part size get another
+        multipart ETag, so a mismatch proves nothing."""
+        self.assertEqual(
+            self._status((10, 100.0, "abc-2"), (10, 9000.0, "def-3")),
+            "unverified")
+        self.assertEqual(
+            self._status((10, 100.0, "abc-2"), (10, 101.0, "def-3")),
+            "same")
+
+    def test_an_opaque_etag_mismatch_is_not_a_difference(self):
+        """A listing cannot see SSE-KMS/SSE-C, under which a 32-hex ETag is
+        no digest at all. The caller's check confirms a mismatch; when it
+        cannot, the pair is unverified rather than "differs"."""
+        seen = []
+
+        def opaque(rel, here, there):
+            seen.append(rel)
+            return None
+
+        self.assertEqual(
+            self._status((10, 100.0, self.MD5_A), (10, 9000.0, self.MD5_B),
+                         opaque),
+            "unverified")
+        self.assertEqual(seen, ["f"])
+
+    def test_a_confirmed_mismatch_differs(self):
+        self.assertEqual(
+            self._status((10, 100.0, self.MD5_A), (10, 9000.0, self.MD5_B),
+                         lambda *_a: False),
+            "differs")
+
+    def test_local_pair_with_equal_content_is_the_same_whatever_the_time(self):
+        """A folder just downloaded: same bytes, the mtime of the download."""
+        self.assertEqual(
+            self._status((10, 100.0, self.MD5_A), (10, 9000.0),
+                         lambda *_a: True),
+            "same")
+
+    def test_local_pair_with_different_content_differs(self):
+        self.assertEqual(
+            self._status((10, 100.0, self.MD5_A), (10, 9000.0),
+                         lambda *_a: False),
+            "differs")
+
+    def test_local_pair_that_cannot_be_hashed_is_unverified(self):
+        self.assertEqual(
+            self._status((10, 100.0, "abc-2"), (10, 9000.0),
+                         lambda *_a: None),
+            "unverified")
+
+    def test_the_check_receives_both_entries(self):
+        calls = []
+        main_window.build_compare_plan(
+            {"f": (10, 100.0, self.MD5_A)}, {"f": (10, 9000.0)},
+            content_check=lambda *args: calls.append(args))
+        self.assertEqual(calls, [("f", (10, 100.0, self.MD5_A), (10, 9000.0))])
+
+    def test_no_check_is_spent_where_the_answer_is_already_known(self):
+        """Hashing is the expensive part: not for a size mismatch, not for
+        equal ETags, and not where the clocks agree and nothing cheaper can
+        be compared -- the old rule still holds there."""
+        calls = []
+
+        def check(*args):
+            calls.append(args)
+            return False
+
+        rows = main_window.build_compare_plan(
+            {"size": (10, 100.0, self.MD5_A), "etag": (5, 100.0, self.MD5_A),
+             "clock": (7, 100.0, "abc-2")},
+            {"size": (20, 9000.0), "etag": (5, 9000.0, self.MD5_A),
+             "clock": (7, 101.0)},
+            content_check=check)
+        self.assertEqual(calls, [])
+        self.assertEqual({row["rel"]: row["status"] for row in rows},
+                         {"size": "differs", "etag": "same", "clock": "same"})
+
+    def test_two_empty_files_are_the_same(self):
+        self.assertEqual(
+            self._status((0, 100.0, "abc-1"), (0, 9000.0),
+                         lambda *_a: False),
+            "same")
+
+    def test_the_sync_planner_keeps_its_mtime_rule(self):
+        """build_sync_plan decides what to transfer and is unchanged: a newer
+        source of the same size is still sent."""
+        actions = main_window.build_sync_plan(
+            {"f": (10, 9000.0)}, {"f": (10, 100.0)}, direction="upload")
+        self.assertEqual(actions[0]["action"], "upload")
 class CompareJobTests(unittest.TestCase):
     """Which queue operation a compare turns into depends entirely on the
     pair of sides."""

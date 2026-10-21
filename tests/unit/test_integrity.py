@@ -11,6 +11,9 @@ import struct
 import tempfile
 import unittest
 import zlib
+from core.integrity import (
+    etag_is_opaque, file_matches_etag, file_part_md5s,
+)
 from model import CHECKSUM_ALGORITHMS, Model
 from tests.support import FakeS3Client, _AttributesClient, _dt, make_model
 from unittest.mock import patch
@@ -624,3 +627,145 @@ class ObjectFingerprintTests(unittest.TestCase):
     def test_a_single_member_is_never_a_verdict(self):
         self.assertEqual(
             Model.compare_fingerprints([("full", "MD5:aa")]), "unknown")
+class EncryptedObjectEtagTests(unittest.TestCase):
+    """
+    REGRESSION (false failure): under SSE-KMS, DSSE-KMS and SSE-C the ETag is
+    still 32 hex characters but is not an MD5 of the bytes. "Verify
+    downloads" compared it anyway and failed every intact download of such
+    an object that had no computable checksum of its own.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.path = os.path.join(self.dir, "payload.bin")
+        self.data = b"duck" * 100
+        with open(self.path, "wb") as handle:
+            handle.write(self.data)
+        self.model = make_model(bucket="bkt")
+        # 32 hex characters, so etag_is_md5 cannot tell it from a real one.
+        self.kms_etag = hashlib.md5(b"not the payload").hexdigest()
+
+    def _crc32(self, data):
+        return base64.b64encode(
+            struct.pack(">I", zlib.crc32(data) & 0xFFFFFFFF)).decode()
+
+    def test_which_heads_hide_the_content(self):
+        self.assertTrue(etag_is_opaque({"ServerSideEncryption": "aws:kms"}))
+        self.assertTrue(etag_is_opaque(
+            {"ServerSideEncryption": "aws:kms:dsse"}))
+        self.assertTrue(etag_is_opaque({"SSECustomerAlgorithm": "AES256"}))
+        self.assertFalse(etag_is_opaque({"ServerSideEncryption": "AES256"}))
+        self.assertFalse(etag_is_opaque({}))
+        self.assertFalse(etag_is_opaque(None))
+
+    def test_an_intact_kms_object_is_skipped_not_failed(self):
+        """THE POINT: this used to return False — "Checksum mismatch"."""
+        for head in ({"ServerSideEncryption": "aws:kms"},
+                     {"ServerSideEncryption": "aws:kms:dsse"},
+                     {"SSECustomerAlgorithm": "AES256"}):
+            with self.subTest(head=head):
+                logged = []
+                self.assertTrue(self.model.verify_download(
+                    self.path, self.kms_etag, head=head,
+                    log_fn=logged.append, key="k"))
+                self.assertTrue(any("skipped" in line for line in logged),
+                                logged)
+                self.assertFalse(any("MISMATCH" in line for line in logged))
+
+    def test_sse_s3_still_compares_the_etag(self):
+        """AES256 (SSE-S3) ETags ARE MD5s: a wrong one must still fail."""
+        head = {"ServerSideEncryption": "AES256"}
+        self.assertFalse(self.model.verify_download(
+            self.path, self.kms_etag, head=head))
+        self.assertTrue(self.model.verify_download(
+            self.path, hashlib.md5(self.data).hexdigest(), head=head))
+
+    def test_a_kms_object_with_a_checksum_is_still_verified(self):
+        """Skipping the ETag must not skip the checksum: that one is about
+        the bytes whatever the encryption."""
+        head = {"ServerSideEncryption": "aws:kms",
+                "ChecksumCRC32": self._crc32(self.data)}
+        self.assertTrue(self.model.verify_download(
+            self.path, self.kms_etag, head=head))
+        head["ChecksumCRC32"] = self._crc32(b"something else")
+        self.assertFalse(self.model.verify_download(
+            self.path, self.kms_etag, head=head))
+
+    def test_a_multipart_kms_object_is_settled_by_its_part_checksums(self):
+        """Per-part checksums decide; the composite KMS ETag must not be
+        rebuilt from MD5s and compared, which can only ever mismatch."""
+        first, second = self.data[:256], self.data[256:]
+        client = _AttributesClient(attributes={"k": {"ObjectParts": {
+            "Parts": [
+                {"PartNumber": 1, "Size": len(first),
+                 "ChecksumCRC32": self._crc32(first)},
+                {"PartNumber": 2, "Size": len(second),
+                 "ChecksumCRC32": self._crc32(second)}]}}})
+        self.model._client = client
+        head = {"ServerSideEncryption": "aws:kms",
+                "ChecksumCRC32": "c29tZQ==-2"}
+        logged = []
+        self.assertTrue(self.model.verify_download(
+            self.path, "f" * 32 + "-2", head=head, log_fn=logged.append,
+            key="k"))
+        self.assertTrue(any("CRC32, 2 parts" in line for line in logged),
+                        logged)
+
+    def test_a_multipart_kms_etag_without_part_checksums_is_skipped(self):
+        first, second = self.data[:256], self.data[256:]
+        client = _AttributesClient(attributes={"k": {"ObjectParts": {
+            "Parts": [{"PartNumber": 1, "Size": len(first)},
+                      {"PartNumber": 2, "Size": len(second)}]}}})
+        self.model._client = client
+        self.assertTrue(self.model.verify_download(
+            self.path, "f" * 32 + "-2",
+            head={"ServerSideEncryption": "aws:kms"}, key="k"))
+
+
+class LocalFileEtagTests(unittest.TestCase):
+    """What the pane comparison puts a local file against: the ETag the
+    listing reported for its remote counterpart."""
+
+    DATA = bytes(range(256)) * 5            # 1280 bytes
+
+    def setUp(self):
+        handle, self.path = tempfile.mkstemp()
+        with os.fdopen(handle, "wb") as out:
+            out.write(self.DATA)
+        self.addCleanup(os.remove, self.path)
+
+    def _composite(self, part):
+        pieces = [self.DATA[i:i + part] for i in range(0, len(self.DATA), part)]
+        return Model.composite_etag(
+            [hashlib.md5(piece).digest() for piece in pieces])
+
+    def test_a_plain_md5_settles_it_either_way(self):
+        self.assertTrue(file_matches_etag(
+            self.path, '"%s"' % hashlib.md5(self.DATA).hexdigest()))
+        self.assertFalse(file_matches_etag(self.path, "0" * 32))
+
+    def test_parts_are_cut_at_the_part_size(self):
+        self.assertEqual(
+            file_part_md5s(self.path, 512),
+            [hashlib.md5(self.DATA[:512]).digest(),
+             hashlib.md5(self.DATA[512:1024]).digest(),
+             hashlib.md5(self.DATA[1024:]).digest()])
+        # An exact multiple has no empty trailing part.
+        self.assertEqual(len(file_part_md5s(self.path, 640)), 2)
+
+    def test_a_multipart_etag_is_rebuilt_at_the_guessed_part_size(self):
+        self.assertTrue(file_matches_etag(
+            self.path, self._composite(512), part_sizes=[100, 512]))
+
+    def test_a_multipart_etag_no_guess_reproduces_is_inconclusive(self):
+        """Another part size gives the same bytes another ETag."""
+        self.assertIsNone(file_matches_etag(
+            self.path, self._composite(512), part_sizes=[640]))
+        self.assertIsNone(file_matches_etag(self.path, self._composite(512)))
+
+    def test_a_missing_or_malformed_etag_cannot_tell(self):
+        for etag in ("", None, "short", "abc-x", "abc-0"):
+            with self.subTest(etag=etag):
+                self.assertIsNone(file_matches_etag(
+                    self.path, etag, part_sizes=[512]))

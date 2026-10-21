@@ -279,12 +279,61 @@ class ObjectAdminMixin:
             self.rebind_bucket()
             return _fetch()
 
+    @staticmethod
+    def _sse_args(head) -> dict:
+        """
+        The encryption a copy onto itself has to restate in order to keep it.
+
+        CopyObject does not inherit the source's encryption: a copy that names
+        none is encrypted with the bucket's DEFAULT. An object written under
+        its own KMS key therefore came back SSE-S3 after a storage-class
+        change, a metadata edit or a version restore -- readable by anyone
+        with s3:GetObject, with no kms:Decrypt on the key standing in the way
+        any more. SSE-C is not covered: its HEAD needs the customer key, which
+        this app never has, so such an object keeps behaving as before.
+        """
+        head = head or {}
+        algorithm = str(head.get("ServerSideEncryption") or "")
+        if not algorithm:
+            return {}
+        args = {"ServerSideEncryption": algorithm}
+        # Both are KMS-only; sending either beside AES256 is refused.
+        if algorithm.startswith("aws:kms"):
+            if head.get("SSEKMSKeyId"):
+                args["SSEKMSKeyId"] = str(head["SSEKMSKeyId"])
+            if head.get("BucketKeyEnabled"):
+                args["BucketKeyEnabled"] = True
+        return args
+
+    def _head_for_rewrite(self, key, version_id="") -> dict:
+        """
+        HEAD of an object about to be copied onto itself, or {}.
+
+        Best effort, like _copy_create_args: a HEAD the credentials cannot
+        make leaves the copy exactly as it was rather than refusing it. A
+        region error is the exception -- it is let out so the caller's
+        rebind-and-retry sees it, instead of the retry going out with no
+        encryption because the first HEAD went to the wrong place.
+        """
+        params = {"Bucket": self.bucket, "Key": key}
+        if version_id:
+            params["VersionId"] = version_id
+        try:
+            return self.client.head_object(**params) or {}
+        except Exception as exc:
+            if self._is_region_error(exc):
+                raise
+            return {}
+
     def make_version_current(self, key, version_id, log_fn=None):
         """
         Promote an older version to be the current one by copying that version
         onto the same key server-side. This creates a new current version with
         the older version's data (the standard S3 "restore a previous version"
         technique); nothing is deleted.
+
+        The promoted version keeps the encryption it was stored with; see
+        _sse_args for what an unqualified copy would do instead.
         """
         self._guard_write()
         if not self.bucket:
@@ -292,8 +341,9 @@ class ObjectAdminMixin:
         copy_source = {"Bucket": self.bucket, "Key": key, "VersionId": version_id}
 
         def _do():
+            sse = self._sse_args(self._head_for_rewrite(key, version_id))
             self.client.copy_object(
-                CopySource=copy_source, Bucket=self.bucket, Key=key
+                CopySource=copy_source, Bucket=self.bucket, Key=key, **sse
             )
 
         try:
@@ -626,25 +676,36 @@ class ObjectAdminMixin:
         requested class. S3 refuses a copy onto itself that changes nothing —
         "This copy request is illegal…", an InvalidRequest, on AWS and MinIO
         alike — so normalising a selection to STANDARD failed on every object
-        already in STANDARD. That is a no-op, not an error, and the happy
-        path still costs exactly one request: the class is only looked up
-        after the service has objected.
+        already in STANDARD. That is a no-op, not an error.
+
+        The happy path costs a HEAD and the copy. It used to be the copy
+        alone, and that copy re-encrypted every object under the bucket's
+        default -- see _sse_args. The same HEAD answers "already there?"
+        when the service objects, so the no-op path costs no more than before.
         """
         self._guard_write()
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
         copy_source = {"Bucket": self.bucket, "Key": key}
+        head = {}
 
         def _do():
+            # Read on every attempt: after a rebind, the HEAD the first try
+            # made may have been the request that went to the wrong place.
+            head.clear()
+            head.update(self._head_for_rewrite(key))
             self.client.copy_object(
                 CopySource=copy_source,
                 Bucket=self.bucket,
                 Key=key,
                 StorageClass=storage_class,
                 MetadataDirective="COPY",
+                **self._sse_args(head),
             )
 
         def _already_there():
+            if head:
+                return (head.get("StorageClass") or "STANDARD") == storage_class
             try:
                 return self.current_storage_class(key) == storage_class
             except Exception:
@@ -696,7 +757,8 @@ class ObjectAdminMixin:
         """
         Return editable metadata for an object:
           {content_type, cache_control, content_disposition, content_encoding,
-           storage_class, metadata (user x-amz-meta-* dict)}
+           storage_class, metadata (user x-amz-meta-* dict),
+           sse (the encryption arguments a rewrite must restate)}
         """
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
@@ -708,17 +770,24 @@ class ObjectAdminMixin:
             "content_encoding": resp.get("ContentEncoding", "") or "",
             "storage_class": resp.get("StorageClass") or "STANDARD",
             "metadata": dict(resp.get("Metadata", {}) or {}),
+            # Read here so a caller about to rewrite the object can hand it
+            # back to set_object_metadata instead of paying a second HEAD.
+            "sse": self._sse_args(resp),
         }
 
     def set_object_metadata(self, key: str, *, content_type=None,
                             cache_control=None, content_disposition=None,
                             content_encoding=None, metadata=None,
-                            storage_class=None, log_fn=None):
+                            storage_class=None, sse=None, log_fn=None):
         """
         Replace an object's system + user metadata via a server-side copy onto
         itself with MetadataDirective=REPLACE. The current storage class is
         preserved when passed in (a REPLACE copy would otherwise reset it to
         STANDARD).
+
+        So is its encryption: *sse* is what get_object_metadata returned under
+        "sse". When it is not passed the object is HEADed for it, because a
+        REPLACE copy that names no encryption takes the bucket's default.
         """
         self._guard_write()
         if not self.bucket:
@@ -743,8 +812,15 @@ class ObjectAdminMixin:
             params["Metadata"] = {str(k): str(v) for k, v in metadata.items()}
         if storage_class and storage_class != "STANDARD":
             params["StorageClass"] = storage_class
+        if sse is not None:
+            params.update(sse)
 
         def _do():
+            if sse is None:
+                # Inside the attempt, so a retry after a rebind reads it again
+                # from the right place. What lands in params also reaches the
+                # in-parts route below, which builds its upload from them.
+                params.update(self._sse_args(self._head_for_rewrite(key)))
             self.client.copy_object(**params)
 
         try:
@@ -803,6 +879,7 @@ class ObjectAdminMixin:
             content_encoding=current.get("content_encoding"),
             metadata=current.get("metadata"),
             storage_class=current.get("storage_class"),
+            sse=current.get("sse"),
             log_fn=log_fn,
         )
         return True, guessed

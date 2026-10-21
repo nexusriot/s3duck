@@ -44,6 +44,19 @@ class PreviewDialog(DialogDismissMixin, QDialog):
     IMG_LIMIT = 25 * 1024 * 1024
     TEXT_LIMIT = 1 * 1024 * 1024
     PDF_LIMIT = 50 * 1024 * 1024
+    # Characters the text editor does not hand back as it was given them:
+    # QPlainTextEdit turns CR and CRLF into LF, NBSP into a space, the two
+    # Unicode separators (and Qt's own frame markers) into LF, and drops a
+    # leading byte-order mark. Saving would rewrite every one of them across
+    # the whole file, whatever the user actually changed.
+    UNFAITHFUL_CHARS = (
+        ("\r", "Windows or classic-Mac line endings"),
+        ("\u00a0", "non-breaking spaces"),
+        ("\u2028", "Unicode line separators"),
+        ("\u2029", "Unicode paragraph separators"),
+        ("\ufdd0", "U+FDD0"),
+        ("\ufdd1", "U+FDD1"),
+    )
 
     def __init__(self, parent, model, key):
         super().__init__(parent)
@@ -138,6 +151,15 @@ class PreviewDialog(DialogDismissMixin, QDialog):
 
     def _ext(self):
         return os.path.splitext(self._key)[1].lower()
+
+    @classmethod
+    def unfaithful_characters(cls, text) -> list:
+        """What in *text* the editor would silently change on save."""
+        found = [label for char, label in cls.UNFAITHFUL_CHARS
+                 if char in (text or "")]
+        if (text or "").startswith("\ufeff"):
+            found.append("a byte-order mark")
+        return found
 
     def _start_load(self):
         ext = self._ext()
@@ -245,16 +267,31 @@ class PreviewDialog(DialogDismissMixin, QDialog):
         # Editing is offered only for text that arrived whole and decoded
         # cleanly: saving a truncated body would silently delete the tail, and
         # saving a replacement-charactered decode would corrupt the file.
+        # Nor for text the editor cannot hand back unchanged — a CRLF file
+        # came back LF throughout, its BOM gone, from a one-word edit.
+        read_only = getattr(self._model, "read_only", False)
+        unfaithful = self.unfaithful_characters(text)
         self._editable = (
             not truncated
-            and not getattr(self._model, "read_only", False)
-            and "\ufffd" not in text)
-        self._edit_btn.setVisible(self._editable)
+            and not read_only
+            and "\ufffd" not in text
+            and not unfaithful)
+        self._edit_btn.setVisible(
+            self._editable or bool(unfaithful and not truncated and not read_only))
+        self._edit_btn.setEnabled(self._editable)
         if truncated:
             self._edit_btn.setToolTip(
                 "Too large to edit in-app; the preview is truncated")
-        elif getattr(self._model, "read_only", False):
+        elif read_only:
             self._edit_btn.setToolTip("Profile is read-only")
+        elif unfaithful:
+            self._edit_btn.setToolTip(
+                "Not editable here: this file contains "
+                + ", ".join(unfaithful)
+                + ", which saving from this editor would rewrite throughout "
+                "the file. Use \"Open with default app\" instead.")
+        else:
+            self._edit_btn.setToolTip("")
 
     def _toggle_edit(self):
         if not self._editable:
@@ -279,7 +316,10 @@ class PreviewDialog(DialogDismissMixin, QDialog):
         clone = self._model.clone_for_worker()
 
         def _write(_w):
-            return clone.put_object_body(key, payload, if_match=etag)
+            # The object's own headers, metadata, class, encryption and tags
+            # go back with the new body; a bare PUT would have reset them all.
+            return clone.put_object_body(key, payload, if_match=etag,
+                                         preserve_properties=True)
 
         self._save_btn.setEnabled(False)
         self._save_thread = QThread(self)

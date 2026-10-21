@@ -624,8 +624,68 @@ class UploadMixin:
             self.rebind_bucket(log_fn=log_fn)
             _do_upload()
 
+    # What a body rewrite carries over from the object it replaces. A PUT
+    # makes a new object, so anything not sent is reset rather than kept.
+    REWRITE_KEPT_FIELDS = (
+        "ContentType", "CacheControl", "ContentDisposition", "ContentEncoding",
+        "ContentLanguage", "WebsiteRedirectLocation", "ServerSideEncryption",
+        "SSEKMSKeyId", "BucketKeyEnabled",
+    )
+    # A backend with no object tagging at all has no tags to lose.
+    NO_TAGGING_CODES = ("NotImplemented", "MethodNotAllowed",
+                        "UnsupportedOperation")
+
+    def _rewrite_params(self, key) -> tuple:
+        """
+        ``(put_object params, current ETag)`` that keep *key* as it is.
+
+        The in-app editor's Save was a bare PUT of the new body: the object's
+        own Content-Type (charset and all) was replaced by a guess from the
+        extension, and its Cache-Control, Content-Disposition, user metadata,
+        tags, storage class and KMS key were all reset — a one-word edit
+        re-tiered an IA object to STANDARD and stripped the headers a website
+        served it with. Not carried: the ACL and Object Lock settings, which
+        need their own calls.
+
+        A tag set that cannot be read refuses the save rather than being
+        written back empty.
+        """
+        head = self.client.head_object(Bucket=self.bucket, Key=key)
+        params = {}
+        for field in self.REWRITE_KEPT_FIELDS:
+            value = head.get(field)
+            if value:
+                params[field] = value
+        if head.get("Metadata"):
+            params["Metadata"] = dict(head["Metadata"])
+        expires = head.get("Expires")
+        if expires is not None and not isinstance(expires, str):
+            params["Expires"] = expires
+        # HEAD names no class for STANDARD. Saying nothing is right then: the
+        # profile's default upload class is for new objects, not this one.
+        storage_class = head.get("StorageClass")
+        if storage_class and storage_class != "STANDARD":
+            params["StorageClass"] = storage_class
+        try:
+            tag_set = self.client.get_object_tagging(
+                Bucket=self.bucket, Key=key).get("TagSet") or []
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code not in self.NO_TAGGING_CODES:
+                raise RuntimeError(
+                    "Could not read the object's tags, and saving without "
+                    f"them would delete them: {exc}") from exc
+            tag_set = []
+        if tag_set:
+            # S3 wants the tag set as a url-encoded query string here.
+            params["Tagging"] = urlencode(sorted(
+                (str(tag.get("Key") or ""), str(tag.get("Value") or ""))
+                for tag in tag_set if tag.get("Key")))
+        return params, self.normalize_etag(head.get("ETag"))
+
     def put_object_body(self, key: str, data: bytes, *, if_match="",
-                        content_type="", log_fn=None) -> str:
+                        content_type="", preserve_properties=False,
+                        log_fn=None) -> str:
         """
         Replace an object's body, refusing when it changed since it was read.
 
@@ -633,17 +693,32 @@ class UploadMixin:
         safe; a backend without conditional writes falls back to comparing the
         ETag first, which is racy but still catches the case that happens in
         practice — someone saved while the editor was open.
+
+        *preserve_properties* is for rewriting an existing object in place:
+        its headers, metadata, storage class, encryption and tags are read
+        first and sent with the new body (see _rewrite_params). Without it
+        the write is shaped like a fresh upload.
         """
         self._guard_write()
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
         expected = self.normalize_etag(if_match)
-        params = dict(self.upload_extra_args)
-        params.pop("ChecksumAlgorithm", None)
-        params.pop("ChecksumType", None)
-        guessed = content_type or self.guess_content_type(key)
-        if guessed:
-            params["ContentType"] = guessed
+        if preserve_properties:
+            params, current = self._rewrite_params(key)
+            if expected and current and current != expected:
+                # The properties just read belong to someone else's save.
+                raise self.PreconditionFailed(
+                    "The object changed on the server since it was opened.")
+        else:
+            params = dict(self.upload_extra_args)
+            params.pop("ChecksumAlgorithm", None)
+            params.pop("ChecksumType", None)
+        if content_type:
+            params["ContentType"] = content_type
+        elif not params.get("ContentType"):
+            guessed = self.guess_content_type(key)
+            if guessed:
+                params["ContentType"] = guessed
 
         def _put(conditional):
             kwargs = dict(Bucket=self.bucket, Key=key, Body=data, **params)
