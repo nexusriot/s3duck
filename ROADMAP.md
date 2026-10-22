@@ -89,6 +89,17 @@ credential-storage choice in 0.18.0. What is left:
 
 ## Known limitations (accepted for now)
 
+- Multipart server-side copies require a readable source HEAD and an ETag or
+  version ID. A version ID pins the original revision across overwrites; an
+  ETag precondition refuses a changed source. A backend that ignores these
+  preconditions cannot provide the same protection.
+- Resumable uploads check local file identity, size, and nanosecond modification
+  and change times during the transfer and before completion. These checks
+  detect ordinary concurrent edits, including an edit that restores mtime,
+  but do not lock the file or provide an atomic filesystem snapshot. Keep
+  source files stable while transferring and between resume attempts; existing
+  resume records match size, mtime, and chunk size rather than a content hash.
+
 - A multipart upload this app drives itself names CRC32 explicitly on
   `CreateMultipartUpload`, because botocore puts that same checksum on every
   `UploadPart` whether it is asked to or not, and a service that checks a

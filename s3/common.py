@@ -314,6 +314,27 @@ class RateLimiter:
             self._last = now + delay
         self._sleep(delay)
         return delay
+class _CopySourceReader:
+    """Keep managed streaming uploads cancellable during source buffering.
+
+    s3transfer can read several MiB before invoking its upload callback.
+    Expose only read(), as S3 response bodies are non-seekable.
+    The caller owns and closes the underlying response body.
+    """
+
+    def __init__(self, body, cancel_event=None):
+        self.body = body
+        self.cancel_event = cancel_event
+
+    def read(self, size=-1):
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise TransferCancelled("cancelled")
+        data = self.body.read(size)
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise TransferCancelled("cancelled")
+        return data
+
+
 class _BotoProgressAdapter:
     """
     Adapt boto3 Callback(bytes_amount) -> progress_cb(total, current, key).

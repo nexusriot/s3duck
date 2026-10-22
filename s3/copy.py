@@ -5,7 +5,7 @@ import botocore.exceptions
 import threading
 from core.errors import ArchivedObject, TransferCancelled
 from s3.common import (
-    _BotoProgressAdapter, drop_unsendable_checksum_args, prefix_of,
+    _BotoProgressAdapter, _CopySourceReader, drop_unsendable_checksum_args, prefix_of,
     run_parallel,
 )
 
@@ -115,20 +115,21 @@ class CopyMixin:
             raise TransferCancelled("cancelled")
         resp = self.client.get_object(Bucket=self.bucket, Key=src_key)
         body = resp["Body"]
-        extra = drop_unsendable_checksum_args(
-            dst_model.client,
-            self._carried_extra_args(resp, dst_model.upload_extra_args))
-        callback = None
-        if progress_cb is not None:
+        try:
+            extra = drop_unsendable_checksum_args(
+                dst_model.client,
+                self._carried_extra_args(resp, dst_model.upload_extra_args))
             callback = _BotoProgressAdapter(
                 resp.get("ContentLength"), dst_key, progress_cb,
                 cancel_event=cancel_event, limiter=self.rate_limiter)
-        dst_model.client.upload_fileobj(
-            body, dst_model.bucket, dst_key,
-            ExtraArgs=extra or None,
-            Callback=callback,
-            Config=dst_model.transfer_cfg_upload,
-        )
+            dst_model.client.upload_fileobj(
+                _CopySourceReader(body, cancel_event), dst_model.bucket, dst_key,
+                ExtraArgs=extra or None,
+                Callback=callback,
+                Config=dst_model.transfer_cfg_upload,
+            )
+        finally:
+            body.close()
         if log_fn:
             log_fn(f"copied {self.bucket}/{src_key} -> "
                    f"{dst_model.bucket}/{dst_key}")
@@ -158,7 +159,7 @@ class CopyMixin:
                 cancel_event=cancel_event, log_fn=log_fn)
 
     def _stream_copy(self, src_key: str, dst_key: str, dst_bucket: str,
-                     log_fn=None, storage_class=""):
+                     log_fn=None, storage_class="", cancel_event=None):
         """
         Copy by streaming the object through this process.
 
@@ -167,24 +168,29 @@ class CopyMixin:
         source client and writing with a client bound to the destination works
         anywhere, at the cost of moving the bytes.
         """
+        if cancel_event is not None and cancel_event.is_set():
+            raise TransferCancelled("cancelled")
         dst_client, _endpoint, _region, _use_path = self._try_bind_bucket(dst_bucket)
         resp = self.client.get_object(Bucket=self.bucket, Key=src_key)
         body = resp["Body"]
-        extra = drop_unsendable_checksum_args(
-            dst_client, self._carried_extra_args(resp, self.upload_extra_args))
-        # The source's class wins over the profile's upload policy, which the
-        # carried args brought along: this is a copy that happens to be
-        # routed through an upload, and a cross-region copy landing in a
-        # different class than the same copy made in-region would be a
-        # difference nobody asked for.
-        extra.pop("StorageClass", None)
-        extra.update(self._preserved_class_args(storage_class))
+        try:
+            extra = drop_unsendable_checksum_args(
+                dst_client, self._carried_extra_args(resp, self.upload_extra_args))
+            # A streamed copy preserves the source class just as the
+            # server-side route does, overriding the upload policy.
+            extra.pop("StorageClass", None)
+            extra.update(self._preserved_class_args(storage_class))
 
-        dst_client.upload_fileobj(
-            body, dst_bucket, dst_key,
-            ExtraArgs=extra or None,
-            Config=self.transfer_cfg_upload,
-        )
+            dst_client.upload_fileobj(
+                _CopySourceReader(body, cancel_event), dst_bucket, dst_key,
+                ExtraArgs=extra or None,
+                Callback=_BotoProgressAdapter(
+                    resp.get("ContentLength"), dst_key, None,
+                    cancel_event=cancel_event, limiter=self.rate_limiter),
+                Config=self.transfer_cfg_upload,
+            )
+        finally:
+            body.close()
         if log_fn:
             log_fn(f"streamed {src_key} -> {dst_bucket}/{dst_key}")
 
@@ -251,10 +257,22 @@ class CopyMixin:
         self._guard_write()
         dst_bucket = dst_bucket or self.bucket
         src_bucket = src_bucket or self.bucket
-        size = int(size)
+        if cancel_event is not None and cancel_event.is_set():
+            raise TransferCancelled("cancelled")
+        # A listing's size can already be stale. Pin every range to this
+        # HEAD so a concurrent overwrite cannot assemble unrelated revisions
+        # or silently copy only the old length of a growing object.
+        head = self.client.head_object(Bucket=src_bucket, Key=src_key)
+        size = int(head["ContentLength"])
+        version = head.get("VersionId")
+        etag = head.get("ETag")
+        if not etag and version in (None, "", "null"):
+            raise ValueError("A multipart copy needs a source ETag or version ID")
         part = self.copy_part_size(size, self.multipart_chunksize_bytes)
         total_parts = max(1, (size + part - 1) // part)
         copy_source = {"Bucket": src_bucket, "Key": src_key}
+        if version not in (None, "", "null"):
+            copy_source["VersionId"] = version
 
         upload_id = self.client.create_multipart_upload(
             Bucket=dst_bucket, Key=dst_key, **(create_args or {})
@@ -271,6 +289,7 @@ class CopyMixin:
                 Bucket=dst_bucket, Key=dst_key, UploadId=upload_id,
                 PartNumber=number, CopySource=copy_source,
                 CopySourceRange=f"bytes={start}-{end}",
+                **({"CopySourceIfMatch": etag} if etag else {}),
             )
             result = resp.get("CopyPartResult") or {}
             entry = {"PartNumber": number, "ETag": result.get("ETag")}
@@ -283,6 +302,8 @@ class CopyMixin:
         try:
             run_parallel(list(range(1, total_parts + 1)), _copy_part,
                          self.transfer_concurrency, cancel_event=cancel_event)
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled("cancelled")
             self.client.complete_multipart_upload(
                 Bucket=dst_bucket, Key=dst_key, UploadId=upload_id,
                 MultipartUpload={"Parts": [parts[n] for n in sorted(parts)]},
@@ -378,7 +399,8 @@ class CopyMixin:
                     log_fn(f"Multipart copy refused ({code}); streaming "
                            f"'{src_key}' to bucket '{dst_bucket}' instead")
                 self._stream_copy(src_key, dst_key, dst_bucket, log_fn=log_fn,
-                                  storage_class=storage_class)
+                                  storage_class=storage_class,
+                                  cancel_event=cancel_event)
 
         if size is not None and int(size) > self.MAX_SINGLE_COPY_BYTES:
             _multipart(int(size))
@@ -426,7 +448,8 @@ class CopyMixin:
                         f"'{src_key}' to bucket '{dst_bucket}' instead"
                     )
                 self._stream_copy(src_key, dst_key, dst_bucket, log_fn=log_fn,
-                                  storage_class=storage_class)
+                                  storage_class=storage_class,
+                                  cancel_event=cancel_event)
                 return
             if not self._is_region_error(exc):
                 raise

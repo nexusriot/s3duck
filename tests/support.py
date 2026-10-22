@@ -265,7 +265,7 @@ class _CopyPartClient(FakeS3Client):
         self.source_size = int(source_size)
         self._copy_error = copy_error
         self.fail_on_part = fail_on_part
-        self._head = dict(head or {})
+        self._head = dict({"ETag": '"source-snapshot"'}, **(head or {}))
         self.created = []
         self.ranges = []
         self.completed = []

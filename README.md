@@ -56,9 +56,9 @@ pull request:
 - **Object browser** — navigate prefixes as a virtual folder tree with sorting by name, size, and modified date; optional Storage-class and ETag columns via the header context menu (both come free with the listing)
 - **Upload** — single/multiple files via dialog or drag-and-drop from the OS file manager; whole directory trees via "Upload folder" (`Ctrl+Shift+U`) or drag-and-drop
 - **Download** — single files or entire folder prefixes, recreating the directory tree locally
-- **Download as ZIP** — stream a selection (files and whole folders) straight into one archive, without staging it on disk twice
+- **Download as ZIP** — stream a selection (files and whole folders) into one temporary archive beside the destination, then replace the destination only after the ZIP closes successfully. Cancellation or failure preserves an existing archive and removes the temporary file
 - **Drag out** — drag objects from the list onto a file manager; the selection is downloaded to a temp folder first, with progress and a size warning. Staged payloads are removed when the app exits, and a crashed run's leftovers are reclaimed on the next start
-- **Resumable uploads** — a large upload is sent part by part with its upload id recorded, so an interrupted transfer resumes instead of restarting; a cancelled one deliberately leaves the parts on the server (clean them up from Incomplete uploads)
+- **Resumable uploads** — a large upload is sent part by part with its upload id recorded, so an interrupted transfer resumes instead of restarting; a cancelled one deliberately leaves the parts on the server (clean them up from Incomplete uploads). Changes detected in the local source during transfer refuse completion, abort the mixed parts where possible, and discard the resume record
 - **Resumable downloads** — large files download as parallel ranges into a `.s3duckpart` file with a progress sidecar, so an interrupted transfer picks up where it stopped instead of restarting (a changed ETag discards the stale partial). This applies to every download route — a single file, a whole folder, a sync, a drag-out — because they all go through one per-object path rather than each deciding for itself
 - **Upload rules by destination** — `archive/* -> class=GLACIER, tag:team=infra`: a small per-profile table that decides the storage class and tags from the key an upload is heading for, so a storage policy is applied rather than remembered
 - **Content-Type detection** — every upload is stamped with a type derived from the file extension, so a public link renders in a browser instead of downloading as `binary/octet-stream`; the table is overridable per extension, and the object context menu's "Fix Content-Type from extension" re-stamps objects that were uploaded before (or by something else)
@@ -75,8 +75,8 @@ pull request:
 - **Delete** — objects and folder prefixes (recursive, batched 1000 keys per call, and cancellable inside the walk rather than only between selected rows); confirmation shows the scanned object count and total size; recursive bucket delete also purges noncurrent versions, delete markers and in-flight uploads
 - **Undo delete** (`Ctrl+Z`) — on a versioning-enabled bucket a delete only writes a delete marker, so the last delete can be rolled back by removing those markers
 - **Clipboard** (`Ctrl+C` / `Ctrl+X` / `Ctrl+V`) — copy or cut a selection and paste it into any folder or bucket; copying also puts the `s3://` URIs on the system clipboard for use elsewhere
-- **Copy / Move** — server-side copy or move of a multi-selection, within a bucket or **across buckets**; when the destination lives in another region or account (where a server-side copy is impossible) the object is streamed through instead of failing. Copies, moves, renames and pastes keep each object in its **own storage class** — a plain `CopyObject` carries none and S3 would create the new object as STANDARD, re-tiering an IA or Glacier-IR object nobody asked to re-tier. The class comes from the listing, which already knows it, so nothing is spent discovering it; only a route with no listing behind it — an object picked in the other pane, a pane comparison, a job replayed from an older history entry — costs one `HeadObject`. It holds on all three routes — the single copy, the multipart rebuild past 5 GiB, and the cross-region stream — and metadata, content type and cache headers ride along as they always did. A backend that names a class in its own listing and then refuses it on a copy (`InvalidStorageClass`, `NotImplemented`) gets the plain copy it used to get, and the log says the class was not preserved: the tier is worth one request, never the copy itself. A source that is archived in GLACIER or DEEP_ARCHIVE and **not restored** cannot be copied at all: the service refuses to read it, and the failure now says so and points at Restore from Glacier instead of reporting `InvalidObjectState`
-- **Objects over 5 GiB** — S3 refuses a `CopyObject` whose source is larger than that, which used to be a hard failure for every copy onto itself: rename, bulk rename, paste, change storage class, edit metadata and "Fix Content-Type". Such an object is now rebuilt at the destination from `UploadPartCopy` ranges, which the service still performs itself — not the streaming fallback, and no part of it travels through this machine. Where the listing already knows the size, the doomed single copy is skipped rather than bought with a request
+- **Copy / Move** — server-side copy or move of a multi-selection, within a bucket or **across buckets**; when the destination lives in another region or account (where a server-side copy is impossible) the object is streamed through instead of failing. Copies, moves, renames and pastes keep each object in its **own storage class** — a plain `CopyObject` carries none and S3 would create the new object as STANDARD, re-tiering an IA or Glacier-IR object nobody asked to re-tier. The class comes from the listing, which already knows it, so nothing is spent discovering it; routes without a listing — an object picked in the other pane, a pane comparison, a job replayed from an older history entry — ask `HeadObject` for the class. Multipart copies also fetch a fresh HEAD to pin the source revision and size. It holds on all three routes — the single copy, the multipart rebuild past 5 GiB, and the cross-region stream — and metadata, content type and cache headers ride along as they always did. A backend that names a class in its own listing and then refuses it on a copy (`InvalidStorageClass`, `NotImplemented`) gets the plain copy it used to get, and the log says the class was not preserved: the tier is worth one request, never the copy itself. A source that is archived in GLACIER or DEEP_ARCHIVE and **not restored** cannot be copied at all: the service refuses to read it, and the failure now says so and points at Restore from Glacier instead of reporting `InvalidObjectState`
+- **Objects over 5 GiB** — S3 refuses a `CopyObject` whose source is larger than that, which used to be a hard failure for every copy onto itself: rename, bulk rename, paste, change storage class, edit metadata and "Fix Content-Type". Such an object is now rebuilt at the destination from `UploadPartCopy` ranges, which the service still performs itself — not the streaming fallback, and no part of it travels through this machine. Where the listing already knows the size, the doomed single copy is skipped. A fresh HEAD supplies the size and version ID or ETag used by every part; a changed unversioned source fails the copy and aborts its multipart upload rather than assembling mixed revisions
 - **Rename** — in-place rename of a file or folder (server-side copy + delete), on the context menu or `F2`
 - **Bulk rename** (`Shift+F2`) — rename a whole selection by find-and-replace (optionally regex, with backreferences) or a `{name}/{ext}/{n}` numbering template, with a live preview and duplicate/invalid-name checks
 - **Create folder** — creates an S3 prefix placeholder
@@ -131,7 +131,7 @@ Planned work and known limitations are tracked in [ROADMAP.md](ROADMAP.md).
 
 `make` lists every target; `make check` runs all three suites.
 
-Three suites. The unit suite stubs boto3 and needs nothing but Python:
+Three suites. The unit suite stubs S3 requests and runs offline, but needs the project dependencies, including PyQt6 and cryptography. Create the environment with `make venv`, then run:
 
 ```
 make test
@@ -149,9 +149,9 @@ everything it created:
 make e2e
 ```
 
-It skips itself when no endpoint is configured, so the command above is the
-only way it costs anything — a plain `unittest discover` stays offline and
-green. To run it against a server you already have instead:
+The end-to-end suites skip themselves when `S3DUCK_TEST_ENDPOINT` is unset.
+With that variable set, discovery runs against the configured server and creates
+and deletes throwaway buckets; use a dedicated test account. To run it against a server you already have instead:
 
 ```
 S3DUCK_TEST_ENDPOINT=http://localhost:9000 \
@@ -182,14 +182,11 @@ answer. Any *other* modal that opens fails the test by name rather than
 hanging it, which is what keeps an unanswerable dialog from turning into a
 silent timeout.
 
-MinIO archived its open-source server in 2025 — `quay.io/minio/minio` stopped
-granting anonymous pulls, the Docker Hub repository went away, and `dl.min.io`
-answers `410 Gone` for every community binary — so the compose file names the
-Alpine project's rebuild of the final community release, pinned to that exact
-upstream tag. It stays on MinIO rather than moving to another server because
-half the limitations documented here are statements about how MinIO behaves,
-and a different backend would answer differently and quietly stop checking
-them. `S3DUCK_TEST_MINIO_IMAGE` overrides the image if you host your own.
+The compose file defaults to `alpine/minio:RELEASE.2025-10-15T17-29-55Z`,
+pinned to the release used by these tests. `S3DUCK_TEST_MINIO_IMAGE` overrides
+the image if you host your own. Both model runners use the same server; one
+uses the pinned boto3 from `requirements.txt`, the other uses the supported
+floor, boto3 1.26.76.
 
 The model suite's runner image holds boto3 and nothing else: `model.py`
 imports no Qt, so it needs no display and no PyQt6. The GUI runner is the one
@@ -210,6 +207,7 @@ What the model suite covers, a module at a time (`tests/e2e/`):
 | `test_bucket_admin.py` | *Writing* lifecycle rules, policies and tags — and that CORS, website hosting and encryption are refused with something the dialog can show |
 | `test_object_lock.py` | Legal holds: that the server refuses the delete, and that a held version survives the delete marker written over it |
 | `test_versions.py` | Fetching one version, promoting an old one, deleting a single version, delete markers |
+| `test_copy_safety.py` | Multipart source changes, stale listed sizes, streaming cancellation, and local upload mutation preserving existing destinations |
 | `test_cross_profile.py` | Copying between two independent clients, and a read-only destination refusing before anything is written |
 | `test_discovery.py` | Deep search filters, the sync planner's tree, duplicate fingerprints, usage totals across pages, preview windows |
 | `test_profile_and_sdk.py` | The profile check's write-and-remove probe, and which parameters the *installed* SDK will actually send |

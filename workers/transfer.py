@@ -7,6 +7,7 @@ UI thread the bottleneck.
 
 import functools
 import os
+import tempfile
 import threading
 import time
 import zipfile
@@ -572,7 +573,8 @@ class Worker(QObject):
         so nothing is staged on disk twice.
         """
         archive = None
-        complete = False
+        staged = None
+        staged_file = None
         try:
             zip_path = self.job[0][0]
             base_prefix = self.job[0][1]
@@ -608,8 +610,17 @@ class Worker(QObject):
                     throttle["b"] = current
                     self.batch_progress.emit(int(current), int(total_bytes_all))
 
+            if self._cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+            # Publish only a fully closed ZIP. Failure, even during listing
+            # or writing the central directory, must preserve an existing
+            # archive the user chose to replace.
+            fd, staged = tempfile.mkstemp(
+                prefix=".s3duck-zip-", suffix=".tmp",
+                dir=os.path.dirname(os.path.abspath(zip_path)))
+            staged_file = os.fdopen(fd, "w+b")
             archive = zipfile.ZipFile(
-                zip_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True)
+                staged_file, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True)
             for key, _size in entries:
                 if self._cancel_event.is_set():
                     raise TransferCancelled("cancelled")
@@ -622,25 +633,27 @@ class Worker(QObject):
                         target.write(block)
                         done += len(block)
                         _emit(done)
+            archive.close()
+            archive = None
+            staged_file.close()
+            staged_file = None
+            if self._cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+            os.replace(staged, zip_path)
+            staged = None
             self.batch_progress.emit(int(done), int(total_bytes_all))
             self.progress.emit(f"wrote {len(entries)} object(s) to {zip_path}")
-            complete = True
         finally:
             if archive is not None:
                 try:
                     archive.close()
                 except Exception:
                     pass
-            # A cancelled or failed archive is unusable; do not leave it
-            # behind. A half-written zip that opens and is simply missing its
-            # tail is worse than no zip at all, so the failure path removes it
-            # too — it used to keep one and report an error beside it.
-            # `complete` rather than the old `cancelled or failed`: the
-            # decorator owns the handler now, and "the body did not finish"
-            # is the same condition said from the inside.
-            if not complete:
+            if staged_file is not None:
+                staged_file.close()
+            if staged is not None:
                 try:
-                    os.remove(self.job[0][0])
+                    os.remove(staged)
                 except OSError:
                     pass
 
