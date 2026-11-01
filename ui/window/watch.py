@@ -37,6 +37,20 @@ def plan_watch_pass(local, remote, config, direction):
     return {"plan": plan, "local_count": managed}
 
 
+def _recreatable_download_root(local_root, direction) -> bool:
+    """
+    True when a download watch's folder is simply gone, so the pass can
+    recreate it: a mirror down deletes nothing locally from an empty tree.
+
+    Only the folder itself. A missing parent (an unmounted drive's path, say)
+    would have the pass rebuild the whole tree on whatever disk is there now,
+    and an unreadable root or a dangling link in its place is not "gone".
+    """
+    root = os.path.abspath(local_root or "")
+    return (direction == "download" and not os.path.lexists(root)
+            and os.path.isdir(os.path.dirname(root)))
+
+
 def scan_watch_pass(local_root, remote, config, direction="upload"):
     """
     Scan the local folder and plan one watch pass, or raise WatchSkipped.
@@ -49,7 +63,9 @@ def scan_watch_pass(local_root, remote, config, direction="upload"):
     try:
         local = scan_local_tree(local_root, strict=True)
     except OSError as exc:
-        raise WatchSkipped(f"cannot read {local_root}: {exc}") from exc
+        if not _recreatable_download_root(local_root, direction):
+            raise WatchSkipped(f"cannot read {local_root}: {exc}") from exc
+        local = {}
     if (direction != "download" and config.get("delete_extra")
             and not local and remote):
         # An empty folder that used to hold files looks exactly like a mount

@@ -2713,6 +2713,51 @@ class WatchModeTests(unittest.TestCase):
         with self.assertRaises(WatchSkipped):
             scan_watch_pass(missing, self.REMOTE, config)
 
+    def test_a_download_watch_recreates_its_vanished_folder(self):
+        """Mirroring down into a deleted folder fetches everything again;
+        it deletes nothing, so there is nothing to protect by skipping."""
+        parent = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, parent, ignore_errors=True)
+        config = dict(self._config(), delete_extra=True)
+        plan = scan_watch_pass(os.path.join(parent, "gone"), self.REMOTE,
+                               config, "download")["plan"]
+        self.assertEqual(
+            sorted(a["rel"] for a in plan if a["action"] == "download"),
+            sorted(self.REMOTE))
+        # The upload direction still refuses the same folder.
+        with self.assertRaises(WatchSkipped):
+            scan_watch_pass(os.path.join(parent, "gone"), self.REMOTE, config)
+
+    def test_a_download_watch_still_skips_what_it_cannot_trust(self):
+        parent = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, parent, ignore_errors=True)
+        config = self._config()
+        # A missing parent: an unmounted drive's path, not a deleted folder.
+        with self.assertRaises(WatchSkipped):
+            scan_watch_pass(os.path.join(parent, "mnt", "backup"),
+                            self.REMOTE, config, "download")
+        # A dangling link where the folder was.
+        link = os.path.join(parent, "link")
+        os.symlink(os.path.join(parent, "nowhere"), link)
+        with self.assertRaises(WatchSkipped):
+            scan_watch_pass(link, self.REMOTE, config, "download")
+        # A missing entry inside an existing root.
+        root = os.path.join(parent, "root")
+        os.mkdir(root)
+        os.symlink(os.path.join(parent, "nowhere"), os.path.join(root, "x"))
+        with self.assertRaises(WatchSkipped):
+            scan_watch_pass(root, self.REMOTE, config, "download")
+        # An unreadable root.
+        locked = os.path.join(parent, "locked")
+        os.mkdir(locked)
+        os.mkdir(os.path.join(locked, "sub"))
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o700)
+        if os.access(locked, os.R_OK):
+            return                      # running as root: nothing is locked
+        with self.assertRaises(WatchSkipped):
+            scan_watch_pass(locked, self.REMOTE, config, "download")
+
     def test_an_empty_folder_does_not_empty_a_full_prefix(self):
         config = dict(self._config(), delete_extra=True)
         empty = tempfile.mkdtemp()
