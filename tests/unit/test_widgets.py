@@ -176,6 +176,27 @@ class SecondPaneListingTests(unittest.TestCase):
         self.assertEqual(pane.current_mode(), SecondPane.LOCAL)
         self.assertEqual(pane.entries(), local)
         self.assertNotIn("remote.txt", [name for name, _d, _s in pane.entries()])
+
+    def test_switching_back_to_remote_clears_the_local_rows(self):
+        """REGRESSION (wrong object): Remote -> Local -> Remote kept the local
+        rows on screen under the remote path while the listing loaded, and
+        F5/F6 resolved a selected local name as a key under the prefix."""
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        pane = self._pane({("bkt", "a/"): [("remote.txt", FSObjectType.FILE, 1)]},
+                          gates={("bkt", "a/"): gate})
+        gate.set()
+        pane.set_remote("bkt", "a/")
+        self._wait(lambda: pane.entries())
+        gate.clear()
+        pane.set_local(os.path.dirname(os.path.abspath(__file__)))
+        self.assertTrue(pane.entries())
+        pane.mode.setCurrentIndex(pane.mode.findData(SecondPane.REMOTE))
+        self.assertEqual(pane.location(), "s3://bkt/a/")
+        self.assertEqual(pane.entries(), [])
+        gate.set()
+        self._wait(lambda: pane.entries())
+        self.assertEqual(pane.entries(), [("remote.txt", False, 1)])
 class DiagnosticsTests(unittest.TestCase):
     """Exists because a blank-icon report took three rounds to explain: the
     venv's PyQt6 wheel bundles QtSvg, the distribution package does not, and

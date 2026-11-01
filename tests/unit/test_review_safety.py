@@ -9,6 +9,8 @@ import unittest
 import zipfile
 from unittest.mock import Mock, patch
 
+import botocore.exceptions
+
 from core.errors import TransferCancelled
 from tests.support import _CopyPartClient, _MultipartClient, _ensure_qapp, make_model
 from workers.transfer import Worker
@@ -106,7 +108,38 @@ class StreamCopySafetyTests(unittest.TestCase):
         self.assertTrue(body.closed)
 
 
+class _ChangesAfterPartOne(_CopyPartClient):
+    """The source is overwritten once the first part is copied, so every
+    later part's CopySourceIfMatch is refused."""
+
+    def upload_part_copy(self, **kw):
+        if kw["PartNumber"] > 1:
+            raise botocore.exceptions.ClientError(
+                {"Error": {"Code": "PreconditionFailed",
+                           "Message": "At least one of the pre-conditions "
+                                      "you specified did not hold"}},
+                "UploadPartCopy")
+        return super().upload_part_copy(**kw)
+
+
 class MultipartCopySnapshotTests(unittest.TestCase):
+    def test_a_changed_source_stays_a_precondition_failure(self):
+        """REGRESSION: the refused copy became a bare Exception with a
+        readable message; callers (and the end-to-end suite) branch on the
+        ClientError's PreconditionFailed code."""
+        model = make_model(bucket="source")
+        client = _ChangesAfterPartOne(source_size=11)
+        model._client = client
+        model.copy_part_size = lambda *a: 5
+        model.transfer_concurrency = 1
+        with self.assertRaises(botocore.exceptions.ClientError) as caught:
+            model._copy_multipart("key", "copy", size=11)
+        self.assertEqual(caught.exception.response["Error"]["Code"],
+                         "PreconditionFailed")
+        self.assertIn("changed on the server", str(caught.exception))
+        self.assertEqual(client.completed, [])
+        self.assertEqual(len(client.aborted), 1)
+
     def test_every_range_is_pinned_to_the_head_snapshot(self):
         for version in (None, "null", "version-1"):
             with self.subTest(version=version):

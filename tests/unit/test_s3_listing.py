@@ -191,6 +191,20 @@ class ScanLocalTreeTests(unittest.TestCase):
                 with self.assertRaises(PermissionError):
                     scan_local_tree(tmp, strict=True)
 
+    @unittest.skipIf(os.name == "nt", "POSIX symlinks")
+    def test_a_complete_scan_refuses_a_dangling_link(self):
+        """REGRESSION (data loss): a symlink to a file on an unmounted drive
+        was skipped as if it had vanished, so two-way sync, `sync --delete`,
+        an upload watch and the Sync dialog deleted its remote copy."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "a.txt"), "w") as handle:
+                handle.write("a")
+            os.symlink(os.path.join(tmp, "unmounted", "b.txt"),
+                       os.path.join(tmp, "b.txt"))
+            self.assertEqual(list(scan_local_tree(tmp)), ["a.txt"])
+            with self.assertRaises(OSError):
+                scan_local_tree(tmp, strict=True)
+
     def test_an_ordinary_scan_still_skips_what_it_cannot_read(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "file")
