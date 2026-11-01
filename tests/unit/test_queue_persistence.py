@@ -6,7 +6,9 @@ import threading
 import time
 import types
 import unittest
+import botocore.exceptions
 from PyQt6.QtCore import QSettings
+from PyQt6.QtWidgets import QMessageBox
 from core.queue_state import (
     PENDING_JOB_LIMIT, describe_pending, parse_pending, remaining_job,
     restore_rows, serialize_pending, split_restorable,
@@ -427,6 +429,196 @@ class QueueEdgeTests(_QueueWindowCase):
             win.assign_thread_operation("delete", ["a"], need_refresh=False)
         self.assertEqual(self._stored(win), [])
         win._closing = False
+
+
+def _connection_reset():
+    """A dropped connection: transient, so the job is retried once."""
+    return botocore.exceptions.ConnectionClosedError(
+        endpoint_url="https://s3.example.test/bkt")
+
+
+class _FlakyDeletes:
+    """A worker model whose delete of each key in ``fail_once`` fails once."""
+
+    def __init__(self, fail_once=(), bucket="bkt"):
+        self.calls = []
+        self.fail_once = set(fail_once)
+        self.bucket = bucket
+        self.sse_c_key = b""
+        self.binding_cache = {}
+
+    def delete(self, key, log_fn=None, cancel_event=None):
+        self.calls.append(key)
+        if key in self.fail_once:
+            self.fail_once.discard(key)
+            raise _connection_reset()
+
+    def set_sse_c_key(self, key):
+        self.sse_c_key = key
+
+
+class _ResetOnCancel(_FlakyDeletes):
+    """Deleting ``block`` waits for the cancel, which then surfaces as a
+    connection reset rather than TransferCancelled."""
+
+    def __init__(self, block):
+        super().__init__()
+        self.block = block
+        self.reached = threading.Event()
+        self.released = False
+
+    def delete(self, key, log_fn=None, cancel_event=None):
+        self.calls.append(key)
+        if key == self.block and not self.released:
+            self.reached.set()
+            while not cancel_event.is_set():
+                time.sleep(0.01)
+            raise _connection_reset()
+
+
+class _FailingJobCase(_QueueWindowCase):
+    """A window whose failed jobs do not stop the test on a modal dialog."""
+
+    def setUp(self):
+        super().setUp()
+        quiet = patch.object(QMessageBox, "critical",
+                             lambda *a, **kw: QMessageBox.StandardButton.Ok)
+        quiet.start()
+        self.addCleanup(quiet.stop)
+
+    def _settle(self, seconds):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            self._app.processEvents()
+            time.sleep(0.01)
+
+
+class RetryAndPauseTests(_FailingJobCase):
+    """Automatic retries and pause/resume, which grew up apart."""
+
+    def test_an_automatic_retry_skips_the_finished_rows(self):
+        """REGRESSION: a retry re-ran the whole job. A delete run again on a
+        versioned bucket stacks a second marker on the rows it already
+        deleted, and undo, which lifts one, then reported them restored."""
+        win = self._window()
+        fake = _FlakyDeletes(fail_once={"c"})
+        with patch.object(type(win.data_model), "clone_for_worker",
+                          lambda _s: fake), \
+                patch("ui.window.transfers.AUTO_RETRY_DELAY_MS", 50):
+            first = win.assign_thread_operation("delete", ["a", "b", "c"],
+                                                need_refresh=False)
+            self._pump(lambda: first.status == "error")
+            self._pump(lambda: len(win._queue_entries) == 2 and
+                       max(win._queue_entries.values(),
+                           key=lambda e: e.entry_id).status == "done")
+        self.assertEqual(fake.calls, ["a", "b", "c", "c"])
+        retry = max(win._queue_entries.values(), key=lambda e: e.entry_id)
+        self.assertEqual(retry.job, ["c"])
+        # Undo still covers everything the two attempts deleted.
+        self.assertEqual(retry.full_job, ["a", "b", "c"])
+
+    def test_pause_all_stops_a_pending_retry(self):
+        """REGRESSION: "Pause all" during an automatic retry's wait left the
+        timer armed, and the job started a few seconds later anyway."""
+        win = self._window()
+        fake = _FlakyDeletes(fail_once={"z"})
+        with patch.object(type(win.data_model), "clone_for_worker",
+                          lambda _s: fake), \
+                patch("ui.window.transfers.AUTO_RETRY_DELAY_MS", 300):
+            first = win.assign_thread_operation("delete", ["y", "z"],
+                                                need_refresh=False)
+            self._pump(lambda: first.status == "error")
+            self.assertEqual(len(win._pending_retries), 1)
+            win.pause_all_transfers()
+            self._settle(0.8)
+        self.assertEqual(list(win._queue_entries), [first.entry_id])
+        self.assertEqual(win._pending_retries, [])
+        # Still a failure, and still the user's to retry by hand.
+        self.assertFalse(first.retried)
+        self.assertEqual(fake.calls, ["y", "z"])
+
+    def test_a_pause_ending_in_an_error_is_paused_not_retried(self):
+        """REGRESSION: a pause whose cancellation surfaced as a transient
+        error was treated as a failure, retried automatically, and ran to
+        the end the user had paused."""
+        win = self._window()
+        fake = _ResetOnCancel(block="b")
+        with patch.object(type(win.data_model), "clone_for_worker",
+                          lambda _s: fake), \
+                patch("ui.window.transfers.AUTO_RETRY_DELAY_MS", 50):
+            entry = win.assign_thread_operation("delete", ["a", "b", "c"],
+                                                need_refresh=False)
+            self.assertTrue(fake.reached.wait(5))
+            win.pause_entry(entry.entry_id)
+            self._pump(lambda: entry.status == "paused")
+            self._settle(0.3)
+            self.assertEqual(win._pending_retries, [])
+            self.assertEqual(list(win._queue_entries), [entry.entry_id])
+            self.assertIsNone(entry.error)
+            fake.released = True
+            self.assertTrue(win.resume_entry(entry.entry_id))
+            self._pump(lambda: entry.status == "done")
+        self.assertEqual(entry.job, ["b", "c"])
+
+    def test_a_job_of_another_profile_is_not_resumed(self):
+        """REGRESSION (wrong account): a paused job too large to park stays
+        on the panel through a profile switch. Resumed there, it ran through
+        the old account but recorded its undo under the new one, so Ctrl+Z
+        removed delete markers in the new account's same-named bucket."""
+        win = self._window()
+        win.data_model.bucket = "logs"
+        fake = _FlakyDeletes(bucket="logs")
+        keys = [f"k{i}" for i in range(PENDING_JOB_LIMIT + 1)]
+        with patch.object(type(win.data_model), "clone_for_worker",
+                          lambda _s: fake), \
+                patch.object(main_window.MainWindow, "transfers_active",
+                             lambda _s: True):
+            entry = win.assign_thread_operation("delete", keys,
+                                                need_refresh=False)
+        self.assertTrue(win.pause_entry(entry.entry_id))
+        win.apply_profile(types.SimpleNamespace(
+            name="other-account", url="https://s3.amazonaws.com",
+            region="us-east-1", access_key="AK2", secret_key="SK2",
+            no_ssl_check=False, use_path=False, session_token="",
+            read_only=False))
+        self.assertIn(entry.entry_id, win._queue_entries)
+        win.data_model.bucket = "logs"
+        self.assertFalse(win.resume_entry(entry.entry_id))
+        self.assertEqual(entry.status, "paused")
+        self.assertEqual(fake.calls, [])
+        self.assertIsNone(getattr(win, "_undo_delete", None))
+
+
+class SyncNotPersistedTests(unittest.TestCase):
+    """REGRESSION (data loss): a sync plan -- its deletes included -- was
+    written down and offered after a restart, days later maybe, against two
+    sides that had changed since. History refuses to re-run one for the
+    same reason."""
+
+    def _entry(self, method, job):
+        return types.SimpleNamespace(
+            entry_id=1, method=method, job=job, status="queued", label=method,
+            need_refresh=True, source_bucket="bkt", bucket="bkt",
+            if_none_match=False, origin={}, done_items=set(), sse_c_md5="")
+
+    def test_a_sync_is_skipped_and_said_so(self):
+        job = [["delete_remote", "old.txt", "/tmp/x/old.txt", "old.txt", 1]]
+        records, skipped = serialize_pending([self._entry("sync", job)])
+        self.assertEqual(records, [])
+        self.assertEqual(skipped, ["sync"])
+
+    def test_a_stored_sync_is_not_offered(self):
+        raw = ('[{"method": "sync", "job": [["upload", "a", "/a", "a", 1]]},'
+               ' {"method": "delete", "job": ["a"]}]')
+        self.assertEqual([r["method"] for r in parse_pending(raw)],
+                         ["delete"])
+
+    def test_other_jobs_are_still_kept_with_their_bucket(self):
+        records, skipped = serialize_pending(
+            [self._entry("delete", ["a", "b"])])
+        self.assertEqual(skipped, [])
+        self.assertEqual(records[0]["job"], ["a", "b"])
+        self.assertEqual(records[0]["bucket"], "bkt")
 
 
 class StoreKeyTests(unittest.TestCase):

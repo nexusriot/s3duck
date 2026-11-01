@@ -113,6 +113,9 @@ class CredentialsMixin:
             self.actUseTrash.setChecked(self.trash_enabled())
             self.actUseTrash.blockSignals(False)
         self.navigate(show_loading=True)
+        # As a fresh window does: the profile reopens where it was left, and
+        # that landing is what selects its saved tab (see _restore_tab_for).
+        self.restore_last_location()
         self.update_window_title()
         self.offer_pending_restore()
 

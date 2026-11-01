@@ -398,6 +398,17 @@ class ThumbnailWindowTests(unittest.TestCase):
         win._on_thumbnail_loaded(stale, "pics/a.png", thumbnail_image(_png()))
         self.assertEqual(len(win._thumb_cache), 0)
 
+    def test_nothing_is_fetched_while_the_listing_moves(self):
+        """Switched on mid-navigation, the view fetched the old rows' names
+        under the new folder: objects nobody was looking at."""
+        win = self._window()
+        win.data_model.current_folder = "elsewhere/"
+        self.assertFalse(win.listing_settled())
+        win.set_thumbnail_view(True)
+        self.assertEqual(win.request_thumbnails(), 0)
+        self._app.processEvents()
+        self.assertEqual(self.fetched, [])
+
     def test_switching_off_and_the_setting_reopens_it(self):
         win = self._window()
         win.set_thumbnail_view(True)

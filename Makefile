@@ -2,9 +2,11 @@
 #
 # The shell scripts stay the source of truth for how a thing is built:
 # build_deb.sh, build_linux_bin.sh, build_macos_bin.sh, build_dmg.sh and
-# run_e2e.sh are what CI calls and what this file calls. Re-implementing any
-# of them here would give the project two answers to the same question, which
-# is how the packaged version drifted behind the app version once already.
+# run_e2e.sh are what this file calls, and CI goes through this file
+# (`make deb`, `make check-deb`, `make e2e-all`) rather than around it.
+# Re-implementing any of them here would give the project two answers to the
+# same question, which is how the packaged version drifted behind the app
+# version once already.
 #
 # The version is never written here either — it is read from version.py,
 # the single source of truth that build_deb.sh also seds.
@@ -53,7 +55,7 @@ help:
 	@echo "    check-deb     inspect the built .deb the way CI does"
 	@echo ""
 	@echo "  Binaries (PyInstaller)"
-	@echo "    bin           self-contained Linux binary -> $(DIST_DIR)/"
+	@echo "    bin, linux    self-contained Linux binary -> $(DIST_DIR)/"
 	@echo "    macos         self-contained macOS binary (run on macOS)"
 	@echo "    dmg           pack the macOS binary into a .dmg (run on macOS)"
 	@echo "    windows       how to build on Windows"
@@ -82,7 +84,8 @@ test-one:
 	@test -n "$(T)" || { echo "usage: make test-one T=tests.unit.test_window.SomeTests"; exit 2; }
 	$(PYTHON) -m unittest -v $(T)
 
-# Brings up its own MinIO and removes it again; needs Docker and nothing else.
+# Brings up its own MinIO and removes it again; needs Docker with the Compose
+# v2 plugin (`docker compose`) and nothing else.
 # Both suites skip themselves when no endpoint is configured, which is why
 # `test` stays offline even though it discovers tests/e2e and tests/e2e_gui.
 .PHONY: e2e

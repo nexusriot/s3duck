@@ -12,7 +12,7 @@ import tempfile
 
 import botocore.exceptions
 
-from model import DeleteRefused, safe_local_path
+from model import DeleteRefused, DownloadIncomplete, safe_local_path
 from tests.e2e.harness import ServerCase
 
 
@@ -58,7 +58,13 @@ class TraversalTests(ServerCase):
         self._try_put_hostile()
         logs = []
         with tempfile.TemporaryDirectory() as tmp:
-            self.model.download_file("docs/", None, tmp, log_fn=logs.append)
+            # Skipped and said: the job reports the key it refused rather
+            # than finishing "done" over a folder that is not all there.
+            with self.assertRaises(DownloadIncomplete) as caught:
+                self.model.download_file("docs/", None, tmp,
+                                         log_fn=logs.append)
+            self.assertEqual(
+                [k for k, _why in caught.exception.failures], [self.HOSTILE])
             landed = []
             for root, _dirs, files in os.walk(tmp):
                 landed.extend(os.path.join(root, f) for f in files)

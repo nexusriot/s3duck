@@ -245,7 +245,7 @@ class Cli:
             if not self.args.recursive:
                 raise CliError(f"{src} is a folder; use -r", EXIT_USAGE)
             prefix = key if key.endswith("/") or not key else key + "/"
-            tree = scan_local_tree(src, require_complete=True)
+            tree = scan_local_tree(src, strict=True)
             for rel in sorted(tree):
                 self.say(f"upload {rel} -> s3://{bucket}/{prefix}{rel}")
                 model.upload_file(os.path.join(src, *rel.split("/")),
@@ -295,7 +295,7 @@ class Cli:
         bucket, prefix = remote(dst if upward else src)
         model = self.model(bucket)
         if upward or os.path.isdir(local):
-            local_tree = scan_local_tree(local, require_complete=True)
+            local_tree = scan_local_tree(local, strict=True)
         else:
             local_tree = {}
         remote_tree = model.list_tree(prefix)

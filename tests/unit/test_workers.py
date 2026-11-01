@@ -1,5 +1,6 @@
 """workers/: the background operations and their contract."""
 
+import botocore.exceptions
 import botocore.session
 import main_window
 import os
@@ -19,7 +20,7 @@ from main_window import Worker
 from model import ObjectExists, TransferCancelled
 from tests.support import (
     MIN_APP_SOURCES, PROJECT_ROOT, _StubModel, _ensure_qapp,
-    make_main_window, read_app_sources,
+    make_main_window, patch_app_wide, read_app_sources,
 )
 from unittest.mock import Mock, patch
 
@@ -911,7 +912,8 @@ class MoveOverlapSafetyTests(unittest.TestCase):
              ("2.txt", "3.txt", False, None)],
             copy_object=Mock(), delete=Mock())
         worker.move()
-        self.assertIn("overlaps source", errors[0])
+        self.assertIn("Nothing was moved", errors[0])
+        self.assertIn("'2.txt' is both a source and a destination", errors[0])
         model.copy_object.assert_not_called()
         model.delete.assert_not_called()
 
@@ -920,7 +922,8 @@ class MoveOverlapSafetyTests(unittest.TestCase):
             [("a/", "b/", True, None), ("b/", "c/", True, None)],
             copy_prefix=Mock(), delete=Mock())
         worker.move()
-        self.assertIn("overlaps source", errors[0])
+        self.assertIn("Nothing was moved", errors[0])
+        self.assertIn("'b/' is both a source and a destination", errors[0])
         model.copy_prefix.assert_not_called()
 
     def test_a_destination_under_a_moving_folder_is_refused(self):
@@ -928,7 +931,8 @@ class MoveOverlapSafetyTests(unittest.TestCase):
             [("a/", "z/", True, None), ("f.txt", "a/f.txt", False, None)],
             copy_prefix=Mock(), copy_object=Mock(), delete=Mock())
         worker.move()
-        self.assertIn("overlaps source", errors[0])
+        self.assertIn("Nothing was moved", errors[0])
+        self.assertIn("overlaps 'a/'", errors[0])
         model.copy_object.assert_not_called()
 
     def test_a_batch_that_does_not_overlap_still_runs(self):
@@ -1196,6 +1200,31 @@ class SetTagsWorkerTests(unittest.TestCase):
         worker.set_tags()
         self.assertEqual(model.calls, [])
         self.assertEqual(finished, [True])
+class UndeleteWorkerTests(unittest.TestCase):
+    """The undo job carries when the delete started, so only that delete's
+    own markers are removed; rows from before that change still work."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    class FakeModel:
+        def __init__(self):
+            self.calls = []
+
+        def undelete(self, key, log_fn=None, since=None):
+            self.calls.append((key, since))
+            return 1
+
+    def test_the_start_time_reaches_the_model(self):
+        model = self.FakeModel()
+        Worker(model, [("dir/", 1234.5), ("a.txt", 1234.5)]).undelete()
+        self.assertEqual(model.calls, [("dir/", 1234.5), ("a.txt", 1234.5)])
+
+    def test_a_bare_key_row_still_undoes_everything(self):
+        model = self.FakeModel()
+        Worker(model, [("a.txt",)]).undelete()
+        self.assertEqual(model.calls, [("a.txt", None)])
 class TransientErrorTests(unittest.TestCase):
     """botocore already retries inside one request; this is about the job
     above it, which it gave up on."""
@@ -1304,3 +1333,591 @@ class AutoRetryLifetimeTests(unittest.TestCase):
         win._shutdown_threads()
         self.assertFalse(win._retry_timer.isActive())
         self.assertEqual(win._pending_retries, [])
+
+
+def _pump(app, condition, timeout=5):
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        app.processEvents()
+    for _ in range(20):
+        app.processEvents()
+
+
+class _QueueWindowMixin:
+    """A real window whose transfers run real Workers against fakes."""
+
+    ROOT = PROJECT_ROOT
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    def _window(self, profile_name="prod"):
+        settings = QSettings("s3duck-tests-queuebind",
+                             "s3duck-tests-queuebind")
+        settings.clear()
+        self.addCleanup(settings.clear)
+        with patch.object(main_window, "DataModel", _StubModel):
+            win = make_main_window(self.ROOT, settings,
+                                   profile_name=profile_name)
+        self.addCleanup(win.close)
+        _pump(self._app, lambda: win.listview.isEnabled())
+        return win
+
+    def _idle(self, win):
+        _pump(self._app,
+              lambda: win._active_entry is None and not win.transfers_active())
+
+    @staticmethod
+    def _quiet():
+        """No modal 'Transfer failed' box, wherever it is imported."""
+        return patch_app_wide("QMessageBox")
+
+    @staticmethod
+    def _recording_deletes(win, deleted, fail_first=0):
+        """clone_for_worker whose delete() records (bucket, key)."""
+        real_clone = type(win.data_model).clone_for_worker
+        calls = [0]
+
+        def clone(self_model):
+            model = real_clone(self_model)
+
+            def delete(key, log_fn=None, cancel_event=None):
+                calls[0] += 1
+                if calls[0] <= fail_first:
+                    raise RuntimeError("AccessDenied")
+                deleted.append((model.bucket, key))
+            model.delete = delete
+            return model
+
+        return patch.object(type(win.data_model), "clone_for_worker", clone)
+
+
+class DestinationCheckBindingTests(unittest.TestCase):
+    """The overwrite check for another bucket must not list it through the
+    open bucket's endpoint, which may be that bucket's own virtual host."""
+
+    class _Clone:
+        def __init__(self):
+            self.bucket = "here"
+            self.endpoint_url = "https://here.s3.eu-west-1.amazonaws.com"
+            self.use_path = False
+            self.region_name = "eu-west-1"
+            self.profile_endpoint_url = "https://s3.amazonaws.com"
+            self.profile_use_path = True
+            self.profile_region = "us-east-1"
+            self._client = object()
+            self.seen = None
+
+        def existing_keys(self, keys):
+            self.seen = (self.bucket, self.endpoint_url, self.use_path,
+                         self.region_name, self._client)
+            return {"a.txt"}
+
+    def _check(self, dst_bucket, dest_model=None):
+        clone = self._Clone()
+        other = self._Clone()
+        other.bucket = "theirs"
+        other.endpoint_url = "https://theirs.s3.ap-south-1.amazonaws.com"
+        other.region_name = "ap-south-1"
+        other.profile_endpoint_url = "https://other-account.example"
+
+        class _Window:
+            data_model = type("M", (), {
+                "bucket": "here", "clone_for_worker": lambda _s: clone})()
+
+            @staticmethod
+            def _run_with_progress(_title, fn):
+                return fn(None), None
+
+        picked = type("M", (), {"clone_for_worker": lambda _s: other})()
+        found = main_window.MainWindow._destination_conflicts(
+            _Window(), ["a.txt"], dst_bucket=dst_bucket,
+            dest_model=picked if dest_model else None)
+        return found, (other if dest_model else clone).seen
+
+    def test_a_cross_profile_destination_is_checked_on_its_own_connection(self):
+        """A paste into another profile is written through that profile's
+        model, so asking the open one whether the keys are already there
+        answers for the wrong account -- "nothing exists", then overwrite."""
+        _found, seen = self._check("theirs", dest_model=True)
+        self.assertEqual(seen[:4], ("theirs",
+                                    "https://theirs.s3.ap-south-1.amazonaws.com",
+                                    False, "ap-south-1"))
+
+    def test_a_cross_profile_destination_elsewhere_goes_to_that_root(self):
+        """Another bucket of the other profile: back to THAT profile's root,
+        never the open profile's."""
+        _found, seen = self._check("elsewhere", dest_model=True)
+        self.assertEqual(seen[:2], ("elsewhere", "https://other-account.example"))
+        self.assertIsNone(seen[4])      # rebound, so the client is dropped
+
+    def test_another_bucket_is_listed_from_the_profile_root(self):
+        found, seen = self._check("there")
+        self.assertEqual(found, {"a.txt"})
+        self.assertEqual(seen, ("there", "https://s3.amazonaws.com", True,
+                                "us-east-1", None))
+
+    def test_the_open_bucket_keeps_its_binding(self):
+        _found, seen = self._check("here")
+        self.assertEqual(seen[:4], ("here",
+                                    "https://here.s3.eu-west-1.amazonaws.com",
+                                    False, "eu-west-1"))
+
+
+class RetryBindsTheJobsOwnBucketTests(_QueueWindowMixin, unittest.TestCase):
+    """
+    REGRESSION (data loss): job rows are bare keys, and a queued job was
+    bound to whatever bucket was open when it STARTED. A retry, "Retry
+    failed" or History > Run again starts after the user may have browsed
+    elsewhere, so a failed delete of "logs/" in one bucket, retried after
+    opening another, deleted the other bucket's "logs/".
+    """
+
+    def test_a_new_job_remembers_the_bucket_and_profile_it_was_made_in(self):
+        win = self._window()
+        win.data_model.bucket = "bucket-a"
+        deleted = []
+        with self._recording_deletes(win, deleted), self._quiet():
+            entry = win.assign_thread_operation(
+                "delete", ["x.txt"], need_refresh=False)
+            self._idle(win)
+        self.assertEqual((entry.bucket, entry.profile), ("bucket-a", "prod"))
+        record = win.load_transfer_history()[0]
+        self.assertEqual((record["bucket"], record["profile"]),
+                         ("bucket-a", "prod"))
+
+    def test_a_retry_runs_where_the_job_was_made(self):
+        win = self._window()
+        win.data_model.bucket = "bucket-a"
+        deleted = []
+        with self._recording_deletes(win, deleted, fail_first=1), \
+                self._quiet():
+            win.assign_thread_operation("delete", ["logs/"],
+                                        need_refresh=False)
+            self._idle(win)
+            failed = win.failed_entries()
+            self.assertEqual(len(failed), 1)
+            win.data_model.bucket = "bucket-b"      # the user browsed on
+            win._on_queue_retry_requested(failed[0].entry_id)
+            self._idle(win)
+        self.assertEqual(deleted, [("bucket-a", "logs/")])
+
+    def test_retry_failed_runs_where_each_job_was_made(self):
+        win = self._window()
+        win.data_model.bucket = "bucket-a"
+        deleted = []
+        with self._recording_deletes(win, deleted, fail_first=1), \
+                self._quiet():
+            win.assign_thread_operation("delete", ["logs/"],
+                                        need_refresh=False)
+            self._idle(win)
+            win.data_model.bucket = "bucket-b"
+            win.retry_failed_transfers()
+            self._idle(win)
+        self.assertEqual(deleted, [("bucket-a", "logs/")])
+
+    def test_a_job_from_the_bucket_list_stays_there(self):
+        """delete_buckets runs with no bucket open; a retry made from inside
+        a bucket must not inherit that bucket."""
+        win = self._window()
+        win.data_model.bucket = ""
+        entry = main_window._QEntry(1, "delete_buckets", [("old", False)],
+                                    bucket="", profile="prod")
+        win.data_model.bucket = "bucket-b"
+        self.assertEqual(win._worker_model_for(entry).bucket, "")
+
+    def test_history_run_again_runs_where_the_job_was_made(self):
+        win = self._window()
+        win.data_model.bucket = "bucket-a"
+        deleted = []
+        with self._recording_deletes(win, deleted), self._quiet():
+            win.assign_thread_operation("delete", ["tmp/"],
+                                        need_refresh=False)
+            self._idle(win)
+            record = win.load_transfer_history()[0]
+            win.data_model.bucket = "bucket-b"
+            win.rerun_history_entry(record)
+            self._idle(win)
+        self.assertEqual(deleted, [("bucket-a", "tmp/"), ("bucket-a", "tmp/")])
+
+    def test_a_job_from_another_profile_is_not_retried(self):
+        """An in-place profile switch keeps the queue rows; their keys belong
+        to the other account."""
+        win = self._window()
+        entry = main_window._QEntry(1, "delete", ["logs/"], bucket="b",
+                                    profile="staging")
+        entry.status = "error"
+        win._queue_entries[1] = entry
+        queued = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: queued.append(m)):
+            self.assertIsNone(win._requeue(entry))
+            win.retry_failed_transfers()
+        self.assertEqual(queued, [])
+
+    def _rerun_refused(self, win, record):
+        queued = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: queued.append(m)), \
+                self._quiet() as box:
+            win.rerun_history_entry(record)
+        return queued, box
+
+    def test_history_refuses_a_record_without_its_bucket(self):
+        """Recorded before history kept the bucket: guessing the open one is
+        the bug itself."""
+        win = self._window()
+        queued, box = self._rerun_refused(
+            win, {"method": "delete", "job": ["logs/"]})
+        self.assertEqual(queued, [])
+        self.assertIn("without its bucket", str(box.call_args))
+
+    def test_history_refuses_a_record_without_its_source_bucket(self):
+        """A replay is bound to the bucket the job was made in; a record that
+        never carried one cannot be bound to anything but the open bucket,
+        which is the guess the whole guard exists to prevent."""
+        win = self._window()
+        queued, box = self._rerun_refused(
+            win, {"method": "delete", "job": ["logs/"], "bucket": "b",
+                  "profile": win.profile_name,
+                  "origin": win._transfer_origin()})
+        self.assertEqual(queued, [])
+        self.assertIn("without its bucket and connection", str(box.call_args))
+
+    def test_history_refuses_a_record_without_its_origin(self):
+        """Bucket and profile name alone do not say which account that name
+        meant: the endpoint or the key behind the profile may have been
+        edited since."""
+        win = self._window()
+        queued, box = self._rerun_refused(
+            win, {"method": "delete", "job": ["logs/"], "bucket": "b",
+                  "source_bucket": "b", "profile": win.profile_name})
+        self.assertEqual(queued, [])
+        self.assertIn("without its bucket and connection", str(box.call_args))
+
+    def test_a_replay_hands_on_the_bucket_and_the_connection(self):
+        """The replayed entry has to be as bound as the original: a retry of
+        a replay, after more navigation, must still go to the same place."""
+        win = self._window()
+        win.data_model.bucket = "bucket-a"
+        with self._quiet():
+            original = win.assign_thread_operation(
+                "delete", ["tmp/"], need_refresh=False)
+            self._idle(win)
+            record = win.load_transfer_history()[0]
+
+            win.data_model.bucket = "bucket-b"
+            win.rerun_history_entry(record)
+            self._idle(win)
+        replayed = win._queue_entries[max(win._queue_entries)]
+        self.assertIsNot(replayed, original)
+        self.assertEqual(replayed.bucket, "bucket-a")
+        self.assertEqual(replayed.origin, original.origin)
+        self.assertEqual(win._worker_model_for(replayed).bucket, "bucket-a")
+
+    def test_history_refuses_another_profiles_record(self):
+        win = self._window()
+        queued, box = self._rerun_refused(
+            win, {"method": "delete", "job": ["logs/"], "bucket": "b",
+                  "profile": "staging"})
+        self.assertEqual(queued, [])
+        self.assertIn("staging", str(box.call_args))
+
+    def test_history_refuses_to_replay_a_sync(self):
+        """A sync job is a plan made from both sides as they were. Replayed
+        days later its delete_local rows deleted files created since."""
+        win = self._window()
+        queued, box = self._rerun_refused(
+            win, {"method": "sync", "bucket": "b", "profile": "prod",
+                  "job": [["delete_local", "draft.docx", "/tmp/draft.docx",
+                           "docs/draft.docx", 9]]})
+        self.assertEqual(queued, [])
+        self.assertIn("Open Sync", str(box.call_args))
+
+
+class AutoRetryReallyOnceTests(_QueueWindowMixin, unittest.TestCase):
+    """
+    REGRESSION: "retry once" retried forever. The retry is a fresh entry,
+    and its auto_retries started at 0 again, so a dead network (or a skewed
+    clock, or a 503 that never ends) re-ran the job every five seconds with
+    a new modal error each time -- and Cancel did not stop it.
+    """
+
+    @staticmethod
+    def _always_slow_down(calls):
+        transient = botocore.exceptions.ClientError(
+            {"Error": {"Code": "SlowDown", "Message": "Please reduce"},
+             "ResponseMetadata": {"HTTPStatusCode": 503}}, "DeleteObject")
+
+        class Clone:
+            parallel_files = 1
+            # A re-queue captures the bucket off the source model it carries.
+            bucket = "bkt"
+
+            def delete(self, key, log_fn=None, cancel_event=None):
+                calls.append(key)
+                raise transient
+
+        return Clone
+
+    def test_the_retry_of_a_retry_is_not_retried_again(self):
+        win = self._window()
+        calls = []
+        clone = self._always_slow_down(calls)
+        with patch.object(type(win.data_model), "clone_for_worker",
+                          lambda _s: clone()), self._quiet():
+            win.assign_thread_operation("delete", ["k"], need_refresh=False)
+            self._idle(win)
+            self.assertTrue(win._retry_timer.isActive())
+            win._retry_timer.stop()
+            win._run_pending_retries()             # what the timer would do
+            self._idle(win)
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(win._retry_timer.isActive())
+        self.assertEqual(win._pending_retries, [])
+
+    def test_a_retry_by_hand_gets_its_own_automatic_retry(self):
+        win = self._window()
+        entry = main_window._QEntry(1, "delete", ["k"], bucket="",
+                                    profile="prod")
+        entry.status = "error"
+        entry.auto_retries = 1
+        seen = []
+        with patch.object(main_window.MainWindow, "assign_thread_operation",
+                          lambda _s, m, j, **kw: seen.append(kw)):
+            win._requeue(entry)
+            win._requeue(entry, automatic=True)
+        self.assertEqual([kw["auto_retries"] for kw in seen], [0, 1])
+
+    def test_cancelling_everything_drops_a_pending_retry(self):
+        win = self._window()
+        calls = []
+        clone = self._always_slow_down(calls)
+        with patch.object(type(win.data_model), "clone_for_worker",
+                          lambda _s: clone()), self._quiet():
+            win.assign_thread_operation("delete", ["k"], need_refresh=False)
+            self._idle(win)
+            self.assertEqual(len(win._pending_retries), 1)
+            win.cancel_transfers()                 # Esc: stop everything
+            self.assertFalse(win._retry_timer.isActive())
+            self.assertEqual(win._pending_retries, [])
+            win._run_pending_retries()             # a late timeout
+            self._idle(win)
+        self.assertEqual(len(calls), 1)
+        # Still a failure, and still the user's to retry by hand.
+        self.assertEqual(len(win.failed_entries()), 1)
+
+
+class RetriedRowsAreNotOutstandingTests(_QueueWindowMixin, unittest.TestCase):
+    """
+    REGRESSION: a row that had been retried kept status "error" and stayed
+    in failed_entries(), so "Retry failed" re-ran jobs whose retry had
+    already succeeded -- including rows the user had cleared from the panel
+    and could no longer see.
+    """
+
+    def _fail_then_succeed(self, win):
+        deleted = []
+        return deleted, self._recording_deletes(win, deleted, fail_first=1)
+
+    def test_a_retried_row_is_no_longer_failed(self):
+        win = self._window()
+        deleted, patcher = self._fail_then_succeed(win)
+        with patcher, self._quiet():
+            first = win.assign_thread_operation("delete", ["k"],
+                                                need_refresh=False)
+            self._idle(win)
+            win._on_queue_retry_requested(first.entry_id)
+            self._idle(win)
+            self.assertEqual(win.failed_entries(), [])
+            win.retry_failed_transfers()           # nothing left to do
+            self._idle(win)
+        self.assertEqual(len(deleted), 1)
+        row = win._queue_panel._rows[first.entry_id]
+        self.assertTrue(row._retry_btn.isHidden())
+
+    def test_a_second_press_of_retry_is_ignored(self):
+        win = self._window()
+        deleted, patcher = self._fail_then_succeed(win)
+        with patcher, self._quiet():
+            first = win.assign_thread_operation("delete", ["k"],
+                                                need_refresh=False)
+            self._idle(win)
+            win._on_queue_retry_requested(first.entry_id)
+            win._on_queue_retry_requested(first.entry_id)
+            self._idle(win)
+        self.assertEqual(len(deleted), 1)
+
+    def test_a_pending_automatic_retry_counts_as_retried(self):
+        win = self._window()
+        entry = main_window._QEntry(1, "delete", ["k"], bucket="",
+                                    profile="prod")
+        entry.status = "error"
+        entry.error_transient = True
+        win._queue_entries[1] = entry
+        self.assertTrue(win._maybe_auto_retry(entry))
+        self.assertEqual(win.failed_entries(), [])
+
+    def test_rows_cleared_from_the_panel_are_forgotten(self):
+        win = self._window()
+        deleted = []
+        with self._recording_deletes(win, deleted, fail_first=1), \
+                self._quiet():
+            entry = win.assign_thread_operation("delete", ["k"],
+                                                need_refresh=False)
+            self._idle(win)
+        self.assertEqual(entry.status, "error")
+        win._queue_panel._clear_done()
+        self.assertNotIn(entry.entry_id, win._queue_entries)
+        self.assertEqual(win.failed_entries(), [])
+
+    def test_the_row_hides_retry_once_retried_and_offers_it_again(self):
+        entry = main_window._QEntry(1, "upload", [("k", "/tmp/f")])
+        row = main_window._QueueRow(entry)
+        self.addCleanup(row.deleteLater)
+        row.set_status("error")
+        self.assertFalse(row._retry_btn.isHidden())
+        row.set_retried(True)
+        self.assertTrue(row._retry_btn.isHidden())
+        row.set_retried(False)                     # a dropped auto-retry
+        self.assertFalse(row._retry_btn.isHidden())
+
+
+class MoveRefusesToOverwriteItsOwnSourcesTests(unittest.TestCase):
+    """
+    REGRESSION (data loss): a move copies every row, then deletes every
+    source. When one row's destination is another row's source -- a bulk
+    rename renumbering img1->img2, img2->img3, img3->img4 with "Overwrite" --
+    the copy pass overwrote img2 and img3 before they had been moved, and the
+    delete pass then removed the copies: three objects in, one out. Skipping
+    those deletes would not help: the bytes are gone after the copy pass, so
+    the move must refuse before it copies anything.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    class _Bucket:
+        bucket = "bkt"
+
+        def __init__(self, objects):
+            self.objects = dict(objects)
+
+        def copy_object(self, src, dst, dst_bucket=None, log_fn=None,
+                        storage_class=None, cancel_event=None):
+            self.objects[dst] = self.objects[src]
+
+        def copy_prefix(self, src, dst, dst_bucket=None, log_fn=None,
+                        cancel_event=None):
+            for key in [k for k in self.objects if k.startswith(src)]:
+                self.objects[dst + key[len(src):]] = self.objects[key]
+
+        def delete(self, key, log_fn=None, cancel_event=None):
+            for k in [k for k in self.objects
+                      if k == key or (key.endswith("/") and k.startswith(key))]:
+                del self.objects[k]
+
+    def _move(self, model, job):
+        worker = Worker(model, job)
+        errors = []
+        worker.error.connect(errors.append)
+        worker.move()
+        return errors
+
+    def test_a_renumbering_chain_is_refused_before_anything_changes(self):
+        before = {"d/img1": "one", "d/img2": "two", "d/img3": "three"}
+        model = self._Bucket(before)
+        errors = self._move(model, [("d/img1", "d/img2", False, None, ""),
+                                    ("d/img2", "d/img3", False, None, ""),
+                                    ("d/img3", "d/img4", False, None, "")])
+        self.assertEqual(model.objects, before)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Nothing was moved", errors[0])
+
+    def test_a_swap_is_refused(self):
+        before = {"a": "A", "b": "B"}
+        model = self._Bucket(before)
+        errors = self._move(model, [("a", "b", False, None, ""),
+                                    ("b", "a", False, None, "")])
+        self.assertEqual(model.objects, before)
+        self.assertTrue(errors)
+
+    def test_writing_inside_a_folder_being_moved_is_refused(self):
+        before = {"a.txt": "A", "x/keep": "K"}
+        model = self._Bucket(before)
+        errors = self._move(model, [("a.txt", "x/a.txt", False, None, ""),
+                                    ("x/", "y/", True, None, "")])
+        self.assertEqual(model.objects, before)
+        self.assertTrue(errors)
+
+    def test_an_ordinary_move_still_runs(self):
+        model = self._Bucket({"a.txt": "A", "b.txt": "B"})
+        errors = self._move(model, [("a.txt", "n/a.txt", False, None, ""),
+                                    ("b.txt", "n/b.txt", False, None, "")])
+        self.assertEqual(errors, [])
+        self.assertEqual(model.objects, {"n/a.txt": "A", "n/b.txt": "B"})
+
+    def test_the_same_key_in_another_bucket_is_not_a_clash(self):
+        """A destination in a different bucket is a different object."""
+        model = self._Bucket({"a.txt": "A", "b.txt": "B"})
+        model.copy_object = lambda *a, **kw: None     # lands elsewhere
+        errors = self._move(model, [("a.txt", "b.txt", False, "other", ""),
+                                    ("b.txt", "c.txt", False, "other", "")])
+        self.assertEqual(errors, [])
+        self.assertEqual(model.objects, {})
+
+
+class SyncLocalDeleteFailureTests(unittest.TestCase):
+    """
+    REGRESSION: a delete_local that failed (permission, a file held open)
+    was only logged, the job finished "done", and the folder silently did
+    not match the source.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._app = _ensure_qapp()
+
+    class _Model:
+        parallel_files = 1
+
+        def __init__(self):
+            self.deletes = []
+
+        def delete(self, key, log_fn=None, cancel_event=None):
+            self.deletes.append(key)
+
+    def _run(self, job):
+        model = self._Model()
+        worker = Worker(model, job)
+        errors, finished = [], []
+        worker.error.connect(errors.append)
+        worker.finished.connect(finished.append)
+        worker.sync()
+        return model, errors, finished
+
+    def test_a_refused_local_delete_is_a_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = os.path.join(tmp, "locked.txt")
+            with open(victim, "w") as handle:
+                handle.write("x")
+            refused = PermissionError(13, "Permission denied", victim)
+            with patch.object(os, "remove", side_effect=refused):
+                model, errors, finished = self._run([
+                    ("delete_local", "locked.txt", victim, "p/locked.txt", 0),
+                    ("delete_remote", "gone.txt", "", "p/gone.txt", 0),
+                ])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("locked.txt", errors[0])
+        # One locked file does not abandon the rest of the plan.
+        self.assertEqual(model.deletes, ["p/gone.txt"])
+        self.assertEqual(finished, [False])
+
+    def test_an_already_missing_file_is_not_a_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _model, errors, _finished = self._run([
+                ("delete_local", "gone.txt", os.path.join(tmp, "gone.txt"),
+                 "p/gone.txt", 0)])
+        self.assertEqual(errors, [])

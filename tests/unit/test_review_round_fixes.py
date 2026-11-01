@@ -484,7 +484,8 @@ class QueueReviewTests(_QueueWindowCase):
         win = self._window()
         fake = _BlockingDeletes(block="b")
         recorded = []
-        win._record_undoable_delete = recorded.append
+        win._record_undoable_delete = (
+            lambda keys, **_kw: recorded.append(keys))
         with patch.object(type(win.data_model), "clone_for_worker",
                           lambda _s: fake):
             entry = win.assign_thread_operation("delete", ["a", "b", "c"],

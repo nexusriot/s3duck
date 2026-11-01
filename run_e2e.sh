@@ -2,9 +2,13 @@
 # Run the end-to-end suite against a throwaway MinIO in Docker.
 #
 #   ./run_e2e.sh                 the model suite, on both SDK versions
+#   ./run_e2e.sh model           the same, named explicitly
 #   ./run_e2e.sh gui             the GUI suite: the real window, headless
 #   ./run_e2e.sh all             both of the above
 #   ./run_e2e.sh -k Traversal    pass extra arguments through to unittest
+#   ./run_e2e.sh gui -k Queue    a selector first, then unittest arguments
+#
+# Needs Docker with the Compose v2 plugin (`docker compose`).
 #
 # The two suites cover different seams. tests/e2e drives model.py and needs no
 # Qt at all, which is what keeps it small and fast. tests/e2e_gui drives the
@@ -16,8 +20,10 @@
 # the oldest supported, because a parameter the installed boto3 does not know
 # is refused client-side and no backend can stand in for that. The GUI suite
 # runs once — that axis is about the SDK, not about the window. Narrow a run
-# with
-#   S3DUCK_TEST_RUNNERS=runner ./run_e2e.sh
+# to one SDK with
+#   S3DUCK_TEST_RUNNERS=runner ./run_e2e.sh        (the pinned boto3)
+#   S3DUCK_TEST_RUNNERS=runner-old ./run_e2e.sh    (the oldest supported)
+# A leading selector (model / gui / all) overrides S3DUCK_TEST_RUNNERS.
 #
 # Nothing is left behind: the server, its data and the private network are
 # all removed on the way out, whether the suite passed or not.
@@ -28,6 +34,9 @@
 #   S3DUCK_TEST_ENDPOINT=http://localhost:9000 \
 #   S3DUCK_TEST_ACCESS_KEY=... S3DUCK_TEST_SECRET_KEY=... \
 #       python -m unittest discover -s tests/e2e -t .
+#
+# S3DUCK_TEST_REGION sets the signing region (default us-east-1); the keys
+# default to minioadmin.
 #
 # Swap tests/e2e for tests/e2e_gui to drive the window instead; that one also
 # needs PyQt6 and the libraries Qt's offscreen platform links against.

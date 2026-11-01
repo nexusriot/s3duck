@@ -5,6 +5,19 @@ Getting that wrong turns "delete under logs/" into "delete everything", so the
 reading is done once, here, and the editor and the summary both use it.
 """
 
+import copy
+
+
+# What the rule editor can hold. A rule outside these bounds cannot be shown
+# in the form without the form changing it (a spin box clamps, a combo falls
+# back to its first entry), so lifecycle_form_problem refuses it instead.
+LIFECYCLE_TRANSITION_CLASSES = (
+    "STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING", "GLACIER_IR",
+    "GLACIER", "DEEP_ARCHIVE",
+)
+LIFECYCLE_MAX_DAYS = 36500
+LIFECYCLE_MAX_ABORT_DAYS = 3650
+
 
 def lifecycle_rule_scope(rule) -> str:
     """The prefix a rule applies to, across both filter shapes."""
@@ -58,6 +71,58 @@ def lifecycle_filter_is_simple(rule) -> bool:
                 or extras["max_size"] is not None)
 
 
+def lifecycle_form_problem(rule) -> str:
+    """
+    Why the rule editor cannot show this rule's actions faithfully, or "".
+
+    The editor holds one transition by days, an expiration by days and the
+    two clean-ups. Opening a rule it cannot hold showed the form's defaults
+    in place of the real values — an unticked box for a second transition or
+    a dated expiration, 30 for a day-0 transition — and OK then wrote the
+    form back, quietly changing what the service does. The filter has its
+    own guard (lifecycle_filter_is_simple); this one covers the actions.
+    """
+    rule = dict(rule or {})
+
+    def _days_fit(value, upper):
+        try:
+            return 1 <= int(value) <= upper
+        except (TypeError, ValueError):
+            return False
+
+    transitions = list(rule.get("Transitions") or [])
+    if len(transitions) > 1:
+        return ("It moves objects through more than one storage class, and "
+                "the editor holds a single transition.")
+    for transition in transitions:
+        if transition.get("Days") is None:
+            return "Its transition happens on a calendar date."
+        if not _days_fit(transition.get("Days"), LIFECYCLE_MAX_DAYS):
+            return (f"Its transition fires after {transition.get('Days')} "
+                    "day(s), which the editor cannot hold.")
+        if transition.get("StorageClass") not in LIFECYCLE_TRANSITION_CLASSES:
+            return (f"It transitions to {transition.get('StorageClass')}, "
+                    "which the editor does not offer.")
+    expiration = rule.get("Expiration") or {}
+    if expiration.get("Date") is not None:
+        return "It expires objects on a calendar date."
+    if (expiration.get("Days") is not None
+            and not _days_fit(expiration["Days"], LIFECYCLE_MAX_DAYS)):
+        return f"It expires objects after {expiration['Days']} day(s)."
+    noncurrent = rule.get("NoncurrentVersionExpiration") or {}
+    if (noncurrent.get("NoncurrentDays") is not None
+            and not _days_fit(noncurrent["NoncurrentDays"], LIFECYCLE_MAX_DAYS)):
+        return (f"It deletes old versions after "
+                f"{noncurrent['NoncurrentDays']} day(s).")
+    abort = rule.get("AbortIncompleteMultipartUpload") or {}
+    if (abort.get("DaysAfterInitiation") is not None
+            and not _days_fit(abort["DaysAfterInitiation"],
+                              LIFECYCLE_MAX_ABORT_DAYS)):
+        return (f"It aborts uploads after {abort['DaysAfterInitiation']} "
+                "day(s).")
+    return ""
+
+
 def summarize_lifecycle_rule(rule) -> str:
     """One readable line for a rule, for a list the user can scan."""
     rule = dict(rule or {})
@@ -86,13 +151,20 @@ def summarize_lifecycle_rule(rule) -> str:
     if expiration.get("ExpiredObjectDeleteMarker"):
         parts.append("clean up delete markers")
     noncurrent = rule.get("NoncurrentVersionExpiration") or {}
+    # NewerNoncurrentVersions is what keeps the newest N old versions out of
+    # reach of the rule. A summary without it describes a rule that deletes
+    # every old version, which is not the one being confirmed.
     if noncurrent.get("NoncurrentDays") is not None:
+        kept = noncurrent.get("NewerNoncurrentVersions")
         parts.append(
-            f"delete old versions after {noncurrent['NoncurrentDays']}d")
+            f"delete old versions after {noncurrent['NoncurrentDays']}d"
+            + (f" (keeping the newest {kept})" if kept else ""))
     for transition in rule.get("NoncurrentVersionTransitions") or []:
+        kept = transition.get("NewerNoncurrentVersions")
         parts.append(
             f"old versions to {transition.get('StorageClass')} after "
-            f"{transition.get('NoncurrentDays')}d")
+            f"{transition.get('NoncurrentDays')}d"
+            + (f" (beyond the newest {kept})" if kept else ""))
     abort = rule.get("AbortIncompleteMultipartUpload") or {}
     if abort.get("DaysAfterInitiation") is not None:
         parts.append(
@@ -106,35 +178,62 @@ def summarize_lifecycle_rule(rule) -> str:
 def build_lifecycle_rule(rule_id, *, prefix="", enabled=True,
                          transition_days=None, transition_class="",
                          expire_days=None, noncurrent_days=None,
-                         abort_days=None, expire_delete_markers=False):
+                         abort_days=None, expire_delete_markers=False,
+                         base=None):
     """
     Assemble a rule document from the fields the editor collects.
 
-    Raises ValueError when the result would do nothing: S3 accepts such a
-    rule and then silently never fires it.
+    *base* is the rule being edited. The result starts from a copy of it and
+    only the fields the form controls are overwritten, so whatever the form
+    has no box for — NoncurrentVersionTransitions, NewerNoncurrentVersions,
+    anything a newer API adds — comes back as it was. Rebuilding from the
+    form alone dropped them on every Edit -> OK, and losing
+    NewerNoncurrentVersions turns "keep the newest 3 old versions" into
+    "delete every old version".
+
+    Raises ValueError when the result would do nothing (S3 accepts such a
+    rule and then silently never fires it), or asks for two expirations S3
+    will not combine.
     """
-    rule = {
-        "ID": str(rule_id or "").strip() or "rule",
-        "Status": "Enabled" if enabled else "Disabled",
-        # The modern shape. A bare "Prefix" is the deprecated one and is
-        # rejected outright when mixed with Filter.
-        "Filter": {"Prefix": str(prefix or "")},
-    }
+    if expire_days is not None and expire_delete_markers:
+        # One Expiration cannot carry both; the builder used to keep the days
+        # and drop the clean-up without a word, though the box stayed ticked.
+        raise ValueError(
+            "A rule cannot both delete objects after a number of days and "
+            "clean up expired delete markers — S3 refuses the combination. "
+            "Untick one, or make a second rule for it.")
+    rule = copy.deepcopy(dict(base or {}))
+    rule["ID"] = str(rule_id or "").strip() or "rule"
+    rule["Status"] = "Enabled" if enabled else "Disabled"
+    # The modern shape. A bare "Prefix" is the deprecated one and is
+    # rejected outright when mixed with Filter.
+    rule.pop("Prefix", None)
+    rule["Filter"] = {"Prefix": str(prefix or "")}
     if transition_days is not None and transition_class:
         rule["Transitions"] = [{"Days": int(transition_days),
                                 "StorageClass": str(transition_class)}]
+    else:
+        rule.pop("Transitions", None)
     if expire_days is not None:
         rule["Expiration"] = {"Days": int(expire_days)}
     elif expire_delete_markers:
         rule["Expiration"] = {"ExpiredObjectDeleteMarker": True}
+    else:
+        rule.pop("Expiration", None)
     if noncurrent_days is not None:
-        rule["NoncurrentVersionExpiration"] = {
-            "NoncurrentDays": int(noncurrent_days)}
+        noncurrent = dict(rule.get("NoncurrentVersionExpiration") or {})
+        noncurrent["NoncurrentDays"] = int(noncurrent_days)
+        rule["NoncurrentVersionExpiration"] = noncurrent
+    else:
+        rule.pop("NoncurrentVersionExpiration", None)
     if abort_days is not None:
         rule["AbortIncompleteMultipartUpload"] = {
             "DaysAfterInitiation": int(abort_days)}
+    else:
+        rule.pop("AbortIncompleteMultipartUpload", None)
     if not any(key in rule for key in (
             "Transitions", "Expiration", "NoncurrentVersionExpiration",
+            "NoncurrentVersionTransitions",
             "AbortIncompleteMultipartUpload")):
         raise ValueError(
             "A lifecycle rule needs at least one action, or it will never "

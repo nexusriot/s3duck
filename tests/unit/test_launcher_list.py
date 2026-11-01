@@ -152,7 +152,7 @@ class ProfileListWindowTests(unittest.TestCase):
         win = self._launcher(["a", "a-copy"])
         with patch.object(win, "save_settings"):
             win.copy_profile()
-        self.assertEqual(win.items[-1].name, "a-copy2")
+        self.assertEqual(win.items[-1].name, "a-copy-2")
 
 
 class DuplicateNameDialogTests(unittest.TestCase):

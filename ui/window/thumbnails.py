@@ -53,6 +53,10 @@ class ThumbnailMixin:
         self._thumb_targets = {}
         if not self.thumbnail_view_active() or self.in_bucket_list_mode():
             return 0
+        if not self.listing_settled():
+            # The rows are the folder being left, named under the one being
+            # entered; the landing listing asks again.
+            return 0
         bucket = self.data_model.bucket
         folder = self.data_model.current_folder or ""
         clone = None

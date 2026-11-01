@@ -28,3 +28,36 @@ class ArchivedObject(Exception):
     InvalidObjectState, which means nothing to anyone who has not met it
     before; this carries the object, its class and what to do instead.
     """
+class DownloadIncomplete(Exception):
+    """
+    A folder download ended with objects that could not be written locally.
+
+    Raised at the END, once everything that could be written was. One key
+    the local filesystem cannot hold -- "logs" beside "logs/2024.txt", a
+    ':' on Windows -- used to be the first error of the fan-out, which
+    re-raised it and abandoned every file not yet started: one bad name cost
+    the whole folder. Raising at all, rather than only logging, is what keeps
+    the queue row from saying "done" over a folder that is not all there.
+
+    *failures* is ``[(key, why)]``; *total* is how many objects the download
+    covered, so the message can say how much DID arrive.
+    """
+
+    # More than this many lines makes the dialog taller than the screen;
+    # the log has every one of them.
+    SHOWN = 10
+
+    def __init__(self, failures, total=0):
+        self.failures = list(failures)
+        self.total = int(total or 0)
+        super().__init__(self._summary())
+
+    def _summary(self) -> str:
+        count = len(self.failures)
+        of = f" of {self.total}" if self.total >= count else ""
+        lines = [f"{count}{of} object(s) could not be written locally; "
+                 "everything else was downloaded:"]
+        lines += [f"  {key}: {why}" for key, why in self.failures[:self.SHOWN]]
+        if count > self.SHOWN:
+            lines.append(f"  …and {count - self.SHOWN} more (see the log)")
+        return "\n".join(lines)

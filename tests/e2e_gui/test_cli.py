@@ -9,6 +9,7 @@ environment keys, the route an unattended cron job takes.
 import io
 import os
 import tempfile
+import unittest
 
 import s3duck_cli
 from tests.e2e.harness import ServerCase, _env, endpoint
@@ -98,3 +99,20 @@ class CommandLineTests(ServerCase):
                                    os.path.join(self.tmp.name, "x.txt"))
         self.assertEqual(code, 1)
         self.assertTrue(err)
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlinks")
+    def test_sync_delete_keeps_what_a_dangling_link_points_at(self):
+        """REGRESSION (data loss): a file symlinked to an unmounted drive
+        dropped out of the strict scan as if deleted, and --delete removed
+        its only reachable copy from the bucket."""
+        src = os.path.join(self.tmp.name, "linked")
+        self._tree(src, {"keep.txt": b"k", "photo.jpg": b"jpeg"})
+        self.assertEqual(self.cli("sync", src, f"s3://{self.bucket}/lnk/")[0], 0)
+        os.remove(os.path.join(src, "photo.jpg"))
+        os.symlink(os.path.join(self.tmp.name, "unmounted", "photo.jpg"),
+                   os.path.join(src, "photo.jpg"))
+        code, _out, err = self.cli("sync", "--delete", src,
+                                   f"s3://{self.bucket}/lnk/")
+        self.assertEqual(code, 1)
+        self.assertTrue(err)
+        self.assertEqual(self.keys("lnk/"), ["lnk/keep.txt", "lnk/photo.jpg"])

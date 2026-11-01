@@ -22,6 +22,7 @@ class BulkRenameDialog(QDialog):
         self.resize(660, 520)
         self._items = list(items)   # [(name, is_folder)]
         self._plan = []
+        self._problems = []
 
         self._mode_find = QRadioButton("Find and replace")
         self._mode_template = QRadioButton("Numbering template")
@@ -122,6 +123,7 @@ class BulkRenameDialog(QDialog):
             padding=self._padding.value(),
         )
         self._plan = plan
+        self._problems = list(problems)
 
         self._table.setRowCount(0)
         for old, new in plan:
@@ -143,6 +145,11 @@ class BulkRenameDialog(QDialog):
             ok.setEnabled(bool(plan) and not problems)
 
     def plan(self):
+        # A plan with problems is shown so it can be fixed, never handed out:
+        # the disabled OK is the only thing between a chain or collision and
+        # the queue, and the caller runs whatever this returns.
+        if self._problems:
+            return []
         return list(self._plan)
 
 

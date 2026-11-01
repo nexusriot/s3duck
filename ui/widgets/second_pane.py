@@ -71,6 +71,9 @@ class SecondPane(QWidget):
         self._model = model
         self._thread = None
         self._worker = None
+        # Set by shutdown(): a result still queued for delivery must not
+        # start a fresh listing on a pane that is being torn down.
+        self._closed = False
         self._entries = []
         self._modified = {}
         self._sort = (NAME, False)
@@ -557,8 +560,14 @@ class SecondPane(QWidget):
         remote listing starts, and a listing that lands for a target the
         pane has left since is thrown away rather than shown.
         """
+        if self._closed:
+            return
         self.path.setText(self.location())
         if self.current_mode() == self.LOCAL:
+            # The rows are no longer any remote listing: switching back must
+            # clear them, or F5/F6 resolve local names as keys under the
+            # remote prefix.
+            self._listing_for = None
             self._scan_error = ""
             self._show(self._scan_local())
             if self._scan_error:
@@ -570,6 +579,8 @@ class SecondPane(QWidget):
             self.status.setText("No bucket selected")
             return
         if self._thread is not None:
+            # One listing at a time; the one in flight is for somewhere else
+            # now, and _on_listed re-issues this refresh when it returns.
             if self._listing_for != self.view_target():
                 self._show([])
                 self.status.setText("Loading…")
@@ -626,8 +637,12 @@ class SecondPane(QWidget):
     def _on_listed(self, result, exc):
         thread, self._thread, self._worker = self._thread, None, None
         join_qthread(thread)
+        if self._closed:
+            return
         if self._listing_for != self.view_target() or self._refresh_again:
             # Stale, or superseded by a refresh asked for while it ran.
+            # Shown, stale rows would be resolved under the new location --
+            # keys that were never listed there.
             self._listing_for = None
             self._refresh_again = False
             self.refresh()
@@ -670,5 +685,6 @@ class SecondPane(QWidget):
             f"{folders} folder(s), {len(self._entries) - folders} file(s)")
 
     def shutdown(self):
+        self._closed = True
         thread, self._thread, self._worker = self._thread, None, None
         join_qthread(thread)

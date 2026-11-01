@@ -36,7 +36,7 @@ def remote_digest_tree(model, prefix, cancel_event=None):
 def plan_two_way_pass(model, local_dir, prefix, state_file, exclude=None,
                       cancel_event=None) -> dict:
     """Everything the dialog needs: the plan, the state it was made against."""
-    local = scan_local_tree(local_dir, require_complete=True)
+    local = scan_local_tree(local_dir, strict=True)
     remote, skipped = remote_digest_tree(model, prefix, cancel_event)
     state = load_state(state_file)
 
@@ -92,7 +92,7 @@ class TwoWaySyncMixin:
         clone.bucket = bucket
 
         def _scan(_w):
-            local = scan_local_tree(local_dir, require_complete=True)
+            local = scan_local_tree(local_dir, strict=True)
             remote, _skipped = remote_digest_tree(clone, prefix)
             paths = build_state(local, remote, keep_old=conflicts,
                                 old_state=old_state)

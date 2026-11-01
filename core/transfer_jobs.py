@@ -1,7 +1,8 @@
 """Turning a user gesture into a list of transfer rows.
 
 A drag-and-drop or a paste becomes ``(key, local_path)`` or
-``(src, dst, is_folder, bucket)`` tuples here, before any worker sees it.
+``(src_key, dst_key, is_folder, dst_bucket, storage_class)`` tuples here,
+before any worker sees it.
 """
 
 import os

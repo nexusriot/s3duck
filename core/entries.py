@@ -14,6 +14,7 @@ class PrefixDownloadPlan(NamedTuple):
     dirs: list
     files: list      # [(key, out_path, size)]
     unsafe: list     # keys that cannot be written under base_dir
+    reasons: dict    # unsafe key -> why, in words the user can act on
 class FSObjectType(Enum):
     FILE = 1
     FOLDER = 2

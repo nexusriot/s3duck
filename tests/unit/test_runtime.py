@@ -7,11 +7,12 @@ import os
 import profile_switcher
 import s3duck
 import shutil
+import socket as socket_module
 import tempfile
 import time
 import unittest
 import utils
-from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QDir, QSettings
 from PyQt6.QtWidgets import QDialogButtonBox
 from model import Model, TransferCancelled, installed_sdk_accepts
 from tests.support import (
@@ -353,10 +354,13 @@ class ReviewRegressionTests(unittest.TestCase):
         started = []
         with patch.object(main_window.MainWindow, "assign_thread_operation",
                           lambda _s, method, job, **kw: started.append(method)):
+            # History records carry the bucket and profile they ran in; a
+            # replay is bound to those, never to whatever is open now.
             win.rerun_history_entry(
                 {"method": "upload", "job": [["k", "/tmp/f"]],
                  "origin": win._transfer_origin(),
-                 "source_bucket": win.data_model.bucket})
+                 "source_bucket": win.data_model.bucket,
+                 "bucket": "bkt", "profile": win.profile_name})
         self.assertEqual(started, ["upload"])
 
     def test_switching_profiles_saves_where_the_old_one_was(self):
@@ -622,16 +626,37 @@ class InstanceHandoverTests(unittest.TestCase):
             "s3://bkt/", utils.instance_socket_name("s3duck-test-nobody"),
             timeout_ms=100))
 
+    @unittest.skipIf(os.name == "nt", "a named pipe leaves no file behind")
     def test_a_stale_socket_does_not_block_the_next_listener(self):
         """A crash leaves the socket behind; without removeServer the next
         run could never listen again."""
         name = utils.instance_socket_name("s3duck-test-stale")
+        path = os.path.join(QDir.tempPath(), name)
+        if os.path.exists(path):
+            os.remove(path)
+        dead = socket_module.socket(socket_module.AF_UNIX)
+        dead.bind(path)
+        dead.close()            # the file stays, nobody listens on it
+        self.assertTrue(os.path.exists(path))
+        server = utils.InstanceServer()
+        self.assertTrue(server.start(name))
+        self.addCleanup(server.stop)
+
+    def test_a_second_launch_leaves_the_running_listener_alone(self):
+        """removeServer unlinked a LIVE window's socket as well, so a launch
+        with a named profile took every later handover away from it."""
+        name = utils.instance_socket_name("s3duck-test-live")
         first = utils.InstanceServer()
         self.assertTrue(first.start(name))
-        second = utils.InstanceServer()
-        self.assertTrue(second.start(name))
-        self.addCleanup(second.stop)
-        first.stop()
+        self.addCleanup(first.stop)
+        received = []
+        first.received.connect(received.append)
+        self.assertFalse(utils.InstanceServer().start(name))
+        self.assertTrue(utils.send_to_running_instance("s3://bkt/", name))
+        deadline = time.monotonic() + 3
+        while not received and time.monotonic() < deadline:
+            self._app.processEvents()
+        self.assertEqual(received, ["s3://bkt/"])
 
     def test_the_socket_name_is_per_user(self):
         self.assertNotEqual(utils.instance_socket_name("a"),

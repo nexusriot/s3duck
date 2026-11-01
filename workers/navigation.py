@@ -1,8 +1,10 @@
 """Listing a bucket or a prefix off the UI thread.
 
-Each worker drives a private Model clone: two threads sharing one botocore
-client race on its endpoint and region state, and the symptom is a listing
-that belongs to the bucket you were looking at a moment ago.
+NavigationWorker drives a private Model clone: two threads sharing one
+botocore client race on its endpoint and region state, and the symptom is a
+listing that belongs to the bucket you were looking at a moment ago.
+BucketEnterWorker deliberately works on the shared model instead, because
+entering a bucket is what commits its endpoint and region for the window.
 """
 
 import time

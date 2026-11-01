@@ -269,20 +269,40 @@ def redact_url_credentials(value) -> str:
     scheme, sep, rest = text.partition("://")
     if not sep:
         scheme, rest = "", text
-    # Credentials can only live in the authority, which ends at the first
-    # "/", "?" or "#". A path or query is free to hold an "@" of its own.
-    end = len(rest)
-    for mark in "/?#":
-        found = rest.find(mark)
-        if found != -1:
-            end = min(end, found)
-    authority, tail = rest[:end], rest[end:]
+    authority, tail = _split_authority(rest)
+    if "@" not in authority and "@" in tail and not _plausible_host(authority):
+        # An unencoded "/", "?" or "#" in the password ended the authority
+        # early: "alice:p/ss@proxy" reads as host "alice", port "p". No real
+        # host:port looks like that, so the userinfo runs to the last "@".
+        userinfo, _at, after = rest.rpartition("@")
+        host, tail = _split_authority(after)
+        authority = f"{userinfo}@{host}"
     if "@" not in authority:
         return text
     # Last "@" wins: a password may contain one, a host may not. Whatever is
     # left is the host — brackets and port included, so IPv6 survives intact.
     host = authority.rpartition("@")[2]
     return f"{scheme}{sep}***@{host}{tail}"
+
+
+def _split_authority(rest):
+    """(authority, tail): credentials can only live in the authority, which
+    ends at the first "/", "?" or "#". A path or query may hold an "@"."""
+    end = len(rest)
+    for mark in "/?#":
+        found = rest.find(mark)
+        if found != -1:
+            end = min(end, found)
+    return rest[:end], rest[end:]
+
+
+def _plausible_host(authority) -> bool:
+    """False for a host:port whose port is empty or not a number."""
+    if authority.startswith("["):
+        authority = authority.partition("]")[2]
+    if ":" not in authority:
+        return True
+    return authority.rpartition(":")[2].isdigit()
 
 
 def format_report(sections) -> str:

@@ -12,7 +12,7 @@ import urllib.request
 
 import botocore.exceptions
 
-from model import local_name_is_writable, safe_local_path
+from model import DownloadIncomplete, local_name_is_writable, safe_local_path
 from tests.e2e.harness import ServerCase
 
 
@@ -178,17 +178,25 @@ class LocalFilesystemLimitTests(ServerCase):
         simply has nothing to skip — the point is that the OTHER objects
         arrive either way, which is what used to fail."""
         long_name = "L" * 300
+        stored = True
         try:
             self.put(f"longnames/{long_name}.txt", b"x")
         except botocore.exceptions.ClientError as exc:
+            stored = False
             code = exc.response.get("Error", {}).get("Code", "?")
             print(f"\n    over-long component: REFUSED by the backend ({code})")
         self.put("longnames/ok.txt", b"fine")
         self.put("longnames/also-ok.txt", b"fine")
         logs = []
         with tempfile.TemporaryDirectory() as tmp:
-            self.model.download_file("longnames/", None, tmp,
-                                     log_fn=logs.append)
+            if stored:
+                # Skipped, and the job says so instead of ending "done".
+                with self.assertRaises(DownloadIncomplete):
+                    self.model.download_file("longnames/", None, tmp,
+                                             log_fn=logs.append)
+            else:
+                self.model.download_file("longnames/", None, tmp,
+                                         log_fn=logs.append)
             landed = []
             for root, _dirs, files in os.walk(tmp):
                 landed.extend(files)
@@ -199,6 +207,65 @@ class LocalFilesystemLimitTests(ServerCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(safe_local_path(tmp, "a/" + "L" * 300), "")
             self.assertTrue(safe_local_path(tmp, "a/" + "L" * 200))
+
+    def test_a_file_and_a_folder_of_the_same_name(self):
+        """AWS stores and LISTS "clash/logs" beside "clash/logs/2024.txt";
+        locally one path cannot be both. A backend that refuses the pair, or
+        (MinIO) stores both but lists only "clash/logs", leaves the download
+        nothing to clash over -- recorded, and the rest asserted."""
+        self.put("clash/ok.txt", b"fine")
+        pair = ["clash/logs", "clash/logs/2024.txt"]
+        try:
+            self.put(pair[0], b"a file called logs")
+            self.put(pair[1], b"inside the folder")
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "?")
+            print(f"\n    file beside a same-named folder: REFUSED by the "
+                  f"backend ({code})")
+        listed = [k for k in self.keys("clash/") if k in pair]
+        if listed != pair:
+            print(f"\n    file beside a same-named folder: the listing shows "
+                  f"{listed}")
+        with tempfile.TemporaryDirectory() as tmp:
+            if listed == pair:
+                with self.assertRaises(DownloadIncomplete) as caught:
+                    self.model.download_file("clash/", None, tmp)
+                self.assertEqual(
+                    [k for k, _why in caught.exception.failures],
+                    ["clash/logs"])
+                with open(os.path.join(tmp, "clash", "logs", "2024.txt"),
+                          "rb") as handle:
+                    self.assertEqual(handle.read(), b"inside the folder")
+            else:
+                self.model.download_file("clash/", None, tmp)
+            with open(os.path.join(tmp, "clash", "ok.txt"), "rb") as handle:
+                self.assertEqual(handle.read(), b"fine")
+
+    def test_a_local_folder_in_the_way_costs_that_object_only(self):
+        """What the plan cannot see: the managed transfer writes a temporary
+        file and renames it over the destination, and a FOLDER at the
+        destination fails that rename. It used to abort the whole folder;
+        now it costs the one object, under both parallel settings."""
+        for parallel in (1, 4):
+            with self.subTest(parallel=parallel), \
+                    tempfile.TemporaryDirectory() as tmp:
+                prefix = f"inway{parallel}/"
+                for name in ("a.txt", "b.txt", "c.txt", "d.txt"):
+                    self.put(prefix + name, name.encode())
+                os.makedirs(os.path.join(tmp, prefix, "b.txt"))
+                before = self.model.parallel_files
+                self.model.parallel_files = parallel
+                try:
+                    with self.assertRaises(DownloadIncomplete) as caught:
+                        self.model.download_file(prefix, None, tmp)
+                finally:
+                    self.model.parallel_files = before
+                self.assertEqual(
+                    [k for k, _why in caught.exception.failures],
+                    [prefix + "b.txt"])
+                for name in ("a.txt", "c.txt", "d.txt"):
+                    with open(os.path.join(tmp, prefix, name), "rb") as h:
+                        self.assertEqual(h.read(), name.encode())
 
 
 class OverwriteCheckTests(ServerCase):

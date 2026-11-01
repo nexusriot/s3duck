@@ -65,8 +65,10 @@ class BookmarksMixin:
         if not bucket:
             return
         if bucket == self.data_model.bucket:
-            self.change_current_folder(prefix)
-            self.navigate(select_up_entry=True)
+            # Through the guarded move: committing the prefix and letting
+            # navigate() refuse (a transfer running) left the model in the
+            # bookmarked folder under a listing of this one.
+            self._go_to_prefix(prefix, select_up_entry=True)
             return
         self.enter_bucket_async(bucket, target_prefix=prefix)
 

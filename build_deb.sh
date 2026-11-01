@@ -21,13 +21,13 @@ fi
 
 echo "building deb for s3duck $version ($arch)"
 
-if ! type "dpkg-deb" > /dev/null; then
-  echo "please install required build tools first"
+if ! type "dpkg-deb" > /dev/null 2>&1; then
+  echo "dpkg-deb not found: install the dpkg package first"; exit 1
 fi
 
 project="s3duck_${version}_${arch}"
 folder_name="build/$project"
-echo "crating $folder_name"
+echo "creating $folder_name"
 mkdir -p $folder_name
 cp -r DEBIAN/ $folder_name
 bin_dir="$folder_name/usr/bin"

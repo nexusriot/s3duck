@@ -5,7 +5,15 @@ redirects to the bucket's real region, is normal. Working out what the URL is
 actually saying is plain string work and belongs away from the client.
 """
 
+import re
 from urllib.parse import urlparse
+
+# s3.<region>, s3-<region> (the legacy dash form), the dualstack and FIPS
+# variants, optionally behind a bucket label. Anchored on the region shape
+# so that s3-accelerate and s3-external-1, which name no region, never match.
+_AWS_REGIONAL_HOST = re.compile(
+    r"^(?:.+\.)?s3(?:-fips)?[.-](?:dualstack\.)?"
+    r"(?P<region>[a-z]{2}(?:-[a-z]+)+-\d+)\.amazonaws\.com(?:\.cn)?$")
 
 
 def _endpoint_has_bucket(endpoint_url: str, bucket_name: str) -> bool:
@@ -100,3 +108,50 @@ def build_region_swapped_endpoint(base_endpoint: str,
         return f"{scheme}://{netloc}{parsed.path or ''}"
     except Exception:
         return None
+
+
+def aws_endpoint_region(endpoint_url: str) -> str:
+    """
+    The region an AWS S3 endpoint is pinned to, or "" when it is not one.
+
+      https://s3.eu-west-1.amazonaws.com          -> eu-west-1
+      https://mybucket.s3.eu-west-1.amazonaws.com -> eu-west-1
+      https://s3.amazonaws.com                    -> us-east-1
+      https://minio.local:9000                    -> ""
+
+    The global endpoint counts as us-east-1: that is the region botocore
+    signs for there, and the region a path-style link on it is served from.
+    """
+    try:
+        host = (urlparse(endpoint_url).hostname or "").lower()
+    except Exception:
+        return ""
+    if host == "s3.amazonaws.com" or host.endswith(".s3.amazonaws.com"):
+        return "us-east-1"
+    match = _AWS_REGIONAL_HOST.match(host)
+    return match.group("region") if match else ""
+
+
+def strip_bucket_label(endpoint_url: str, bucket_name: str) -> str:
+    """
+    endpoint_url with a leading "<bucket_name>." taken off its host.
+
+      https://mybucket.s3.eu-west-1.amazonaws.com -> https://s3.eu-west-1.amazonaws.com
+
+    Only a LEADING label is removed: _endpoint_has_bucket also matches the
+    bucket name in the middle of a host, and a bucket called "eu-west-1"
+    must not turn s3.eu-west-1.amazonaws.com into s3.amazonaws.com.
+    Anything else is returned as it came.
+    """
+    try:
+        parsed = urlparse(endpoint_url)
+        host = parsed.hostname or ""
+    except Exception:
+        return endpoint_url
+    prefix = (bucket_name or "").lower() + "."
+    if not bucket_name or not host.lower().startswith(prefix):
+        return endpoint_url
+    netloc = host[len(prefix):]
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    return f"{parsed.scheme or 'https'}://{netloc}{parsed.path or ''}"

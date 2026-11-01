@@ -6,6 +6,12 @@ rule about when a comparison is meaningful lives here.
 """
 
 import hashlib
+import os
+
+
+# Server-side encryption under which S3's ETag is NOT an MD5 of the bytes.
+# SSE-S3 ("AES256") still is one; these are not, and SSE-C is not either.
+OPAQUE_ETAG_ENCRYPTION = ("aws:kms", "aws:kms:dsse")
 
 
 def normalize_etag(etag) -> str:
@@ -20,6 +26,23 @@ def etag_is_md5(etag) -> bool:
     """
     tag = normalize_etag(etag)
     return bool(tag) and "-" not in tag and len(tag) == 32
+
+
+def etag_is_opaque(head) -> bool:
+    """
+    True when a HEAD response says the object's ETag is no digest of its bytes.
+
+    S3 documents the ETag as an MD5 only for objects stored unencrypted or
+    with SSE-S3. Under SSE-KMS, DSSE-KMS and SSE-C it is still 32 hex
+    characters -- so etag_is_md5 cannot tell -- but it describes nothing a
+    local file can reproduce, and comparing it reported every intact
+    download of such an object as corrupt.
+    """
+    head = head or {}
+    if head.get("SSECustomerAlgorithm"):
+        return True
+    mode = str(head.get("ServerSideEncryption") or "").lower()
+    return mode in OPAQUE_ETAG_ENCRYPTION
 
 
 def file_md5(path, chunk_size: int = 1024 * 1024) -> str:
@@ -40,6 +63,55 @@ def composite_etag(md5_digests) -> str:
         return ""
     combined = hashlib.md5(b"".join(digests)).hexdigest()
     return f"{combined}-{len(digests)}"
+
+
+def file_part_md5s(path, part_size, chunk_size: int = 1024 * 1024) -> list:
+    """Raw MD5 digests of a local file cut into *part_size* pieces."""
+    part_size = int(part_size)
+    digests = []
+    with open(path, "rb") as handle:
+        while True:
+            digest = hashlib.md5()
+            remaining = part_size
+            while remaining:
+                block = handle.read(min(chunk_size, remaining))
+                if not block:
+                    break
+                digest.update(block)
+                remaining -= len(block)
+            if remaining == part_size:
+                break
+            digests.append(digest.digest())
+            if remaining:
+                break
+    return digests
+
+
+def file_matches_etag(path, etag, part_sizes=()):
+    """
+    Whether the local file at *path* holds the bytes *etag* describes:
+    True, False, or None when the ETag cannot say.
+
+    A plain MD5 settles it either way. A multipart ETag depends on the part
+    size the uploader chose, and nothing records that, so it is rebuilt at
+    each of *part_sizes* that yields the right number of parts: a match is
+    proof, but no match is only None -- the same bytes split elsewhere
+    digest differently. Whether the ETag is a digest at all is the caller's
+    question (etag_is_opaque); this assumes it is.
+    """
+    tag = normalize_etag(etag)
+    if etag_is_md5(tag):
+        return file_md5(path) == tag
+    _digest, sep, count = tag.rpartition("-")
+    if not sep or not count.isdigit() or int(count) < 1:
+        return None
+    size = os.path.getsize(path)
+    for part in sorted({int(p) for p in part_sizes or () if int(p) > 0}):
+        if max(1, -(-size // part)) != int(count):
+            continue
+        if composite_etag(file_part_md5s(path, part)) == tag:
+            return True
+    return None
 
 
 def checksum_is_composite(value) -> bool:

@@ -18,7 +18,10 @@ or point it at any endpoint you already have::
     S3DUCK_TEST_ENDPOINT=http://localhost:9000 \
     S3DUCK_TEST_ACCESS_KEY=minioadmin \
     S3DUCK_TEST_SECRET_KEY=minioadmin \
-        python -m unittest discover -s tests -t .
+        python -m unittest discover -s tests/e2e -t .
+
+(``-s tests`` would also run the unit suite and, against the same endpoint,
+the GUI suite in ``tests/e2e_gui``.)
 
 It targets model.py rather than the GUI on purpose: that module is the whole
 S3 surface and imports nothing from Qt, so the runner needs no display and no

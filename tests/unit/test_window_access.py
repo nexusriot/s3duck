@@ -319,6 +319,9 @@ class DeleteWordingTests(_WindowCase):
         win.listview.selectionModel = lambda: types.SimpleNamespace(
             selectedIndexes=lambda: indexes)
         win.get_row_primary_item = lambda ix: (object(), ix.name, FSObjectType.FILE)
+        # The faked rows stand for a listing that has landed; the window's
+        # own first listing may still be in flight.
+        win.listing_settled = lambda: True
 
     def test_a_delete_with_the_trash_on_says_move(self):
         win = self._window()
