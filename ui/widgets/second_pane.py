@@ -564,6 +564,10 @@ class SecondPane(QWidget):
             return
         self.path.setText(self.location())
         if self.current_mode() == self.LOCAL:
+            # The rows are no longer any remote listing: switching back must
+            # clear them, or F5/F6 resolve local names as keys under the
+            # remote prefix.
+            self._listing_for = None
             self._scan_error = ""
             self._show(self._scan_local())
             if self._scan_error:

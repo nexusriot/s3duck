@@ -13,6 +13,23 @@ from s3.common import (
 from urllib.parse import quote, urlencode
 
 
+class SourceChanged(botocore.exceptions.ClientError):
+    """
+    A multipart copy refused because its source changed mid-copy.
+
+    Still the service's PreconditionFailed -- callers that branch on
+    ``response["Error"]["Code"]`` keep working -- but it reads as what
+    happened rather than as a bare error code.
+    """
+
+    def __init__(self, error, message):
+        super().__init__(error.response, error.operation_name)
+        self.message = message
+
+    def __str__(self):
+        return self.message
+
+
 class CopyMixin:
     """Server-side copy, and the stream-through fallback when it is refused.
     """
@@ -410,10 +427,10 @@ class CopyMixin:
             except Exception:
                 pass
             if source_etag and precondition_failed(exc):
-                raise Exception(
-                    f"'{src_key}' changed on the server while it was being "
-                    "copied; nothing was written. Copy it again to get the "
-                    "new version.") from exc
+                raise SourceChanged(
+                    exc, f"'{src_key}' changed on the server while it was "
+                    "being copied; nothing was written. Copy it again to get "
+                    "the new version.") from exc
             raise
         if log_fn:
             log_fn(f"copied {src_key} -> {dst_bucket}/{dst_key} server-side "

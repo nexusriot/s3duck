@@ -403,10 +403,16 @@ class TransferQueueMixin:
         def _on_worker_finished(cancelled: bool):
             if self._closing:
                 return
-            if cancelled and entry.pause_requested:
+            if entry.pause_requested:
                 # Not an outcome: the job is parked, keeps its queue row and
-                # is not written to history until it really ends.
+                # is not written to history until it really ends. Also when
+                # the cancellation surfaced as an error (a connection reset
+                # by the abort): treated as a failure, it was retried
+                # automatically and ran to the end the user had paused.
                 entry.pause_requested = False
+                entry.error = None
+                entry.error_details = ""
+                entry.error_transient = False
                 entry.status = "paused"
                 self.log(f"{method} paused")
                 self._queue_panel.update_status(entry)
@@ -446,7 +452,11 @@ class TransferQueueMixin:
             else:
                 self._record_history(entry)
 
-            if method == "delete" and entry.status == "done":
+            # Only under the profile the delete ran in: undo resolves the
+            # bucket by name through this window's connection, which after a
+            # profile switch is another account's bucket of the same name.
+            if (method == "delete" and entry.status == "done"
+                    and entry.profile in (None, self.profile_name)):
                 self._record_undoable_delete(
                     entry.full_job, since=entry.started_at, bucket=entry.bucket)
 
@@ -592,6 +602,14 @@ class TransferQueueMixin:
         entry = self._queue_entries.get(int(entry_id))
         if entry is None or entry.status != "paused":
             return False
+        if entry.profile is not None and entry.profile != self.profile_name:
+            # Kept on the panel by a profile switch (too large to park). Its
+            # rows are bare keys of that account, as for a retry.
+            self.statusBar().showMessage(
+                f"That job belongs to profile '{entry.profile}'", 4000)
+            self.log(f"not resuming {entry.method}: it belongs to profile "
+                     f"'{entry.profile}'")
+            return False
         if entry.sse_c_md5:
             current = getattr(self.data_model, "sse_c_key", b"") or b""
             if sse_c_md5(current) != entry.sse_c_md5:
@@ -617,6 +635,15 @@ class TransferQueueMixin:
 
     def pause_all_transfers(self):
         """Pause the queued jobs first, so none starts as the running one stops."""
+        # An automatic retry waiting on its timer is about to start a job;
+        # "Pause all" that let it run would not pause all. It stays a failed
+        # row the user can retry by hand.
+        held, self._pending_retries = self._pending_retries, []
+        if held:
+            self._retry_timer.stop()
+            for entry in held:
+                self._set_retried(entry, False)
+            self.log(f"held back {len(held)} pending automatic retry(ies)")
         for entry in list(self._transfer_queue):
             self.pause_entry(entry.entry_id)
         if self._active_entry is not None:
@@ -656,8 +683,8 @@ class TransferQueueMixin:
         for label in skipped:
             if label not in reported:
                 reported.add(label)
-                self.log(f"not kept across a restart (too large, or another "
-                         f"profile's connection): {label}")
+                self.log(f"not kept across a restart (too large, a sync "
+                         f"plan, or another profile's connection): {label}")
         key = self._pending_queue_key()
         if records:
             self.store.set(key, json.dumps(records))
@@ -711,7 +738,9 @@ class TransferQueueMixin:
                 source_bucket=record.get("source_bucket") or "",
                 if_none_match=bool(record.get("if_none_match")),
                 origin=record.get("origin"),
-                bucket=record.get("bucket"),
+                # Records written before the bucket was kept: the job was
+                # queued against its source bucket.
+                bucket=record.get("bucket") or record.get("source_bucket"),
                 # A job queued under an SSE-C key comes back paused: the key
                 # was never stored, and running it without one would write
                 # unencrypted objects or fail every read.
@@ -962,8 +991,14 @@ class TransferQueueMixin:
         # overwrite prompt, and a retry that drops it is a retry that quietly
         # overwrites what they asked to skip. An automatic retry also hands
         # on its count, so the retry of a retry is not "the first" again.
+        # Only what did not finish: a delete run again on a versioned bucket
+        # stacks a second marker on rows already deleted, and undo, which
+        # lifts one, then reports them restored while they stay deleted.
+        job = entry.job
+        if entry.method in ITEM_RESUMABLE_METHODS and entry.done_items:
+            job = remaining_job(entry.job, entry.done_items)
         fresh = self.assign_thread_operation(
-            entry.method, entry.job, need_refresh=entry.need_refresh,
+            entry.method, job, need_refresh=entry.need_refresh,
             source_bucket=entry.source_bucket, dest_model=entry.dest_model,
             source_model=entry.source_model,
             if_none_match=entry.if_none_match, origin=entry.origin,

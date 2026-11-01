@@ -18,6 +18,12 @@ import json
 
 from core.locations import CROSS_PROFILE_METHODS
 
+# Methods whose job is a plan worked out from both sides as they were then --
+# including what to delete. Replayed after a restart (days later, maybe), its
+# delete rows would remove what has changed since; history refuses to re-run
+# one for the same reason. Run Sync again for a fresh comparison instead.
+NOT_PERSISTED_METHODS = ("sync", "sync_to_profile")
+
 # Statuses worth keeping. "running" is stored as queued -- whatever was
 # running when the window went away has stopped -- and "pausing" as paused.
 PENDING_STATUSES = ("queued", "running", "paused", "pausing")
@@ -72,7 +78,8 @@ def serialize_pending(entries, limit=PENDING_JOB_LIMIT):
         if status not in PENDING_STATUSES:
             continue
         label = getattr(entry, "label", "") or entry.method
-        if entry.method in CROSS_PROFILE_METHODS:
+        if (entry.method in CROSS_PROFILE_METHODS
+                or entry.method in NOT_PERSISTED_METHODS):
             skipped.append(label)
             continue
         job = entry.job or []
@@ -122,7 +129,7 @@ def parse_pending(raw) -> list:
             continue
         if not isinstance(job, list) or not job:
             continue
-        if method in CROSS_PROFILE_METHODS:
+        if method in CROSS_PROFILE_METHODS or method in NOT_PERSISTED_METHODS:
             continue
         out.append(record)
     return out

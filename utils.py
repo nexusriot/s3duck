@@ -1219,6 +1219,11 @@ def scan_local_tree(root, *, strict=False) -> dict:
             try:
                 stat = os.stat(full)
             except FileNotFoundError:
+                # Vanished since the listing: genuinely gone. A symlink whose
+                # target is missing (on an unmounted drive, say) is not --
+                # dropped from a strict scan, its remote copy got deleted.
+                if strict and os.path.lexists(full):
+                    raise
                 continue
             except OSError:
                 if strict:
