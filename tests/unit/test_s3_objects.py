@@ -865,6 +865,19 @@ class BucketSettingsRenderTests(unittest.TestCase):
         def get_bucket_acceleration(self):
             return "Enabled"
 
+        def get_public_access_block(self):
+            return {"BlockPublicAcls": True, "IgnorePublicAcls": True,
+                    "BlockPublicPolicy": False, "RestrictPublicBuckets": False}
+
+        def get_bucket_logging(self):
+            return {"target_bucket": "logs", "target_prefix": "bkt/"}
+
+        def get_bucket_replication(self):
+            return {"role": "arn:aws:iam::1:role/r", "rules": [
+                {"id": "r1", "status": "Enabled", "prefix": "a/", "tags": [],
+                 "destination": "arn:aws:s3:::dst", "storage_class": "",
+                 "delete_markers": ""}]}
+
     def test_every_document_is_fetched_once(self):
         payload = main_window.BucketSettingsDialog.read_documents(
             self._DocModel())
@@ -877,6 +890,9 @@ class BucketSettingsRenderTests(unittest.TestCase):
         self.assertEqual(payload["acceleration"], "Enabled")
         self.assertEqual(len(payload["events"]), 1)
         self.assertNotIn("policy_error", payload)
+        self.assertTrue(payload["public_access"]["BlockPublicAcls"])
+        self.assertEqual(payload["logging"]["target_bucket"], "logs")
+        self.assertEqual(payload["replication"]["rules"][0]["id"], "r1")
 
     def test_one_failure_does_not_hide_the_others(self):
         class _Failing(BucketSettingsRenderTests._DocModel):

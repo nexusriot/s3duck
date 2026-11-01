@@ -2,6 +2,7 @@
 throwaway bucket, and the event-loop pumping that makes asynchronous workers
 testable."""
 
+import atexit
 import contextlib
 import os
 import sys
@@ -258,13 +259,28 @@ class GuiServerCase(unittest.TestCase):
         return sorted(model.item(i).text() for i in range(model.rowCount()))
 
     def await_transfers(self, timeout=WORKER_TIMEOUT):
-        """Wait for the transfer queue to drain."""
+        """Wait for the transfer queue to drain, and for what it set off.
+
+        A finished job that changed the listing schedules a refresh on a
+        zero-delay timer, which starts a navigation thread after the queue
+        is already empty. Returning on "queue empty" alone let a test end
+        with that thread running, and when it was the last test in the
+        process the interpreter exited under it: "QThread: Destroyed while
+        thread is still running", and a green run that exits 139.
+        """
         self.pump(
             lambda: not self.window.transfers_active()
             and not self.window._transfer_queue,
             timeout=timeout,
             what="the transfer queue to drain",
         )
+        # Let the zero-delay timers fire, then wait out the listing they start.
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(POLL)
+        self.pump(lambda: not _busy_threads(self.window), timeout=timeout,
+                  what="the refresh after the transfers")
 
     def queue_statuses(self):
         """Every queue entry's final status, newest last."""
@@ -360,6 +376,34 @@ _CLOSED = []
 
 # The window every class shares unless it asked for its own; see setUpClass.
 _SHARED = None
+
+
+def _busy_threads(window):
+    """The window's background threads that are still running."""
+    threads = [getattr(window, name, None) for name in (
+        "thread", "_nav_thread", "_bucket_enter_thread", "_watch_thread")]
+    threads.extend(getattr(window, "_nav_orphan_threads", ()))
+    pane = getattr(window, "second_pane", None)
+    threads.append(getattr(pane, "_thread", None))
+    return [th for th in threads
+            if th is not None and window._thread_is_running(th)]
+
+
+@atexit.register
+def _join_shared_window():
+    """Join the shared window's threads before the interpreter tears down.
+
+    It is never closed (see close_window), so nothing else would: a thread a
+    late timer started after the last test would otherwise outlive the
+    window and abort the process with a passing run already reported.
+    """
+    if _SHARED is None:
+        return
+    try:
+        _SHARED._shutdown_threads()
+        _SHARED.second_pane.shutdown()
+    except Exception:
+        pass
 
 
 def _shared_window(profile_fields):

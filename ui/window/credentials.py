@@ -39,6 +39,11 @@ class CredentialsMixin:
         # Before the name changes: the location is stored per profile, so the
         # one being left behind has to record where it was first.
         self._save_last_location()
+        self._park_paused_for_profile_switch()
+        # The edits are of this account's objects, through its connection.
+        self.stop_external_edits()
+        self._pending_restore = []
+        self._queue_panel.hide_restore_offer()
 
         self.profile_name = prof.name
 
@@ -66,6 +71,11 @@ class CredentialsMixin:
             getattr(prof, "credential_process", "") or "")
         self.set_accent(getattr(prof, "color", ""))
         self.data_model.binding_cache.clear()
+        if getattr(self.data_model, "sse_c_key", b""):
+            # A key chosen for one account's objects is not a default for
+            # the next account's.
+            self.data_model.set_sse_c_key(b"")
+            self.log("SSE-C key cleared with the profile switch")
         self._clear_undo_delete()
         self._clipboard = None
 
@@ -98,8 +108,13 @@ class CredentialsMixin:
         if self.watch_active():
             self.stop_watch()
         self._load_watch_config()
+        if getattr(self, "actUseTrash", None) is not None:
+            self.actUseTrash.blockSignals(True)
+            self.actUseTrash.setChecked(self.trash_enabled())
+            self.actUseTrash.blockSignals(False)
         self.navigate(show_loading=True)
         self.update_window_title()
+        self.offer_pending_restore()
 
         if old_profile and old_profile != self.profile_name:
             self.log(f"Profile switched: {old_profile} → {self.profile_name}")

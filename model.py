@@ -18,6 +18,7 @@ from s3.common import (  # noqa: F401  (re-exported: model is the front door)
     local_name_is_writable, plan_prefix_download, prefix_of, run_parallel,
     safe_local_path,
 )
+from s3.access import AccessMixin
 from s3.binding import BindingMixin
 from s3.bucket_admin import BucketAdminMixin
 from s3.copy import CopyMixin
@@ -25,6 +26,7 @@ from s3.delete import DeleteMixin
 from s3.download import DownloadMixin
 from s3.listing import ListingMixin
 from s3.object_admin import ObjectAdminMixin
+from s3.reports import ReportsMixin
 from s3.upload import UploadMixin
 from core.entries import FSObjectType, Item  # noqa: F401  (re-exported)
 from core import endpoints as _endpoints
@@ -69,6 +71,8 @@ class Model(
     DeleteMixin,
     BucketAdminMixin,
     ObjectAdminMixin,
+    AccessMixin,
+    ReportsMixin,
 ):
     # Parallel multipart threads per transfer; user-tunable at runtime via
     # set_transfer_concurrency ("Transfer settings…" in the UI).
@@ -96,6 +100,18 @@ class Model(
         "GetObjectTagging", "PutObjectTagging",
         "GetObjectAcl", "PutObjectAcl", "GetObjectAttributes",
     )
+
+    # Operations that carry a customer-provided key (SSE-C). Every read of
+    # such an object needs the key as much as the write did, and a ranged GET
+    # or a HEAD without it is refused like any other.
+    SSE_C_OPERATIONS = (
+        "GetObject", "HeadObject", "PutObject", "CreateMultipartUpload",
+        "UploadPart", "CompleteMultipartUpload", "GetObjectAttributes",
+        "SelectObjectContent",
+    )
+    # The copy calls need the key twice: once to read the source and once to
+    # encrypt the destination.
+    SSE_C_COPY_OPERATIONS = ("CopyObject", "UploadPartCopy")
 
     DEFAULT_MULTIPART_THRESHOLD_MB = 16
     DEFAULT_MULTIPART_CHUNKSIZE_MB = 8
@@ -195,6 +211,9 @@ class Model(
         # Requester-pays buckets refuse every read that does not opt in to
         # being billed for it, so without this such a bucket is unusable.
         self.requester_pays = bool(requester_pays)
+        # A customer-provided encryption key (32 raw bytes), held for this
+        # session only; see set_sse_c_key.
+        self.sse_c_key = b""
 
         # A CDN or custom domain in front of this bucket. Public and presigned
         # links are shown against it instead of the raw endpoint.
@@ -509,6 +528,8 @@ class Model(
     raise_on_delete_errors = staticmethod(_objects.raise_on_delete_errors)
 
     build_search_matcher = staticmethod(_search.build_search_matcher)
+    # Tag / Content-Type lookups one recursive search may spend.
+    MAX_SEARCH_PROBES = 2000
 
 
 

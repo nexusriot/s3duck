@@ -51,9 +51,68 @@ def build_profile_sync_job(actions, source_prefix, dest_prefix) -> list:
         elif kind == "delete_remote":
             rows.append(("delete", "", dest_prefix + rel))
     return rows
+def build_profile_copy_job(items, dest_prefix) -> list:
+    """
+    ``(src_key, dst_key, is_folder)`` rows copying *items* under *dest_prefix*.
+
+    ``items`` are the ``(name, key, is_folder)`` targets every selection
+    produces; a folder lands as ``dest_prefix + name/``.
+    """
+    prefix = str(dest_prefix or "")
+    rows = []
+    for name, src_key, is_folder in items or []:
+        name = str(name or "").rstrip("/")
+        if not name:
+            continue
+        if is_folder:
+            rows.append((src_key, prefix + name + "/", True))
+        else:
+            rows.append((src_key, prefix + name, False))
+    return rows
+def same_store(left, right) -> bool:
+    """
+    Whether two connections address the same bucket of the same account.
+
+    Two profiles can do that: an alias with the same keys, or the window
+    switched to the profile the second pane is already showing. A "move to
+    another profile" between them is a move within one bucket, and has to
+    obey the same overlap rule as any other.
+    """
+    def ident(model):
+        endpoint = (getattr(model, "profile_endpoint_url", "")
+                    or getattr(model, "endpoint_url", "") or "")
+        return (str(endpoint).rstrip("/").lower(),
+                str(getattr(model, "bucket", "") or ""),
+                str(getattr(model, "access_key", "") or ""))
+    return ident(left) == ident(right)
+
+
+def move_overlap(rows):
+    """
+    The first ``(src, dst)`` of a move whose destination overlaps a source.
+
+    Copying a folder into itself and then deleting the source deletes the
+    copy with it; moving an object onto its own key copies it in place and
+    then deletes the only copy. ``rows`` are ``(src, dst, is_folder, …)``.
+    """
+    rows = list(rows or [])
+    sources = {row[0] for row in rows}
+    folders = [row[0] for row in rows if row[2]]
+    for src, dst, is_folder, *_rest in rows:
+        if dst in sources:
+            return src, dst
+        inside = next((key for key in folders if dst.startswith(key)), None)
+        if inside is not None:
+            return inside, dst
+        if is_folder and any(key.startswith(dst) for key in sources):
+            return src, dst
+    return None
+
+
 # Jobs that hold a live connection to another profile, so they cannot be
 # reconstructed from persisted history.
-CROSS_PROFILE_METHODS = ("copy_to_profile", "sync_to_profile")
+CROSS_PROFILE_METHODS = ("copy_to_profile", "sync_to_profile",
+                         "move_to_profile")
 def serialize_location(bucket, prefix) -> str:
     """
     A browsing location as one settings string, or "" in bucket-list mode.

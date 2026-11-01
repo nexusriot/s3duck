@@ -68,6 +68,8 @@ class PropertiesWindow(DialogDismissMixin, QDialog):
         self.storageClass = QLabel()
         self.restoreStatus = QLabel()
         self.objectLock = QLabel()
+        self.encryption = QLabel()
+        self.replication = QLabel()
         self.publicUrl = QLineEdit()
         self.publicUrl.setReadOnly(True)
 
@@ -86,6 +88,8 @@ class PropertiesWindow(DialogDismissMixin, QDialog):
         display_etag = ""
         display_storage_class = ""
         display_restore = ""
+        display_encryption = ""
+        display_replication = ""
         display_public_url = ""
 
         is_folder = bool(key) and key.endswith("/")
@@ -101,6 +105,10 @@ class PropertiesWindow(DialogDismissMixin, QDialog):
                 display_storage_class = resp.get("StorageClass") or "STANDARD"
                 display_restore = self.model.parse_restore_status(
                     resp.get("Restore"))
+                display_encryption = describe_encryption(resp)
+                # PENDING / COMPLETED / FAILED on a source, REPLICA on the
+                # copy; absent when no rule applies to this object.
+                display_replication = str(resp.get("ReplicationStatus") or "")
                 # head_object already carries the exact byte count, so a single
                 # object needs no extra listing call at all.
                 content_length = resp.get("ContentLength")
@@ -129,6 +137,8 @@ class PropertiesWindow(DialogDismissMixin, QDialog):
         self.eTag.setText(display_etag)
         self.storageClass.setText(display_storage_class)
         self.restoreStatus.setText(display_restore or "—")
+        self.encryption.setText(display_encryption or "—")
+        self.replication.setText(display_replication or "—")
         if is_folder:
             self.objectLock.setText("—")
         self.publicUrl.setText(display_public_url)
@@ -239,5 +249,22 @@ class PropertiesWindow(DialogDismissMixin, QDialog):
         layout.addRow(QLabel("Storage class"), self.storageClass)
         layout.addRow(QLabel("Restore"), self.restoreStatus)
         layout.addRow(QLabel("Object Lock"), self.objectLock)
+        layout.addRow(QLabel("Encryption"), self.encryption)
+        layout.addRow(QLabel("Replication"), self.replication)
         layout.addRow(QLabel("Public URL"), self.publicUrl)
         self.formGroupBox.setLayout(layout)
+
+
+def describe_encryption(head) -> str:
+    """How an object is encrypted at rest, from its HEAD."""
+    head = head or {}
+    if head.get("SSECustomerAlgorithm"):
+        return (f"SSE-C ({head['SSECustomerAlgorithm']}, key MD5 "
+                f"{head.get('SSECustomerKeyMD5') or '?'})")
+    sse = head.get("ServerSideEncryption") or ""
+    if sse == "aws:kms" or sse == "aws:kms:dsse":
+        key = head.get("SSEKMSKeyId") or "the AWS managed key"
+        return f"SSE-KMS ({key})"
+    if sse:
+        return f"SSE-S3 ({sse})"
+    return ""

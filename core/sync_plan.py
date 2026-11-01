@@ -6,6 +6,7 @@ in as "left" and "right".
 """
 
 import fnmatch
+import posixpath
 import re
 
 
@@ -60,6 +61,19 @@ def build_exclude_matcher(patterns):
         return False
 
     return _match
+def local_form(rel) -> str:
+    """
+    The relative local path a remote rel is written to.
+
+    Mirrors safe_local_path: backslashes are separators, a leading slash is
+    dropped, and empty or "." components collapse, so the key "p//x" is the
+    local file "x". Comparing the raw rels instead made a download sync with
+    delete fetch such a file and then delete it as an extra in the same run.
+    """
+    text = str(rel or "").replace("\\", "/").lstrip("/")
+    return posixpath.normpath(text) if text else ""
+
+
 def build_sync_plan(local_entries, remote_entries, *, direction,
                     delete_extra=False, tolerance=SYNC_MTIME_TOLERANCE_SEC,
                     exclude=None):
@@ -83,16 +97,25 @@ def build_sync_plan(local_entries, remote_entries, *, direction,
         source, dest = remote_entries, local_entries
         transfer, delete_action = "download", "delete_local"
 
+    # Where each source rel lands at the destination. Only a download
+    # rewrites rels; an upload's key is the local rel verbatim.
+    if direction == "download":
+        landing = {rel: local_form(rel) for rel in source}
+    else:
+        landing = {rel: rel for rel in source}
+    claimed = set(landing.values())
+
     actions = []
     for rel in sorted(source):
         if is_excluded(rel):
             continue
         src_size, src_mtime = source[rel]
-        if rel not in dest:
+        target = landing[rel]
+        if target not in dest:
             actions.append({"action": transfer, "rel": rel,
                             "size": src_size, "reason": "missing at destination"})
             continue
-        dst_size, dst_mtime = dest[rel]
+        dst_size, dst_mtime = dest[target]
         if int(src_size) != int(dst_size):
             actions.append({"action": transfer, "rel": rel,
                             "size": src_size, "reason": "size differs"})
@@ -104,7 +127,7 @@ def build_sync_plan(local_entries, remote_entries, *, direction,
                             "size": src_size, "reason": "up to date"})
 
     for rel in sorted(dest):
-        if rel in source or is_excluded(rel):
+        if rel in claimed or is_excluded(rel):
             continue
         size = dest[rel][0]
         if delete_extra:
@@ -167,3 +190,25 @@ def summarize_sync_plan(actions) -> dict:
             total_bytes += int(entry.get("size") or 0)
     counts["bytes"] = total_bytes
     return counts
+
+
+# A download watch may delete local files on its own only up to this many,
+# or this share of the folder, per pass -- whichever is larger.
+LOCAL_DELETE_FLOOR = 5
+LOCAL_DELETE_RATIO = 0.1
+
+
+def local_delete_guard(actions, local_count, floor=LOCAL_DELETE_FLOOR,
+                       ratio=LOCAL_DELETE_RATIO, action="delete_local"):
+    """
+    ``(allowed, deletes)``: may an unattended pass delete what it plans to?
+
+    A download mirror deletes local files whose objects are gone. One
+    mistaken prefix, an emptied bucket or a listing that came back short
+    would otherwise turn the next tick into deleting the whole folder, with
+    nobody at the keyboard. A pass over the threshold is refused and the
+    watch stops, so the user reviews it in Sync instead.
+    """
+    deletes = sum(1 for a in actions or [] if a.get("action") == action)
+    limit = max(int(floor), int(int(local_count or 0) * float(ratio)))
+    return deletes <= limit, deletes

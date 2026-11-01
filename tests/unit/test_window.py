@@ -2489,10 +2489,10 @@ class WatchModeTests(unittest.TestCase):
         with patch.object(main_window.MainWindow, "start_sync",
                           lambda _s, a, l, p, d, bucket="": started.append(
                               (a, l, p, d, bucket))):
-            win._on_watch_planned([
+            win._on_watch_planned({"plan": [
                 {"action": "skip", "rel": "a.txt", "size": 1},
                 {"action": "upload", "rel": "b.txt", "size": 2},
-            ], None)
+            ], "local_count": 1}, None)
         self.assertEqual(len(started), 1)
         self.assertEqual([e["rel"] for e in started[0][0]], ["b.txt"])
         self.assertEqual(started[0][3], "upload")
@@ -2514,7 +2514,8 @@ class WatchModeTests(unittest.TestCase):
                           lambda _s, a, l, p, d, bucket="": started.append(
                               bucket)):
             win._on_watch_planned(
-                [{"action": "upload", "rel": "b.txt", "size": 2}], None)
+                {"plan": [{"action": "upload", "rel": "b.txt", "size": 2}]},
+                None)
         self.assertEqual(started, [config["bucket"]])
 
     def test_an_all_skip_pass_queues_nothing(self):
@@ -2525,8 +2526,8 @@ class WatchModeTests(unittest.TestCase):
         started = []
         with patch.object(main_window.MainWindow, "start_sync",
                           lambda *a: started.append(a)):
-            win._on_watch_planned([{"action": "skip", "rel": "a", "size": 1}],
-                                  None)
+            win._on_watch_planned(
+                {"plan": [{"action": "skip", "rel": "a", "size": 1}]}, None)
         self.assertEqual(started, [])
 
     def test_a_failed_comparison_is_logged_not_raised(self):
@@ -2547,7 +2548,8 @@ class WatchModeTests(unittest.TestCase):
         with patch.object(main_window.MainWindow, "start_sync",
                           lambda *a: started.append(a)):
             win._on_watch_planned(
-                [{"action": "upload", "rel": "b.txt", "size": 2}], None)
+                {"plan": [{"action": "upload", "rel": "b.txt", "size": 2}]},
+                None)
         self.assertEqual(started, [])
 
     def test_a_tick_is_skipped_while_the_queue_is_busy(self):
@@ -2639,7 +2641,9 @@ class DualPaneTests(unittest.TestCase):
         """REGRESSION: the pane read ``item.t`` from the listing, an
         attribute Item has never had, so every remote listing in the second
         pane died with an AttributeError before it could be shown."""
-        pane = types.SimpleNamespace(_thread=None, _worker=None, _show=Mock())
+        pane = types.SimpleNamespace(_thread=None, _worker=None, _show=Mock(),
+                                     _listing_for="here", _refresh_again=False,
+                                     view_target=lambda: "here")
         main_window.SecondPane._on_listed(
             pane,
             [Item("folder", FSObjectType.FOLDER, "", 0),
@@ -3351,6 +3355,9 @@ class _QueueHarness(main_window.TransferQueueMixin):
     def _start_transfer(self, entry):
         self.started.append(entry)
 
+    def _persist_queue(self):
+        pass
+
     def load_transfer_history(self):
         return self.history
 
@@ -3495,6 +3502,7 @@ class OverwriteRouteTests(unittest.TestCase):
         dlg.destination_bucket.return_value = "dest"
         dlg.destination_prefix.return_value = "p/"
         dlg.selected_profile.return_value = profile
+        dlg.move_requested.return_value = False
         destination = object()
         with patch("main_window.CrossProfileCopyDialog", return_value=dlg), \
              patch("main_window.build_profile_model", return_value=destination):

@@ -31,10 +31,13 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Install the libraries Qt's offscreen plugin links against
+        # The last three are QtMultimedia's: without them the media preview's
+        # import fails and its tests skip rather than run.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1 \
+            libpulse0 libgssapi-krb5-2 libxrandr2
 
       - name: Install Python dependencies (pinned)
         if: matrix.qt == 'pinned'
@@ -75,10 +78,13 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Install the libraries Qt's offscreen plugin links against
+        # The last three are QtMultimedia's: without them the media preview's
+        # import fails and its tests skip rather than run.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1 \
+            libpulse0 libgssapi-krb5-2 libxrandr2
 
       - name: Install Python dependencies
         run: |

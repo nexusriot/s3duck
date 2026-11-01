@@ -512,6 +512,12 @@ class DebianPackagingTests(unittest.TestCase):
         and without it every bundled icon renders blank."""
         self.assertTrue(self.RUNTIME_ONLY <= self._depends())
 
+    def test_the_multimedia_module_is_recommended(self):
+        """The preview import-guards QtMultimedia; audio and video fall back
+        to the default application without it, so it is a Recommends."""
+        self.assertIn("python3-pyqt6.qtmultimedia", self._recommends())
+        self.assertNotIn("python3-pyqt6.qtmultimedia", self._depends())
+
     def test_the_pdf_module_is_a_dependency(self):
         """The preview import-guards QtPdf, so a missing package degrades
         silently rather than failing loudly."""

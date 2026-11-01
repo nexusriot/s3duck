@@ -306,8 +306,23 @@ class ObjectAdminMixin:
             self.rebind_bucket(log_fn=log_fn)
             _do()
 
+    def refuse_presign_with_sse_c(self):
+        """
+        A presigned link cannot be minted while an SSE-C key is set.
+
+        The key is a header, so it is signed into the link: whoever opens it
+        would have to send the raw key, which is the one thing a link exists
+        to avoid. A link that can only ever answer SignatureDoesNotMatch is
+        refused here with the reason instead.
+        """
+        if getattr(self, "sse_c_key", b""):
+            raise ValueError(
+                "A shareable link cannot carry an SSE-C key; clear the key "
+                "(Tools → Customer encryption key) to make one.")
+
     def presigned_get_url(self, key: str, expires_sec: int = 3600) -> str:
         """Return a temporary download (HTTP GET) URL for an object."""
+        self.refuse_presign_with_sse_c()
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
         return self.client.generate_presigned_url(
@@ -323,6 +338,7 @@ class ObjectAdminMixin:
         e.g. `curl --upload-file localfile "<url>"`.
         """
         self._guard_write()
+        self.refuse_presign_with_sse_c()
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
         return self.client.generate_presigned_url(

@@ -60,6 +60,7 @@ bucket is a probe rather than a constructor argument.
         m.session_token = self.session_token
         m.read_only = self.read_only
         m.requester_pays = self.requester_pays
+        m.sse_c_key = getattr(self, "sse_c_key", b"")
         m.public_base_url = self.public_base_url
         m.proxy_url = self.proxy_url
         m.ca_bundle = self.ca_bundle
@@ -179,6 +180,76 @@ bucket is a probe rather than a constructor argument.
         self._register_ranged_checksum_guard(client)
         if self.requester_pays:
             self._register_requester_pays(client)
+        if getattr(self, "sse_c_key", b""):
+            self._register_sse_c(client)
+        return client
+
+    def set_sse_c_key(self, key):
+        """
+        Use *key* (32 raw bytes) for every object read and write, or b"" to stop.
+
+        Never stored: a key written to the settings file next to the
+        credentials would protect the objects exactly as well as the
+        credentials already do, which is the thing SSE-C exists to improve
+        on. The client is rebuilt so the hooks match.
+        """
+        key = bytes(key or b"")
+        if key and len(key) != 32:
+            raise ValueError("An SSE-C key is 32 bytes (AES-256).")
+        self.sse_c_key = key
+        self._client = None
+
+    def _register_sse_c(self, client):
+        """
+        Add the customer key to every call that reads or writes object data.
+
+        The same hook as requester-pays and for the same reason: the managed
+        transfer paths build their own requests. botocore computes the key's
+        MD5 itself. Server-managed encryption is dropped from the same
+        requests, because S3 refuses a write that asks for both.
+        """
+        key = self.sse_c_key
+
+        def _add(params, **_kwargs):
+            if not isinstance(params, dict):
+                return
+            params.pop("ServerSideEncryption", None)
+            params.pop("SSEKMSKeyId", None)
+            params.pop("BucketKeyEnabled", None)
+            params.setdefault("SSECustomerAlgorithm", "AES256")
+            params.setdefault("SSECustomerKey", key)
+
+        def _add_copy(params, **kwargs):
+            _add(params, **kwargs)
+            if isinstance(params, dict):
+                params.setdefault("CopySourceSSECustomerAlgorithm", "AES256")
+                params.setdefault("CopySourceSSECustomerKey", key)
+
+        def _accepted(operation, handler):
+            # An older SDK's CompleteMultipartUpload has no SSE-C members,
+            # and an unknown parameter is refused before anything is sent.
+            try:
+                members = set(client.meta.service_model.operation_model(
+                    operation).input_shape.members)
+            except Exception:
+                return None
+
+            def run(params, **kwargs):
+                handler(params, **kwargs)
+                if isinstance(params, dict):
+                    for name in [n for n in params if n.startswith(
+                            ("SSECustomer", "CopySourceSSECustomer"))]:
+                        if name not in members:
+                            params.pop(name)
+            return run
+
+        for operations, handler in ((self.SSE_C_OPERATIONS, _add),
+                                    (self.SSE_C_COPY_OPERATIONS, _add_copy)):
+            for operation in operations:
+                hook = _accepted(operation, handler)
+                if hook is not None:
+                    client.meta.events.register(
+                        f"provide-client-params.s3.{operation}", hook)
         return client
 
     def _register_ranged_checksum_guard(self, client):

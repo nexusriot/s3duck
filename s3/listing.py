@@ -5,6 +5,7 @@ import botocore.exceptions
 from core.entries import FSObjectType, Item
 from core.errors import TransferCancelled
 from core.naming import as_epoch
+from core.search import content_type_matches, parse_tag_filter, tags_match
 
 
 def expecting_region(exc) -> str:
@@ -423,7 +424,32 @@ class ListingMixin:
         """
         if not self.bucket:
             raise ValueError("Bucket is empty; select a bucket first")
+        filters = dict(filters)
+        wanted_tags = parse_tag_filter(filters.pop("tags", "") or "")
+        wanted_type = str(filters.pop("content_type", "") or "").strip()
         matches = self.build_search_matcher(query, **filters)
+        # Tags and Content-Type are not in a listing: each candidate costs a
+        # request, so they only ever narrow what the cheap filters already
+        # found, and the walk stops at a fixed number of such requests.
+        self.last_search_probe_limited = False
+        probes = {"n": 0}
+
+        def _metadata_ok(key):
+            if not wanted_tags and not wanted_type:
+                return True
+            if probes["n"] >= self.MAX_SEARCH_PROBES:
+                self.last_search_probe_limited = True
+                return None
+            if wanted_type:
+                probes["n"] += 1
+                head = self.client.head_object(Bucket=self.bucket, Key=key)
+                if not content_type_matches(head.get("ContentType"), wanted_type):
+                    return False
+            if wanted_tags:
+                probes["n"] += 1
+                if not tags_match(self.get_object_tags(key), wanted_tags):
+                    return False
+            return True
 
         def _fetch():
             res = []
@@ -438,6 +464,11 @@ class ListingMixin:
                     size = int(obj.get("Size") or 0)
                     modified = obj.get("LastModified")
                     if not matches(key, size, modified):
+                        continue
+                    verdict = _metadata_ok(key)
+                    if verdict is None:
+                        return res
+                    if not verdict:
                         continue
                     res.append((key, size, modified))
                     if max_results and len(res) >= int(max_results):
@@ -455,6 +486,30 @@ class ListingMixin:
                 log_fn(f"Region error searching '{prefix}': {exc}")
             self.rebind_bucket(log_fn=log_fn)
             return _fetch()
+
+    def list_prefix_versions(self, prefix="", cancel_event=None) -> list:
+        """
+        Every version and delete marker under *prefix*, as flat dicts with
+        ``key`` added to list_object_versions' fields.
+        """
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        out = []
+        paginator = self.client.get_paginator("list_object_versions")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix or ""):
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+            for marker, group in ((False, "Versions"), (True, "DeleteMarkers")):
+                for v in page.get(group) or []:
+                    out.append({
+                        "key": v.get("Key") or "",
+                        "version_id": v.get("VersionId") or "null",
+                        "last_modified": v.get("LastModified"),
+                        "size": 0 if marker else int(v.get("Size") or 0),
+                        "is_latest": bool(v.get("IsLatest")),
+                        "is_delete_marker": marker,
+                    })
+        return out
 
     def list_tree(self, prefix: str = "", cancel_event=None, log_fn=None) -> dict:
         """

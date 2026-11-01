@@ -1,4 +1,5 @@
-"""Lifecycle, CORS, policy, encryption and Object Lock for one bucket.
+"""Lifecycle, CORS, policy, encryption, access, logging, replication and
+Object Lock for one bucket.
 """
 
 import json
@@ -9,7 +10,11 @@ from PyQt6.QtWidgets import (
     QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTabWidget,
     QVBoxLayout, QWidget,
 )
+from core.policy_templates import grants_public_access, merge_statements
+from core.replication import describe_replication_rule
 from model import Model as DataModel
+from s3.access import PUBLIC_ACCESS_FLAGS
+from ui.dialogs.access import PolicyTemplateDialog
 from utils import run_with_progress
 
 
@@ -168,6 +173,9 @@ class BucketSettingsDialog(QDialog):
         self.tabs.addTab(self._build_bucket(), "Encryption && tags")
         self.tabs.addTab(self._build_website(), "Website")
         self.tabs.addTab(self._build_events(), "Events")
+        self.tabs.addTab(self._build_access(), "Access")
+        self.tabs.addTab(self._build_logging(), "Logging")
+        self.tabs.addTab(self._build_replication(), "Replication")
         self.tabs.addTab(self._build_lock(), "Object Lock")
 
         close_btn = QPushButton("Close")
@@ -253,8 +261,12 @@ class BucketSettingsDialog(QDialog):
         self._btn_policy_save = QPushButton("Save to bucket")
         self._btn_policy_save.clicked.connect(self._save_policy)
         self._btn_policy_save.setEnabled(False)
+        self._btn_policy_template = QPushButton("Insert template…")
+        self._btn_policy_template.clicked.connect(lambda: self.insert_policy_template())
+        self._btn_policy_template.setEnabled(False)
         row = QHBoxLayout()
         row.addWidget(self._policy_edit)
+        row.addWidget(self._btn_policy_template)
         row.addStretch(1)
         row.addWidget(self._btn_policy_save)
         layout = QVBoxLayout(page)
@@ -408,6 +420,96 @@ class BucketSettingsDialog(QDialog):
         self._site_status.setText("Saved.")
         self.reload()
 
+    def _build_access(self):
+        page = QWidget()
+        labels = {
+            "BlockPublicAcls": "Block new public ACLs",
+            "IgnorePublicAcls": "Ignore existing public ACLs",
+            "BlockPublicPolicy": "Block new public bucket policies",
+            "RestrictPublicBuckets": "Restrict access to buckets with a public policy",
+        }
+        self._pab = {}
+        form = QVBoxLayout()
+        for flag in PUBLIC_ACCESS_FLAGS:
+            box = QCheckBox(f"{labels[flag]}  ({flag})")
+            box.setEnabled(self._writable)
+            self._pab[flag] = box
+            form.addWidget(box)
+        self._pab_status = QLabel("")
+        self._pab_status.setWordWrap(True)
+        save = QPushButton("Save Block Public Access")
+        save.clicked.connect(lambda: self.save_public_access_block())
+        save.setEnabled(self._writable)
+        remove = QPushButton("Remove (use the account setting)")
+        remove.clicked.connect(lambda: self.remove_public_access_block())
+        remove.setEnabled(self._writable)
+        self._btn_pab_save, self._btn_pab_remove = save, remove
+        acl = QPushButton("Bucket ACL…")
+        acl.clicked.connect(lambda: self._mw.edit_bucket_acl(self))
+        row = QHBoxLayout()
+        row.addWidget(acl)
+        row.addStretch(1)
+        row.addWidget(remove)
+        row.addWidget(save)
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel(
+            "Block Public Access overrides ACLs and policies that would make "
+            "this bucket public. Turning a flag off is what lets a public "
+            "grant take effect, so the save asks first."))
+        layout.addLayout(form)
+        layout.addWidget(self._pab_status)
+        layout.addStretch(1)
+        layout.addLayout(row)
+        return page
+
+    def _build_logging(self):
+        page = QWidget()
+        self._log_bucket = QLineEdit()
+        self._log_bucket.setPlaceholderText("target bucket (blank = logging off)")
+        self._log_prefix = QLineEdit()
+        self._log_prefix.setPlaceholderText(f"logs/{self._model.bucket}/")
+        for widget in (self._log_bucket, self._log_prefix):
+            widget.setReadOnly(not self._writable)
+        self._log_status = QLabel("")
+        self._log_status.setWordWrap(True)
+        save = QPushButton("Save to bucket")
+        save.clicked.connect(lambda: self.save_logging())
+        save.setEnabled(self._writable)
+        self._btn_log_save = save
+        self._logging_was = {}
+        form = QFormLayout()
+        form.addRow(QLabel("Deliver logs to"), self._log_bucket)
+        form.addRow(QLabel("Key prefix"), self._log_prefix)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(save)
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel(
+            "Server access logging writes one record per request into another "
+            "bucket. Never point it at this bucket itself: every log write is "
+            "a request that gets logged too."))
+        layout.addLayout(form)
+        layout.addWidget(self._log_status)
+        layout.addStretch(1)
+        layout.addLayout(row)
+        return page
+
+    def _build_replication(self):
+        page = QWidget()
+        self._replication = QLabel("")
+        self._replication.setWordWrap(True)
+        self._replication.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel(
+            "Replication rules, read-only: each one names an IAM role and a "
+            "destination this app cannot validate, and a wrong one quietly "
+            "stops replicating. Each object's replication status is shown "
+            "in its Properties."))
+        layout.addWidget(self._replication)
+        layout.addStretch(1)
+        return page
+
     def _build_lock(self):
         page = QWidget()
         self._lock_status = QLabel("")
@@ -439,6 +541,9 @@ class BucketSettingsDialog(QDialog):
             ("website", model.get_bucket_website),
             ("events", model.get_bucket_notifications),
             ("acceleration", model.get_bucket_acceleration),
+            ("public_access", model.get_public_access_block),
+            ("logging", model.get_bucket_logging),
+            ("replication", model.get_bucket_replication),
         ):
             try:
                 out[name] = fetch()
@@ -508,6 +613,7 @@ class BucketSettingsDialog(QDialog):
                 + ("" if policy else " No bucket policy is set."))
 
         self._apply_bucket_documents(payload)
+        self._apply_access_documents(payload)
 
         if payload.get("lock_error"):
             self._lock_status.setText(
@@ -583,6 +689,141 @@ class BucketSettingsDialog(QDialog):
                 f"<b>{kind}</b> → {target}"
                 + (f"<br>&nbsp;&nbsp;{', '.join(names)}" if names else ""))
         self._events.setText("<br>".join(lines))
+
+    def _apply_access_documents(self, payload):
+        """Render the access, logging and replication tabs."""
+        # A tab whose read failed shows empty controls, and saving those
+        # would write "everything off" over a setting nobody has seen.
+        pab_read = not payload.get("public_access_error")
+        log_read = not payload.get("logging_error")
+        for button in (self._btn_pab_save, self._btn_pab_remove):
+            button.setEnabled(self._writable and pab_read)
+        self._btn_log_save.setEnabled(self._writable and log_read)
+        for box in self._pab.values():
+            box.setEnabled(self._writable and pab_read)
+        if not pab_read:
+            self._pab_status.setText(
+                f"Could not read it, so it cannot be saved from here: "
+                f"{payload['public_access_error']}")
+        else:
+            flags = payload.get("public_access")
+            for flag, box in self._pab.items():
+                box.setChecked(bool((flags or {}).get(flag)))
+            self._pab_status.setText(
+                "No bucket-level setting: the account-level Block Public "
+                "Access applies, which this app cannot see."
+                if flags is None else "")
+
+        logging = dict(payload.get("logging") or {})
+        self._logging_was = logging
+        self._log_bucket.setText(logging.get("target_bucket", ""))
+        self._log_prefix.setText(logging.get("target_prefix", ""))
+        if payload.get("logging_error"):
+            self._log_status.setText(
+                f"Could not read it, so it cannot be saved from here: "
+                f"{payload['logging_error']}")
+        else:
+            self._log_status.setText(
+                "" if logging else "Access logging is off.")
+
+        if payload.get("replication_error"):
+            self._replication.setText(
+                f"Could not read them: {payload['replication_error']}")
+            return
+        replication = dict(payload.get("replication") or {})
+        rules = list(replication.get("rules") or [])
+        if not rules:
+            self._replication.setText("No replication rules are configured.")
+            return
+        lines = [f"Role: {replication.get('role') or '?'}"]
+        lines += [describe_replication_rule(rule) for rule in rules]
+        self._replication.setText("\n".join(lines))
+
+    def public_access_flags(self) -> dict:
+        return {flag: box.isChecked() for flag, box in self._pab.items()}
+
+    def save_public_access_block(self):
+        if not self._btn_pab_save.isEnabled():
+            return False
+        flags = self.public_access_flags()
+        if not all(flags.values()) and QMessageBox.question(
+                self, "Block Public Access",
+                "Save with some protections off?\n\nA public ACL or policy "
+                f"on {self._model.bucket} would then take effect.") \
+                != QMessageBox.StandardButton.Yes:
+            return False
+        try:
+            self._model.put_public_access_block(flags, log_fn=self._mw.log)
+        except Exception as exc:
+            QMessageBox.critical(self, "Block Public Access", str(exc))
+            return False
+        self._pab_status.setText("Saved.")
+        return True
+
+    def remove_public_access_block(self):
+        if not self._btn_pab_remove.isEnabled():
+            return False
+        if QMessageBox.question(
+                self, "Block Public Access",
+                f"Remove the bucket-level setting from {self._model.bucket}?"
+                "\n\nOnly the account-level setting will protect it.") \
+                != QMessageBox.StandardButton.Yes:
+            return False
+        try:
+            self._model.delete_public_access_block(log_fn=self._mw.log)
+        except Exception as exc:
+            QMessageBox.critical(self, "Block Public Access", str(exc))
+            return False
+        for box in self._pab.values():
+            box.setChecked(False)
+        self._pab_status.setText("Removed.")
+        return True
+
+    def save_logging(self):
+        if not self._btn_log_save.isEnabled():
+            return False
+        target = self._log_bucket.text().strip()
+        if not target and self._logging_was.get("target_bucket") and \
+                QMessageBox.question(
+                    self, "Access logging",
+                    f"Turn off access logging for {self._model.bucket}? It "
+                    f"currently goes to {self._logging_was['target_bucket']}.") \
+                != QMessageBox.StandardButton.Yes:
+            return False
+        if target and target == self._model.bucket:
+            QMessageBox.warning(
+                self, "Access logging",
+                "Logging a bucket into itself logs every log write, forever. "
+                "Choose another bucket.")
+            return False
+        try:
+            self._model.put_bucket_logging(
+                target, self._log_prefix.text().strip(), log_fn=self._mw.log)
+        except Exception as exc:
+            QMessageBox.critical(self, "Access logging", str(exc))
+            return False
+        self._log_status.setText("Saved." if target else "Access logging is off.")
+        return True
+
+    def insert_policy_template(self, statements=None):
+        """Merge a reviewed statement into the policy being edited."""
+        if statements is None:
+            dlg = PolicyTemplateDialog(self, self._model.bucket,
+                                       self._model.current_folder or "")
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return False
+            statements = dlg.statements()
+        try:
+            text = merge_statements(self._policy_text.toPlainText(), statements)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Bucket policy", str(exc))
+            return False
+        self._policy_text.setPlainText(text)
+        self._policy_status.setText(
+            "Template inserted — review it, then Save to bucket."
+            + (" It grants public access." if grants_public_access(statements)
+               else ""))
+        return True
 
     def _refresh_rules(self):
         self._rules_list.clear()
@@ -682,6 +923,7 @@ class BucketSettingsDialog(QDialog):
     def _toggle_policy_edit(self, enabled):
         self._policy_text.setReadOnly(not enabled)
         self._btn_policy_save.setEnabled(bool(enabled))
+        self._btn_policy_template.setEnabled(bool(enabled))
 
     def _save_policy(self):
         text = self._policy_text.toPlainText().strip()

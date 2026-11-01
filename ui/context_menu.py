@@ -23,7 +23,9 @@ import os
 
 from PyQt6.QtGui import QAction
 
+from core.trash import in_trash
 from model import FSObjectType
+from ui.dialogs.reports import select_format
 from ui.constants import UP_ENTRY_LABEL
 from utils import themed_icon
 
@@ -144,6 +146,9 @@ def _listing_menu(window, builder, ixs, entry, raw_name, upload_path, key,
             builder.add("tab-new", "folder_24px.svg",
                         "Open in new tab (Ctrl+T)",
                         window.open_selection_in_new_tab, mutates=False)
+            builder.add("document-revert", "refresh_24px.svg",
+                        "Restore folder to a point in time…",
+                        lambda: window.open_point_in_time(key))
         builder.add("emblem-downloads", "download_24px.svg", "Download",
                     window.download, mutates=False)
         if is_file:
@@ -152,12 +157,23 @@ def _listing_menu(window, builder, ixs, entry, raw_name, upload_path, key,
             builder.add("document-open-recent", "document_24px.svg",
                         "Versions…", lambda: window.show_versions(key),
                         mutates=False)
+            builder.add("accessories-text-editor", "edit_24px.svg",
+                        "Edit in external app",
+                        lambda: window.edit_externally(key))
+            if select_format(key):
+                builder.add("edit-find", "document_24px.svg",
+                            "Query with S3 Select…",
+                            lambda: window.query_with_select(key),
+                            mutates=False)
             builder.add("insert-link", "copy_24px.svg", "Share link…",
                         lambda: window.share_link(key), mutates=False)
             builder.add("insert-link", "copy_24px.svg",
                         "Make public + copy URL…",
                         lambda: window.make_public_and_copy(key))
         builder.add("edit-delete", "delete_24px.svg", "Delete", window.delete)
+        if in_trash(model.current_folder or ""):
+            builder.add("edit-undo", "refresh_24px.svg", "Restore from trash",
+                        lambda: window.restore_from_trash())
 
         builder.separator()
         builder.add("edit-copy", "copy_24px.svg", "Copy (Ctrl+C)",
@@ -199,6 +215,11 @@ def _listing_menu(window, builder, ixs, entry, raw_name, upload_path, key,
             # object's context menu", so this is where it belongs.
             builder.add("channel-secure", "ok_24px.svg", "Legal hold…",
                         lambda: window.toggle_legal_hold(key))
+            builder.add("channel-secure", "ok_24px.svg", "Retention…",
+                        lambda: window.set_object_retention_ui(key))
+            builder.add("dialog-password", "settings_24px.svg",
+                        "Permissions (ACL)…",
+                        lambda: window.edit_object_acl(key), mutates=False)
 
     if raw_name and entry and raw_name.rstrip("/") != UP_ENTRY_LABEL:
         builder.add("document-properties", "puzzle_24px.svg", "Properties",

@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 from core.formatting import _scaled_bar_values
+from core.queue_state import sse_c_md5
 
 
 class _QEntry:
@@ -41,22 +42,41 @@ class _QEntry:
         self.error_transient = False
         # How many times this job has been re-queued automatically.
         self.auto_retries = 0
+        # Indices of job rows the worker reported finished; a resume runs
+        # only the rest.
+        self.done_items = set()
+        # Every row the job has had, across pauses: a resume trims job, but
+        # undo-delete and history describe the whole thing.
+        self.full_job = list(job or [])
+        # MD5 of the SSE-C key the job was queued under ("" for none).
+        self.sse_c_md5 = sse_c_md5(getattr(source_model, "sse_c_key", b"") or b"")
+        # Set by Pause: the cancellation that follows ends the run as
+        # "paused" rather than "cancelled".
+        self.pause_requested = False
+        # Called once the job really ends (not on a pause); see transfers.
+        self.on_finished = None
 
 
 class _QueueRow(QWidget):
     cancel_requested = pyqtSignal(int)
     retry_requested = pyqtSignal(int)
     details_requested = pyqtSignal(int)
+    pause_requested = pyqtSignal(int)
+    resume_requested = pyqtSignal(int)
 
     _OP_ICONS = {
         "upload": "⬆", "download": "⬇", "delete": "✕",
         "copy": "⇆", "move": "➜", "delete_buckets": "✕",
         "empty_buckets": "∅", "sync": "⇅", "undelete": "↺",
         "set_tags": "🏷", "zip_download": "🗜",
+        "copy_to_profile": "⇆", "move_to_profile": "➜",
+        "restore_versions": "⏱",
+        "sync_to_profile": "⇅",
     }
     _STATUS_COLORS = {
         "queued": "#e4e4e8", "running": "#bbdefb",
         "done": "#c8e8c8", "cancelled": "#ffe0b2", "error": "#ffcdd2",
+        "paused": "#fff3b0", "pausing": "#fff3b0",
     }
 
     def __init__(self, entry, parent=None):
@@ -86,6 +106,19 @@ class _QueueRow(QWidget):
         self._cancel_btn.setToolTip("Cancel")
         self._cancel_btn.clicked.connect(lambda: self.cancel_requested.emit(self._entry_id))
 
+        self._pause_btn = QPushButton("⏸")
+        self._pause_btn.setFixedSize(22, 22)
+        self._pause_btn.setToolTip("Pause — keeps what is already transferred")
+        self._pause_btn.clicked.connect(
+            lambda: self.pause_requested.emit(self._entry_id))
+
+        self._resume_btn = QPushButton("▶")
+        self._resume_btn.setFixedSize(22, 22)
+        self._resume_btn.setToolTip("Resume")
+        self._resume_btn.clicked.connect(
+            lambda: self.resume_requested.emit(self._entry_id))
+        self._resume_btn.hide()
+
         self._retry_btn = QPushButton("↻")
         self._retry_btn.setFixedSize(22, 22)
         self._retry_btn.setToolTip("Retry")
@@ -108,6 +141,8 @@ class _QueueRow(QWidget):
         row.addWidget(self._status)
         row.addWidget(self._bar, 1)
         row.addWidget(self._details_btn)
+        row.addWidget(self._pause_btn)
+        row.addWidget(self._resume_btn)
         row.addWidget(self._retry_btn)
         row.addWidget(self._cancel_btn)
 
@@ -126,6 +161,10 @@ class _QueueRow(QWidget):
             self._bar.setRange(0, 1)
             self._bar.setValue(1 if status == "done" else 0)
             self._cancel_btn.setEnabled(False)
+        else:
+            self._cancel_btn.setEnabled(True)
+        self._pause_btn.setVisible(status in ("queued", "running"))
+        self._resume_btn.setVisible(status == "paused")
         # Only an unfinished job is worth re-running.
         self._retry_btn.setVisible(status in ("cancelled", "error"))
         self._details_btn.setVisible(status == "error")
@@ -142,6 +181,12 @@ class TransferQueuePanel(QWidget):
     details_requested = pyqtSignal(int)
     retry_all_requested = pyqtSignal()
     history_requested = pyqtSignal()
+    pause_requested = pyqtSignal(int)
+    resume_requested = pyqtSignal(int)
+    pause_all_requested = pyqtSignal()
+    resume_all_requested = pyqtSignal()
+    restore_requested = pyqtSignal()
+    discard_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -160,6 +205,14 @@ class TransferQueuePanel(QWidget):
         retry_btn.setFlat(True)
         retry_btn.clicked.connect(self.retry_all_requested)
 
+        pause_all_btn = QPushButton("Pause all")
+        pause_all_btn.setFlat(True)
+        pause_all_btn.clicked.connect(self.pause_all_requested)
+
+        resume_all_btn = QPushButton("Resume all")
+        resume_all_btn.setFlat(True)
+        resume_all_btn.clicked.connect(self.resume_all_requested)
+
         history_btn = QPushButton("History")
         history_btn.setFlat(True)
         history_btn.clicked.connect(self.history_requested)
@@ -168,6 +221,8 @@ class TransferQueuePanel(QWidget):
         hdr_row.setContentsMargins(0, 0, 0, 0)
         hdr_row.setSpacing(0)
         hdr_row.addWidget(hdr, 1)
+        hdr_row.addWidget(pause_all_btn)
+        hdr_row.addWidget(resume_all_btn)
         hdr_row.addWidget(retry_btn)
         hdr_row.addWidget(history_btn)
         hdr_row.addWidget(clear_btn)
@@ -185,10 +240,29 @@ class TransferQueuePanel(QWidget):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
+        # Unfinished work from the last session. A bar rather than a modal:
+        # the window may be opening headless, behind another one, or for a
+        # profile whose jobs the user no longer wants, and none of those is a
+        # reason to stop and ask.
+        self._restore_bar = QWidget()
+        restore_row = QHBoxLayout(self._restore_bar)
+        restore_row.setContentsMargins(6, 2, 6, 2)
+        self._restore_label = QLabel("")
+        self._restore_label.setWordWrap(True)
+        restore_btn = QPushButton("Restore")
+        restore_btn.clicked.connect(self.restore_requested)
+        discard_btn = QPushButton("Discard")
+        discard_btn.clicked.connect(self.discard_requested)
+        restore_row.addWidget(self._restore_label, 1)
+        restore_row.addWidget(restore_btn)
+        restore_row.addWidget(discard_btn)
+        self._restore_bar.hide()
+
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         lay.addLayout(hdr_row)
+        lay.addWidget(self._restore_bar)
         lay.addWidget(scroll)
 
         self.hide()
@@ -198,6 +272,8 @@ class TransferQueuePanel(QWidget):
         row.cancel_requested.connect(self.cancel_requested)
         row.retry_requested.connect(self.retry_requested)
         row.details_requested.connect(self.details_requested)
+        row.pause_requested.connect(self.pause_requested)
+        row.resume_requested.connect(self.resume_requested)
         self._rows[entry.entry_id] = row
         count = self._content_lay.count()
         self._content_lay.insertWidget(count - 1, row)
@@ -207,6 +283,30 @@ class TransferQueuePanel(QWidget):
         row = self._rows.get(entry.entry_id)
         if row is not None:
             row.set_status(entry.status)
+
+    def remove_entry(self, entry_id):
+        row = self._rows.pop(entry_id, None)
+        if row is not None:
+            self._content_lay.removeWidget(row)
+            row.deleteLater()
+        if not self._rows and self._restore_bar.isHidden():
+            self.hide()
+
+    def show_restore_offer(self, text):
+        self._restore_label.setText(text)
+        self._restore_bar.show()
+        self.show()
+
+    def hide_restore_offer(self):
+        self._restore_bar.hide()
+        if not self._rows:
+            self.hide()
+
+    def restore_offer_visible(self) -> bool:
+        return not self._restore_bar.isHidden()
+
+    def restore_offer_text(self) -> str:
+        return self._restore_label.text()
 
     def update_byte_progress(self, entry_id: int, done: int, total: int):
         row = self._rows.get(entry_id)
@@ -222,5 +322,5 @@ class TransferQueuePanel(QWidget):
             row = self._rows.pop(eid)
             self._content_lay.removeWidget(row)
             row.deleteLater()
-        if not self._rows:
+        if not self._rows and self._restore_bar.isHidden():
             self.hide()

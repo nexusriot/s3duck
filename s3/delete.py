@@ -232,6 +232,19 @@ class DeleteMixin:
             self.rebind_bucket(log_fn=log_fn)
             _do()
 
+    def mark_deleted(self, key):
+        """
+        DeleteObject on exactly *key*, never a prefix walk.
+
+        delete() reads a trailing "/" as "everything under this folder"; a
+        point-in-time restore that must remove a folder *marker* would have
+        removed the folder's whole contents with it.
+        """
+        self._guard_write()
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        self.client.delete_object(Bucket=self.bucket, Key=key)
+
     def delete(self, key, log_fn=None, cancel_event=None) -> bool:
         """Delete one object, or every object under a prefix (batched)."""
         self._guard_write()

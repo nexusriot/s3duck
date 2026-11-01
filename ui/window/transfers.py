@@ -9,6 +9,10 @@ from PyQt6.QtCore import QThread, QTimer, pyqtSlot
 from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox, QSystemTrayIcon
 from core.formatting import format_completion_notification
 from core.locations import CROSS_PROFILE_METHODS
+from core.queue_state import (
+    ITEM_RESUMABLE_METHODS, describe_pending, parse_pending, remaining_job,
+    restore_rows, serialize_pending, split_restorable, sse_c_md5,
+)
 from core.naming import _human_bytes
 from datetime import datetime
 from model import plan_prefix_download, prefix_of
@@ -32,12 +36,23 @@ class TransferQueueMixin:
     """The transfer queue: what is running, what is waiting, what failed."""
 
     def _transfer_origin(self):
+        """
+        Which account a job was queued against, without naming its secret.
+
+        The access key identifies a profile with fixed keys. A profile whose
+        keys are minted -- by its credential_process or from a ~/.aws
+        profile -- gets a new key id with every session, so it is identified
+        by where the keys come from instead; otherwise every restart of an
+        SSO profile threw its saved and paused jobs away as "foreign".
+        """
         model = self.data_model
+        source = (getattr(self, "credential_process", "")
+                  or getattr(self, "aws_profile", ""))
+        identity = f"minted:{source}" if source else str(model.access_key or "")
         return {"profile": self.profile_name,
                 "endpoint": model.profile_endpoint_url,
                 "region": model.profile_region,
-                "credential_id": hashlib.sha256(
-                    str(model.access_key or "").encode()).hexdigest()}
+                "credential_id": hashlib.sha256(identity.encode()).hexdigest()}
 
     def transfers_active(self) -> bool:
         if self.thread is None:
@@ -152,7 +167,7 @@ class TransferQueueMixin:
     def assign_thread_operation(self, method, job, need_refresh=True,
                                 source_bucket="", dest_model=None,
                                 source_model=None, if_none_match=False,
-                                origin=None):
+                                origin=None, start_paused=False):
         if not job:
             return
         if not self._credentials_ok_for_transfer():
@@ -197,12 +212,17 @@ class TransferQueueMixin:
 
         self._queue_panel.add_entry(entry)
 
-        if self.transfers_active():
+        if start_paused:
+            entry.status = "paused"
+            self._queue_panel.update_status(entry)
+            self.log(f"paused {method}: {label}")
+        elif self.transfers_active():
             self._transfer_queue.append(entry)
             self.log(f"queued {method}: {label}")
-            return
-
-        self._start_transfer(entry)
+        else:
+            self._start_transfer(entry)
+        self._persist_queue()
+        return entry
 
     def _queue_build_label(self, method: str, job) -> str:
         n = len(job)
@@ -217,6 +237,8 @@ class TransferQueueMixin:
             "set_tags": "Tag",
             "zip_download": "Zip",
             "copy_to_profile": "Copy to profile",
+            "move_to_profile": "Move to profile",
+            "restore_versions": "Restore to a point in time",
             "sync_to_profile": "Sync to profile",
         }.get(method, method.capitalize())
         return f"{verb} {n} item(s)"
@@ -228,8 +250,10 @@ class TransferQueueMixin:
 
         self.log(f"starting {method}")
         entry.status = "running"
+        entry.pause_requested = False
         self._queue_panel.update_status(entry)
         self._active_entry = entry
+        self._persist_queue()
 
         self.thread = QThread(self)
         # Its own boto3 client, so a region rebind inside the transfer cannot
@@ -262,6 +286,7 @@ class TransferQueueMixin:
 
         self.worker.error.connect(_record_error)
         self.worker.details.connect(_record_details)
+        self.worker.item_done.connect(entry.done_items.add)
 
         def _transfer_ui_start(prefix_text: str):
             self.pb.reset()
@@ -338,6 +363,15 @@ class TransferQueueMixin:
         def _on_worker_finished(cancelled: bool):
             if self._closing:
                 return
+            if cancelled and entry.pause_requested:
+                # Not an outcome: the job is parked, keeps its queue row and
+                # is not written to history until it really ends.
+                entry.pause_requested = False
+                entry.status = "paused"
+                self.log(f"{method} paused")
+                self._queue_panel.update_status(entry)
+                self._persist_queue()
+                return
             if cancelled:
                 self.log(f"{method} cancelled")
                 entry.status = "cancelled"
@@ -355,6 +389,15 @@ class TransferQueueMixin:
             self._batch_stats[entry.status] = (
                 self._batch_stats.get(entry.status, 0) + 1)
             self._queue_panel.update_status(entry)
+            self._persist_queue()
+            # Follow-up work a feature hung on the job: a two-way sync
+            # records what both sides now agree on, however the run ended.
+            finished = getattr(entry, "on_finished", None)
+            if finished is not None:
+                try:
+                    finished(entry)
+                except Exception as exc:
+                    self.log(f"{method}: follow-up failed: {exc}")
 
             # _smooth_done only tracks byte-progress methods; for the rest it
             # still holds the previous transfer's total.
@@ -364,7 +407,7 @@ class TransferQueueMixin:
                 self._record_history(entry)
 
             if method == "delete" and entry.status == "done":
-                self._record_undoable_delete(entry.job)
+                self._record_undoable_delete(entry.full_job)
 
             if need_refresh:
                 QTimer.singleShot(0, lambda: self.navigate(force=True))
@@ -443,6 +486,8 @@ class TransferQueueMixin:
             # start once this one stops. (cancel_transfers aborts the whole
             # queue and stays on Esc / the toolbar Cancel button.)
             self.statusBar().showMessage("Canceling…", 2000)
+            # A Cancel pressed while it was pausing is still a Cancel.
+            self._active_entry.pause_requested = False
             try:
                 if self.worker is not None:
                     self.worker.cancel()
@@ -454,7 +499,219 @@ class TransferQueueMixin:
                 e.status = "cancelled"
                 self._transfer_queue.pop(i)
                 self._queue_panel.update_status(e)
+                self._persist_queue()
                 return
+        entry = self._queue_entries.get(entry_id)
+        if entry is not None and entry.status == "paused":
+            entry.status = "cancelled"
+            self._queue_panel.update_status(entry)
+            self.log(f"{entry.method} cancelled while paused")
+            self._persist_queue()
+
+    def pause_entry(self, entry_id):
+        """
+        Park a job without losing what it has done.
+
+        A running job is stopped through the ordinary cancellation, which
+        already leaves a resumable upload's parts and a ranged download's
+        ``.s3duckpart`` in place; the rows the worker reported finished are
+        dropped when it resumes. A queued job simply stops waiting.
+        """
+        entry = self._queue_entries.get(int(entry_id))
+        if entry is None:
+            return False
+        if entry is self._active_entry and entry.status == "running":
+            entry.pause_requested = True
+            entry.status = "pausing"
+            self._queue_panel.update_status(entry)
+            try:
+                if self.worker is not None:
+                    self.worker.cancel()
+            except Exception:
+                pass
+            return True
+        if entry.status == "queued" and entry in self._transfer_queue:
+            self._transfer_queue.remove(entry)
+            entry.status = "paused"
+            self._queue_panel.update_status(entry)
+            self.log(f"{entry.method} paused")
+            self._persist_queue()
+            return True
+        return False
+
+    def resume_entry(self, entry_id):
+        """Put a paused job back in line, minus the rows it finished."""
+        entry = self._queue_entries.get(int(entry_id))
+        if entry is None or entry.status != "paused":
+            return False
+        if entry.sse_c_md5:
+            current = getattr(self.data_model, "sse_c_key", b"") or b""
+            if sse_c_md5(current) != entry.sse_c_md5:
+                self.statusBar().showMessage(
+                    "Set the SSE-C key this job was queued with first", 6000)
+                self.log(f"{entry.label}: not resumed, the SSE-C key does "
+                         "not match the one it was queued with")
+                return False
+            if entry.source_model is not None:
+                entry.source_model.set_sse_c_key(current)
+        if entry.method in ITEM_RESUMABLE_METHODS and entry.done_items:
+            entry.job = remaining_job(entry.job, entry.done_items)
+            entry.done_items = set()
+        entry.status = "queued"
+        self._queue_panel.update_status(entry)
+        self.log(f"resuming {entry.method}: {entry.label}")
+        if self.transfers_active():
+            self._transfer_queue.append(entry)
+            self._persist_queue()
+        else:
+            self._start_transfer(entry)
+        return True
+
+    def pause_all_transfers(self):
+        """Pause the queued jobs first, so none starts as the running one stops."""
+        for entry in list(self._transfer_queue):
+            self.pause_entry(entry.entry_id)
+        if self._active_entry is not None:
+            self.pause_entry(self._active_entry.entry_id)
+
+    def resume_all_transfers(self):
+        for entry in sorted(self._queue_entries.values(),
+                            key=lambda e: e.entry_id):
+            if entry.status == "paused":
+                self.resume_entry(entry.entry_id)
+
+    def paused_entries(self) -> list:
+        return [entry for entry in
+                sorted(self._queue_entries.values(), key=lambda e: e.entry_id)
+                if entry.status == "paused"]
+
+    def _pending_queue_key(self):
+        return self.store.profile_key("pending_queue")
+
+    def _persist_queue(self):
+        """
+        Write every unfinished job down, so a close or a crash loses nothing.
+
+        Frozen while the window shuts down: teardown marks the waiting jobs
+        cancelled and stops the running one, and recording *that* would
+        erase exactly the state this exists to keep.
+        """
+        if self._closing:
+            return
+        records, skipped = serialize_pending(self._queue_entries.values())
+        # The last session's jobs stay written down until the user answers
+        # the restore bar. Writing only the live queue erased them the moment
+        # any job of this session started, finished or was cancelled.
+        records = list(getattr(self, "_pending_restore", None) or []) + records
+        # Once per job: this runs on every queue change.
+        reported = self.__dict__.setdefault("_unpersisted_reported", set())
+        for label in skipped:
+            if label not in reported:
+                reported.add(label)
+                self.log(f"not kept across a restart (too large, or another "
+                         f"profile's connection): {label}")
+        key = self._pending_queue_key()
+        if records:
+            self.store.set(key, json.dumps(records))
+        else:
+            self.store.remove(key)
+        try:
+            self.settings.sync()
+        except Exception:
+            pass
+
+    def load_pending_queue(self) -> list:
+        return parse_pending(self.store.get_str(self._pending_queue_key(), ""))
+
+    def offer_pending_restore(self):
+        """Show the restore bar if the last session left work behind."""
+        records = self.load_pending_queue()
+        if not records:
+            self._queue_panel.hide_restore_offer()
+            return False
+        restorable, foreign = split_restorable(records, self._transfer_origin())
+        if foreign:
+            # Not offered -- replaying them against this connection could
+            # write to another account -- and not kept either: once the
+            # profile points elsewhere, nothing can ever restore them.
+            self.log(
+                f"dropped {len(foreign)} unfinished transfer(s) queued "
+                "against a different connection for this profile")
+        if not restorable:
+            self.store.remove(self._pending_queue_key())
+            self._queue_panel.hide_restore_offer()
+            return False
+        self._pending_restore = restorable
+        self._queue_panel.show_restore_offer(
+            describe_pending(restorable) + ".")
+        self.log(describe_pending(restorable))
+        return True
+
+    def restore_pending_queue(self):
+        """Queue the last session's unfinished jobs again."""
+        records = getattr(self, "_pending_restore", None) or []
+        self._pending_restore = []
+        self._queue_panel.hide_restore_offer()
+        if not records:
+            return 0
+        restored = 0
+        for record in records:
+            needs_key = record.get("sse_c_md5", "")
+            entry = self.assign_thread_operation(
+                record["method"], restore_rows(record["job"]),
+                need_refresh=bool(record.get("need_refresh", True)),
+                source_bucket=record.get("source_bucket") or "",
+                if_none_match=bool(record.get("if_none_match")),
+                origin=record.get("origin"),
+                # A job queued under an SSE-C key comes back paused: the key
+                # was never stored, and running it without one would write
+                # unencrypted objects or fail every read.
+                start_paused=bool(record.get("paused") or needs_key))
+            if entry is not None:
+                entry.sse_c_md5 = needs_key
+                restored += 1
+                if needs_key:
+                    self.log(f"{entry.label} needs the SSE-C key it was "
+                             f"queued with (MD5 {needs_key}); set it, then "
+                             "resume")
+        self.log(f"restored {restored} unfinished transfer(s)")
+        return restored
+
+    def discard_pending_queue(self):
+        self._pending_restore = []
+        self._queue_panel.hide_restore_offer()
+        # Only what this session has not queued itself is thrown away.
+        self._persist_queue()
+        self.log("discarded the last session's unfinished transfers")
+
+    def _park_paused_for_profile_switch(self):
+        """
+        Save this profile's paused jobs and take them off the panel.
+
+        They hold this account's connection; resuming one after the switch
+        would be correct, but a queue that mixes two accounts invites the
+        user to believe the visible profile is the one being written to.
+        They come back when this profile is opened again.
+        """
+        self._persist_queue()
+        parked = []
+        for entry in self.paused_entries():
+            records, _skipped = serialize_pending([entry])
+            if not records:
+                # Too large or holding another profile's connection, so not
+                # written down: taking it off the panel would delete it. It
+                # stays, still bound to the account it was queued against.
+                self.log(f"{entry.label} stays paused in the queue: it "
+                         "cannot be saved with the profile")
+                continue
+            parked.append(entry)
+            self._queue_entries.pop(entry.entry_id, None)
+            self._queue_panel.remove_entry(entry.entry_id)
+        if parked:
+            self.log(
+                f"{len(parked)} paused transfer(s) saved with profile "
+                f"{self.profile_name}")
+        return len(parked)
 
     def load_transfer_history(self) -> list:
         with self.store.group():
@@ -472,7 +729,7 @@ class TransferQueueMixin:
 
     def _record_history(self, entry, done_bytes=0):
         """Append a finished job to the persisted history, newest first."""
-        job = entry.job or []
+        job = entry.full_job or entry.job or []
         record = {
             "when": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "method": entry.method,
@@ -627,6 +884,7 @@ class TransferQueueMixin:
             e.status = "cancelled"
             self._queue_panel.update_status(e)
         self._transfer_queue.clear()
+        self._persist_queue()
 
         if not self.transfers_active() or self.worker is None:
             return

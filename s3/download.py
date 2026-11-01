@@ -286,6 +286,20 @@ class DownloadMixin:
                     log_fn(f"checksum ok ({algorithm}): {path}")
                 return True
 
+        encrypted_by = ""
+        if getattr(self, "sse_c_key", b"") or (head or {}).get(
+                "SSECustomerAlgorithm"):
+            encrypted_by = "SSE-C"
+        elif (head or {}).get("ServerSideEncryption") in ("aws:kms",
+                                                           "aws:kms:dsse"):
+            encrypted_by = "SSE-KMS"
+        if encrypted_by:
+            # The ETag of an SSE-C or SSE-KMS object is not the MD5 of its
+            # plaintext, so comparing would fail every such download.
+            if log_fn:
+                log_fn(f"checksum skipped ({encrypted_by} ETag is not an "
+                       f"MD5): {path}")
+            return True
         if not self.etag_is_md5(etag):
             verdict = self._verify_by_parts(path, key, etag, "", log_fn=log_fn)
             if verdict is not None:

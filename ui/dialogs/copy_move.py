@@ -159,9 +159,13 @@ class CrossProfileCopyDialog(QDialog):
         self._buttons.accepted.connect(self.accept)
         self._buttons.rejected.connect(self.reject)
 
+        self.move = QCheckBox(
+            "Delete the originals once every copy succeeds (move)")
+
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel(f"Copying {count} item(s)."))
         lay.addWidget(self.picker)
+        lay.addWidget(self.move)
         lay.addWidget(self.picker.note)
         lay.addWidget(self._buttons)
 
@@ -172,6 +176,9 @@ class CrossProfileCopyDialog(QDialog):
 
     def selected_profile(self):
         return self.picker.selected_profile()
+
+    def move_requested(self) -> bool:
+        return self.move.isChecked()
 
     def destination_bucket(self) -> str:
         return self.picker.destination_bucket()

@@ -232,6 +232,8 @@ class NavigationMixin:
 
         finally:
             self._end_model_reset_ui()
+        if self.thumbnail_view_active():
+            self.request_thumbnails()
 
     def change_current_folder(self, new_folder):
         self.data_model.prev_folder = self.data_model.current_folder

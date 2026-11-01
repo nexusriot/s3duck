@@ -66,3 +66,52 @@ def build_search_matcher(query: str = "", *, regex: bool = False,
         return True
 
     return _match
+
+
+def parse_tag_filter(text) -> list:
+    """
+    ``[(key, value_or_None)]`` from ``"team=infra, archived"``.
+
+    A bare name asks only that the tag exist; ``name=value`` asks for that
+    value. Commas or semicolons separate terms, so a value may contain
+    spaces ("owner=Jane Doe").
+    """
+    out = []
+    for part in re.split(r"[,;]", str(text or "")):
+        part = part.strip()
+        if not part:
+            continue
+        name, sep, value = part.partition("=")
+        name = name.strip()
+        if not name:
+            raise ValueError(f"A tag filter needs a tag name: {part!r}")
+        out.append((name, value.strip() if sep else None))
+    return out
+
+
+def tags_match(tag_set, wanted) -> bool:
+    """Every wanted term is satisfied by *tag_set* (S3's [{Key, Value}])."""
+    tags = {str(t.get("Key")): str(t.get("Value") or "")
+            for t in tag_set or []}
+    for name, value in wanted or []:
+        if name not in tags:
+            return False
+        if value is not None and tags[name] != value:
+            return False
+    return True
+
+
+def content_type_matches(content_type, wanted) -> bool:
+    """
+    Case-insensitive: "image/" or "image/*" matches every image type, a full
+    type matches itself, and parameters (";charset=...") are ignored.
+    """
+    wanted = str(wanted or "").strip().lower()
+    if not wanted:
+        return True
+    actual = str(content_type or "").split(";", 1)[0].strip().lower()
+    if wanted.endswith("/*"):
+        wanted = wanted[:-1]
+    if wanted.endswith("/"):
+        return actual.startswith(wanted)
+    return actual == wanted

@@ -1,8 +1,10 @@
 #!/usr/bin/python
 
 import sys
+import json
 import os
 import pathlib
+import time
 import urllib3
 from copy import deepcopy
 from PyQt6.QtGui import QIcon, QColor, QFont, QFontMetrics, QAction
@@ -76,6 +78,8 @@ def selected_row_index(row, item_count) -> int:
 READ_ONLY_BADGE = "read-only"
 INSECURE_BADGE = "TLS unverified"
 EXPIRED_BADGE = "expired"
+# The last connect from this machine was refused or timed out.
+UNREACHABLE_BADGE = "unreachable"
 
 # Badges are colour-coded by what they mean for the user: amber for a mode
 # worth knowing about, red for an actual exposure. Fixed colours rather than
@@ -83,6 +87,7 @@ EXPIRED_BADGE = "expired"
 BADGE_COLORS = {
     READ_ONLY_BADGE: QColor("#b26a00"),
     INSECURE_BADGE: QColor("#c62828"),
+    UNREACHABLE_BADGE: QColor("#c62828"),
     EXPIRED_BADGE: QColor("#c62828"),
 }
 
@@ -133,6 +138,59 @@ def profile_summary(item) -> str:
     return " · ".join(parts)
 
 
+def filter_profile_rows(items, text) -> list:
+    """
+    Indices of the profiles a filter text matches, in list order.
+
+    Matches the name, endpoint, region and pinned bucket, case-insensitively,
+    every word somewhere: "prod eu" finds "prod" in eu-west-1.
+    """
+    words = str(text or "").lower().split()
+    out = []
+    for index, item in enumerate(items):
+        haystack = " ".join(str(v or "") for v in (
+            item.name, item.url, item.region, item.bucket_name)).lower()
+        if all(word in haystack for word in words):
+            out.append(index)
+    return out
+
+
+def name_taken(items, name, exclude_index=-1) -> bool:
+    """Whether another profile (not the one at exclude_index) has *name*."""
+    wanted = str(name or "").strip()
+    return any(str(item.name or "").strip() == wanted
+               for index, item in enumerate(items) if index != exclude_index)
+
+
+def order_by_last_used(items, last_used) -> list:
+    """Most recently opened first; never-opened keep their relative order."""
+    def key(pair):
+        index, item = pair
+        return (-float((last_used or {}).get(item.name) or 0), index)
+    return [item for _i, item in sorted(enumerate(items), key=key)]
+
+
+def move_item(items, index, delta) -> int:
+    """Move items[index] by delta in place; returns its new index."""
+    target = index + delta
+    if not (0 <= index < len(items)) or not (0 <= target < len(items)):
+        return index
+    items[index], items[target] = items[target], items[index]
+    return target
+
+
+def describe_probe(probe) -> str:
+    """The tooltip line for a profile's last connection attempt."""
+    probe = probe or {}
+    state = probe.get("state")
+    when = probe.get("when") or ""
+    if state == "ok":
+        return f"Last connect: OK ({when})"
+    if state == "refused":
+        return f"Last connect FAILED ({when}): {probe.get('reason') or ''}"
+    return "Never connected from here"
+
+
 def profile_badges(item) -> list:
     """
     Safety flags, shown beside the name rather than inside the summary.
@@ -149,6 +207,8 @@ def profile_badges(item) -> list:
     expiry = expiry_badge(item)
     if expiry:
         badges.append(expiry)
+    if (getattr(item, "probe", None) or {}).get("state") == "refused":
+        badges.append(UNREACHABLE_BADGE)
     return badges
 
 
@@ -315,6 +375,10 @@ class SettingsItem:
         # bundle that makes a private certificate trustworthy.
         self.proxy_url = proxy_url
         self.ca_bundle = ca_bundle
+        # The last connect attempt from this machine; kept in its own
+        # settings key, not in the profile array, so it never travels in an
+        # export.
+        self.probe = None
 
 
 def get_current_dir():
@@ -348,8 +412,16 @@ class Profiles(QDialog):
             ask_passphrase=lambda prompt: self._ask_passphrase(
                 "Unlock credentials", prompt))
         self.items = []
+        # List row -> index into self.items; the filter shows a subset.
+        self._row_map = []
         vbox = QVBoxLayout(self)
         hbox = QHBoxLayout()
+
+        self.filterEdit = QLineEdit(self)
+        self.filterEdit.setPlaceholderText("Filter profiles…")
+        self.filterEdit.setClearButtonEnabled(True)
+        self.filterEdit.textChanged.connect(lambda _t: self.populate_list())
+        self.filterEdit.hide()
 
         self.listWidget = QListWidget(self)
         self.listWidget.setItemDelegate(ProfileRowDelegate(self.listWidget))
@@ -358,6 +430,14 @@ class Profiles(QDialog):
         self.btnAdd = QPushButton("Add", self)
         self.btnEdit = QPushButton("Edit", self)
         self.btnDelete = QPushButton("Delete", self)
+        self.btnUp = QPushButton("▲", self)
+        self.btnUp.setToolTip("Move up (Ctrl+Up)")
+        self.btnUp.setFixedWidth(32)
+        self.btnDown = QPushButton("▼", self)
+        self.btnDown.setToolTip("Move down (Ctrl+Down)")
+        self.btnDown.setFixedWidth(32)
+        self.btnUp.clicked.connect(lambda: self.move_selected(-1))
+        self.btnDown.clicked.connect(lambda: self.move_selected(1))
 
         self.btnRun.clicked.connect(self.onStart)
         self.btnAdd.clicked.connect(self.onAdd)
@@ -365,16 +445,20 @@ class Profiles(QDialog):
         self.btnDelete.clicked.connect(self.onDelete)
         # Buttons in a QDialog are autoDefault, so Enter anywhere fired the
         # first one (Add) instead of opening the selected profile.
-        for button in (self.btnRun, self.btnAdd, self.btnEdit, self.btnDelete):
+        for button in (self.btnRun, self.btnAdd, self.btnEdit, self.btnDelete,
+                       self.btnUp, self.btnDown):
             button.setAutoDefault(False)
             button.setDefault(False)
         self.main_window = None
 
+        vbox.addWidget(self.filterEdit)
         vbox.addWidget(self.listWidget)
         hbox.addWidget(self.btnAdd)
         hbox.addWidget(self.btnRun)
         hbox.addWidget(self.btnEdit)
         hbox.addWidget(self.btnDelete)
+        hbox.addWidget(self.btnUp)
+        hbox.addWidget(self.btnDown)
         self.btnEdit.setEnabled(False)
         self.btnDelete.setEnabled(False)
         self.btnRun.setEnabled(False)
@@ -393,8 +477,7 @@ class Profiles(QDialog):
             last_profile = self.settings.value("last_profile", "") or ""
         row = preselect_row(self.items, last_profile)
         if row >= 0:
-            self.listWidget.setCurrentIndex(
-                self.listWidget.model().index(row, 0))
+            self.select_item(row)
         self.listWidget.doubleClicked.connect(self.onStart)
 
         # Listening is best-effort: when another window already holds the
@@ -450,14 +533,17 @@ class Profiles(QDialog):
         wanted = str(self.startup.get("profile") or "")
         row = self.profile_row_for(wanted)
         if row < 0 and self.listWidget.count():
-            row = max(0, self.listWidget.currentRow())
+            # An index into self.items, not a list row: with a filter on,
+            # list row 0 is whichever profile the filter left at the top.
+            row = self._current_item_index()
+            if row < 0:
+                row = self._row_map[0]
         if row < 0:
             QMessageBox.information(
                 self, "Open location",
                 f"No profile is configured to open {location}.")
             return
-        self.listWidget.setCurrentIndex(
-            self.listWidget.model().index(row, 0))
+        self.select_item(row)
         self.pending_location = location
         self.onStart()
 
@@ -559,20 +645,99 @@ class Profiles(QDialog):
     def _current_item_index(self) -> int:
         model = self.listWidget.selectionModel()
         row = model.currentIndex().row() if model is not None else -1
-        return selected_row_index(row, len(self.items))
+        row = selected_row_index(row, len(self._row_map))
+        return self._row_map[row] if row >= 0 else -1
+
+    def select_item(self, index):
+        """Select the profile at items[index], clearing a filter that hides it."""
+        if index not in self._row_map and self.filterEdit.text():
+            self.filterEdit.clear()
+        if index in self._row_map:
+            self.listWidget.setCurrentIndex(
+                self.listWidget.model().index(self._row_map.index(index), 0))
 
     def select_last(self):
-        index = self.listWidget.model().index(
-            self.listWidget.count() - 1, 0
-        )
-        self.listWidget.setCurrentIndex(index)
+        self.select_item(len(self.items) - 1)
+
+    def _load_json(self, key) -> dict:
+        with SettingsStore(self.settings).group():
+            raw = self.settings.value(key, "") or ""
+        try:
+            data = json.loads(raw) if raw else {}
+        except ValueError:
+            data = {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_json(self, key, data):
+        with SettingsStore(self.settings).group():
+            self.settings.setValue(key, json.dumps(data))
+
+    def record_probe(self, item, ok, reason=""):
+        """Remember how the last connect to *item* went, for its row."""
+        probes = self._load_json("profile_probes")
+        probe = {"state": "ok" if ok else "refused",
+                 "when": time.strftime("%Y-%m-%d %H:%M"),
+                 "reason": str(reason or "")[:200]}
+        probes[item.name] = probe
+        self._save_json("profile_probes", probes)
+        item.probe = probe
+        if ok:
+            used = self._load_json("profile_last_used")
+            used[item.name] = time.time()
+            self._save_json("profile_last_used", used)
+        self.populate_list(keep_selection=True)
+
+    def _rename_profile_state(self, old, new):
+        for key in ("profile_probes", "profile_last_used"):
+            data = self._load_json(key)
+            if old in data:
+                data[new] = data.pop(old)
+                self._save_json(key, data)
+
+    def _forget_profile_state(self, name):
+        for key in ("profile_probes", "profile_last_used"):
+            data = self._load_json(key)
+            if data.pop(name, None) is not None:
+                self._save_json(key, data)
+
+    def move_selected(self, delta):
+        """Move the selected profile up or down; the order is what is saved."""
+        if self.filterEdit.text():
+            # A filtered view has no single meaning for "one place up".
+            return False
+        elem = self._current_item_index()
+        if elem < 0:
+            return False
+        target = move_item(self.items, elem, delta)
+        if target == elem:
+            return False
+        self.save_settings()
+        self.populate_list()
+        self.select_item(target)
+        return True
+
+    def sort_by_last_used(self):
+        current = self._current_item_index()
+        chosen = self.items[current] if current >= 0 else None
+        self.items = order_by_last_used(
+            self.items, self._load_json("profile_last_used"))
+        self.save_settings()
+        self.filterEdit.clear()
+        self.populate_list()
+        if chosen is not None:
+            self.select_item(self.items.index(chosen))
 
     def copy_profile(self):
         elem = self._current_item_index()
         if elem < 0:
             return
         item = deepcopy(self.items[elem])
-        item.name = "%s-copy" % item.name
+        base = "%s-copy" % item.name
+        name, n = base, 2
+        while name_taken(self.items, name):
+            name, n = f"{base}{n}", n + 1
+        item.name = name
+        item.probe = None
         self.items.append(item)
         self.save_settings()
         self.populate_list()
@@ -693,6 +858,7 @@ class Profiles(QDialog):
         if result is None and exc is None:
             return  # cancelled
         ok, reason = (False, str(exc)) if exc is not None else result
+        self.record_probe(item, ok, reason)
 
         msgBox = QMessageBox()
         msgBox.setWindowTitle("Profile check")
@@ -711,6 +877,10 @@ class Profiles(QDialog):
             and source is self.listWidget
         ):
             key = event.key()
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier \
+                    and key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+                self.move_selected(-1 if key == Qt.Key.Key_Up else 1)
+                return True
             handler = self.KEY_ACTIONS.get(key)
             if handler is not None:
                 getattr(self, handler)()
@@ -743,8 +913,11 @@ class Profiles(QDialog):
             export_action = QAction(
                 themed_icon("document-save", os.path.join(self.current_dir, "icons", "download_24px.svg")), "Export profiles…")
             menu.addAction(import_action)
+            sort_action = None
             if self.items:
                 menu.addAction(export_action)
+                sort_action = QAction("Sort by last used")
+                menu.addAction(sort_action)
             if ixs:
                 copy_profile_action = QAction(
                     themed_icon("edit-copy", os.path.join(
@@ -797,6 +970,9 @@ class Profiles(QDialog):
                 self.check_profile()
             if refresh_action is not None and clk == refresh_action:
                 self.refresh_credentials()
+            if sort_action is not None and clk == sort_action:
+                self.sort_by_last_used()
+                return True
             if clk == add_profile_action:
                 self.onAdd()
                 return True
@@ -838,6 +1014,9 @@ class Profiles(QDialog):
                     )
                 )
             self.settings.endArray()
+        probes = self._load_json("profile_probes")
+        for item in self.items:
+            item.probe = probes.get(item.name)
 
     def onStart(self):
         elem = self._current_item_index()
@@ -907,6 +1086,7 @@ class Profiles(QDialog):
             return  # cancelled
         ok = probed is True
         reason = str(exc) if exc is not None else None
+        self.record_probe(item, ok, reason)
 
         if ok:
             profile = ProfileSettings(
@@ -1109,20 +1289,36 @@ class Profiles(QDialog):
                 self.settings.setValue("ca_bundle", item.ca_bundle)
             self.settings.endArray()
 
-    def populate_list(self):
+    # The filter appears once the list stops fitting on one screen.
+    FILTER_THRESHOLD = 6
+
+    def populate_list(self, keep_selection=False):
+        chosen = self._current_item_index() if keep_selection else -1
+        self.filterEdit.setVisible(
+            len(self.items) >= self.FILTER_THRESHOLD
+            or bool(self.filterEdit.text()))
         self.listWidget.clear()
-        for item in self.items:
+        self._row_map = filter_profile_rows(self.items, self.filterEdit.text())
+        for index in self._row_map:
+            item = self.items[index]
             summary = profile_summary(item)
             badges = profile_badges(item)
             row = QListWidgetItem(f"{item.name}\n{summary}")
             row.setData(Qt.ItemDataRole.UserRole, badges)
             row.setData(Qt.ItemDataRole.UserRole + 1, item.color)
             # The row elides; the tooltip is where the whole truth stays.
-            row.setToolTip(" · ".join([summary] + badges))
+            row.setToolTip(" · ".join([summary] + badges) + "\n"
+                           + describe_probe(getattr(item, "probe", None)))
             self.listWidget.addItem(row)
+        if chosen >= 0:
+            self.select_item(chosen)
+        elif self._row_map and self.filterEdit.text():
+            self.listWidget.setCurrentRow(0)
+        self.on_elements_changed()
 
     def onAdd(self):
-        settings = SettingsWindow(self)
+        settings = SettingsWindow(
+            self, taken_names=[item.name for item in self.items])
         value = settings.exec()
         if value:
             crypto = self._crypto_or_warn()
@@ -1178,7 +1374,6 @@ class Profiles(QDialog):
             self.select_last()
 
     def onEdit(self):
-        index = self.listWidget.selectionModel().currentIndex()
         elem = self._current_item_index()
         if elem < 0:
             return
@@ -1210,7 +1405,10 @@ class Profiles(QDialog):
             item.proxy_url,
             item.ca_bundle,
         )
-        settings = SettingsWindow(self, settings=settings)
+        settings = SettingsWindow(
+            self, settings=settings,
+            taken_names=[other.name for i, other in enumerate(self.items)
+                         if i != elem])
         value = settings.exec()
         if value:
             (
@@ -1236,6 +1434,8 @@ class Profiles(QDialog):
             enc_access_key = crypto.encrypt(access_key)
             enc_secret_key = crypto.encrypt(secret_key)
             enc_session_token = crypto.encrypt(session_token or "")
+            if name != item.name:
+                self._rename_profile_state(item.name, name)
             self.items[elem] = SettingsItem(
                 name,
                 url,
@@ -1256,9 +1456,11 @@ class Profiles(QDialog):
                 proxy_url,
                 ca_bundle,
             )
+            self.items[elem].probe = self._load_json(
+                "profile_probes").get(name)
             self.save_settings()
             self.populate_list()
-            self.listWidget.setCurrentIndex(index)
+            self.select_item(elem)
 
     def onDelete(self):
         elem = self._current_item_index()
@@ -1272,12 +1474,17 @@ class Profiles(QDialog):
             qm.StandardButton.Yes | qm.StandardButton.No,
         )
         if ret == qm.StandardButton.Yes:
+            self._forget_profile_state(self.items[elem].name)
             del self.items[elem]
             self.save_settings()
             self.populate_list()
 
     @QtCore.pyqtSlot()
     def on_elements_changed(self):
+        movable = (bool(self.listWidget.selectedIndexes())
+                   and not self.filterEdit.text())
+        self.btnUp.setEnabled(movable)
+        self.btnDown.setEnabled(movable)
         self.btnRun.setEnabled(
             self.listWidget.count() > 0
             and bool(self.listWidget.selectedIndexes())
