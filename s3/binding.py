@@ -424,7 +424,10 @@ bucket is a probe rather than a constructor argument.
 
         candidates = []
         swapped = self.build_region_swapped_endpoint(endpoint, real)
-        if swapped:
+        # The rewrite is best-effort: on a dualstack or VPC host it yields a
+        # name that is not an endpoint of any region, and probing it only
+        # costs a DNS failure (or a timeout).
+        if swapped and aws_endpoint_region(swapped) == real:
             candidates.append(swapped)
         if endpoint not in candidates:
             candidates.append(endpoint)

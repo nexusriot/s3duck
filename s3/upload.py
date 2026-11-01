@@ -14,7 +14,7 @@ from s3.common import (
     _BotoProgressAdapter, _ProgressReader, client_accepts,
     drop_unsendable_checksum_args, run_parallel,
 )
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 
 class _UploadSourceChanged(IOError):
@@ -674,9 +674,11 @@ class UploadMixin:
         "ContentLanguage", "WebsiteRedirectLocation", "ServerSideEncryption",
         "SSEKMSKeyId", "BucketKeyEnabled",
     )
-    # A backend with no object tagging at all has no tags to lose.
-    NO_TAGGING_CODES = ("NotImplemented", "MethodNotAllowed",
-                        "UnsupportedOperation")
+    # A backend with no object tagging at all has no tags to lose, and one
+    # that answers "no tag set" for an untagged object has none either.
+    NO_TAGGING_CODES = ("NotImplemented", "XNotImplemented",
+                        "MethodNotAllowed", "UnsupportedOperation",
+                        "NoSuchTagSet", "NoSuchTagSetError")
 
     def _rewrite_params(self, key) -> tuple:
         """
@@ -720,10 +722,11 @@ class UploadMixin:
                     f"them would delete them: {exc}") from exc
             tag_set = []
         if tag_set:
-            # S3 wants the tag set as a url-encoded query string here.
+            # S3 wants the tag set as a url-encoded query string here; %20
+            # rather than '+' for a space, as _source_tagging does.
             params["Tagging"] = urlencode(sorted(
                 (str(tag.get("Key") or ""), str(tag.get("Value") or ""))
-                for tag in tag_set if tag.get("Key")))
+                for tag in tag_set if tag.get("Key")), quote_via=quote)
         return params, self.normalize_etag(head.get("ETag"))
 
     def put_object_body(self, key: str, data: bytes, *, if_match="",

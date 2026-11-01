@@ -1481,6 +1481,33 @@ class RangedDownloadIntegrityTests(unittest.TestCase):
         self.assertEqual(_run("v7"), 2, "did not resume the matching record")
         self.assertEqual(_run("v6"), 4, "resumed another version's record")
 
+    def test_a_version_pinned_download_writes_its_resume_record(self):
+        """The record was only ever written with an ETag, so a download
+        pinned by version alone started over after every interruption."""
+        payload = os.urandom(4096)
+
+        class _Versioned(_PinnedRangedClient):
+            def head_object(self, **kw):
+                return {"ContentLength": len(self.payload), "ETag": "",
+                        "VersionId": "v7"}
+
+        c = _Versioned(payload)
+        c.fail_on_chunk = 2048
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "big.bin")
+            m = self._model(c)
+            with self.assertRaises(Exception):
+                m.download_file("big.bin", out, tmp)
+            with open(out + Model.PART_SUFFIX + ".meta") as handle:
+                record = json.load(handle)
+            self.assertEqual(record["identity"]["version"], "v7")
+            self.assertEqual(record["chunks"], [0, 1])
+            c.requests.clear()
+            m.download_file("big.bin", out, tmp)
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(), payload)
+        self.assertEqual(len(c.requests), 2, "did not resume")
+
     def test_a_failed_head_never_takes_the_unpinned_ranged_path(self):
         """With no ETag there is nothing to pin the ranges to and nothing to
         key a resume record on, so the managed transfer — which pins its

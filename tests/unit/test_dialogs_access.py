@@ -189,6 +189,18 @@ class BucketSettingsTabTests(unittest.TestCase):
         self.assertEqual(model.calls, [])
         self.assertIn("cannot be saved", dlg._pab_status.text())
 
+    def test_a_cancelled_read_cannot_be_saved_over(self):
+        """The cancel/failure payload named only the first nine documents,
+        so Block Public Access came up unticked and saveable."""
+        dlg, model, _ = self._dialog(_DocModel())
+        dlg.apply_documents(dlg.unread_payload("the read was cancelled"))
+        self.assertFalse(dlg._btn_pab_save.isEnabled())
+        self.assertFalse(dlg._btn_pab_remove.isEnabled())
+        self.assertFalse(dlg._btn_log_save.isEnabled())
+        self.assertFalse(dlg.save_public_access_block())
+        self.assertEqual(model.calls, [])
+        self.assertIn("cancelled", dlg._replication.text())
+
     def test_a_refused_logging_write_is_reported(self):
         class _Refusing(_DocModel):
             def put_bucket_logging(self, *a, **kw):

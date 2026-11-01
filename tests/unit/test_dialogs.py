@@ -2433,6 +2433,26 @@ class PreviewEditFidelityTests(unittest.TestCase):
             "a.csv", b"x", if_match='"abc"', preserve_properties=True)
         self.assertNotIn("Tagging", client.calls_of("put_object")[0])
 
+    def test_no_tag_set_saves_as_untagged(self):
+        """Some backends answer an untagged object with an error rather than
+        an empty TagSet; that refused every editor save there."""
+        for code in ("NoSuchTagSet", "NoSuchTagSetError", "XNotImplemented"):
+            with self.subTest(code=code):
+                client = self._Client(
+                    tag_error=botocore.exceptions.ClientError(
+                        {"Error": {"Code": code, "Message": "no"}},
+                        "GetObjectTagging"))
+                self._model(client).put_object_body(
+                    "a.csv", b"x", if_match='"abc"', preserve_properties=True)
+                self.assertNotIn("Tagging", client.calls_of("put_object")[0])
+
+    def test_a_space_in_a_tag_is_sent_as_percent_20(self):
+        client = self._Client(tags=[{"Key": "Owner", "Value": "Data Team"}])
+        self._model(client).put_object_body(
+            "a.csv", b"x", if_match='"abc"', preserve_properties=True)
+        self.assertEqual(client.calls_of("put_object")[0]["Tagging"],
+                         "Owner=Data%20Team")
+
     def test_a_changed_object_is_refused_before_its_properties_are_copied(self):
         client = self._Client(head=dict(self._Client.HEAD, ETag='"other"'))
         with self.assertRaises(Model.PreconditionFailed):

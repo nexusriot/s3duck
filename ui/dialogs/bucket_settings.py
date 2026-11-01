@@ -581,7 +581,8 @@ class BucketSettingsDialog(QDialog):
 
     # Every document read_documents fetches, in the order it fetches them.
     DOCUMENTS = ("lifecycle", "cors", "policy", "lock", "encryption", "tags",
-                 "website", "events", "acceleration")
+                 "website", "events", "acceleration", "public_access",
+                 "logging", "replication")
 
     @staticmethod
     def read_documents(model) -> dict:

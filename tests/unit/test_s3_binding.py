@@ -461,6 +461,19 @@ class OffRegionBucketTests(unittest.TestCase):
         self.assertEqual(_credential_region(m.presigned_get_url("k")),
                          "eu-west-1")
 
+    def test_a_rewrite_that_names_no_region_is_not_probed(self):
+        """The rewrite of a dualstack host is s3.eu-west-1.us-east-1…, which
+        is no endpoint at all; probing it was a DNS failure per bucket."""
+        m = make_model()
+        probed = []
+        m._bucket_region = lambda *_a, **_k: "eu-west-1"
+        m._make_client = lambda **kw: probed.append(kw["endpoint_url"])
+        m._can_list_bucket = lambda *_a: False
+        endpoint = "https://s3.dualstack.us-east-1.amazonaws.com"
+        binding = (object(), endpoint, "us-east-1", False)
+        self.assertIs(m._settle_bucket_region("eu-bucket", binding), binding)
+        self.assertEqual(probed, [endpoint])
+
     def test_a_bucket_in_the_profiles_region_costs_nothing_extra(self):
         self.m.enter_bucket("us-bucket")
         self.assertEqual(self.m.binding_cache["us-bucket"],

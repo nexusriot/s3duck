@@ -329,6 +329,10 @@ class NavigationMixin:
 
         if not proxy_index.isValid():
             return
+        # The row is resolved under the model's location, which has already
+        # moved while a listing is in flight.
+        if self._refuse_unsettled_listing():
+            return
 
         # Normalize selection
         sm = self.listview.selectionModel()

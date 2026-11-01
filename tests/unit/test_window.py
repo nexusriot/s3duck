@@ -3706,6 +3706,22 @@ class ListingConsistencyTests(unittest.TestCase):
         self.assertTrue(self.win.listing_settled())
         self.assertEqual(self._rows(), ["[..]", "report.csv"])
 
+    def test_a_double_click_waits_for_a_listing_in_flight(self):
+        """The old rows resolved under the new prefix: report.csv opened as
+        archive/report.csv, and archive went to archive/archive/."""
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        _ListingModel.GATES[("bkt", "archive/")] = gate
+        self.win.list_doubleClicked(self.win.ix_by_name("archive"))
+        self._app.processEvents()
+        with patch.object(self.win, "open_or_preview") as opened:
+            self.win.list_doubleClicked(self.win.ix_by_name("report.csv"))
+        opened.assert_not_called()
+        self.win.list_doubleClicked(self.win.ix_by_name("archive"))
+        gate.set()
+        self._settle()
+        self.assertEqual(self.win.data_model.current_folder, "archive/")
+
     def test_a_refused_back_moves_nothing_and_the_next_move_counts(self):
         self.win.list_doubleClicked(self.win.ix_by_name("archive"))
         self._settle()

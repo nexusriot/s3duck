@@ -704,6 +704,13 @@ class InstanceServer(QObject):
         if QLocalServer is None:
             return False
         name = name or instance_socket_name()
+        # Another window answering on the socket keeps it: removing it took
+        # the handovers away from the window that was there first.
+        probe = QLocalSocket()
+        probe.connectToServer(name)
+        if probe.waitForConnected(200):
+            probe.disconnectFromServer()
+            return False
         self._server = QLocalServer(self)
         # A crash leaves the socket file behind; without this the second run
         # can never listen again.

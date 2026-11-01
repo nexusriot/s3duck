@@ -507,7 +507,7 @@ class DownloadMixin:
         transferred = sum(min(chunk_size, size - i * chunk_size) for i in done)
 
         def _save_meta():
-            if not etag:
+            if not etag and not version:
                 return      # never a resumable record without a version
             tmp = meta_path + ".tmp"
             require_safe_local_destination(root, tmp)

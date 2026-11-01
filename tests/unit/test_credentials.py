@@ -220,6 +220,17 @@ class ProfileBundleTests(unittest.TestCase):
         # and the old key is now useless against the migrated copy
         with self.assertRaises(CredentialError):
             load_profile_secrets(source_key, migrated)
+def _isolated_launcher(name, clear=False):
+    """
+    A launcher built on its own QSettings. Swapping win.settings after the
+    constructor was too late: by then it had read the user's real config and
+    built its credential store on it.
+    """
+    settings = QSettings(name, name)
+    if clear:
+        settings.clear()
+    with patch.object(s3duck, "QSettings", return_value=settings):
+        return s3duck.Profiles()
 class LauncherAccentTests(unittest.TestCase):
     """The same colour marks the row in the picker and the open window."""
 
@@ -228,8 +239,7 @@ class LauncherAccentTests(unittest.TestCase):
         cls._app = _ensure_qapp()
 
     def _launcher(self, items):
-        win = s3duck.Profiles()
-        win.settings = QSettings("s3duck-tests", "s3duck-tests")
+        win = _isolated_launcher("s3duck-tests")
         win.items = list(items)
         win.populate_list()
         self.addCleanup(win.close)
@@ -454,9 +464,8 @@ class LauncherListTests(unittest.TestCase):
         cls._app = _ensure_qapp()
 
     def _launcher(self, items=()):
-        win = s3duck.Profiles()
-        # Never write to the real config from a test.
-        win.settings = QSettings("s3duck-tests", "s3duck-tests")
+        # Never read or write the real config from a test.
+        win = _isolated_launcher("s3duck-tests")
         win.items = list(items)
         win.populate_list()
         if win.items:
@@ -1316,9 +1325,7 @@ class LauncherProfileWriteTests(unittest.TestCase):
         cls._app = _ensure_qapp()
 
     def _launcher(self, items=()):
-        win = s3duck.Profiles()
-        win.settings = QSettings("s3duck-tests-write", "s3duck-tests-write")
-        win.settings.clear()
+        win = _isolated_launcher("s3duck-tests-write", clear=True)
         self.addCleanup(win.settings.clear)
         win.items = list(items)
         win.populate_list()
