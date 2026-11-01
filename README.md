@@ -23,8 +23,9 @@ GitHub Actions (`.github/workflows/ci.yml`) runs four jobs on every push to
   toolbar buttons.
 - **.deb package** — builds the package and checks that the build substituted
   every control placeholder, that `Installed-Size` is measured rather than
-  hardcoded, that the Qt SVG/PDF dependencies are declared, and that a PNG twin
-  ships for every bundled SVG.
+  hardcoded, that the Qt SVG/PDF dependencies are declared, that a PNG twin
+  ships for every bundled SVG, and that `s3duck-cli` and its module are in
+  the package.
 - **end-to-end (MinIO)** — `make e2e-all`: `model.py` against a throwaway MinIO
   on the pinned SDK and on the oldest supported one, then the real window,
   headless, against the same server. Everything both suites need is a
@@ -32,7 +33,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs four jobs on every push to
 
 ## Features
 
-- **Multi-profile management** — create, edit, copy, and delete named connection profiles; credentials are encrypted at rest using Fernet symmetric encryption. Each row shows its endpoint, region and pinned bucket, with colour-coded `[read-only]` / `[TLS unverified]` badges beside the name, and the list is keyboard-driven (`Enter` opens, `F2` edits, `Del` removes). Connecting runs off the UI thread behind a cancellable dialog, so an unreachable endpoint no longer freezes the launcher
+- **Multi-profile management** — create, edit, copy, and delete named connection profiles; credentials are encrypted at rest using Fernet symmetric encryption. Each row shows its endpoint, region and pinned bucket, with colour-coded `[read-only]` / `[TLS unverified]` badges beside the name, and the list is keyboard-driven (`Enter` opens, `F2` edits, `Del` removes, `Ctrl+Up` / `Ctrl+Down` reorder). Connecting runs off the UI thread behind a cancellable dialog, so an unreachable endpoint no longer freezes the launcher. A row whose last connect failed carries an `[unreachable]` badge, and its tooltip says when each profile last connected from this machine and what went wrong; a filter box appears once the list outgrows a screen, the context menu can **Sort by last used**, and a profile cannot be saved under a name another one already has
 - **Check profile** (launcher context menu) — proves a profile works before you open it. With no bucket set it lists buckets and with a read-only profile it lists the bucket; otherwise it writes a temporary, randomly named empty object to the bucket root and deletes it again, so it needs write and delete permission and leaves a delete marker behind on a versioned bucket
 - **Profile export / import** — move profiles between machines as a bundle whose credentials are encrypted with a passphrase you choose (never written in the clear)
 - **Read-only profiles** — mark a profile read-only to block every write and delete; the toolbar and context menus hide mutating actions, the title bar shows `[read-only]`, and the data layer refuses writes as a backstop
@@ -51,16 +52,17 @@ GitHub Actions (`.github/workflows/ci.yml`) runs four jobs on every push to
 - **Quick open** (`Ctrl+P`) — type-to-jump across buckets and bookmarks, using the command palette's matcher
 - **Sync to another profile** — compare this prefix against one in a different account or provider, review the dry-run plan, then run it; the bytes stream through this machine because no server-side copy can span two credentials
 - **Command palette** (`Ctrl+K`) — type-to-run index of every toolbar and menu action, built from the live actions so it cannot drift (context-menu entries are built on demand when the menu opens, so they are not in it)
-- **Copy to another profile** — stream objects (or whole prefixes) into a different account or provider; a server-side copy cannot use two sets of credentials, so the bytes travel through this machine
+- **Copy to another profile** — stream objects (or whole prefixes) into a different account or provider; a server-side copy cannot use two sets of credentials, so the bytes travel through this machine. Ticking "Delete the originals once every copy succeeds (move)" makes it a **cross-profile move**: the deletes wait for every copy, so a failure leaves both copies of some objects, never neither
 - **Bucket browser** — list, create, and delete buckets; recursive delete runs through the transfer queue (progress + cancel, UI stays responsive)
 - **Empty bucket** — delete every object, version, delete marker and in-flight upload while keeping the bucket, queued with progress and cancel
 - **Incomplete uploads** — find and abort in-flight multipart uploads that are invisible to normal listings but keep their parts billed; shows how much space they waste and can abort everything older than N days
 - **Object browser** — navigate prefixes as a virtual folder tree with sorting by name, size, and modified date; optional Storage-class and ETag columns via the header context menu (both come free with the listing)
+- **Thumbnail view** (Tools → Thumbnail view) — the listing as a grid of image thumbnails, fetched in the background for PNG/JPEG/GIF/BMP/WebP objects up to 8 MB (at most 300 per folder) and cached for the session; it shares the list's selection, so every menu, key and transfer works the same in either view, and the choice is remembered
 - **Upload** — single/multiple files via dialog or drag-and-drop from the OS file manager; whole directory trees via "Upload folder" (`Ctrl+Shift+U`) or drag-and-drop
 - **Download** — single files or entire folder prefixes, recreating the directory tree locally
-- **Download as ZIP** — stream a selection (files and whole folders) straight into one archive, without staging it on disk twice
+- **Download as ZIP** — stream a selection (files and whole folders) into one temporary archive beside the destination, then replace the destination only after the ZIP closes successfully. Cancellation or failure preserves an existing archive and removes the temporary file
 - **Drag out** — drag objects from the list onto a file manager; the selection is downloaded to a temp folder first, with progress and a size warning. Staged payloads are removed when the app exits, and a crashed run's leftovers are reclaimed on the next start
-- **Resumable uploads** — a large upload is sent part by part with its upload id recorded, so an interrupted transfer resumes instead of restarting; a cancelled one deliberately leaves the parts on the server (clean them up from Incomplete uploads)
+- **Resumable uploads** — a large upload is sent part by part with its upload id recorded, so an interrupted transfer resumes instead of restarting; a cancelled one deliberately leaves the parts on the server (clean them up from Incomplete uploads). Changes detected in the local source during transfer refuse completion, abort the mixed parts where possible, and discard the resume record
 - **Resumable downloads** — large files download as parallel ranges into a `.s3duckpart` file with a progress sidecar, so an interrupted transfer picks up where it stopped instead of restarting (a changed ETag discards the stale partial). This applies to every download route — a single file, a whole folder, a sync, a drag-out — because they all go through one per-object path rather than each deciding for itself
 - **Upload rules by destination** — `archive/* -> class=GLACIER, tag:team=infra`: a small app-wide table (one set of rules shared by every profile, edited in Transfer settings) that decides the storage class and tags from the key an upload is heading for, so a storage policy is applied rather than remembered
 - **Content-Type detection** — every upload is stamped with a type derived from the file extension, so a public link renders in a browser instead of downloading as `binary/octet-stream`; the table is overridable per extension, and the object context menu's "Fix Content-Type from extension" re-stamps objects that were uploaded before (or by something else)
@@ -70,37 +72,49 @@ GitHub Actions (`.github/workflows/ci.yml`) runs four jobs on every push to
 - **Transfer settings** — files in flight, connections per file, bandwidth limit, multipart part size and threshold, resumable uploads, automatic retry of transient failures, the per-listing entry limit, the session log file, Content-Type detection with its override table, the upload rules by destination, download verification, completion notifications, plus the storage class, checksum and server-side encryption (SSE-S3 / SSE-KMS) applied to uploads — all persisted across sessions and shared by every profile
 - **Overwrite protection** — uploads (dialog, folder upload, drag-in and the dual pane's `F5`), downloads (single files *and* whole folders), copies, moves, renames and pastes all detect existing destinations and offer Skip / Overwrite / Cancel. For uploads the answer is then *enforced by the service*: unless you chose Overwrite, every write carries an `If-None-Match` precondition, so an object that appears after the check — the gap a check-then-write always leaves — is refused and reported as skipped instead of being replaced. A backend without conditional writes — or an installed boto3 too old to send the header, which is what a distribution package often pins — degrades to the old check-then-write and says so in the log. The answer travels with the job, so a retry — an automatic one included — and a re-run from history keep it instead of overwriting on the second attempt
 - **Sync with a local folder** (`Ctrl+E`) — compare a directory against a prefix in either direction, review a dry-run plan (upload / download / delete / skip with a reason per file), then run it through the queue; supports exclude globs (`*.tmp`, `node_modules/`) and optionally deleting extras at the destination
-- **Transfer queue** — queued jobs with per-row progress, cancel, and retry for failed or cancelled entries; "Retry failed" re-queues every failure at once, and a job the service itself asked us to repeat (throttling, 5xx, a dropped connection) is retried once automatically. A retry runs in the bucket and profile the job was made in, not whichever one is open by then
+- **Two-way sync** ("Both ways" in the Sync dialog) — copies what changed on either side to the other and propagates deletions, using a small state file per folder/prefix pair (`~/.config/s3duck/two_way/`) written after each run, so "missing here" can be told apart as "new there" or "deleted here". A file changed on both sides — or changed on one and deleted on the other — is a **conflict**: listed, never overwritten, and resolved per file with Keep local / Keep bucket. The first run never deletes anything; a file on both sides with no history is settled by its MD5 where the ETag allows it, and is a conflict otherwise
+- **Transfer queue** — queued jobs with per-row progress, cancel, and retry for failed or cancelled entries; "Retry failed" re-queues every failure at once, and a job the service itself asked us to repeat (throttling, 5xx, a dropped connection) is retried once automatically. A retry runs in the bucket and profile the job was made in, not whichever one is open by then. **Pause / resume** (`⏸` / `▶` per row, or Pause all / Resume all) parks a job without losing what it did: the rows the worker finished are dropped from the resumed job, and the file in flight picks up from its resume record (multipart upload parts or a `.s3duckpart`)
+- **The queue survives a restart** — every unfinished job (queued, running or paused) is written down as it changes, so closing the window or a crash loses nothing; the next launch of the same profile offers the last session's work in a bar above the queue (Restore / Discard), never restarting it unasked. The saved jobs stay saved until you answer the bar, whatever this session queues meanwhile. A job queued against a connection that has since changed (endpoint, region, or the access key of a profile with fixed keys — a credential_process or `~/.aws` profile keeps its jobs across new session keys) is not offered; a job queued under an SSE-C key comes back paused and resumes only once the same key is set again; and a profile switch keeps its paused jobs with the profile they belong to (one too large to save stays in the queue instead)
 - **Transfer history** — a persisted log of past jobs (when, what, bytes, outcome) with one-click re-run for small jobs, from the queue panel. A re-run goes to the bucket the job ran in and is refused under another profile; a sync is never replayed, because its plan was worked out from both sides as they were then — open Sync again for a fresh comparison
 - **Bandwidth limit** — optional ceiling on total transfer throughput, shared across every parallel file and chunk
 - **Completion notifications** — a desktop notification when the queue drains while the window is in the background (toggle in Transfer settings)
 - **Delete** — objects and folder prefixes (recursive, batched 1000 keys per call, and cancellable inside the walk rather than only between selected rows); confirmation shows the scanned object count and total size; recursive bucket delete also purges noncurrent versions, delete markers and in-flight uploads
 - **Undo delete** (`Ctrl+Z`) — on a versioning-enabled bucket a delete only writes a delete marker, so the last delete can be rolled back by removing the markers *that delete* wrote — anything deleted from the same folder earlier stays deleted. A delete made while versioning was suspended removed the object outright and is reported as not restorable
 - **Clipboard** (`Ctrl+C` / `Ctrl+X` / `Ctrl+V`) — copy or cut a selection and paste it into any folder or bucket; copying also puts the `s3://` URIs on the system clipboard for use elsewhere
-- **Copy / Move** — server-side copy or move of a multi-selection, within a bucket or **across buckets**; when the destination lives in another region or account (where a server-side copy is impossible) the object is streamed through instead of failing. Copies, moves, renames and pastes keep each object in its **own storage class** — a plain `CopyObject` carries none and S3 would create the new object as STANDARD, re-tiering an IA or Glacier-IR object nobody asked to re-tier. The class comes from the listing, which already knows it, so nothing is spent discovering it; only a route with no listing behind it — an object picked in the other pane, a pane comparison, a job replayed from an older history entry — costs one `HeadObject`. It holds on all three routes — the single copy, the multipart rebuild past 5 GiB, and the cross-region stream — and metadata, content type and cache headers ride along as they always did. A backend that names a class in its own listing and then refuses it on a copy (`InvalidStorageClass`, `NotImplemented`) gets the plain copy it used to get, and the log says the class was not preserved: the tier is worth one request, never the copy itself. A source that is archived in GLACIER or DEEP_ARCHIVE and **not restored** cannot be copied at all: the service refuses to read it, and the failure now says so and points at Restore from Glacier instead of reporting `InvalidObjectState`
-- **Objects over 5 GiB** — S3 refuses a `CopyObject` whose source is larger than that, which used to be a hard failure for every copy onto itself: rename, bulk rename, paste, change storage class, edit metadata and "Fix Content-Type". Such an object is now rebuilt at the destination from `UploadPartCopy` ranges, which the service still performs itself — not the streaming fallback, and no part of it travels through this machine. Where the listing already knows the size, the doomed single copy is skipped rather than bought with a request
+- **Copy / Move** — server-side copy or move of a multi-selection, within a bucket or **across buckets**; when the destination lives in another region or account (where a server-side copy is impossible) the object is streamed through instead of failing. Copies, moves, renames and pastes keep each object in its **own storage class** — a plain `CopyObject` carries none and S3 would create the new object as STANDARD, re-tiering an IA or Glacier-IR object nobody asked to re-tier. The class comes from the listing, which already knows it, so nothing is spent discovering it; routes without a listing — an object picked in the other pane, a pane comparison, a job replayed from an older history entry — ask `HeadObject` for the class. Multipart copies also fetch a fresh HEAD to pin the source revision and size. It holds on all three routes — the single copy, the multipart rebuild past 5 GiB, and the cross-region stream — and metadata, content type and cache headers ride along as they always did. A backend that names a class in its own listing and then refuses it on a copy (`InvalidStorageClass`, `NotImplemented`) gets the plain copy it used to get, and the log says the class was not preserved: the tier is worth one request, never the copy itself. A source that is archived in GLACIER or DEEP_ARCHIVE and **not restored** cannot be copied at all: the service refuses to read it, and the failure now says so and points at Restore from Glacier instead of reporting `InvalidObjectState`
+- **Objects over 5 GiB** — S3 refuses a `CopyObject` whose source is larger than that, which used to be a hard failure for every copy onto itself: rename, bulk rename, paste, change storage class, edit metadata and "Fix Content-Type". Such an object is now rebuilt at the destination from `UploadPartCopy` ranges, which the service still performs itself — not the streaming fallback, and no part of it travels through this machine. Where the listing already knows the size, the doomed single copy is skipped. A fresh HEAD supplies the size and version ID or ETag used by every part; a changed unversioned source fails the copy and aborts its multipart upload rather than assembling mixed revisions
 - **Rename** — in-place rename of a file or folder (server-side copy + delete), on the context menu or `F2`
 - **Bulk rename** (`Shift+F2`) — rename a whole selection by find-and-replace (optionally regex, with backreferences) or a `{name}/{ext}/{n}` numbering template, with a live preview and duplicate/invalid-name checks. A plan in which a new name is another selected item's current name (renumbering 1,2,3 to 2,3,4, or a swap) is refused: a rename is copy-then-delete, so it would overwrite objects before moving them — rename via temporary names instead
 - **Create folder** — creates an S3 prefix placeholder
 - **Preview / open** — double-click a file to preview images, text, **PDFs** and syntax-highlighted code in-app, with a **hex dump** for binaries; anything can still be opened with the OS default application
+- **Audio and video preview** — common audio and video formats play in the preview with play/pause and a seek bar. The player streams from a presigned link instead of downloading first, so only what is watched is transferred and seeking is a ranged GET (needs QtMultimedia; `python3-pyqt6.qtmultimedia` on Debian)
+- **S3 Select** ("Query with S3 Select…" on a CSV, TSV or JSON object, or the preview's Query button) — run SQL where the object is stored and get back only the matching rows, capped at 1 MiB; a backend without S3 Select says so
+- **Edit in an external app** ("Edit in external app" on a file) — the object is downloaded and opened in its default application, and every save there is uploaded automatically with an `If-Match` on the ETag it was opened at. A save refused because someone else changed the object offers Overwrite, Save as a copy (beside it, named `… (conflict <time>)`) or Not now; changes not yet sent when the window closes or the profile switches are offered for upload first. Watching ends from the Tools menu (Tools → Stop external edits). Objects up to 100 MiB; a read-only profile opens a local copy only
 - **Edit in place** — a text object that arrived whole can be edited in the preview and written back with an `If-Match` precondition, so a concurrent save is refused rather than silently overwritten (backends without conditional writes — and an installed boto3 too old to send `If-Match` on a PUT — fall back to an ETag check). The save keeps the object's Content-Type, Cache-Control and other headers, user metadata, storage class, encryption and tags. Text the editor cannot hand back byte-for-byte — CR or CRLF line endings, a byte-order mark, non-breaking spaces — is shown read-only, since saving would rewrite them throughout the file
-- **Recursive search** — search a whole bucket/prefix by key substring or regular expression (`Ctrl+Shift+F` or "Search here…"), filtered by size range, extension and modified date, with jump-to-location on any result
+- **Recursive search** — search a whole bucket/prefix by key substring or regular expression (`Ctrl+Shift+F` or "Search here…"), filtered by size range, extension and modified date, **tags** (`team=infra, archived`) and **Content-Type** (`image/`, `text/csv`), with jump-to-location on any result. Tags and type are not in a listing, so they cost a request per candidate the other filters leave, and a search stops after 2 000 such lookups and says so
 - **Act on search results** — select any number of matches and download, delete, tag, re-type, restore or change the storage class of all of them through the transfer queue, or copy their keys and `s3://` URIs
 - **Saved searches** — name a query with its filters and re-run it from a drop-down; stored per profile, so a recurring cleanup is one click rather than a re-typed form
 - **Object versioning** — enable/suspend bucket versioning from the UI; list every version and delete marker of an object, download a specific version, promote an older version to current, or delete individual versions
+- **Restore to a point in time** (Tools → Restore to a point in time…, or on a folder) — pick a moment, preview the plan, and every key under the prefix is put back as it was then: a changed or deleted object gets its old version copied back on top, an object that did not exist yet gets a delete marker. Nothing is destroyed, so the restore itself can be rolled back the same way
 - **Diff two versions** — select any two versions of a text object and see a coloured unified diff of what changed, which is the question a version list is usually opened with
 - **Storage class** — view an object's storage class and change it (Standard, IA, Intelligent-Tiering, Glacier, Deep Archive, …); works on a multi-selection or whole folders and runs through the transfer queue
 - **Glacier restore** — initiate a restore of archived objects (single, multi-select, or whole prefixes) with a chosen retrieval tier and retention window, queued like other transfers; restore status shown in properties
 - **Bulk tagging** — add, overwrite or strip tags across a whole selection, expanding folders to every object beneath them
 - **Edit metadata** — set `Content-Type`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, and custom `x-amz-meta-*` user metadata
-- **Object properties** — key, size, ETag, storage class, restore status, Object Lock retention and legal hold (probed in the background, since most buckets have none), and public URL
+- **Object properties** — key, size, ETag, storage class, restore status, Object Lock retention and legal hold (probed in the background, since most buckets have none), encryption at rest (SSE-S3, SSE-KMS or SSE-C with the key's MD5), replication status, and public URL
+- **Object Lock retention** ("Retention…" on a file) — set GOVERNANCE or COMPLIANCE retention and its date. Shortening GOVERNANCE retention is offered only with the explicit governance bypass, a COMPLIANCE date can only move later, and choosing COMPLIANCE at all needs an "I understand" tick, because nothing — the account root included — can undo it before the date
+- **Permissions (ACL)** (on a file, and Bucket settings → Access → Bucket ACL…) — view and edit grants to canonical users, email addresses and the public groups; saving asks first when a grant goes to everyone or the owner would lose FULL_CONTROL, and a bucket whose Object Ownership disables ACLs is explained rather than reported as a bare error
+- **Customer-provided encryption (SSE-C)** (Tools → Customer encryption key, SSE-C) — generate or paste a 256-bit key and every read and write in the window uses it, uploads, ranged downloads, copies, previews and S3 Select alike; the title bar says `[SSE-C]`. Share links and upload forms are refused while a key is set, because the key would be signed into the link and the recipient would have to send it. The key is held in memory only and cleared by a profile switch
 - **Legal hold** — the object context menu's Legal hold… entry places or clears an Object Lock legal hold on one object after reading its current state; while it is on the object cannot be deleted or overwritten. A bucket without Object Lock says so instead (it can only be enabled when the bucket is created)
-- **Presigned links** — generate a temporary download (GET) or **upload (PUT)** link with a configurable expiry (up to the 7-day S3 maximum)
+- **Presigned links** — generate a temporary download (GET) or **upload (PUT)** link with a configurable expiry (up to the 7-day S3 maximum), and show a download link as a **QR code** to hand it to a phone (encoded in-app, no extra dependency)
+- **Upload form (POST)** — the same dialog mints a browser upload form whose limits the *service* enforces: a largest size, a required Content-Type, and optionally letting the uploader choose the file name under this object's folder. Copy gives a curl command; the HTML form beside it works in any browser
 - **Make public** — set `public-read` ACL and copy direct URL; when the ACL is refused, Block Public Access and Object Ownership settings are reported as the reason
 - **Location tabs** (`Ctrl+T`) — keep several buckets/prefixes a click apart in one window, reorder them by dragging, and reopen them next time; `Ctrl+W` closes one, `Ctrl+Tab` cycles. They are remembered locations for one shared listing view, not independent views, so switching tabs navigates
 - **Compare panes** (Tools → Compare panes…) — what differs between the two panes, recursively: only-here, only-there, differs, identical, with the selected differences copyable either way. This is also how two prefixes in one account get compared, which previously had to go through a local folder. Files of the same size are judged on content rather than timestamps — ETags against each other, or a local file's MD5 (or rebuilt multipart ETag, up to 512 MiB) against the remote one — so a folder compared with its own upload, or a prefix with its server-side copy, shows as identical. A pair whose content cannot be compared (an encrypted object's ETag, a multipart one at an unknown part size) is shown as "same size, different time" and is not hidden as identical
-- **Dual pane** (`F3`) — a second pane showing a local folder or another remote prefix, with `F5` to copy the focused pane's selection to the other side and `F6` to move it, all through the transfer queue. `F5` belongs to Refresh while there is only one pane, and Refresh keeps `Ctrl+R` either way
-- **Watch a folder** (Tools → Watch folder…) — mirror a local folder up to a prefix on an interval; each pass compares the two and queues only what differs, and a pass is skipped while the queue is still busy. A pass whose local folder is missing or unreadable is skipped and flagged rather than read as empty; with "Delete objects that no longer exist locally" on, so is a pass whose folder is empty while the prefix is not — the signature of an unmounted drive — instead of deleting the remote side. The settings are remembered, but a watch is never resumed on its own at startup
+- **Dual pane** (`F3`) — a second pane showing a local folder, another remote prefix, or a prefix in **another profile's** account, with `F5` to copy the focused pane's selection to the other side and `F6` to move it, all through the transfer queue. Between two profiles the bytes stream through this machine and read-only is checked per side. `F5` belongs to Refresh while there is only one pane, and Refresh keeps `Ctrl+R` either way
+- **Local pane as a file manager** — the local side sorts by name, size or modified date (folders stay on top), and has its own context menu and keys: Open, Upload to the main pane, Rename… (`F2`), New folder… (`F7`), Move to trash (`Del`, to the desktop trash; a permanent delete only after a second question where there is none), Copy path and Show in file manager
+- **Watch a folder** (Tools → Watch folder…) — mirror a local folder up to a prefix, or a prefix **down** to a local folder, on an interval; each pass compares the two and queues only what differs, and a pass is skipped while the queue is still busy. A pass whose local folder is missing or unreadable is skipped and flagged rather than read as empty; so is an upload pass with "Delete objects that no longer exist locally" on whose folder is empty while the prefix is not — the signature of an unmounted drive. A download watch that deletes local files asks before it starts. In either direction, a pass that would delete more than 5 files or 10% of the destination (excluded files not counted) is refused and stops the watch, so an emptied bucket cannot empty the folder unattended, nor an unmounted folder the prefix. The settings are remembered, but a watch is never resumed on its own at startup
+- **Trash** (Tools → Delete moves to .trash/) — a per-profile switch that turns delete into a move under `.trash/` at the same relative key, for buckets without versioning; "Restore from trash" inside it moves things back, deleting something already in the trash is a real delete, and Empty trash (Tools → Empty trash…) removes it all after showing what that is
 - **Back / forward** (`Alt+←` / `Alt+→`) — a real navigation trail per tab, across buckets, that a new move truncates the way a browser does
 - **Clickable breadcrumb** — jump straight to any parent prefix, the bucket root, or the bucket list from the path bar
 - **Go to location** (`Ctrl+L`) — paste an `s3://bucket/prefix` (or a bare prefix) and jump straight there, across buckets
@@ -114,10 +128,12 @@ GitHub Actions (`.github/workflows/ci.yml`) runs four jobs on every push to
 - **Theme** — Light, Dark, or system-default appearance, remembered across sessions
 - **Duplicate finder** (Tools → Find duplicates, `Ctrl+Shift+D`) — group objects holding identical content by size + ETag at the cost of a listing, showing reclaimable space; select all-but-newest/oldest and delete the redundant copies. Objects whose ETags cannot settle the question (multipart vs single-part) are listed separately and never auto-selected — "Confirm candidates" then settles them from each object's stored digests, without downloading either copy, where the backend can supply one
 - **Bucket usage stats** — total size and object count, breakdown by file category with a pie chart, top folder groups, a storage-class breakdown and the largest objects
+- **Inventory report** (Tools → Inventory report…) — read the bucket's latest S3 Inventory report (CSV) instead of listing it: totals and storage classes by prefix, plus confirmed duplicates when the report carries ETags. A handful of GETs instead of a listing of a hundred million objects, at the price of being up to a day or a week old, which the dialog says
+- **Command line** (`s3duck-cli`) — `ls`, `cp` and `sync` with the app's saved profiles (or `--endpoint` and environment keys), the same sync planner and the same path-traversal guard; this is how a sync runs at 02:00 with the app closed: a crontab line
 - **Size explorer** (Tools → Size explorer…) — a treemap of the bucket by prefix, drilling down on a click. Area is the only encoding that makes a 400 GB folder look like one, which a breakdown by file category cannot
 - **Integrity manifest** (Tools → Export manifest…, then Tools → Verify against manifest…) — record what a prefix holds as a CSV, then later ask what has gone missing, been added, or changed. Both directions cost one listing, so it is affordable on a bucket you would never hash
 - **Cost estimate** — on an AWS endpoint the usage report also prices the storage per class and shows what the STANDARD bytes would cost in IA, Glacier IR or Deep Archive, with the minimum-duration catch spelled out beside each one (storage only, us-east-1 list price)
-- **Bucket settings** (Tools → Bucket settings…) — lifecycle rules with a real editor (transitions, expiration, noncurrent versions, aborting incomplete uploads), the CORS document, the bucket policy (read-only until you tick "Allow editing", and JSON-checked before it is sent), default encryption, the bucket's own tags, static-website hosting, transfer acceleration, a read-only view of the event notifications, and Object Lock state — all read in one background pass. A rule filtered by tag or object size is listed and summarized but not editable here, because rebuilding it from the prefix form would silently widen it
+- **Bucket settings** (Tools → Bucket settings…) — lifecycle rules with a real editor (transitions, expiration, noncurrent versions, aborting incomplete uploads), the CORS document, the bucket policy (read-only until you tick "Allow editing", and JSON-checked before it is sent), default encryption, the bucket's own tags, static-website hosting, transfer acceleration, a read-only view of the event notifications, **Block Public Access** (all four flags, or removing the bucket-level setting), **server access logging**, a read-only view of the **replication** rules, and Object Lock state — all read in one background pass. The policy tab's **Insert template…** merges a reviewed statement (make a prefix publicly readable, allow another AWS account, refuse plain HTTP) into the document by `Sid` instead of handing you a blank box. A rule filtered by tag or object size is listed and summarized but not editable here, because rebuilding it from the prefix form would silently widen it
 - **Runtime profile switch** — switch S3 accounts without restarting the app
 - **Cached bucket bindings** — the proven endpoint/region/addressing combination per bucket is remembered, so reopening an off-region bucket skips the probe round trips
 - **Automatic region/endpoint detection** — when an operation fails due to a region or endpoint mismatch the app probes the server for the correct region, rebuilds the client, and retries transparently; applies to bucket open, listing, upload, download, and delete
@@ -134,9 +150,7 @@ Planned work and known limitations are tracked in [ROADMAP.md](ROADMAP.md).
 
 `make` lists every target; `make check` runs all three suites.
 
-Three suites. The unit suite stubs every S3 call: it needs the
-`requirements.txt` packages (PyQt6, boto3, cryptography) but no server, no
-network and no Docker:
+Three suites. The unit suite stubs S3 requests and runs offline, but needs the project dependencies, including PyQt6 and cryptography. Create the environment with `make venv`, then run:
 
 ```
 make test
@@ -155,9 +169,9 @@ everything it created:
 make e2e
 ```
 
-It skips itself when no endpoint is configured, so the command above is the
-only way it costs anything — a plain `unittest discover` stays offline and
-green. To run it against a server you already have instead:
+The end-to-end suites skip themselves when `S3DUCK_TEST_ENDPOINT` is unset.
+With that variable set, discovery runs against the configured server and creates
+and deletes throwaway buckets; use a dedicated test account. To run it against a server you already have instead:
 
 ```
 S3DUCK_TEST_ENDPOINT=http://localhost:9000 \
@@ -193,14 +207,11 @@ answer. Any *other* modal that opens fails the test by name rather than
 hanging it, which is what keeps an unanswerable dialog from turning into a
 silent timeout.
 
-MinIO archived its open-source server in 2025 — `quay.io/minio/minio` stopped
-granting anonymous pulls, the Docker Hub repository went away, and `dl.min.io`
-answers `410 Gone` for every community binary — so the compose file names the
-Alpine project's rebuild of the final community release, pinned to that exact
-upstream tag. It stays on MinIO rather than moving to another server because
-half the limitations documented here are statements about how MinIO behaves,
-and a different backend would answer differently and quietly stop checking
-them. `S3DUCK_TEST_MINIO_IMAGE` overrides the image if you host your own.
+The compose file defaults to `alpine/minio:RELEASE.2025-10-15T17-29-55Z`,
+pinned to the release used by these tests. `S3DUCK_TEST_MINIO_IMAGE` overrides
+the image if you host your own. Both model runners use the same server; one
+uses the pinned boto3 from `requirements.txt`, the other uses the supported
+floor, boto3 1.26.76.
 
 The model suite's runner image holds boto3 and nothing else: `model.py`
 imports no Qt, so it needs no display and no PyQt6. The GUI runner is the one
@@ -223,11 +234,15 @@ What the model suite covers, a module at a time (`tests/e2e/`):
 | `test_bucket_admin.py` | *Writing* lifecycle rules, policies and tags — and that CORS, website hosting and encryption are refused with something the dialog can show |
 | `test_object_lock.py` | Legal holds: that the server refuses the delete, and that a held version survives the delete marker written over it |
 | `test_versions.py` | Fetching one version, promoting an old one, deleting a single version, delete markers |
+| `test_copy_safety.py` | Multipart source changes, stale listed sizes, streaming cancellation, and local upload mutation preserving existing destinations |
 | `test_cross_profile.py` | Copying between two independent clients, and a read-only destination refusing before anything is written |
 | `test_discovery.py` | Deep search filters, the sync planner's tree, duplicate fingerprints, usage totals across pages, preview windows |
 | `test_profile_and_sdk.py` | The profile check's write-and-remove probe, and which parameters the *installed* SDK will actually send |
 | `test_transfer_tuning.py` | The transfer settings as requests: files in flight, threads per file, the bandwidth ceiling, part sizes |
 | `test_upload_policy.py` | What an upload carries besides the body — the per-destination rules' storage class and tags, as the service stores them |
+| `test_access.py` | Upload forms the service enforces (size, Content-Type, key prefix), GOVERNANCE retention and its bypass, ACL reads (and that MinIO's owner-less ACL is not editable), Block Public Access, logging and replication answers, SSE-C over plain HTTP |
+| `test_reports.py` | Finding and reading the latest inventory report in the layout S3 delivers it, and S3 Select returning rows or a code |
+| `test_point_in_time.py` | A versioned prefix restored to a moment reads as it did then, keeps every version, and a folder marker's delete leaves its contents; search by tags and Content-Type |
 
 And the GUI suite (`tests/e2e_gui/`), which asks the same server what the
 window actually did:
@@ -237,6 +252,13 @@ window actually did:
 | `test_navigation.py` | Prefix listings through the navigation worker, sibling prefixes, a refresh seeing a change made behind the app, a failed navigation re-enabling the list view |
 | `test_transfers.py` | Uploads, downloads and deletes driven through the window's own entry points, and the transfer queue draining them |
 | `test_queue_outcomes.py` | How a job *ends*: done, cancelled or failed, and whether the user is told — the dialog as much as the row; and a read-only window refusing uploads and deletes while reads and downloads still work |
+| `test_queue_pause.py` | A paused ranged download finishing from its partial file, a paused batch not rewriting the objects it had finished, and a paused job written down, offered after a restart, restored still paused and completed |
+| `test_dual_pane.py` | The second pane on another profile's bucket — a copy across, a move back that removes the original — and an upload from the local half after a rename |
+| `test_media_preview.py` | The player opening a real object through its presigned link |
+| `test_bucket_access.py` | The Access, Logging and Replication tabs rendered from the server's answers, and a policy template the service accepts |
+| `test_trash_and_watch.py` | Delete-to-trash, restore and empty trash; a download watch filling a folder, and refusing a pass that would empty it |
+| `test_cli.py` | `s3duck-cli` through its own connection path: sync up and down, `--delete`, `cp`, `ls`, exit codes |
+| `test_recovery_and_editing.py` | Point-in-time restore through its dialog and the queue; two runs of two-way sync, the second propagating a local deletion, and an edit on both sides staying a conflict until resolved; a save in another program uploaded by the real file watcher, and a server-side change not overwritten; a real image filling its thumbnail |
 
 ## Requirements
 
@@ -247,6 +269,7 @@ window actually did:
 | boto3         | ≥ 1.26.76 (1.42.44 pinned) | AWS / S3-compatible SDK          |
 | cryptography  | 46.0.4 pinned              | Fernet credential encryption     |
 | keyring       | optional                   | Keep the credential key in the OS secret store |
+| QtMultimedia  | optional                   | Audio and video preview (part of the PyQt6 wheel; `python3-pyqt6.qtmultimedia` on Debian) |
 | awscrt        | optional                   | CRC32C and CRC64NVME upload checksums          |
 | pyinstaller   | 6.18.0 pinned              | Binary packaging — installed by `requirements.txt`, used only by the build targets |
 
@@ -285,6 +308,18 @@ python3 s3duck.py                # or: make run
 ```
 
 The PyQt6 wheel bundles QtSvg and QtPdf, so nothing else is needed there.
+
+**Command line** — the same S3 layer without a window:
+```bash
+python3 s3duck_cli.py --profile backup sync ~/photos s3://archive/photos/
+python3 s3duck_cli.py --profile backup sync --delete --dry-run ~/photos s3://archive/photos/
+python3 s3duck_cli.py --endpoint http://minio:9000 --path-style ls s3://bucket/
+```
+`--profile` uses the app's saved profiles (a passphrase-sealed store asks on the terminal, or reads `S3DUCK_PASSPHRASE` for an unattended run); `--endpoint` takes keys from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`. The .deb installs it as `s3duck-cli` (the PyInstaller binaries bundle only the window), so a scheduled sync is one crontab line:
+```
+0 2 * * *  s3duck-cli -q --profile backup sync ~/photos s3://archive/photos/
+```
+With `--delete`, a run that would delete more than 5 files and 10% of the destination is refused (exit 1) unless `--force` is given — the same guard the window's watch applies, because a typo'd prefix or an unmounted folder turns everything at the far end into an "extra". `--exclude` may be repeated, and a pattern may contain spaces. It exits 0 when everything was done, 1 when an operation failed or was refused, 2 for a usage error.
 
 ---
 
@@ -343,8 +378,10 @@ Pre-built releases are available on the [GitHub releases page](https://github.co
 ```
 s3duck/
 ├── s3duck               Shell launcher installed as /usr/bin/s3duck by the .deb
+├── s3duck-cli           Installed launcher for s3duck_cli.py
 ├── s3duck.py            Entry point — QApplication bootstrap, command line,
 │                        Profiles dialog
+├── s3duck_cli.py        s3duck-cli — ls / cp / sync without a window, for cron
 ├── main_window.py       MainWindow itself — assembly, actions, the operations
 │                        that are not any one mixin's
 ├── model.py             The S3 front door — a facade over the s3/ mixins
@@ -380,7 +417,18 @@ s3duck/
 │   ├── treemap.py       Squarified treemap layout and prefix tree
 │   ├── formatting.py    Number and byte rendering
 │   ├── entries.py       Item, FSObjectType, PrefixDownloadPlan
-│   └── profile.py       ProfileSettings — one connection, by name not position
+│   ├── profile.py       ProfileSettings — one connection, by name not position
+│   ├── queue_state.py   The transfer queue as JSON: what survives a restart
+│   ├── local_files.py   The local pane's ordering and name rules
+│   ├── acl.py           ACL grants: parse, build, spot the public ones
+│   ├── retention.py     Which Object Lock retention changes are allowed
+│   ├── policy_templates.py  Reviewed bucket-policy statements, merged by Sid
+│   ├── replication.py   Replication rules, summarised
+│   ├── trash.py         The .trash/ convention: delete as a move, and back
+│   ├── inventory.py     S3 Inventory manifests and CSV reports
+│   ├── point_in_time.py What restoring a prefix to a moment changes
+│   ├── two_way.py       Two-way sync planning and its state file
+│   └── qr.py            QR code encoder for presigned links
 │
 ├── s3/                  The boto3 layer — Model's mixins
 │   ├── common.py        What the pieces share: checksum table, progress, limiter
@@ -391,7 +439,10 @@ s3duck/
 │   ├── copy.py          Server-side copy and the stream-through fallback
 │   ├── delete.py        Objects, versions, prefixes and whole buckets
 │   ├── bucket_admin.py  Policy, CORS, lifecycle, encryption, locking
-│   └── object_admin.py  Metadata, tags, class, versions, integrity
+│   ├── object_admin.py  Metadata, tags, class, versions, integrity
+│   ├── access.py        ACLs, Block Public Access, logging, replication,
+│   │                    retention, presigned POST
+│   └── reports.py       Inventory reports and S3 Select
 │
 ├── workers/             QObjects that run on a QThread, talking by signal only
 │   ├── navigation.py    NavigationWorker, BucketEnterWorker
@@ -403,10 +454,12 @@ s3duck/
 │   ├── context_menu.py  The listing's right-click menu, entry + handler as one
 │   ├── window/          MainWindow's mixins — one per cluster of its state
 │   │                    navigation, history, tabs, transfers, quickfind,
-│   │                    bookmarks, watch, usage, credentials
+│   │                    bookmarks, watch, usage, credentials, access,
+│   │                    trash, reports, external_edit, two_way,
+│   │                    thumbnails, point_in_time
 │   ├── widgets/         Listing view, charts, breadcrumb, second pane, queue
 │   │                    panel, profile picker, highlighters, click guard
-│   └── dialogs/         Dialogs grouped by area (18 modules, 30 dialogs)
+│   └── dialogs/         Dialogs grouped by area (21 modules, 39 dialogs)
 ├── diagnostics.py       Qt plugin / icon / library report (Tools → Diagnostics)
 ├── utils.py             Shared helpers — Crypto and CredentialStore, Qt thread
 │                        plumbing, ~/.aws parsing, credential expiry, local tree scan
@@ -488,7 +541,20 @@ s3duck/
 | `BucketEnterWorker` | workers/navigation.py | Off-thread bucket entry with hints-based region/endpoint retry |
 | `Worker` | workers/transfer.py | Off-thread upload / download / delete with byte-level progress and cancellation |
 | `UsageWorker` | workers/usage.py | Off-thread bucket size aggregation by file category, storage class and estimated cost |
-| `SecondPane` | ui/widgets/second_pane.py | The other half of the dual pane — a local folder or a remote prefix, listing only |
+| `SecondPane` | ui/widgets/second_pane.py | The other half of the dual pane — a local folder (sortable, with rename / new folder / trash), a remote prefix, or another profile's prefix |
+| `PaneProfileDialog` | ui/widgets/second_pane.py | Picks the profile, bucket and prefix the second pane shows |
+| `GrantDialog` | ui/dialogs/access.py | One ACL grant: a canonical user, an email address or a group, and its permission |
+| `AclDialog` | ui/dialogs/access.py | View and edit an object's or bucket's ACL grants, asking before a public grant or losing owner control |
+| `RetentionDialog` | ui/dialogs/access.py | Object Lock retention mode and date, gated by what the service would allow |
+| `PolicyTemplateDialog` | ui/dialogs/access.py | Reviewed bucket-policy statements to merge into the policy |
+| `SseCKeyDialog` | ui/dialogs/access.py | The session's customer-provided encryption key |
+| `InventoryDialog` | ui/dialogs/reports.py | Usage and duplicates from the latest S3 Inventory report |
+| `SelectDialog` | ui/dialogs/reports.py | S3 Select over one CSV or JSON object |
+| `QrCodeDialog` | ui/dialogs/presigned.py | A presigned link as a QR code |
+| `PointInTimeDialog` | ui/dialogs/point_in_time.py | Restore a prefix to a moment: plan preview, then the queue |
+| `ThumbnailGrid` | ui/widgets/thumbnails.py | Icon-mode view sharing the listing's model and selection |
+| `ThumbnailLoader` | ui/widgets/thumbnails.py | Background thumbnail fetches, dropped when the folder changes |
+| `Cli` | s3duck_cli.py | The command-line tool's ls / cp / sync |
 | `PieWidget` | ui/widgets/charts.py | Custom `QPainter` pie chart for usage breakdown |
 | `Model` | model.py + s3/ | The one front door to boto3. The class itself keeps only construction, the read-only write guard, the three throughput setters and `get_os_family`; every call that touches a bucket lives in an s3/ mixin — `binding.py` probes addressing styles and auto-corrects region mid-session, `object_admin.py` supplies the part boundaries that make a multipart object verifiable |
 | `job_runner` | workers/transfer.py | The contract every background operation shares: cancellation is not a failure, a real failure is reported three ways, and `finished` always fires — it is what releases the thread and re-enables the toolbar |

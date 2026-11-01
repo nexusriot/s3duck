@@ -52,13 +52,20 @@ from settings_store import SettingsStore
 # re-exported here because main_window is still what the app and the
 # suite import them from.
 from ui.context_menu import show_listing_menu
+from ui.window.access import AccessWindowMixin
 from ui.window.bookmarks import BookmarksMixin
 from ui.window.credentials import CredentialsMixin
+from ui.window.external_edit import ExternalEditMixin
 from ui.window.history import HistoryMixin
 from ui.window.navigation import NavigationMixin
+from ui.window.point_in_time import PointInTimeMixin
 from ui.window.quickfind import QuickFindMixin
+from ui.window.reports import ReportsWindowMixin
 from ui.window.tabs import TabsMixin
+from ui.window.thumbnails import ThumbnailMixin
 from ui.window.transfers import TransferQueueMixin
+from ui.window.trash import TrashMixin
+from ui.window.two_way import TwoWaySyncMixin
 from ui.window.usage import UsageMixin
 from ui.window.watch import WatchMixin
 from ui.constants import (
@@ -130,7 +137,7 @@ from core.commands import (  # noqa: F401
 )
 from core.locations import (  # noqa: F401
     parse_s3_location, serialize_location, parse_location,
-    location_entries, build_profile_sync_job,
+    location_entries, build_profile_sync_job, build_profile_copy_job,
 )
 from core.formatting import (  # noqa: F401
     _listing_summary,
@@ -148,6 +155,13 @@ class MainWindow(
     WatchMixin,
     UsageMixin,
     CredentialsMixin,
+    AccessWindowMixin,
+    TrashMixin,
+    ReportsWindowMixin,
+    ExternalEditMixin,
+    TwoWaySyncMixin,
+    ThumbnailMixin,
+    PointInTimeMixin,
     QMainWindow,
 ):
     def __init__(self, *args, current_dir, qsettings, profile, **kwargs):
@@ -238,6 +252,7 @@ class MainWindow(
         self.proxy = UpTopProxyModel(UP_ENTRY_LABEL, self)
         self.proxy.setSourceModel(self.model)
         self.listview.setModel(self.proxy)
+        self._attach_thumbnail_grid(self._list_container.layout())
 
         # Enable Σ + refresh open usage dialog when selection changes.
         # Single handler — connecting twice was causing duplicate work and
@@ -321,6 +336,7 @@ class MainWindow(
         self._active_entry = None
         self._queue_entries: dict = {}
         self._batch_stats = {"done": 0, "cancelled": 0, "error": 0}
+        self._pending_restore = []
         self._tray_icon = None
         self._undo_delete = None
         self._clipboard = None
@@ -343,6 +359,11 @@ class MainWindow(
         # After the first listing, so a failed reopen leaves a usable window
         # showing the bucket list rather than nothing at all.
         self.restore_last_location()
+        if self.store.get_bool("thumbnail_view", False):
+            self.set_thumbnail_view(True)
+        # Offered, never started: the user may have closed the window to
+        # stop those transfers in the first place.
+        self.offer_pending_restore()
 
         self.listview.header().setSortIndicatorShown(True)
         self.listview.setSortingEnabled(True)
@@ -516,6 +537,13 @@ class MainWindow(
         self._queue_panel.retry_all_requested.connect(
             self.retry_failed_transfers)
         self._queue_panel.history_requested.connect(self.show_transfer_history)
+        self._queue_panel.pause_requested.connect(self.pause_entry)
+        self._queue_panel.resume_requested.connect(self.resume_entry)
+        self._queue_panel.pause_all_requested.connect(self.pause_all_transfers)
+        self._queue_panel.resume_all_requested.connect(
+            self.resume_all_transfers)
+        self._queue_panel.restore_requested.connect(self.restore_pending_queue)
+        self._queue_panel.discard_requested.connect(self.discard_pending_queue)
         self.accent_bar = QWidget()
         self.accent_bar.setFixedHeight(4)
         # autoFillBackground + a palette role rather than a stylesheet: any
@@ -783,6 +811,16 @@ class MainWindow(
         act_usage.triggered.connect(lambda: self.request_bucket_usage())
         self.actSizeExplorer = menu.addAction("Size explorer…")
         self.actSizeExplorer.triggered.connect(lambda: self.open_size_explorer())
+        self.actInventory = menu.addAction("Inventory report…")
+        self.actInventory.triggered.connect(lambda: self.open_inventory())
+        self.actThumbnails = menu.addAction("Thumbnail view")
+        self.actThumbnails.setCheckable(True)
+        self.actThumbnails.toggled.connect(self.set_thumbnail_view)
+        self.actPointInTime = menu.addAction("Restore to a point in time…")
+        self.actPointInTime.triggered.connect(lambda: self.open_point_in_time())
+        self.actStopEdits = menu.addAction("Stop external edits")
+        self.actStopEdits.setEnabled(False)
+        self.actStopEdits.triggered.connect(lambda: self.stop_external_edits())
         self.actExportManifest = menu.addAction("Export manifest…")
         self.actExportManifest.triggered.connect(lambda: self.export_manifest())
         self.actVerifyManifest = menu.addAction("Verify against manifest…")
@@ -802,6 +840,14 @@ class MainWindow(
         self.actBucketSettings = menu.addAction("Bucket settings…")
         self.actBucketSettings.triggered.connect(
             lambda: self.bucket_settings())
+        self.actSseC = menu.addAction("Customer encryption key (SSE-C)…")
+        self.actSseC.triggered.connect(lambda: self.sse_c_key_ui())
+        self.actUseTrash = menu.addAction("Delete moves to .trash/")
+        self.actUseTrash.setCheckable(True)
+        self.actUseTrash.setChecked(self.trash_enabled())
+        self.actUseTrash.toggled.connect(self.set_trash_enabled)
+        self.actEmptyTrash = menu.addAction("Empty trash…")
+        self.actEmptyTrash.triggered.connect(lambda: self.empty_trash())
         menu.addSeparator()
         self.actRefreshCredentials = menu.addAction("Refresh credentials")
         self.actRefreshCredentials.triggered.connect(
@@ -859,6 +905,8 @@ class MainWindow(
     def update_window_title(self):
         profile = getattr(self, "profile_name", "")
         suffix = "  [read-only]" if self.is_read_only() else ""
+        if getattr(self.data_model, "sse_c_key", b""):
+            suffix += "  [SSE-C]"
         if profile:
             self.setWindowTitle(f"{self.title} — {profile}{suffix}")
         else:
@@ -1050,7 +1098,7 @@ class MainWindow(
         """
         if obj is self.search_edit and event.type() == QEvent.Type.KeyPress:
             return self._filter_box_key(event)
-        if obj == self.listview:
+        if obj == self.listview or obj is getattr(self, "thumb_grid", None):
             if event.type() == QEvent.Type.ContextMenu:
                 return self._listing_context_menu(event)
             if event.type() == QEvent.Type.KeyPress:
@@ -1535,15 +1583,21 @@ class MainWindow(
                     f"{_human_bytes(total)}."
                 )
 
+        verb = self.delete_verb(job)
+        if verb != "Delete":
+            detail += ("\n\nThey can be restored from there until the trash "
+                       "is emptied.")
         qm = QMessageBox
         ret = qm.question(
             self,
-            "Delete",
-            "Are you sure to delete objects : %s ?%s" % (",".join(names), detail),
+            verb,
+            "%s: %s ?%s" % (
+                "Are you sure to delete objects" if verb == "Delete" else verb,
+                ",".join(names), detail),
             qm.StandardButton.Yes | qm.StandardButton.No,
         )
         if ret == qm.StandardButton.Yes:
-            self.assign_thread_operation("delete", job)
+            self.queue_delete(job)
 
     def upload(self, folder=None):
         if self.in_bucket_list_mode():
@@ -1992,6 +2046,8 @@ class MainWindow(
                 self.resize(800, 600)
 
     def closeEvent(self, e):
+        # Before the temp workspace goes: it holds the edited files.
+        self.stop_external_edits()
         self.writeSettings()
         self._shutdown_threads()
         # Downloaded payloads staged for previews and drag-out live here; they
@@ -2008,6 +2064,13 @@ class MainWindow(
         bounded timeout (a worker may be blocked inside an S3 call that quit()
         cannot interrupt; we don't want to hang the close indefinitely).
         """
+        # First, while the queue still says what was unfinished; see
+        # _persist_queue for why nothing after this point may write it.
+        try:
+            if not self._closing:
+                self._persist_queue()
+        except Exception:
+            pass
         for e in list(getattr(self, "_transfer_queue", [])):
             try:
                 e.status = "cancelled"
@@ -2025,6 +2088,11 @@ class MainWindow(
 
         self._closing = True
         self._pending_retries = []
+        try:
+            self.shutdown_thumbnails()
+            self.join_two_way_threads()
+        except Exception:
+            pass
         try:
             self._retry_timer.stop()
         except Exception:
@@ -2222,14 +2290,16 @@ class MainWindow(
                 f"Profile '{profile.name}' is read-only.")
             return
 
+        move = dlg.move_requested()
+        if move and self.is_read_only():
+            QMessageBox.warning(
+                self, "Move to another profile",
+                "This profile is read-only, so the originals cannot be "
+                "removed. Copy instead.")
+            return
         dest_model = build_profile_model(profile, bucket)
         prefix = dlg.destination_prefix()
-        job = []
-        for name, src_key, is_folder in items:
-            if is_folder:
-                job.append((src_key, prefix + name.rstrip("/") + "/", True))
-            else:
-                job.append((src_key, prefix + name, False))
+        job = build_profile_copy_job(items, prefix)
 
         conflicts = self._destination_conflicts(
             [row[1] for row in job], dest_model=dest_model)
@@ -2239,10 +2309,18 @@ class MainWindow(
             job, conflicts, what="destination", index_of=lambda row: row[1])
         if not job:
             return
+        if move and QMessageBox.question(
+                self, "Move to another profile",
+                f"Move {len(job)} item(s) to {profile.name}/{bucket}?\n\n"
+                "The originals here are deleted once every copy has "
+                "succeeded.") != QMessageBox.StandardButton.Yes:
+            return
         self.assign_thread_operation(
-            "copy_to_profile", job, need_refresh=False, dest_model=dest_model)
+            "move_to_profile" if move else "copy_to_profile", job,
+            need_refresh=move, dest_model=dest_model)
         self.statusBar().showMessage(
-            f"Copying {len(job)} item(s) to {profile.name}/{bucket}…", 3000)
+            f"{'Moving' if move else 'Copying'} {len(job)} item(s) to "
+            f"{profile.name}/{bucket}…", 3000)
 
     def copy_move(self):
         if self.in_bucket_list_mode():
@@ -2491,14 +2569,15 @@ class MainWindow(
         sample = "\n".join(keys[:10])
         if len(keys) > 10:
             sample += f"\n… and {len(keys) - 10} more"
+        verb = self.delete_verb(keys)
         answer = QMessageBox.question(
             self, "Delete objects",
-            f"Delete {len(keys)} object(s) from {self.data_model.bucket}?"
+            f"{verb} {len(keys)} object(s) from {self.data_model.bucket}?"
             f"\n\n{sample}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self.assign_thread_operation("delete", list(keys))
+        self.queue_delete(list(keys))
         self.statusBar().showMessage(f"Deleting {len(keys)} object(s)…", 4000)
 
 
@@ -2607,6 +2686,10 @@ class MainWindow(
                 self.data_model.current_folder or "")
         if self.second_pane.current_mode() == SecondPane.LOCAL:
             right = ("local", self.second_pane.local_target())
+        elif self.second_pane.current_mode() == SecondPane.OTHER:
+            # The comparison reads both sides through this window's model;
+            # another account's listing needs that account's credentials.
+            return None
         else:
             bucket, prefix = self.second_pane.remote_target()
             if not bucket:
@@ -2617,6 +2700,12 @@ class MainWindow(
     def compare_panes(self):
         """Show what differs between the two panes."""
         sides = self.pane_sides()
+        if (sides is None and self.dual_pane_active()
+                and self.second_pane.current_mode() == SecondPane.OTHER):
+            self.statusBar().showMessage(
+                "Another profile is compared by Tools → Sync to another "
+                "profile; its dry run is the comparison", 5000)
+            return
         if sides is None:
             self.statusBar().showMessage(
                 "Open a bucket and the second pane (F3) to compare", 3000)
@@ -2634,14 +2723,109 @@ class MainWindow(
         if not self.dual_pane_active():
             self.statusBar().showMessage("Press F3 for the second pane", 2000)
             return
+        second_focused = self.second_pane.view.hasFocus()
+        if self.second_pane.current_mode() == SecondPane.OTHER:
+            # Read-only is per side here: either profile may be the one
+            # being written to, so the check lives with the direction.
+            self._pane_profile_transfer(second_focused, move)
+            return
         if self.is_read_only():
             self.statusBar().showMessage("Profile is read-only", 2000)
             return
-        second_focused = self.second_pane.view.hasFocus()
         if second_focused:
             self._transfer_from_second_pane(move)
         else:
             self._transfer_to_second_pane(move)
+
+    def pane_transfer_from_second(self):
+        """The second pane's context menu: send its selection this way."""
+        if not self.dual_pane_active():
+            return
+        if self.second_pane.current_mode() == SecondPane.OTHER:
+            self._pane_profile_transfer(True, False)
+        elif self.is_read_only():
+            self.statusBar().showMessage("Profile is read-only", 2000)
+        else:
+            self._transfer_from_second_pane(False)
+
+    def _pane_profile_transfer(self, from_second, move):
+        """
+        Copy or move between this profile and the one the second pane shows.
+
+        Nothing server-side can span two credentials, so both directions are
+        the cross-profile stream the Tools menu already runs; the pane only
+        decides which model is the source and which the destination.
+        """
+        other = self.second_pane.other_model()
+        other_name = self.second_pane.other_profile()
+        if other is None:
+            self.statusBar().showMessage(
+                "Choose a profile for the second pane", 3000)
+            return
+        bucket, prefix = self.second_pane.remote_target()
+        if from_second:
+            if self.in_bucket_list_mode() or not self.data_model.bucket:
+                self.statusBar().showMessage(
+                    "Open a bucket in the main pane", 2000)
+                return
+            if self.is_read_only():
+                self.statusBar().showMessage("Profile is read-only", 2000)
+                return
+            if move and getattr(other, "read_only", False):
+                self.statusBar().showMessage(
+                    f"Profile '{other_name}' is read-only; its originals "
+                    "cannot be removed", 4000)
+                return
+            items = [(name, (prefix or "") + name + ("/" if is_dir else ""),
+                      is_dir)
+                     for name, is_dir, _size in self.second_pane.selected()]
+            source_model = other
+            dest_model = self.data_model.clone_for_worker()
+            dest_prefix = self.data_model.current_folder or ""
+            where = f"{self.profile_name}/{self.data_model.bucket}"
+            source_name = other_name
+        else:
+            if getattr(other, "read_only", False):
+                self.statusBar().showMessage(
+                    f"Profile '{other_name}' is read-only", 3000)
+                return
+            if move and self.is_read_only():
+                self.statusBar().showMessage("Profile is read-only", 2000)
+                return
+            if self.in_bucket_list_mode():
+                self.statusBar().showMessage("Enter a bucket first", 2000)
+                return
+            items = self._collect_selected_targets()
+            source_model = None
+            dest_model = other
+            dest_prefix = prefix or ""
+            where = f"{other_name}/{bucket}"
+            source_name = self.profile_name
+        job = build_profile_copy_job(items, dest_prefix)
+        if not job:
+            self.statusBar().showMessage("Nothing selected", 2000)
+            return
+        conflicts = self._destination_conflicts(
+            [row[1] for row in job], dest_model=dest_model)
+        if conflicts is None:
+            return
+        job = self._resolve_overwrites(
+            job, conflicts, what="destination", index_of=lambda row: row[1])
+        if not job:
+            return
+        if move and QMessageBox.question(
+                self, "Move to another profile",
+                f"Move {len(job)} item(s) to {where}?\n\nThe originals in "
+                f"profile '{source_name}' are deleted once every copy has "
+                "succeeded.") != QMessageBox.StandardButton.Yes:
+            return
+        self.assign_thread_operation(
+            "move_to_profile" if move else "copy_to_profile", job,
+            need_refresh=bool(from_second or move), dest_model=dest_model,
+            source_model=source_model)
+        self.statusBar().showMessage(
+            f"{'Moving' if move else 'Copying'} {len(job)} item(s) to "
+            f"{where}…", 4000)
 
     def _transfer_to_second_pane(self, move):
         """Main listing (always remote) → the other pane."""
@@ -3343,15 +3527,16 @@ class MainWindow(
                 + "\n".join(unsafe[:10])
             )
         if not job:
-            return
+            return None
         # A sync can delete or overwrite locally, so refresh the listing after.
-        self.assign_thread_operation(
+        entry = self.assign_thread_operation(
             "sync", job, source_bucket=bucket or self.data_model.bucket or "")
         summary = summarize_sync_plan(actions)
         self.log(
             f"sync {direction}: {len(job)} action(s), "
             f"{_human_bytes(summary['bytes'])} to transfer"
         )
+        return entry
 
     def show_incomplete_uploads(self):
         """List and abort in-flight multipart uploads for the current bucket."""

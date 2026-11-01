@@ -313,6 +313,8 @@ class NavigationMixin:
         # puts the model back here, and listing_settled() compares against it.
         self._listing_location = (self.data_model.bucket or "",
                                   self.data_model.current_folder or "")
+        if self.thumbnail_view_active():
+            self.request_thumbnails()
 
     def change_current_folder(self, new_folder):
         self.data_model.prev_folder = self.data_model.current_folder

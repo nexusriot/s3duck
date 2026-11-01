@@ -131,7 +131,7 @@ class SecondPaneListingTests(unittest.TestCase):
         pane.mode.blockSignals(True)
         pane.mode.setCurrentIndex(pane.mode.findData(SecondPane.REMOTE))
         pane.mode.blockSignals(False)
-        pane._listing_for = pane._target()
+        pane._listing_for = pane.view_target()
         pane._on_listed([Item("a.txt", FSObjectType.FILE, "", 5),
                          Item("dir", FSObjectType.FOLDER, "", 0)], None)
         self.assertEqual(pane.entries(),

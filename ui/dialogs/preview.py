@@ -7,10 +7,13 @@ from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QThread, QUrl, Qt
 from PyQt6.QtGui import QDesktopServices, QFontDatabase, QPixmap
 from PyQt6.QtWidgets import (
     QDialog, QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit,
-    QProgressDialog, QPushButton, QScrollArea, QStackedWidget, QVBoxLayout,
+    QProgressDialog, QPushButton, QScrollArea, QSlider, QStackedWidget,
+    QVBoxLayout, QWidget,
 )
 from core.formatting import hex_dump
+from core.naming import format_media_time, media_kind
 from model import Model as DataModel
+from ui.dialogs.reports import SelectDialog, select_format
 from ui.widgets.highlighters import CodeHighlighter
 from utils import (
     DialogDismissMixin, FuncWorker, join_qthread, release_worker_on_finish,
@@ -22,6 +25,15 @@ try:
 except ImportError:
     QPdfDocument = None
     QPdfView = None
+
+# Optional for the same reason as QtPdf: distribution packages split it out.
+try:
+    from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+    from PyQt6.QtMultimediaWidgets import QVideoWidget
+except ImportError:
+    QAudioOutput = None
+    QMediaPlayer = None
+    QVideoWidget = None
 
 
 class PreviewDialog(DialogDismissMixin, QDialog):
@@ -57,6 +69,9 @@ class PreviewDialog(DialogDismissMixin, QDialog):
         ("\ufdd0", "U+FDD0"),
         ("\ufdd1", "U+FDD1"),
     )
+    # A presigned link the player streams from; an hour is longer than any
+    # preview is watched for, and the link never leaves this process.
+    MEDIA_LINK_SEC = 3600
 
     def __init__(self, parent, model, key):
         super().__init__(parent)
@@ -113,6 +128,10 @@ class PreviewDialog(DialogDismissMixin, QDialog):
         self._highlighter = None
         self._pdf_doc = None
         self._pdf_view = None
+        self._player = None
+        self._audio = None
+        self._media_url = ""
+        self._media_page = -1
 
         self._stack.addWidget(self._status)      # index 0
         self._stack.addWidget(self._img_scroll)  # index 1
@@ -124,6 +143,8 @@ class PreviewDialog(DialogDismissMixin, QDialog):
             self._pdf_view.setDocument(self._pdf_doc)
             self._pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
             self._stack.addWidget(self._pdf_view)   # index 4
+        if QMediaPlayer is not None:
+            self._media_page = self._stack.addWidget(self._build_media_page())
 
         self._open_btn = QPushButton("Open with default app")
         self._open_btn.clicked.connect(self._open_external)
@@ -135,9 +156,16 @@ class PreviewDialog(DialogDismissMixin, QDialog):
         self._save_btn.hide()
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.reject)
+        # A query over the object where it lives: the preview only ever
+        # holds its first megabyte.
+        self._select_btn = QPushButton("Query (S3 Select)…")
+        self._select_btn.clicked.connect(
+            lambda: SelectDialog(self, self._model, self._key).exec())
+        self._select_btn.setVisible(bool(select_format(key)))
 
         btns = QHBoxLayout()
         btns.addWidget(self._open_btn)
+        btns.addWidget(self._select_btn)
         btns.addWidget(self._edit_btn)
         btns.addWidget(self._save_btn)
         btns.addStretch(1)
@@ -161,8 +189,122 @@ class PreviewDialog(DialogDismissMixin, QDialog):
             found.append("a byte-order mark")
         return found
 
+    def _build_media_page(self):
+        """Video surface, play/pause, a seek slider and the elapsed time."""
+        page = QWidget()
+        self._video = QVideoWidget()
+        self._play_btn = QPushButton("Play")
+        self._play_btn.clicked.connect(self._toggle_play)
+        self._seek = QSlider(Qt.Orientation.Horizontal)
+        self._seek.setRange(0, 0)
+        self._seek.sliderMoved.connect(self._on_seek)
+        self._time = QLabel("0:00 / 0:00")
+        self._media_note = QLabel("")
+        self._media_note.setWordWrap(True)
+        controls = QHBoxLayout()
+        controls.addWidget(self._play_btn)
+        controls.addWidget(self._seek, 1)
+        controls.addWidget(self._time)
+        lay = QVBoxLayout(page)
+        lay.addWidget(self._video, 1)
+        lay.addWidget(self._media_note)
+        lay.addLayout(controls)
+        return page
+
+    def media_kind(self):
+        return media_kind(self._key)
+
+    def _start_media(self):
+        """
+        Stream the object instead of downloading it.
+
+        A preview's byte cap would cut a video off after a few seconds, and
+        downloading the whole thing first is what "Open with default app" is
+        for. The player reads a presigned link, so only what is watched is
+        transferred, and seeking is a ranged GET.
+        """
+        try:
+            url = self._model.presigned_get_url(self._key, self.MEDIA_LINK_SEC)
+        except Exception as exc:
+            self._status.setText(f"Could not prepare the stream:\n{exc}")
+            self._stack.setCurrentIndex(0)
+            return
+        self._media_url = url
+        self._player = QMediaPlayer(self)
+        self._audio = QAudioOutput(self)
+        self._player.setAudioOutput(self._audio)
+        is_video = self.media_kind() == "video"
+        self._video.setVisible(is_video)
+        if is_video:
+            self._player.setVideoOutput(self._video)
+        self._player.durationChanged.connect(self._on_duration)
+        self._player.positionChanged.connect(self._on_position)
+        self._player.playbackStateChanged.connect(self._on_playback_state)
+        self._player.errorOccurred.connect(self._on_media_error)
+        notes = []
+        if getattr(self._model, "no_ssl_check", False):
+            notes.append("This profile skips TLS verification, which the "
+                         "media player cannot; a self-signed endpoint will "
+                         "not play here.")
+        if getattr(self._model, "requester_pays", False):
+            notes.append("A requester-pays bucket refuses an unsigned "
+                         "stream; use Open with default app.")
+        self._media_note.setText(" ".join(notes))
+        self._media_note.setVisible(bool(notes))
+        self._player.setSource(QUrl(url))
+        self._stack.setCurrentIndex(self._media_page)
+
+    def _toggle_play(self):
+        if self._player is None:
+            return
+        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._player.pause()
+        else:
+            self._player.play()
+
+    def _on_playback_state(self, state):
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self._play_btn.setText("Pause" if playing else "Play")
+
+    def _on_duration(self, duration):
+        self._seek.setRange(0, max(0, int(duration)))
+        self._update_time()
+
+    def _on_position(self, position):
+        if not self._seek.isSliderDown():
+            self._seek.setValue(int(position))
+        self._update_time()
+
+    def _on_seek(self, position):
+        if self._player is not None:
+            self._player.setPosition(int(position))
+
+    def _update_time(self):
+        if self._player is None:
+            return
+        self._time.setText(
+            f"{format_media_time(self._player.position())} / "
+            f"{format_media_time(self._seek.maximum())}")
+
+    def _on_media_error(self, _error, message=""):
+        self._media_note.setText(
+            f"Could not play this object: {message or 'unsupported format'}."
+            ' Use "Open with default app".')
+        self._media_note.show()
+
+    def _stop_media(self):
+        if self._player is not None:
+            try:
+                self._player.stop()
+                self._player.setSource(QUrl())
+            except Exception:
+                pass
+
     def _start_load(self):
         ext = self._ext()
+        if self.media_kind() and QMediaPlayer is not None:
+            self._start_media()
+            return
         if ext in self.IMAGE_EXTS:
             max_bytes = self.IMG_LIMIT
         elif ext in self.PDF_EXTS and QPdfView is not None:
@@ -199,6 +341,7 @@ class PreviewDialog(DialogDismissMixin, QDialog):
         return True
 
     def stop_threads(self):
+        self._stop_media()
         self._stop_load_thread()
         join_qthread(self._save_thread)
         self._save_thread = None
@@ -220,6 +363,12 @@ class PreviewDialog(DialogDismissMixin, QDialog):
         truncated = result.get("truncated")
         self._etag = str(result.get("etag") or "")
         ext = self._ext()
+
+        if QMediaPlayer is not None and media_kind(self._key, ctype):
+            # Only the stored Content-Type said this was media; stream it
+            # rather than show the first megabyte as a hex dump.
+            self._start_media()
+            return
 
         # Raster images render as a pixmap (SVG is XML, shown as text below).
         is_raster = (ext in self.IMAGE_EXTS) or (

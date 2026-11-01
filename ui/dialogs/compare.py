@@ -13,10 +13,13 @@ from PyQt6.QtWidgets import (
 )
 from core.naming import _human_bytes
 from core.sync_plan import (
-    build_compare_plan, build_sync_plan, make_content_check,
-    summarize_compare_plan, summarize_sync_plan,
+    LOCAL_DELETE_FLOOR, LOCAL_DELETE_RATIO, build_compare_plan,
+    build_sync_plan, make_content_check, summarize_compare_plan,
+    summarize_sync_plan,
 )
+from core.two_way import CONFLICT, resolve_conflict
 from model import safe_local_path
+from ui.window.two_way import plan_two_way_pass
 from utils import (
     DialogDismissMixin, FuncWorker, join_qthread, release_worker_on_finish,
     scan_local_tree,
@@ -352,6 +355,13 @@ class WatchFolderDialog(QDialog):
         self.setWindowTitle("Watch a folder")
         self.setMinimumWidth(520)
 
+        self._direction = QComboBox()
+        self._direction.addItem("Mirror up: folder → bucket", "upload")
+        self._direction.addItem("Mirror down: bucket → folder", "download")
+        index = self._direction.findData(str(config.get("direction") or "upload"))
+        self._direction.setCurrentIndex(max(index, 0))
+        self._direction.currentIndexChanged.connect(lambda _i: self._sync_labels())
+
         self._local = QLineEdit(str(config.get("local") or ""))
         self._local.setPlaceholderText("local folder to mirror upwards…")
         browse = QPushButton("Browse…")
@@ -369,13 +379,13 @@ class WatchFolderDialog(QDialog):
         self._exclude = QLineEdit(str(config.get("exclude") or ""))
         self._exclude.setPlaceholderText("*.tmp  node_modules/  .git/")
 
-        self._delete_extra = QCheckBox(
-            "Delete objects that no longer exist locally")
+        self._delete_extra = QCheckBox("")
         self._delete_extra.setChecked(bool(config.get("delete_extra")))
 
         form = QFormLayout()
+        form.addRow(QLabel("Direction"), self._direction)
         form.addRow(QLabel("Local folder"), local_row)
-        form.addRow(QLabel("Destination"),
+        form.addRow(QLabel("Bucket side"),
                     QLabel(f"s3://{bucket}/{prefix}"))
         form.addRow(QLabel("Check every"), self._interval)
         form.addRow(QLabel("Exclude"), self._exclude)
@@ -393,10 +403,30 @@ class WatchFolderDialog(QDialog):
         buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
 
+        self._guard_note = QLabel("")
+        self._guard_note.setWordWrap(True)
+
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(note)
+        layout.addWidget(self._guard_note)
         layout.addWidget(buttons)
+        self._sync_labels()
+
+    def direction(self) -> str:
+        return self._direction.currentData() or "upload"
+
+    def _sync_labels(self):
+        down = self.direction() == "download"
+        self._delete_extra.setText(
+            "Delete local files whose objects are gone" if down
+            else "Delete objects that no longer exist locally")
+        self._guard_note.setText(
+            "A pass that would delete more than "
+            f"{LOCAL_DELETE_FLOOR} files or {int(LOCAL_DELETE_RATIO * 100)}% "
+            "of the folder is refused and the watch stops, so an emptied "
+            "bucket or a wrong prefix cannot empty the folder unattended."
+            if down else "")
 
     def _browse(self):
         path = QFileDialog.getExistingDirectory(self, "Folder to watch")
@@ -408,6 +438,14 @@ class WatchFolderDialog(QDialog):
             QMessageBox.warning(
                 self, "Watch a folder", "Choose an existing local folder.")
             return
+        if (self.direction() == "download" and self._delete_extra.isChecked()
+                and QMessageBox.question(
+                    self, "Watch a folder",
+                    "This watch will delete files in "
+                    f"{self._local.text().strip()} when their objects "
+                    "disappear from the bucket, without asking each time.\n\n"
+                    "Continue?") != QMessageBox.StandardButton.Yes):
+            return
         self.accept()
 
     def config(self) -> dict:
@@ -416,6 +454,7 @@ class WatchFolderDialog(QDialog):
             "interval": int(self._interval.currentData() or 300),
             "exclude": self._exclude.text().strip(),
             "delete_extra": self._delete_extra.isChecked(),
+            "direction": self.direction(),
         }
 
 
@@ -446,7 +485,13 @@ class SyncDialog(DialogDismissMixin, QDialog):
 
         self._up = QRadioButton("Local → S3 (upload)")
         self._down = QRadioButton("S3 → local (download)")
+        self._both = QRadioButton("Both ways")
+        self._both.setToolTip(
+            "Copy what changed on either side to the other, and propagate "
+            "deletions since the last two-way run. A file changed on both "
+            "sides is a conflict and is never overwritten silently.")
         self._up.setChecked(True)
+        self._two_way_state = {}
         self._delete_extra = QCheckBox(
             "Delete files at the destination that are missing at the source")
 
@@ -464,6 +509,7 @@ class SyncDialog(DialogDismissMixin, QDialog):
         dir_row = QHBoxLayout()
         dir_row.addWidget(self._up)
         dir_row.addWidget(self._down)
+        dir_row.addWidget(self._both)
         dir_row.addStretch(1)
 
         self._table = QTableWidget(0, 4)
@@ -484,10 +530,19 @@ class SyncDialog(DialogDismissMixin, QDialog):
         self._btn_preview.clicked.connect(self._preview)
         self._btn_run.clicked.connect(self._run)
         close_btn.clicked.connect(self.reject)
+        self._btn_keep_local = QPushButton("Keep local")
+        self._btn_keep_remote = QPushButton("Keep bucket")
+        self._btn_keep_local.clicked.connect(lambda: self.resolve_selected("local"))
+        self._btn_keep_remote.clicked.connect(lambda: self.resolve_selected("remote"))
+        for button in (self._btn_keep_local, self._btn_keep_remote):
+            button.setToolTip("Resolve the selected conflicts this way")
+            button.hide()
 
         row = QHBoxLayout()
         row.addWidget(self._btn_preview)
         row.addWidget(self._btn_run)
+        row.addWidget(self._btn_keep_local)
+        row.addWidget(self._btn_keep_remote)
         row.addStretch(1)
         row.addWidget(close_btn)
 
@@ -508,6 +563,9 @@ class SyncDialog(DialogDismissMixin, QDialog):
         self._scan_inputs = None
         self._local.textChanged.connect(self.invalidate_plan)
         self._up.toggled.connect(self.invalidate_plan)
+        self._down.toggled.connect(self.invalidate_plan)
+        self._both.toggled.connect(self.invalidate_plan)
+        self._both.toggled.connect(self._sync_direction_widgets)
         self._delete_extra.toggled.connect(self.invalidate_plan)
         self._exclude.textChanged.connect(self.invalidate_plan)
 
@@ -544,7 +602,36 @@ class SyncDialog(DialogDismissMixin, QDialog):
             self._local.setText(path)
 
     def direction(self) -> str:
+        if self._both.isChecked():
+            return "both"
         return "upload" if self._up.isChecked() else "download"
+
+    def _sync_direction_widgets(self, *_args):
+        both = self._both.isChecked()
+        # Two-way deletes come from the recorded state, never from a switch.
+        self._delete_extra.setEnabled(not both)
+        for button in (self._btn_keep_local, self._btn_keep_remote):
+            button.setVisible(both)
+
+    def resolve_selected(self, keep):
+        """Turn the selected conflicts into copies that keep one side."""
+        rows = sorted({i.row() for i in self._table.selectedIndexes()})
+        shown = self._shown_rows()
+        changed = 0
+        for row in rows:
+            if not (0 <= row < len(shown)):
+                continue
+            index = shown[row]
+            if self._actions[index].get("action") != CONFLICT:
+                continue
+            self._actions[index] = resolve_conflict(self._actions[index], keep)
+            changed += 1
+        if changed:
+            self._render_plan()
+        return changed
+
+    def _shown_rows(self):
+        return list(range(len(self._actions)))
 
     def exclude_patterns(self) -> list:
         return [p for p in re.split(r"[,\s]+", self._exclude.text() or "") if p]
@@ -572,7 +659,13 @@ class SyncDialog(DialogDismissMixin, QDialog):
         cancel = threading.Event()
         self._cancel = cancel
 
+        state_file = (self._mw.two_way_state_file(local_dir, prefix)
+                      if direction == "both" else "")
+
         def _scan(_w):
+            if direction == "both":
+                return plan_two_way_pass(clone, local_dir, prefix, state_file,
+                                         exclude=exclude, cancel_event=cancel)
             remote = clone.list_tree(prefix, cancel_event=cancel)
             # Strict when the plan deletes on the remote side whatever the
             # scan does not report: an unreadable subfolder must be an error,
@@ -606,8 +699,18 @@ class SyncDialog(DialogDismissMixin, QDialog):
         if exc is not None:
             self._info.setText(f"Could not build a plan: {exc}")
             return
+        skipped = []
+        if isinstance(result, dict):
+            self._two_way_state = result.get("state") or {}
+            skipped = result.get("skipped") or []
+            result = result.get("plan")
         self._actions = result or []
         self._plan_inputs = self._scan_inputs
+        self._skipped_keys = skipped
+        self._render_plan()
+
+    def _render_plan(self):
+        self._table.setRowCount(0)
         for entry in self._actions:
             r = self._table.rowCount()
             self._table.insertRow(r)
@@ -623,13 +726,21 @@ class SyncDialog(DialogDismissMixin, QDialog):
         summary = summarize_sync_plan(self._actions)
         bits = [f"{k}: {v}" for k, v in sorted(summary.items())
                 if k != "bytes" and v]
-        self._info.setText(
-            "  ".join(bits) + f"   ({_human_bytes(summary['bytes'])} to transfer)"
-        )
+        text = "  ".join(bits) + \
+            f"   ({_human_bytes(summary['bytes'])} to transfer)"
+        if summary.get(CONFLICT):
+            text += (f"\n{summary[CONFLICT]} conflict(s) will be left alone "
+                     "unless you resolve them (select, then Keep local / "
+                     "Keep bucket).")
+        if getattr(self, "_skipped_keys", None):
+            text += (f"\n{len(self._skipped_keys)} object(s) skipped: their "
+                     "key has no single local name (e.g. a double slash).")
+        self._info.setText(text)
         self._btn_run.setEnabled(bool(self.actionable()))
 
     def actionable(self):
-        return [a for a in self._actions if a.get("action") != "skip"]
+        return [a for a in self._actions
+                if a.get("action") not in ("skip", CONFLICT)]
 
     def _run(self):
         if self._plan_inputs != self.inputs():
@@ -657,5 +768,10 @@ class SyncDialog(DialogDismissMixin, QDialog):
         (local_dir, direction, _exclude, _delete,
          bucket, prefix) = self._plan_inputs
         self.accept()
+        if direction == "both":
+            self._mw.start_two_way_sync(
+                self._actions, local_dir, prefix, self._two_way_state,
+                bucket=bucket)
+            return
         self._mw.start_sync(
             todo, local_dir, prefix, direction, bucket=bucket)

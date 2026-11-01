@@ -18,6 +18,9 @@ EMPTY_SETTINGS = ("", "", "", "", "", "", "false", "true", "", "false", "",
 class SettingsWindow(QDialog):
     def __init__(self, *args, **kwargs):
         settings = kwargs.pop("settings", EMPTY_SETTINGS)
+        # Names other profiles already use. Two rows with one name made the
+        # last-used, probe and per-profile settings keys collide.
+        self._taken_names = {str(n).strip() for n in kwargs.pop("taken_names", ())}
         super().__init__(*args, **kwargs)
         # Profiles saved before session-token support carry 8 fields.
         settings = tuple(settings) + EMPTY_SETTINGS[len(settings):]
@@ -207,11 +210,17 @@ class SettingsWindow(QDialog):
         # what produces them, so requiring both would make it unsaveable.
         has_keys = bool(self.accessKeyEdit.text()) and bool(
             self.secretKeyEdit.text())
+        taken = self.nameLineEdit.text().strip() in self._taken_names
         btn_apply.setEnabled(
             bool(self.nameLineEdit.text())
+            and not taken
             and bool(self.urlLineEdit.text())
             and (has_keys or bool(self.credentialProcessEdit.text().strip()))
         )
+        self.nameLineEdit.setToolTip(
+            "Another profile already has this name" if taken else "")
+        self.nameLineEdit.setStyleSheet(
+            "border: 1px solid #c62828;" if taken else "")
 
     def setRetVal(self):
         self.retrunVal = (

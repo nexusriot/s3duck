@@ -7,8 +7,8 @@ import threading
 from boto3.s3.transfer import TransferConfig
 from core.errors import ArchivedObject, TransferCancelled
 from s3.common import (
-    _BotoProgressAdapter, drop_unsendable_checksum_args, precondition_failed,
-    prefix_of, run_parallel,
+    _BotoProgressAdapter, _CopySourceReader, drop_unsendable_checksum_args,
+    precondition_failed, prefix_of, run_parallel,
 )
 from urllib.parse import quote, urlencode
 
@@ -150,21 +150,22 @@ class CopyMixin:
             raise TransferCancelled("cancelled")
         resp = self.client.get_object(Bucket=self.bucket, Key=src_key)
         body = resp["Body"]
-        extra = drop_unsendable_checksum_args(
-            dst_model.client,
-            self._carried_extra_args(resp, dst_model.upload_extra_args))
-        callback = None
-        if progress_cb is not None:
+        try:
+            extra = drop_unsendable_checksum_args(
+                dst_model.client,
+                self._carried_extra_args(resp, dst_model.upload_extra_args))
             callback = _BotoProgressAdapter(
                 resp.get("ContentLength"), dst_key, progress_cb,
                 cancel_event=cancel_event, limiter=self.rate_limiter)
-        dst_model.client.upload_fileobj(
-            body, dst_model.bucket, dst_key,
-            ExtraArgs=extra or None,
-            Callback=callback,
-            Config=self._sized_transfer_config(
-                dst_model.transfer_cfg_upload, resp.get("ContentLength")),
-        )
+            dst_model.client.upload_fileobj(
+                _CopySourceReader(body, cancel_event), dst_model.bucket, dst_key,
+                ExtraArgs=extra or None,
+                Callback=callback,
+                Config=self._sized_transfer_config(
+                    dst_model.transfer_cfg_upload, resp.get("ContentLength")),
+            )
+        finally:
+            body.close()
         if log_fn:
             log_fn(f"copied {self.bucket}/{src_key} -> "
                    f"{dst_model.bucket}/{dst_key}")
@@ -194,7 +195,7 @@ class CopyMixin:
                 cancel_event=cancel_event, log_fn=log_fn)
 
     def _stream_copy(self, src_key: str, dst_key: str, dst_bucket: str,
-                     log_fn=None, storage_class=""):
+                     log_fn=None, storage_class="", cancel_event=None):
         """
         Copy by streaming the object through this process.
 
@@ -203,25 +204,33 @@ class CopyMixin:
         source client and writing with a client bound to the destination works
         anywhere, at the cost of moving the bytes.
         """
+        if cancel_event is not None and cancel_event.is_set():
+            raise TransferCancelled("cancelled")
         dst_client, _endpoint, _region, _use_path = self._try_bind_bucket(dst_bucket)
         resp = self.client.get_object(Bucket=self.bucket, Key=src_key)
         body = resp["Body"]
-        extra = drop_unsendable_checksum_args(
-            dst_client, self._carried_extra_args(resp, self.upload_extra_args))
-        # The source's class wins over the profile's upload policy, which the
-        # carried args brought along: this is a copy that happens to be
-        # routed through an upload, and a cross-region copy landing in a
-        # different class than the same copy made in-region would be a
-        # difference nobody asked for.
-        extra.pop("StorageClass", None)
-        extra.update(self._preserved_class_args(storage_class))
+        try:
+            extra = drop_unsendable_checksum_args(
+                dst_client, self._carried_extra_args(resp, self.upload_extra_args))
+            # The source's class wins over the profile's upload policy, which
+            # the carried args brought along: this is a copy that happens to
+            # be routed through an upload, and a cross-region copy landing in
+            # a different class than the same copy made in-region would be a
+            # difference nobody asked for.
+            extra.pop("StorageClass", None)
+            extra.update(self._preserved_class_args(storage_class))
 
-        dst_client.upload_fileobj(
-            body, dst_bucket, dst_key,
-            ExtraArgs=extra or None,
-            Config=self._sized_transfer_config(
-                self.transfer_cfg_upload, resp.get("ContentLength")),
-        )
+            dst_client.upload_fileobj(
+                _CopySourceReader(body, cancel_event), dst_bucket, dst_key,
+                ExtraArgs=extra or None,
+                Callback=_BotoProgressAdapter(
+                    resp.get("ContentLength"), dst_key, None,
+                    cancel_event=cancel_event, limiter=self.rate_limiter),
+                Config=self._sized_transfer_config(
+                    self.transfer_cfg_upload, resp.get("ContentLength")),
+            )
+        finally:
+            body.close()
         if log_fn:
             log_fn(f"streamed {src_key} -> {dst_bucket}/{dst_key}")
 
@@ -308,7 +317,7 @@ class CopyMixin:
 
     def _copy_multipart(self, src_key, dst_key, *, size, dst_bucket="",
                         src_bucket="", create_args=None, log_fn=None,
-                        cancel_event=None, source_etag=None):
+                        cancel_event=None, source_head=None):
         """
         Server-side copy of an object too large for a single CopyObject.
 
@@ -318,23 +327,34 @@ class CopyMixin:
         part of the object travels through this process.
 
         Every range is pinned to one version of the source with
-        CopySourceIfMatch. *source_etag* (and *size*) are what the caller's
-        own HEAD saw; ``None`` means nobody looked, and the source is asked.
+        CopySourceIfMatch (and its VersionId, where it has one).
+        *source_head* is the caller's own HEAD of the source; ``None`` means
+        nobody looked, and the source is asked.
         """
         self._guard_write()
         dst_bucket = dst_bucket or self.bucket
         src_bucket = src_bucket or self.bucket
-        if source_etag is None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise TransferCancelled("cancelled")
+        # A listing's size can already be stale. Pin every range to one HEAD
+        # (the caller's own, when it already made one for the create args)
+        # so a concurrent overwrite cannot assemble unrelated revisions or
+        # silently copy only the old length of a growing object.
+        head = source_head
+        if head is None:
             head = self.client.head_object(Bucket=src_bucket, Key=src_key)
-            source_etag = head.get("ETag") or ""
-            # The ranges must describe the version being pinned, not the
-            # size some earlier listing reported for an older one.
-            if head.get("ContentLength") is not None:
-                size = head["ContentLength"]
+        if head.get("ContentLength") is not None:
+            size = head["ContentLength"]
         size = int(size)
+        version = head.get("VersionId")
+        source_etag = head.get("ETag") or ""
+        if not source_etag and version in (None, "", "null"):
+            raise ValueError("A multipart copy needs a source ETag or version ID")
         part = self.copy_part_size(size, self.multipart_chunksize_bytes)
         total_parts = max(1, (size + part - 1) // part)
         copy_source = {"Bucket": src_bucket, "Key": src_key}
+        if version not in (None, "", "null"):
+            copy_source["VersionId"] = version
 
         create = dict(create_args or {})
         if "Tagging" not in create:
@@ -373,6 +393,8 @@ class CopyMixin:
         try:
             run_parallel(list(range(1, total_parts + 1)), _copy_part,
                          self.transfer_concurrency, cancel_event=cancel_event)
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled("cancelled")
             self.client.complete_multipart_upload(
                 Bucket=dst_bucket, Key=dst_key, UploadId=upload_id,
                 MultipartUpload={"Parts": [parts[n] for n in sorted(parts)]},
@@ -465,7 +487,7 @@ class CopyMixin:
                     # what holds when the copy was asked to preserve it.
                     create_args=self._copy_create_args(
                         src_key, extra=preserved, head=head),
-                    source_etag=head.get("ETag") or "",
+                    source_head=head,
                     log_fn=log_fn, cancel_event=cancel_event)
             except botocore.exceptions.ClientError as exc:
                 # The size route and the location route are independent: a
@@ -480,7 +502,8 @@ class CopyMixin:
                     log_fn(f"Multipart copy refused ({code}); streaming "
                            f"'{src_key}' to bucket '{dst_bucket}' instead")
                 self._stream_copy(src_key, dst_key, dst_bucket, log_fn=log_fn,
-                                  storage_class=storage_class)
+                                  storage_class=storage_class,
+                                  cancel_event=cancel_event)
 
         if size is not None and int(size) > self.MAX_SINGLE_COPY_BYTES:
             _multipart(int(size))
@@ -528,7 +551,8 @@ class CopyMixin:
                         f"'{src_key}' to bucket '{dst_bucket}' instead"
                     )
                 self._stream_copy(src_key, dst_key, dst_bucket, log_fn=log_fn,
-                                  storage_class=storage_class)
+                                  storage_class=storage_class,
+                                  cancel_event=cancel_event)
                 return
             if not self._is_region_error(exc):
                 raise

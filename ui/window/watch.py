@@ -1,10 +1,12 @@
-"""Watching a local folder and pushing what changes."""
+"""Watching a local folder and mirroring what changes, either way."""
 
 import json
 import os
 from PyQt6.QtCore import QThread, QTimer
 from PyQt6.QtWidgets import QDialog
-from core.sync_plan import build_sync_plan
+from core.sync_plan import (
+    build_exclude_matcher, build_sync_plan, local_delete_guard,
+)
 from ui.dialogs.compare import WatchFolderDialog
 from utils import (
     FuncWorker, join_qthread, release_worker_on_finish, scan_local_tree,
@@ -15,9 +17,29 @@ class WatchSkipped(Exception):
     """A watch pass that would act on a local tree it could not trust."""
 
 
-def plan_watch_pass(local_root, remote, config):
+def plan_watch_pass(local, remote, config, direction):
     """
-    The upload plan for one watch pass, or WatchSkipped.
+    One pass's plan, and how many destination files the mirror manages.
+
+    ``local_count`` is that destination count (the local folder for a
+    download watch, the prefix for an upload one). The guard's share is of
+    the managed files only. Counting excluded ones
+    (a 300-file cache/) raised the limit until a pass could delete every
+    file the watch was actually mirroring.
+    """
+    exclude = config.get("exclude") or ""
+    plan = build_sync_plan(
+        local, remote, direction=direction,
+        delete_extra=bool(config.get("delete_extra")), exclude=exclude)
+    excluded = build_exclude_matcher(exclude)
+    destination = local if direction == "download" else remote
+    managed = sum(1 for rel in destination if not excluded(rel))
+    return {"plan": plan, "local_count": managed}
+
+
+def scan_watch_pass(local_root, remote, config, direction="upload"):
+    """
+    Scan the local folder and plan one watch pass, or raise WatchSkipped.
 
     REGRESSION (critical, data loss): the local scan reported a missing or
     unreadable folder as an EMPTY one, and with "delete extras" on the plan
@@ -28,20 +50,18 @@ def plan_watch_pass(local_root, remote, config):
         local = scan_local_tree(local_root, strict=True)
     except OSError as exc:
         raise WatchSkipped(f"cannot read {local_root}: {exc}") from exc
-    delete_extra = bool(config.get("delete_extra"))
-    if delete_extra and not local and remote:
+    if (direction != "download" and config.get("delete_extra")
+            and not local and remote):
         # An empty folder that used to hold files looks exactly like a mount
         # point whose drive is gone. Mirroring that is never worth guessing.
         raise WatchSkipped(
             f"{local_root} is empty but the remote prefix holds "
             f"{len(remote)} object(s); not deleting them")
-    return build_sync_plan(
-        local, remote, direction="upload", delete_extra=delete_extra,
-        exclude=config.get("exclude") or "")
+    return plan_watch_pass(local, remote, config, direction)
 
 
 class WatchMixin:
-    """Watching a local folder and pushing what changes."""
+    """Watching a local folder and mirroring what changes, either way."""
 
     def open_watch(self):
         """Start or stop mirroring a local folder up to this prefix."""
@@ -51,15 +71,16 @@ class WatchMixin:
         if self.in_bucket_list_mode() or not self.data_model.bucket:
             self.statusBar().showMessage("Open a bucket to watch a folder", 2000)
             return
-        if self.is_read_only():
-            self.statusBar().showMessage("Profile is read-only", 2000)
-            return
         prefix = self.data_model.current_folder or ""
         dlg = WatchFolderDialog(
             self, self.data_model.bucket, prefix, self._watch_config)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         config = dlg.config()
+        # Mirroring down only reads the bucket, so a read-only profile may.
+        if config.get("direction") != "download" and self.is_read_only():
+            self.statusBar().showMessage("Profile is read-only", 2000)
+            return
         config["bucket"] = self.data_model.bucket
         config["prefix"] = prefix
         self._watch_config = config
@@ -82,8 +103,9 @@ class WatchMixin:
             max(10, int(config.get("interval") or 300)) * 1000)
         self._watch_timer.start()
         self._update_watch_status()
+        arrow = "<-" if config.get("direction") == "download" else "->"
         self.log(
-            f"watching {config['local']} -> s3://{config['bucket']}/"
+            f"watching {config['local']} {arrow} s3://{config['bucket']}/"
             f"{config['prefix']} every {config['interval']}s")
         self._watch_tick()
 
@@ -105,9 +127,10 @@ class WatchMixin:
                 else f"watching {name}")
             self.watch_status.setStyleSheet(
                 "color: #c62828;" if problem else "")
+            arrow = "<-" if self._watch.get("direction") == "download" else "->"
             self.watch_status.setToolTip(
                 (f"Last pass skipped: {problem}\n" if problem else "")
-                + f"{self._watch['local']} -> s3://{self._watch['bucket']}/"
+                + f"{self._watch['local']} {arrow} s3://{self._watch['bucket']}/"
                 f"{self._watch['prefix']}  (Tools -> Watch folder to stop)")
             self.watch_status.show()
         if getattr(self, "actWatchFolder", None) is not None:
@@ -128,9 +151,11 @@ class WatchMixin:
         clone = self.data_model.clone_for_worker()
         clone.bucket = config["bucket"]
 
+        direction = config.get("direction") or "upload"
+
         def _scan(_w):
             remote = clone.list_tree(config["prefix"])
-            return plan_watch_pass(config["local"], remote, config)
+            return scan_watch_pass(config["local"], remote, config, direction)
 
         self._watch_thread = QThread(self)
         self._watch_worker = FuncWorker(_scan)
@@ -161,15 +186,37 @@ class WatchMixin:
         if getattr(self, "_watch_problem", ""):
             self._watch_problem = ""
             self._update_watch_status()
-        actions = [entry for entry in (result or [])
+        result = result or {}
+        actions = [entry for entry in (result.get("plan") or [])
                    if entry.get("action") != "skip"]
         if not actions:
             return
-        self.log(f"watch: {len(actions)} change(s) to send")
+        direction = self._watch.get("direction") or "upload"
+        # Both directions: an unmounted or emptied local folder makes every
+        # object an "extra" for an upload watch, exactly as an emptied bucket
+        # does every local file for a download one.
+        down = direction == "download"
+        allowed, deletes = local_delete_guard(
+            actions, result.get("local_count", 0),
+            action="delete_local" if down else "delete_remote")
+        if not allowed:
+            where = (self._watch["local"] if down else
+                     f"s3://{self._watch['bucket']}/{self._watch['prefix']}")
+            kind = "local file(s)" if down else "object(s)"
+            self.stop_watch()
+            self.log(
+                f"watch stopped: one pass would delete {deletes} {kind} in "
+                f"{where}; review it in Sync with local folder before "
+                "mirroring again")
+            self.statusBar().showMessage(
+                f"Watch stopped: it would delete {deletes} {kind}", 10000)
+            return
+        self.log(f"watch: {len(actions)} change(s) to "
+                 f"{'fetch' if direction == 'download' else 'send'}")
         # The plan was compared against the watched bucket, which is not
         # necessarily the one the window is showing by now.
         self.start_sync(actions, self._watch["local"], self._watch["prefix"],
-                        "upload", bucket=self._watch["bucket"])
+                        direction, bucket=self._watch["bucket"])
 
     def _watch_settings_key(self) -> str:
         return self.store.profile_key("watch")

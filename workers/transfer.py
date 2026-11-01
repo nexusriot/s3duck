@@ -7,10 +7,12 @@ UI thread the bottleneck.
 
 import functools
 import os
+import tempfile
 import threading
 import time
 import zipfile
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from core.locations import move_overlap, same_store
 from model import (
     DownloadIncomplete, ObjectExists, TransferCancelled, run_parallel,
 )
@@ -79,6 +81,10 @@ class Worker(QObject):
     # provider's support desk asks for, and what str(exc) throws away — plus
     # whether the service was asking for patience rather than saying no.
     details = pyqtSignal(str, bool)
+    # The index of a job row that has finished for good. The window drops
+    # those rows when a paused or interrupted job is resumed, so the work
+    # already done is not done twice.
+    item_done = pyqtSignal(int)
 
     def __init__(self, data_model, job, dest_model=None, if_none_match=False):
         super().__init__()
@@ -95,6 +101,19 @@ class Worker(QObject):
     def _file_workers(self) -> int:
         """How many files to move at once (1 keeps ordering deterministic)."""
         return int(getattr(self.data_model, "parallel_files", 1) or 1)
+
+    def _tracked(self, fn):
+        """
+        ``fn`` over ``(index, row)`` pairs, reporting each row it finishes.
+
+        A row whose ``fn`` returns False failed without raising (so the rest
+        of the job carried on) and is not reported: a resume runs it again.
+        """
+        def run(pair):
+            index, item = pair
+            if fn(item) is not False:
+                self.item_done.emit(index)
+        return run
 
     @pyqtSlot()
     def cancel(self):
@@ -181,10 +200,13 @@ class Worker(QObject):
                 # theirs at the end instead.
                 with incomplete_lock:
                     incomplete.append(exc)
+                # Not finished: a resume after a pause must run it again.
+                return False
 
         incomplete = []
         incomplete_lock = threading.Lock()
-        run_parallel(self.job, _download_one, self._file_workers,
+        run_parallel(list(enumerate(self.job)), self._tracked(_download_one),
+                     self._file_workers,
                      cancel_event=self._cancel_event)
 
         self.batch_progress.emit(int(done_all), int(total_bytes_all))
@@ -198,7 +220,7 @@ class Worker(QObject):
 
     @job_runner("delete")
     def delete(self):
-        for key in self.job:
+        for index, key in enumerate(self.job):
             if self._cancel_event.is_set():
                 raise TransferCancelled("cancelled")
             msg = "moving %s -> /dev/null" % key
@@ -208,6 +230,7 @@ class Worker(QObject):
             # nothing until a whole folder had been walked.
             self.data_model.delete(key, log_fn=self.progress.emit,
                                    cancel_event=self._cancel_event)
+            self.item_done.emit(index)
 
     @job_runner("upload")
     def upload(self):
@@ -304,7 +327,8 @@ class Worker(QObject):
                     except OSError:
                         pass
 
-        run_parallel(self.job, _upload_one, self._file_workers,
+        run_parallel(list(enumerate(self.job)), self._tracked(_upload_one),
+                     self._file_workers,
                      cancel_event=self._cancel_event)
 
         if skipped:
@@ -338,6 +362,38 @@ class Worker(QObject):
     @job_runner("copy to profile")
     def copy_to_profile(self):
         # job = [(src_key, dst_key, is_folder)] into self.dest_model
+        self._copy_rows_to_profile()
+
+    @job_runner("move to profile")
+    def move_to_profile(self):
+        """
+        Copy into another profile, then delete the originals here.
+
+        The deletes wait for every copy, exactly as a same-account move does:
+        a failure half way leaves both copies of some objects, never neither.
+
+        Two profiles may point at the same bucket of the same account, and
+        then the destination can lie inside the source: copying ``data/`` to
+        ``data/data/`` and deleting ``data/`` deleted both. That is refused
+        before anything is written, as the same-account move refuses it.
+        """
+        if self.dest_model is not None and same_store(self.data_model,
+                                                      self.dest_model):
+            overlap = move_overlap(self.job)
+            if overlap is not None:
+                raise ValueError(
+                    f"Move destination '{overlap[1]}' overlaps source "
+                    f"'{overlap[0]}': both profiles point at the same "
+                    "bucket. Use a temporary name first.")
+        self._copy_rows_to_profile()
+        for src_key, _dst_key, _is_folder in self.job:
+            if self._cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+            self.progress.emit(f"removing {src_key}")
+            self.data_model.delete(src_key, log_fn=self.progress.emit,
+                                   cancel_event=self._cancel_event)
+
+    def _copy_rows_to_profile(self):
         if self.dest_model is None:
             raise Exception("no destination profile for this copy")
         where = f"{self.dest_model.bucket}"
@@ -380,7 +436,7 @@ class Worker(QObject):
     def copy(self):
         # job = [(src_key, dst_key, is_folder, dst_bucket_or_None,
         #         storage_class)]
-        for row in self.job:
+        for index, row in enumerate(self.job):
             (src_key, dst_key, is_folder, dst_bucket,
              storage_class) = self._copy_row(row)
             if self._cancel_event.is_set():
@@ -401,6 +457,7 @@ class Worker(QObject):
                     log_fn=self.progress.emit,
                     storage_class=storage_class,
                     cancel_event=self._cancel_event)
+            self.item_done.emit(index)
 
     @job_runner("move")
     def move(self):
@@ -612,10 +669,12 @@ class Worker(QObject):
                     self.progress.emit(f"could not delete {local_path}: {exc}")
                     with local_failures_lock:
                         local_failures.append(f"{local_path}: {exc}")
+                    return False
 
         local_failures = []
         local_failures_lock = threading.Lock()
-        run_parallel(self.job, _sync_one, self._file_workers,
+        run_parallel(list(enumerate(self.job)), self._tracked(_sync_one),
+                     self._file_workers,
                      cancel_event=self._cancel_event)
 
         self.batch_progress.emit(int(done_all), int(total_bytes_all))
@@ -628,7 +687,8 @@ class Worker(QObject):
     def set_tags(self):
         # job = [(key, is_folder, add_dict, remove_list, replace_bool)]
         changed = 0
-        for key, is_folder, add, remove, replace in self.job:
+        for index, (key, is_folder, add, remove, replace) in enumerate(
+                self.job):
             if self._cancel_event.is_set():
                 raise TransferCancelled("cancelled")
             for k in self._iter_object_keys(key, is_folder):
@@ -636,6 +696,7 @@ class Worker(QObject):
                     k, add=add, remove=remove, replace=replace)
                 changed += 1
                 self.progress.emit(f"tagged {k}")
+            self.item_done.emit(index)
         self.progress.emit(f"tagging done: {changed} object(s)")
 
     @job_runner("zip download")
@@ -646,7 +707,8 @@ class Worker(QObject):
         so nothing is staged on disk twice.
         """
         archive = None
-        complete = False
+        staged = None
+        staged_file = None
         try:
             zip_path = self.job[0][0]
             base_prefix = self.job[0][1]
@@ -682,8 +744,17 @@ class Worker(QObject):
                     throttle["b"] = current
                     self.batch_progress.emit(int(current), int(total_bytes_all))
 
+            if self._cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+            # Publish only a fully closed ZIP. Failure, even during listing
+            # or writing the central directory, must preserve an existing
+            # archive the user chose to replace.
+            fd, staged = tempfile.mkstemp(
+                prefix=".s3duck-zip-", suffix=".tmp",
+                dir=os.path.dirname(os.path.abspath(zip_path)))
+            staged_file = os.fdopen(fd, "w+b")
             archive = zipfile.ZipFile(
-                zip_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True)
+                staged_file, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True)
             for key, _size in entries:
                 if self._cancel_event.is_set():
                     raise TransferCancelled("cancelled")
@@ -696,25 +767,27 @@ class Worker(QObject):
                         target.write(block)
                         done += len(block)
                         _emit(done)
+            archive.close()
+            archive = None
+            staged_file.close()
+            staged_file = None
+            if self._cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+            os.replace(staged, zip_path)
+            staged = None
             self.batch_progress.emit(int(done), int(total_bytes_all))
             self.progress.emit(f"wrote {len(entries)} object(s) to {zip_path}")
-            complete = True
         finally:
             if archive is not None:
                 try:
                     archive.close()
                 except Exception:
                     pass
-            # A cancelled or failed archive is unusable; do not leave it
-            # behind. A half-written zip that opens and is simply missing its
-            # tail is worse than no zip at all, so the failure path removes it
-            # too — it used to keep one and report an error beside it.
-            # `complete` rather than the old `cancelled or failed`: the
-            # decorator owns the handler now, and "the body did not finish"
-            # is the same condition said from the inside.
-            if not complete:
+            if staged_file is not None:
+                staged_file.close()
+            if staged is not None:
                 try:
-                    os.remove(self.job[0][0])
+                    os.remove(staged)
                 except OSError:
                     pass
 
@@ -781,9 +854,10 @@ class Worker(QObject):
         changed = 0
         unchanged = 0
         failures = []
-        for key, is_folder, storage_class in self.job:
+        for index, (key, is_folder, storage_class) in enumerate(self.job):
             if self._cancel_event.is_set():
                 raise TransferCancelled("cancelled")
+            failed_before = len(failures)
             for k in self._iter_object_keys(key, is_folder):
                 self.progress.emit(f"storage-class {storage_class}: {k}")
                 try:
@@ -805,6 +879,10 @@ class Worker(QObject):
                     failures.append(f"{k}: {exc}")
                     self.progress.emit(
                         f"storage-class failed for {k}: {exc}")
+            # A row with a failure is not finished: a pause would otherwise
+            # drop it, and the resumed job end "done" with it unchanged.
+            if len(failures) == failed_before:
+                self.item_done.emit(index)
         self.progress.emit(
             f"storage class: {changed} changed, {unchanged} already "
             f"there, {len(failures)} failed")
@@ -818,7 +896,7 @@ class Worker(QObject):
         # job = [(key, is_folder)]
         fixed = 0
         skipped = 0
-        for key, is_folder in self.job:
+        for index, (key, is_folder) in enumerate(self.job):
             if self._cancel_event.is_set():
                 raise TransferCancelled("cancelled")
             for k in self._iter_object_keys(key, is_folder):
@@ -829,15 +907,43 @@ class Worker(QObject):
                     self.progress.emit(f"content-type {content_type}: {k}")
                 else:
                     skipped += 1
+            self.item_done.emit(index)
         self.progress.emit(
             f"content-type done: {fixed} updated, {skipped} unchanged")
+
+    @job_runner("point-in-time restore")
+    def restore_versions(self):
+        """
+        Apply a point-in-time plan: ``(key, "restore"|"delete", version_id)``.
+
+        Both actions add history rather than remove it -- a restore copies
+        the old version back on top, a delete writes a marker -- so the run
+        can be rolled back by the same means.
+        """
+        restored = deleted = 0
+        for index, (key, action, version_id) in enumerate(self.job):
+            if self._cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+            if action == "restore":
+                self.progress.emit(f"restoring {key} to version {version_id}")
+                self.data_model.make_version_current(
+                    key, version_id, log_fn=self.progress.emit)
+                restored += 1
+            elif action == "delete":
+                self.progress.emit(f"marking {key} deleted")
+                self.data_model.mark_deleted(key)
+                deleted += 1
+            self.item_done.emit(index)
+        self.progress.emit(
+            f"point-in-time restore: {restored} restored, {deleted} marked "
+            "deleted")
 
     @job_runner("restore")
     def restore(self):
         # job = [(key, is_folder, days, tier)]
         initiated = 0
         skipped = 0
-        for key, is_folder, days, tier in self.job:
+        for index, (key, is_folder, days, tier) in enumerate(self.job):
             if self._cancel_event.is_set():
                 raise TransferCancelled("cancelled")
             for k in self._iter_object_keys(key, is_folder):
@@ -850,6 +956,7 @@ class Worker(QObject):
                 else:
                     skipped += 1
                     self.progress.emit(f"restore skipped ({reason}): {k}")
+            self.item_done.emit(index)
         self.progress.emit(
             f"restore done: {initiated} initiated, {skipped} skipped"
         )

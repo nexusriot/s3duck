@@ -6,64 +6,44 @@ limitations worth fixing. Items move up or down based on review findings.
 
 ## Tier 1 — high value
 
-- **Local pane as a first-class side** — the dual pane (F3) can already show a
-  local folder and copy either way, but the local side has no sorting, no
-  context menu and no in-place rename. It is a viewer with transfer keys, not
-  yet a file manager half.
-- **Second pane against another profile** — the pane lists the current
-  profile's account only; cross-profile copy and sync exist as dialogs, and
-  wiring them into the pane would make the whole feature one surface.
+The 0.27.0 round shipped everything that was listed here: the local pane as a
+file manager, the second pane against another profile, pause/resume and a
+queue that survives a restart, and audio/video preview.
+
+- **Compare panes across profiles** — Compare panes reads both sides through
+  this window's model, so with the second pane on another profile it refuses
+  and points at Sync to another profile, whose dry run is the same answer.
+  Reading the right side through the pane's own model would make it one
+  surface.
+- **Persist cross-profile jobs** — a restored queue cannot hold another
+  profile's connection, so copy/move/sync to a profile is not written down
+  and is lost on close. Storing the destination profile's *name* and
+  re-reading its credentials on restore would close that gap.
 
 ## Tier 2 — bucket administration
 
-Lifecycle, CORS, the read-only policy view and Object Lock landed in 0.18.0
-under Tools → Bucket settings; default encryption, bucket tags, website
-hosting, acceleration and a read-only events view joined them in 0.20.0, and
-requester-pays is a per-profile toggle. What is left there:
+Block Public Access, server access logging, a read-only replication view,
+ACL editing, Object Lock retention editing, policy templates, presigned POST
+forms and SSE-C landed in 0.27.0. What is left:
 
-- **Object Lock retention editing** — retention state and legal holds are
-  shown and a hold can be placed or cleared, but setting a per-object
-  retention mode and date is not offered. GOVERNANCE retention can be
-  shortened only with a bypass permission, and COMPLIANCE cannot be shortened
-  at all, so this needs more care than a spin box.
 - **Lifecycle filters beyond a prefix** — the editor writes a prefix filter.
   A rule filtered by tag or object size is listed and summarized (the tags and
   the size bounds appear in its one-line description) but refuses to open in
   the editor, because rebuilding it from the prefix form would drop the filter
   and widen the rule to every object under the prefix — for an expiration
   rule, that deletes things it never used to touch.
-- **Policy templates** — "make this prefix public", "allow this account", as
-  reviewed snippets rather than a blank JSON box.
-
-## Launcher (profiles window)
-
-The connect probe, the two-line rows and keyboard handling landed in 0.13.0;
-the `[read-only]` / `[TLS unverified]` badges in 0.14.0; per-profile accent
-colours in 0.15.0; the credential-expiry badge, "Refresh credentials" and the
-credential-storage choice in 0.18.0. What is left:
-
-- **Reorder profiles** — drag to reorder, or sort by last used; the list is
-  stored as a QSettings array, so order is already persisted and just needs a
-  handle in the UI.
-- **Filter box** — type to narrow the list once a user has more than a screen
-  of profiles.
-- **Duplicate-name validation** — Add/Edit accept a name already in use;
-  only import (`-imported` suffix) and Copy profile (`-copy`, `-copy-2`, …)
-  de-duplicate.
-- **Connection state per row** — show the result of the last probe (reachable
-  / refused / never tried) so a broken profile is visible before Run.
-
-## Tier 3 — polish
-
-- **Pause / resume for the transfer queue** — cancel+retry exists; a true
-  pause that keeps partial state would round it out.
+- **Replication editing** — the rules are shown, not written: each names an
+  IAM role and a destination ARN this app cannot validate.
+- **Inventory configuration editing** — reports are read; creating a
+  configuration needs a destination bucket policy granting S3 write access,
+  which deserves its own reviewed template.
 - **Object Lock retention on a multipart copy** — a copy over 5 GiB is
   rebuilt by CreateMultipartUpload, which does not inherit the source's
   retention the way CopyObject does; the carried fields stop at the content
   headers, user metadata, encryption and the storage class.
-- **Trash convention** — optional "move to `.trash/` prefix" instead of
-  delete, with an empty-trash action (complements undo-delete, which needs
-  versioning).
+
+## Tier 3 — polish
+
 - **Content-hash duplicate confirmation by download** — "Confirm candidates"
   settles a group from the objects' stored digests where the backend supplies
   them. When it cannot, the only remaining answer is downloading and hashing
@@ -74,21 +54,25 @@ credential-storage choice in 0.18.0. What is left:
 - **Upload rules by tag or size** — the rule table matches the destination
   key. Matching on the local file's size or its existing tags would need a
   second matcher and a clear precedence story.
-- **Scheduled sync** — the watch mirrors on an interval while the app is
-  open. Running one at 02:00 with the app closed needs a daemon, which is a
-  different program, not a bigger dialog.
-- **Cross-profile move** — copying between profiles landed; deleting the
-  source afterwards (a true move) is the obvious follow-up, and needs the
-  same are-you-sure care as any cross-account delete.
-- **S3 Select preview** — run simple SQL over CSV/JSON objects in the preview
-  dialog instead of downloading them.
-- **QR code for presigned links** — hand a download link to a phone.
-- **Watch mode for downloads** — the interval mirror only runs local → remote;
-  the reverse direction is the same planner with the arguments swapped, but it
-  can delete local files, which deserves its own confirmation design.
+- **CLI parity** — `s3duck-cli` transfers one file at a time, prints no
+  progress bar and has no `rm`/`mv`; the window's parallel transfer settings
+  and the trash convention would be natural next steps.
+- **Inventory in ORC or Parquet** — only CSV reports are read; the other two
+  formats need libraries this app does not ship.
 - **Localization** — externalize user-facing strings.
 
 ## Known limitations (accepted for now)
+
+- Multipart server-side copies require a readable source HEAD and an ETag or
+  version ID. A version ID pins the original revision across overwrites; an
+  ETag precondition refuses a changed source. A backend that ignores these
+  preconditions cannot provide the same protection.
+- Resumable uploads check local file identity, size, and nanosecond modification
+  and change times during the transfer and before completion. These checks
+  detect ordinary concurrent edits, including an edit that restores mtime,
+  but do not lock the file or provide an atomic filesystem snapshot. Keep
+  source files stable while transferring and between resume attempts; existing
+  resume records match size, mtime, and chunk size rather than a content hash.
 
 - A multipart upload this app drives itself names CRC32 explicitly on
   `CreateMultipartUpload`, because botocore puts that same checksum on every
@@ -241,3 +225,53 @@ credential-storage choice in 0.18.0. What is left:
   and a per-profile setting overrides them for that profile only.
 - A CA bundle is ignored while "No SSL check" is on, and the profile dialog
   says so rather than pretending both apply.
+
+- A pause is a cancellation that keeps its place: the rows a worker
+  reported finished are dropped on resume, and a file in flight resumes from
+  its own record only when it is big enough to have one (past the resumable
+  upload threshold or the ranged-download threshold). A smaller file restarts
+  from zero, and a move restarts whole, because its deletes only happen
+  after every copy.
+- The persisted queue stores a job of up to 10 000 rows; a larger one (a
+  prefix walk expanded to every key) is not written down, and neither is a
+  cross-profile job. Each is named in the log rather than dropped silently.
+- The media preview streams from a presigned link, which a profile with "No
+  SSL check" (the player verifies TLS), a requester-pays bucket and an SSE-C
+  key cannot use; the dialog says so and "Open with default app" still works.
+- MinIO answers GetObjectAcl and GetBucketAcl with an owner whose ID is
+  empty — it implements ACLs only as the owner's FULL_CONTROL — so nothing
+  could be written back; the ACL editor opens read-only there and says why.
+- SSE-C needs TLS: S3 and MinIO refuse a customer key sent over plain HTTP.
+  While a key is set, objects not encrypted with it cannot be read, and the
+  key is never stored, so losing it loses those objects.
+- Trash is a server-side move, so it costs a copy and a delete per object,
+  and an object in an infrequent-access or Glacier class keeps that class
+  (and its minimum-duration charge) in the trash.
+- A watch (either direction) refuses a pass that would delete more than 5
+  files or 10% of the destination and stops itself, and `s3duck-cli sync
+  --delete` refuses the same run without `--force`; a legitimate large
+  cleanup is then done once through Sync with local folder, where the plan
+  is shown first.
+- A move to another profile whose two connections point at the same bucket
+  of the same account is checked for overlap like an in-bucket move and
+  refused when the destination lies inside the source.
+- A restored job queued under an SSE-C key comes back paused, and resumes
+  only once the window holds a key with the same MD5; the key itself is
+  never written down.
+- The QR code is offered for download links only: an upload link or form
+  needs a file a phone camera cannot attach.
+- A point-in-time restore copies each old version back with a plain
+  CopyObject, so an object over 5 GiB cannot be restored that way yet, and
+  the restored copy takes the bucket's default storage class.
+- MinIO stalls for about 30 seconds on a write into a versioned prefix that
+  already holds a folder-marker object. That is the server, not this app;
+  the end-to-end suite orders its fixtures around it.
+- Two-way sync compares local size and modification time with the remote
+  size and ETag recorded at the last run. A local edit that keeps both the
+  size and the mtime is not seen as a change, and a key with no single local
+  name ("a//b", a backslash) is left out of a two-way run and named.
+- Thumbnails are whole GETs of objects up to 8 MB, at most 300 per folder;
+  bigger images and other types keep the generic icon.
+- External editing uploads in one PUT and so stops at 100 MiB; an editor
+  that keeps the file open and writes it in pieces may be uploaded more than
+  once while it saves.

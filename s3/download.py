@@ -397,10 +397,17 @@ class DownloadMixin:
                     log_fn(f"checksum ok ({algorithm}): {path}")
                 return True
 
-        if opaque:
+        if opaque or getattr(self, "sse_c_key", b""):
+            # Under SSE-C the key set on the window means the object is
+            # encrypted even when the HEAD it was given did not say so.
+            if getattr(self, "sse_c_key", b"") or (head or {}).get(
+                    "SSECustomerAlgorithm"):
+                encrypted_by = "SSE-C"
+            else:
+                encrypted_by = "SSE-KMS"
             if log_fn:
-                log_fn(f"checksum skipped (the ETag of an encrypted object "
-                       f"is not an MD5): {path}")
+                log_fn(f"checksum skipped ({encrypted_by} ETag is not an "
+                       f"MD5): {path}")
             return True
         if not self.etag_is_md5(etag):
             verdict = self._verify_by_parts(path, key, etag, "", log_fn=log_fn)

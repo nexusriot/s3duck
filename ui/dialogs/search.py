@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout,
 )
 from core.naming import _human_bytes
+from core.search import parse_tag_filter
 from datetime import datetime, time as dtime, timezone
 from model import Model
 from utils import (
@@ -91,10 +92,23 @@ class SearchDialog(DialogDismissMixin, QDialog):
         self._before.setEnabled(False)
         self._use_before.toggled.connect(self._before.setEnabled)
 
+        # Not in a listing: each match the cheap filters leave costs a request.
+        self._tags = QLineEdit()
+        self._tags.setPlaceholderText("Tags, e.g.  team=infra, archived")
+        self._ctype = QLineEdit()
+        self._ctype.setPlaceholderText("Content-Type, e.g.  image/  or  text/csv")
+        self._ctype.setMaximumWidth(220)
+
         flags_row = QHBoxLayout()
         flags_row.addWidget(self._regex)
         flags_row.addWidget(self._case)
         flags_row.addStretch(1)
+
+        meta_row = QHBoxLayout()
+        meta_row.addWidget(QLabel("Tags"))
+        meta_row.addWidget(self._tags, 1)
+        meta_row.addWidget(QLabel("Type"))
+        meta_row.addWidget(self._ctype)
 
         size_row = QHBoxLayout()
         size_row.addWidget(QLabel("Size"))
@@ -118,6 +132,7 @@ class SearchDialog(DialogDismissMixin, QDialog):
         filters_lay.addLayout(flags_row)
         filters_lay.addLayout(size_row)
         filters_lay.addLayout(date_row)
+        filters_lay.addLayout(meta_row)
         filters.setLayout(filters_lay)
         self._filters_box = filters
 
@@ -285,6 +300,8 @@ class SearchDialog(DialogDismissMixin, QDialog):
             "min_size": self._parse_size(self._min_size.text(), factor),
             "max_size": self._parse_size(self._max_size.text(), factor),
             "extensions": exts or None,
+            "tags": self._tags.text().strip(),
+            "content_type": self._ctype.text().strip(),
         }
         if self._use_after.isChecked():
             kwargs["modified_after"] = datetime.combine(
@@ -308,6 +325,8 @@ class SearchDialog(DialogDismissMixin, QDialog):
             "after": self._after.date().toString("yyyy-MM-dd"),
             "use_before": self._use_before.isChecked(),
             "before": self._before.date().toString("yyyy-MM-dd"),
+            "tags": self._tags.text(),
+            "content_type": self._ctype.text(),
         }
 
     def apply_search_config(self, config):
@@ -319,6 +338,8 @@ class SearchDialog(DialogDismissMixin, QDialog):
         self._exts.setText(str(config.get("extensions") or ""))
         self._min_size.setText(str(config.get("min_size") or ""))
         self._max_size.setText(str(config.get("max_size") or ""))
+        self._tags.setText(str(config.get("tags") or ""))
+        self._ctype.setText(str(config.get("content_type") or ""))
         index = self._size_unit.findData(int(config.get("unit") or 1))
         self._size_unit.setCurrentIndex(max(index, 0))
         self._use_after.setChecked(bool(config.get("use_after")))
@@ -383,7 +404,8 @@ class SearchDialog(DialogDismissMixin, QDialog):
         return any([
             kwargs["min_size"] is not None, kwargs["max_size"] is not None,
             kwargs["extensions"], "modified_after" in kwargs,
-            "modified_before" in kwargs,
+            "modified_before" in kwargs, kwargs["tags"],
+            kwargs["content_type"],
         ])
 
     def _run_search(self):
@@ -396,7 +418,11 @@ class SearchDialog(DialogDismissMixin, QDialog):
             return
         try:
             filters = self.filter_kwargs()
-            Model.build_search_matcher(q, **filters)  # validate the regex now
+            # Validate the regex and the tag terms now, not mid-walk.
+            parse_tag_filter(filters["tags"])
+            Model.build_search_matcher(q, **{
+                k: v for k, v in filters.items()
+                if k not in ("tags", "content_type")})
         except ValueError as exc:
             self._info.setText(str(exc))
             return
@@ -411,8 +437,9 @@ class SearchDialog(DialogDismissMixin, QDialog):
         self._cancel = cancel
 
         def _search(_w):
-            return clone.search_keys(prefix, q, cancel_event=cancel,
-                                     max_results=limit, **filters)
+            found = clone.search_keys(prefix, q, cancel_event=cancel,
+                                      max_results=limit, **filters)
+            return found, bool(getattr(clone, "last_search_probe_limited", False))
 
         self._thread = QThread(self)
         self._worker = FuncWorker(_search)
@@ -439,6 +466,9 @@ class SearchDialog(DialogDismissMixin, QDialog):
         if exc is not None:
             self._info.setText(f"Search failed: {exc}")
             return
+        probe_limited = False
+        if isinstance(result, tuple):
+            result, probe_limited = result
         self._results = result or []
         for key, size, modified in self._results:
             r = self._table.rowCount()
@@ -453,6 +483,9 @@ class SearchDialog(DialogDismissMixin, QDialog):
         self._info.setText(
             f"{len(self._results)} match(es)"
             + (f" — showing first {self.MAX_RESULTS}" if capped else "")
+            + (f" — stopped after {Model.MAX_SEARCH_PROBES} tag/type "
+               "lookups; narrow the name or size filters to search further"
+               if probe_limited else "")
         )
         self._update_buttons()
 

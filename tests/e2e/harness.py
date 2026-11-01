@@ -68,7 +68,11 @@ def purge_bucket(client, name):
                 if entry.get("Key") and entry.get("VersionId")
             ]
             if doomed:
-                client.delete_objects(Bucket=name, Delete={"Objects": doomed})
+                # The bypass lets a GOVERNANCE-retained test object go; it is
+                # ignored on a bucket without Object Lock. Nothing here ever
+                # writes COMPLIANCE retention, which nothing could remove.
+                client.delete_objects(Bucket=name, Delete={"Objects": doomed},
+                                      BypassGovernanceRetention=True)
     except Exception:
         pass
     try:

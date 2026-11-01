@@ -265,7 +265,7 @@ class _CopyPartClient(FakeS3Client):
         self.source_size = int(source_size)
         self._copy_error = copy_error
         self.fail_on_part = fail_on_part
-        self._head = dict(head or {})
+        self._head = dict({"ETag": '"source-snapshot"'}, **(head or {}))
         self.created = []
         self.ranges = []
         self.completed = []
@@ -274,6 +274,12 @@ class _CopyPartClient(FakeS3Client):
     def head_object(self, **kw):
         self.calls.append(("head_object", kw))
         return dict(self._head, ContentLength=self.source_size)
+
+    def get_object_tagging(self, **kw):
+        # A multipart copy carries the source's tags itself; this source
+        # has none.
+        self.calls.append(("get_object_tagging", kw))
+        return {"TagSet": []}
 
     def copy_object(self, **kw):
         self.calls.append(("copy_object", kw))

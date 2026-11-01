@@ -37,6 +37,7 @@ mkdir -p $bin_dir
 mkdir -p $lib_dir
 mkdir -p $res_dir
 cp s3duck $bin_dir
+cp s3duck-cli $bin_dir
 cp -r icons/ $lib_dir
 cp resources/ducky.ico $res_dir
 cp resources/ducky.png $lib_dir

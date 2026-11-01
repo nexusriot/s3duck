@@ -17,6 +17,10 @@ from s3.common import (
 from urllib.parse import urlencode
 
 
+class _UploadSourceChanged(IOError):
+    """Parts from this local file must never be completed or resumed."""
+
+
 class UploadMixin:
     """Putting bytes in: multipart, resume, and the rules that shape a PUT.
     """
@@ -311,7 +315,23 @@ class UploadMixin:
         # what made a very large file transferable.
         chunk = int(self.upload_part_size(size, self.upload_chunk_size))
         total_parts = max(1, (int(size) + chunk - 1) // chunk)
-        mtime = os.path.getmtime(local_file)
+        source_stat = os.stat(local_file)
+        if source_stat.st_size != int(size):
+            raise _UploadSourceChanged("Upload source changed before the transfer; retry it")
+        mtime = source_stat.st_mtime
+
+        def _signature(stat):
+            return (stat.st_dev, stat.st_ino, stat.st_size,
+                    stat.st_mtime_ns, stat.st_ctime_ns)
+
+        def _check_source(handle=None):
+            try:
+                current = (os.fstat(handle.fileno()) if handle is not None
+                           else os.stat(local_file))
+            except OSError as exc:
+                raise _UploadSourceChanged("Upload source changed during the transfer; retry it") from exc
+            if _signature(current) != _signature(source_stat):
+                raise _UploadSourceChanged("Upload source changed during the transfer; retry it")
         state_path = self._upload_state_path(key, local_file)
         extra = self.upload_args_for(local_file, key)
         # CreateMultipartUpload is sent what we pass and nothing more, while
@@ -362,8 +382,12 @@ class UploadMixin:
             start = (number - 1) * chunk
             length = min(chunk, int(size) - start)
             with open(local_file, "rb") as handle:
+                _check_source(handle)
                 handle.seek(start)
                 body = handle.read(length)
+                _check_source(handle)
+            if len(body) != length:
+                raise _UploadSourceChanged("Upload source changed during the transfer; retry it")
             # Paced before the request so the shared ceiling actually throttles
             # rather than being charged after the bytes are already gone.
             if self.rate_limiter is not None:
@@ -384,8 +408,27 @@ class UploadMixin:
                     progress_cb(max(1, int(size)), min(sent, int(size)), key)
 
         pending = [n for n in range(1, total_parts + 1) if n not in done]
-        run_parallel(pending, _send, self.transfer_concurrency,
-                     cancel_event=cancel_event)
+        try:
+            try:
+                run_parallel(pending, _send, self.transfer_concurrency,
+                             cancel_event=cancel_event)
+            finally:
+                # Check failures and cancellations too: changed parts must
+                # not survive as a supposedly resumable interruption.
+                _check_source()
+        except _UploadSourceChanged:
+            # Mixed parts are not a resumable interruption. Discard the
+            # record even if the source's mtime was restored by its writer.
+            try:
+                self.client.abort_multipart_upload(
+                    Bucket=self.bucket, Key=key, UploadId=upload_id)
+            except Exception:
+                pass
+            try:
+                os.remove(state_path)
+            except OSError:
+                pass
+            raise
 
         if cancel_event is not None and cancel_event.is_set():
             raise TransferCancelled("cancelled")

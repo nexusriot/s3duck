@@ -19,6 +19,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libegl1 \
         libfontconfig1 \
         libfreetype6 \
+        # QtMultimedia links against PulseAudio, its network stack against
+        # Kerberos and its FFmpeg backend against XRandR, even when nothing
+        # is played; without them the media preview cannot load a stream
+        # and its end-to-end test can only skip or fail.
+        libpulse0 \
+        libgssapi-krb5-2 \
+        libxrandr2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Pinned to requirements.txt: a GUI run that disagrees with the app about its

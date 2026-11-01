@@ -61,6 +61,41 @@ def _to_epoch(v) -> int:
     except Exception:
         pass
     return 0
+AUDIO_PREVIEW_EXT = {".mp3", ".wav", ".ogg", ".oga", ".opus", ".flac",
+                     ".m4a", ".aac", ".wma"}
+VIDEO_PREVIEW_EXT = {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi",
+                     ".ogv", ".wmv", ".mpg", ".mpeg"}
+
+
+def media_kind(key, content_type="") -> str:
+    """
+    "audio", "video" or "" for what the preview should stream.
+
+    The extension decides first; the stored Content-Type only fills in for a
+    key without a recognised one, because uploads by other tools are
+    routinely stamped ``binary/octet-stream`` whatever they hold.
+    """
+    ext = os.path.splitext(str(key or "").lower())[1]
+    if ext in AUDIO_PREVIEW_EXT:
+        return "audio"
+    if ext in VIDEO_PREVIEW_EXT:
+        return "video"
+    ctype = str(content_type or "").lower()
+    if ctype.startswith("audio/"):
+        return "audio"
+    if ctype.startswith("video/"):
+        return "video"
+    return ""
+
+
+def format_media_time(ms) -> str:
+    """``m:ss``, or ``h:mm:ss`` past an hour, for a player position."""
+    seconds = max(0, int(ms or 0) // 1000)
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
 def categorize_key(key: str) -> str:
     k = (key or "").lower()
     _, ext = os.path.splitext(k)

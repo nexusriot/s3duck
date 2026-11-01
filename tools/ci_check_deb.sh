@@ -52,6 +52,13 @@ check_one() {
     echo "::error::$svgs SVG icons but only $pngs PNG twins packaged"
     exit 1
   fi
+
+  # The command-line tool is what a scheduled sync runs; a package that
+  # ships the module but not its launcher leaves cron with nothing to call.
+  for path in usr/bin/s3duck-cli usr/lib/s3duck/s3duck_cli.py; do
+    grep -q "$path" <<<"$contents" || {
+      echo "::error::$path missing from the package"; exit 1; }
+  done
 }
 
 shopt -s nullglob
