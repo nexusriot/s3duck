@@ -283,6 +283,9 @@ class TransferQueueMixin:
 
     def _start_transfer(self, entry: '_QEntry'):
         method = entry.method
+        mutates = method not in ("download", "zip_download")
+        if mutates:
+            self.invalidate_listing_cache()
         job = entry.job
         need_refresh = entry.need_refresh
 
@@ -401,6 +404,10 @@ class TransferQueueMixin:
             _reenable_after_thread()
 
         def _on_worker_finished(cancelled: bool):
+            # Includes partial failures/cancellation and jobs whose caller
+            # does not refresh the visible folder (e.g. storage-class edits).
+            if mutates:
+                self.invalidate_listing_cache()
             if self._closing:
                 return
             if entry.pause_requested:

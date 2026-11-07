@@ -385,34 +385,44 @@ class Worker(QObject):
                     f"Move destination '{overlap[1]}' overlaps source "
                     f"'{overlap[0]}': both profiles point at the same "
                     "bucket. Use a temporary name first.")
-        self._copy_rows_to_profile()
-        for src_key, _dst_key, _is_folder in self.job:
+        copied_sources = self._copy_rows_to_profile(require_manifest=True)
+        for src_key, manifest in copied_sources:
             if self._cancel_event.is_set():
                 raise TransferCancelled("cancelled")
             self.progress.emit(f"removing {src_key}")
-            self.data_model.delete(src_key, log_fn=self.progress.emit,
-                                   cancel_event=self._cancel_event)
+            if manifest is None:
+                self.data_model.delete(src_key, log_fn=self.progress.emit,
+                                       cancel_event=self._cancel_event)
+            else:
+                self.data_model.delete_exact(manifest, log_fn=self.progress.emit,
+                                             cancel_event=self._cancel_event)
 
-    def _copy_rows_to_profile(self):
+    def _copy_rows_to_profile(self, require_manifest=False):
         if self.dest_model is None:
             raise Exception("no destination profile for this copy")
         where = f"{self.dest_model.bucket}"
+        copied_sources = []
         for src_key, dst_key, is_folder in self.job:
             if self._cancel_event.is_set():
                 raise TransferCancelled("cancelled")
             if is_folder:
                 self.progress.emit(
                     f"copying folder {src_key} -> {where}/{dst_key}")
-                self.data_model.copy_prefix_to_model(
+                manifest = self.data_model.copy_prefix_to_model(
                     src_key, self.dest_model, dst_key,
                     cancel_event=self._cancel_event,
                     log_fn=self.progress.emit)
+                if require_manifest and manifest is None:
+                    raise RuntimeError("Folder copy returned no source manifest; sources kept")
+                copied_sources.append((src_key, manifest))
             else:
                 self.progress.emit(f"copying {src_key} -> {where}/{dst_key}")
                 self.data_model.copy_to_model(
                     src_key, self.dest_model, dst_key,
                     cancel_event=self._cancel_event,
                     log_fn=self.progress.emit)
+                copied_sources.append((src_key, None))
+        return copied_sources
 
     @staticmethod
     def _copy_row(row):
@@ -482,6 +492,7 @@ class Worker(QObject):
                 f"Nothing was moved: {what}, so copying onto it would "
                 f"destroy the original before it was moved. Move or rename "
                 f"in two steps (via temporary names) instead.")
+        copied_sources = []
         for row in self.job:
             (src_key, dst_key, is_folder, dst_bucket,
              storage_class) = self._copy_row(row)
@@ -491,11 +502,14 @@ class Worker(QObject):
             if is_folder:
                 self.progress.emit(
                     f"moving folder {src_key} -> {dst_key}{where}")
-                self.data_model.copy_prefix(
+                manifest = self.data_model.copy_prefix(
                     src_key, dst_key, dst_bucket=dst_bucket,
                     log_fn=self.progress.emit,
                     cancel_event=self._cancel_event,
                 )
+                if manifest is None:
+                    raise RuntimeError("Folder copy returned no source manifest; sources kept")
+                copied_sources.append((src_key, manifest))
             else:
                 self.progress.emit(f"moving {src_key} -> {dst_key}{where}")
                 self.data_model.copy_object(
@@ -503,15 +517,19 @@ class Worker(QObject):
                     log_fn=self.progress.emit,
                     storage_class=storage_class,
                     cancel_event=self._cancel_event)
+                copied_sources.append((src_key, None))
         # Sources are removed only after every copy succeeded, so a failure
         # mid-way never leaves the data deleted-but-not-copied.
-        for row in self.job:
-            src_key = row[0]
+        for src_key, manifest in copied_sources:
             if self._cancel_event.is_set():
                 raise TransferCancelled("cancelled")
             self.progress.emit(f"removing {src_key}")
-            self.data_model.delete(src_key, log_fn=self.progress.emit,
-                                   cancel_event=self._cancel_event)
+            if manifest is None:
+                self.data_model.delete(src_key, log_fn=self.progress.emit,
+                                       cancel_event=self._cancel_event)
+            else:
+                self.data_model.delete_exact(manifest, log_fn=self.progress.emit,
+                                             cancel_event=self._cancel_event)
 
     def _move_clash(self):
         """

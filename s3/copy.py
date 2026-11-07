@@ -189,13 +189,14 @@ class CopyMixin:
 
     def copy_prefix_to_model(self, src_prefix: str, dst_model, dst_prefix: str,
                              progress_cb=None, cancel_event=None, log_fn=None):
-        """Copy a whole prefix into another profile, preserving its shape."""
+        """Copy a prefix and return exactly the source keys copied."""
         dst_model._guard_write()
         # An empty prefix on either side means the bucket root, which
         # prefix_of answers as "" — a guard here would only hide a
         # regression in it.
         source = prefix_of(src_prefix)
         target = prefix_of(dst_prefix)
+        copied = []
         for key, _size in self.get_keys(source, log_fn=log_fn):
             if cancel_event is not None and cancel_event.is_set():
                 raise TransferCancelled("cancelled")
@@ -203,13 +204,20 @@ class CopyMixin:
                 continue
             rel = key[len(source):] if key.startswith(source) else ""
             if not rel:
+                if key == source and key.endswith("/"):
+                    if target:
+                        dst_model.create_folder(target, log_fn=log_fn)
+                    copied.append(key)
                 continue
             if key.endswith("/"):
                 dst_model.create_folder(target + rel, log_fn=log_fn)
+                copied.append(key)
                 continue
             self.copy_to_model(
                 key, dst_model, target + rel, progress_cb=progress_cb,
                 cancel_event=cancel_event, log_fn=log_fn)
+            copied.append(key)
+        return copied
 
     def _stream_copy(self, src_key: str, dst_key: str, dst_bucket: str,
                      log_fn=None, storage_class="", cancel_event=None):
@@ -587,7 +595,7 @@ class CopyMixin:
 
     def copy_prefix(self, src_prefix: str, dst_prefix: str, dst_bucket: str = None,
                     log_fn=None, cancel_event=None):
-        """Server-side recursive copy of all objects under src_prefix to dst_prefix."""
+        """Copy a prefix and return exactly the source keys copied."""
         self._guard_write()
         dst_bucket = dst_bucket or self.bucket
         if dst_bucket == self.bucket:
@@ -619,3 +627,4 @@ class CopyMixin:
                 in self.get_keys_with_class(src_prefix, log_fn=log_fn) if k]
         run_parallel(keys, _copy_one, self.parallel_files,
                      cancel_event=cancel_event)
+        return [key for key, _size, _class in keys]

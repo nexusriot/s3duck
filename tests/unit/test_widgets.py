@@ -6,6 +6,8 @@ import diagnostics
 import main_window
 import os
 import profile_switcher
+import subprocess
+import sys
 import theme
 import threading
 import time
@@ -30,6 +32,22 @@ from utils import (
 
 
 class BreadcrumbTests(unittest.TestCase):
+    def test_deleting_breadcrumb_before_deferred_scroll_does_not_abort(self):
+        script = """
+from PyQt6 import sip
+from PyQt6.QtWidgets import QApplication
+from ui.widgets.breadcrumb import Breadcrumb
+app = QApplication([])
+widget = Breadcrumb()
+widget.set_location('bucket', 'one/two/', False)
+sip.delete(widget)
+app.processEvents()
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script], cwd=PROJECT_ROOT,
+            env=dict(os.environ, QT_QPA_PLATFORM="offscreen"),
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
     @classmethod
     def setUpClass(cls):
         cls._app = _ensure_qapp()

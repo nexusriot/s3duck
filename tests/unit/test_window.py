@@ -3789,11 +3789,218 @@ class ListingConsistencyTests(unittest.TestCase):
         entry = self.win.current_tab_entry()
         position = entry["pos"]
         _ListingModel.FAILURES[("bkt", "")] = "SlowDown"
+        self.win.invalidate_listing_cache()
         self.win.goBack()
         self._settle()
         self.assertEqual(self.win.data_model.current_folder, "archive/")
         self.assertEqual(entry["pos"], position)
         self.assertFalse(self.win._history_navigating)
+
+    def test_revisiting_a_folder_uses_loaded_rows_without_a_worker(self):
+        self.win.open_location("bkt", "archive/")
+        self._settle()
+        with patch.object(self.win.data_model, "clone_for_worker",
+                          side_effect=AssertionError("unexpected listing worker")):
+            self.win.goUp()
+            self.assertEqual(self.win.data_model.current_folder, "")
+            self.assertIn("archive", self._rows())
+            self.win.open_location("bkt", "archive/")
+            self.assertEqual(self.win.data_model.current_folder, "archive/")
+            self.assertIn("report.csv", self._rows())
+        self.assertTrue(self.win.listing_settled())
+        self.assertIn("cached", self.win.statusBar().currentMessage())
+
+    def test_refresh_fetches_changes_and_invalidates_other_folders(self):
+        self.win.open_location("bkt", "archive/")
+        self._settle()
+        _ListingModel.LISTINGS[("bkt", "archive/")] = [("new.csv", self.F)]
+        self.win.btnRefresh.trigger()
+        self._settle()
+        self.assertIn("new.csv", self._rows())
+        self.assertNotIn("report.csv", self._rows())
+        _ListingModel.LISTINGS[("bkt", "")] = [("fresh.csv", self.F)]
+        self.win.goUp()
+        self._settle()
+        self.assertIn("fresh.csv", self._rows())
+
+    def test_invalidated_listing_is_fetched_on_revisit(self):
+        self.win.open_location("bkt", "archive/")
+        self._settle()
+        self.win.invalidate_listing_cache()
+        _ListingModel.LISTINGS[("bkt", "")] = [("changed.csv", self.F)]
+        self.win.goUp()
+        self._settle()
+        self.assertIn("changed.csv", self._rows())
+
+    def test_empty_folder_is_a_cache_hit(self):
+        self.win.open_location("bkt", "archive/deep/")
+        self._settle()
+        self.win.open_location("bkt", "")
+        self._settle()
+        with patch.object(self.win.data_model, "clone_for_worker",
+                          side_effect=AssertionError("empty listing refetched")):
+            self.win.open_location("bkt", "archive/deep/")
+        self.assertEqual(self._rows(), ["[..]"])
+        self.assertTrue(self.win.listing_settled())
+
+    def test_failed_listing_is_retried_on_next_visit(self):
+        _ListingModel.FAILURES[("bkt", "archive/")] = "SlowDown"
+        self.win.open_location("bkt", "archive/")
+        self._settle()
+        self.assertEqual(self.win.data_model.current_folder, "")
+        del _ListingModel.FAILURES[("bkt", "archive/")]
+        _ListingModel.LISTINGS[("bkt", "archive/")] = [("recovered.csv", self.F)]
+        self.win.open_location("bkt", "archive/")
+        self._settle()
+        self.assertIn("recovered.csv", self._rows())
+
+    def test_late_worker_cannot_replace_a_cached_destination(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        _ListingModel.GATES[("bkt", "archive/")] = gate
+        self.win.open_location("bkt", "archive/")
+        thread = self.win._nav_thread
+        self.win.open_location("bkt", "")
+        self.assertTrue(self.win.listing_settled())
+        gate.set()
+        deadline = time.monotonic() + 5
+        while (self.win._thread_is_running(thread)
+               and time.monotonic() < deadline):
+            self._app.processEvents()
+        self._app.processEvents()
+        self.assertFalse(self.win._thread_is_running(thread))
+        self.assertEqual(self.win.data_model.current_folder, "")
+        self.assertIn("archive", self._rows())
+        self.assertTrue(self.win.listing_settled())
+
+    def test_cached_truncation_notice_and_changed_listing_limit(self):
+        original_list = _ListingModel.list
+
+        def capped(model, folder, page_cb=None, max_items=0):
+            items = original_list(model, folder, page_cb, max_items)
+            model.last_listing_truncated = bool(max_items and len(items) > max_items)
+            return items[:max_items] if max_items else items
+
+        _ListingModel.LISTINGS[("bkt", "archive/")] = [
+            ("one.csv", self.F), ("two.csv", self.F)]
+        with patch.object(_ListingModel, "list", capped), \
+                patch.object(self.win, "listing_limit", return_value=1) as limit:
+            self.win.open_location("bkt", "archive/")
+            self._settle()
+            self.assertFalse(self.win.listing_notice.isHidden())
+            self.assertNotIn("two.csv", self._rows())
+            self.win.open_location("bkt", "")
+            self._settle()
+            with patch.object(self.win.data_model, "clone_for_worker",
+                              side_effect=AssertionError("truncated cache missed")):
+                self.win.open_location("bkt", "archive/")
+            self.assertFalse(self.win.listing_notice.isHidden())
+            limit.return_value = 2
+            self.win.open_location("bkt", "archive/")
+            self._settle()
+            self.assertIn("two.csv", self._rows())
+            self.assertTrue(self.win.listing_notice.isHidden())
+
+    def test_switching_credentials_with_same_profile_and_bucket_drops_cache(self):
+        self.win.open_location("bkt", "archive/")
+        self._settle()
+        _ListingModel.LISTINGS[("bkt", "archive/")] = [("other-account.csv", self.F)]
+        prof = types.SimpleNamespace(
+            name="prod", url=self.win.data_model.profile_endpoint_url,
+            region="us-east-1", access_key="NEW", secret_key="NEW-SECRET",
+            no_ssl_check=False, use_path=False, session_token="", read_only=False)
+        self.win.apply_profile(prof)
+        self._settle()
+        self.win.open_location("bkt", "archive/")
+        self._settle()
+        self.assertIn("other-account.csv", self._rows())
+        self.assertNotIn("report.csv", self._rows())
+
+    def test_invalidation_during_listing_does_not_repopulate_cache(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        _ListingModel.GATES[("bkt", "archive/")] = gate
+        self.win.open_location("bkt", "archive/")
+        self.win.invalidate_listing_cache()
+        gate.set()
+        self._settle()
+        key = self.win._listing_cache_key("bkt", "archive/")
+        self.assertIsNone(self.win._listing_cache.get(key))
+        self.win.goUp()
+        self._settle()
+        _ListingModel.LISTINGS[("bkt", "archive/")] = [("fresh.csv", self.F)]
+        self.win.open_location("bkt", "archive/")
+        self._settle()
+        self.assertIn("fresh.csv", self._rows())
+
+    def test_open_usage_window_never_scans_on_selection_changes(self):
+        dialog = Mock()
+        dialog.isVisible.return_value = True
+        self.win._bucket_usage_dialog = dialog
+        self.addCleanup(setattr, self.win, "_bucket_usage_dialog", None)
+        with patch.object(self.win, "request_bucket_usage") as request:
+            for name in ("archive", "private", "report.csv"):
+                self.win.listview.setCurrentIndex(self.win.ix_by_name(name))
+            request.assert_not_called()
+        self.assertTrue(self.win.btnBucketUsage.isEnabled())
+
+    def test_usage_button_stays_disabled_during_scan(self):
+        self.win._bucket_usage_thread = _FakeRunningThread()
+        self.addCleanup(setattr, self.win, "_bucket_usage_thread", None)
+        self.win.listview.setCurrentIndex(self.win.ix_by_name("report.csv"))
+        self.assertFalse(self.win.btnBucketUsage.isEnabled())
+
+    def test_mutation_without_refresh_clears_cache_at_start_and_finish(self):
+        class NoopDeleter:
+            def delete(self, key, log_fn=None, cancel_event=None):
+                return True
+
+        cache = self.win._listing_cache
+        key = self.win._listing_cache_key("bkt", "")
+        snapshot = cache.get(key)
+        self.assertIsNotNone(snapshot)
+        with patch.object(type(self.win.data_model), "clone_for_worker",
+                          lambda _s: NoopDeleter()):
+            self.win.assign_thread_operation(
+                "delete", ["report.csv"], need_refresh=False)
+            self.assertIsNone(cache.get(key))
+            # A listing completed during the transfer must not survive its
+            # completion, including jobs that don't refresh the visible view.
+            cache.put(key, snapshot)
+            deadline = time.monotonic() + 5
+            while (self.win._active_entry is not None
+                   and time.monotonic() < deadline):
+                self._app.processEvents()
+            self.assertIsNone(self.win._active_entry)
+        self.assertIsNone(cache.get(key))
+
+    def test_failed_and_cancelled_mutations_invalidate_partial_results(self):
+        cache = self.win._listing_cache
+        key = self.win._listing_cache_key("bkt", "")
+        snapshot = cache.get(key)
+        for error, status in ((RuntimeError("failed after first delete"), "error"),
+                              (TransferCancelled("cancelled"), "cancelled")):
+            with self.subTest(status=status):
+                class PartialDeleter:
+                    def delete(self, key, log_fn=None, cancel_event=None):
+                        raise error
+
+                cache.put(key, snapshot)
+                with patch.object(type(self.win.data_model), "clone_for_worker",
+                                  lambda _s: PartialDeleter()), \
+                        patch.object(QMessageBox, "critical"), \
+                        patch.object(QMessageBox, "warning"):
+                    entry = self.win.assign_thread_operation(
+                        "delete", ["report.csv"], need_refresh=False)
+                    self.assertIsNone(cache.get(key))
+                    cache.put(key, snapshot)
+                    deadline = time.monotonic() + 5
+                    while (self.win._active_entry is not None
+                           and time.monotonic() < deadline):
+                        self._app.processEvents()
+                    self.assertIsNone(self.win._active_entry)
+                    self.assertEqual(entry.status, status)
+                self.assertIsNone(cache.get(key))
 
     def test_a_tab_click_refused_during_a_transfer_snaps_back(self):
         self.win.open_in_new_tab("bkt", "archive/")

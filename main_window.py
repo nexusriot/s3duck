@@ -254,7 +254,7 @@ class MainWindow(
         self.listview.setModel(self.proxy)
         self._attach_thumbnail_grid(self._list_container.layout())
 
-        # Enable Σ + refresh open usage dialog when selection changes.
+        # Enable Σ when selection changes; usage scans are explicit.
         # Single handler — connecting twice was causing duplicate work and
         # could stack if the disconnect() failed silently after a model swap.
         try:
@@ -1138,7 +1138,10 @@ class MainWindow(
         self.simple(title, message)
 
     def properties(self, model, key):
-        PropertiesWindow(self, settings=(model, key)).exec()
+        try:
+            PropertiesWindow(self, settings=(model, key)).exec()
+        finally:
+            self.invalidate_listing_cache()
 
 
 
@@ -2436,7 +2439,11 @@ class MainWindow(
         """Open the in-app preview for a single file object."""
         if not key or key.endswith("/") or key == UP_ENTRY_LABEL:
             return
-        PreviewDialog(self, self.data_model, key).exec()
+        try:
+            PreviewDialog(self, self.data_model, key).exec()
+        finally:
+            # The preview can save edits back to S3.
+            self.invalidate_listing_cache()
 
     def show_versions(self, key: str):
         """Open the object-version manager for a single file object."""

@@ -280,6 +280,24 @@ class DeleteMixin:
             raise ValueError("Bucket is empty; select a bucket first")
         self.client.delete_object(Bucket=self.bucket, Key=key)
 
+    def delete_exact(self, keys, log_fn=None, cancel_event=None) -> bool:
+        """Delete a known manifest, including folder markers, without listing."""
+        self._guard_write()
+        if not self.bucket:
+            raise ValueError("Bucket is empty; select a bucket first")
+        batch = []
+        for key in keys:
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled("cancelled")
+            batch.append(key)
+            if len(batch) >= self.DELETE_BATCH_SIZE:
+                self._delete_batch(batch, log_fn=log_fn)
+                batch = []
+        if cancel_event is not None and cancel_event.is_set():
+            raise TransferCancelled("cancelled")
+        self._delete_batch(batch, log_fn=log_fn)
+        return True
+
     def delete(self, key, log_fn=None, cancel_event=None) -> bool:
         """Delete one object, or every object under a prefix (batched)."""
         self._guard_write()

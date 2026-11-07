@@ -3,9 +3,16 @@
 Every assertion here is about what the list view ends up showing, not about
 what the model returned: the gap between those two is the navigation worker,
 its model clone, and the queued signal that carries the result back onto the
-UI thread — none of which the unit suite can exercise, because its listings
-never leave the calling thread.
+UI thread. The unit suite also exercises these threads with in-memory
+listings; this suite checks the requests and results against a real server.
 """
+
+from contextlib import contextmanager
+from unittest.mock import patch
+
+from botocore.client import BaseClient
+from PyQt6.QtCore import Qt
+from PyQt6.QtTest import QTest
 
 from tests.e2e_gui.harness import GuiServerCase
 
@@ -80,6 +87,97 @@ class EmptyPrefixTests(GuiServerCase):
         self.assertEqual(self.listing(), ["[..]"])
         self.assertTrue(self.window.listview.isEnabled(),
                         "the list view was left disabled after an empty listing")
+
+
+class NavigationCacheTests(GuiServerCase):
+    """Observe real SDK calls without replacing their server responses."""
+
+    def setUp(self):
+        super().setUp()
+        self.prefix = self._testMethodName + "/"
+        self.child = self.prefix + "child/"
+        self.put(self.child + "first.txt", b"first")
+        self.put(self.child + "second.txt", b"second")
+        self.navigate(self.prefix)
+
+    @contextmanager
+    def recording_api_calls(self):
+        calls = []
+        original = BaseClient._make_api_call
+
+        def record(client, operation, params):
+            calls.append(operation)
+            return original(client, operation, params)
+
+        with patch.object(BaseClient, "_make_api_call", record):
+            yield calls
+
+    def settle_navigation(self):
+        self.pump(lambda: self.window.listing_settled()
+                  and self.window.listview.isEnabled(),
+                  what="the folder listing to settle")
+
+    def test_cached_parent_and_child_navigation_sends_no_requests(self):
+        with self.recording_api_calls() as calls:
+            self.window.list_doubleClicked(self.window.ix_by_name("child"))
+            self.settle_navigation()
+            self.assertIn("ListObjectsV2", calls)
+            calls.clear()
+            self.window.goUp()
+            self.settle_navigation()
+            self.assertIn("child", self.listing())
+            self.window.list_doubleClicked(self.window.ix_by_name("child"))
+            self.settle_navigation()
+            self.assertIn("first.txt", self.listing())
+            self.assertEqual(calls, [])
+
+    def test_refresh_fetches_changes_made_by_another_client(self):
+        self.navigate(self.child)
+        self.put(self.child + "external.txt", b"new")
+        with self.recording_api_calls() as calls:
+            self.window.open_location(self.bucket, self.child)
+            self.settle_navigation()
+            self.assertNotIn("external.txt", self.listing())
+            self.assertEqual(calls, [])
+            self.window.btnRefresh.trigger()
+            self.settle_navigation()
+            self.assertIn("ListObjectsV2", calls)
+            self.assertIn("external.txt", self.listing())
+
+    def test_delete_without_visible_refresh_invalidates_the_cached_folder(self):
+        self.navigate(self.child)
+        entry = self.window.assign_thread_operation(
+            "delete", [self.child + "first.txt"], need_refresh=False)
+        self.await_transfers()
+        self.assertEqual(entry.status, "done")
+        self.assertFalse(self.exists(self.child + "first.txt"))
+        with self.recording_api_calls() as calls:
+            self.window.open_location(self.bucket, self.child)
+            self.settle_navigation()
+            self.assertIn("ListObjectsV2", calls)
+            self.assertNotIn("first.txt", self.listing())
+            self.assertIn("second.txt", self.listing())
+
+    def test_open_usage_window_only_scans_when_explicitly_requested(self):
+        self.navigate(self.child)
+        self.window.listview.setCurrentIndex(self.window.ix_by_name("first.txt"))
+        with self.recording_api_calls() as calls:
+            self.window.btnBucketUsage.trigger()
+            self.addCleanup(self.window._bucket_usage_dialog.hide)
+            self.pump(lambda: self.window._bucket_usage_thread is None,
+                      what="the explicit usage calculation to finish")
+            self.assertIn("ListObjectsV2", calls)
+            self.assertTrue(self.window._bucket_usage_dialog.isVisible())
+            self.assertEqual(self.window.statusBar().currentMessage(), "Usage calculated")
+            calls.clear()
+            for key in (Qt.Key.Key_Down, Qt.Key.Key_Up, Qt.Key.Key_Down):
+                QTest.keyClick(self.window.listview, key)
+                self.app.processEvents()
+            self.assertEqual(calls, [], "highlighting loaded rows sent S3 requests")
+            self.window.btnBucketUsage.trigger()
+            self.pump(lambda: self.window._bucket_usage_thread is None,
+                      what="a second explicit usage calculation to finish")
+            self.assertIn("ListObjectsV2", calls)
 
 
 class NavigationFailureTests(GuiServerCase):

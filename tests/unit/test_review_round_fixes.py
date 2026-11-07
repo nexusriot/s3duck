@@ -70,8 +70,12 @@ class AliasProfileMoveTests(unittest.TestCase):
     def _worker(self, src, dst, job):
         calls = []
         src.copy_to_model = lambda *a, **kw: calls.append(("copy",) + a[:1])
-        src.copy_prefix_to_model = lambda *a, **kw: calls.append(("copy",) + a[:1])
+        def copy_prefix(key, *_args, **_kwargs):
+            calls.append(("copy", key))
+            return [key + "copied.txt"]
+        src.copy_prefix_to_model = copy_prefix
         src.delete = lambda key, **kw: calls.append(("delete", key))
+        src.delete_exact = lambda keys, **kw: [src.delete(key) for key in keys]
         worker = Worker(src, job, dest_model=dst)
         errors = []
         worker.error.connect(errors.append)
@@ -90,7 +94,7 @@ class AliasProfileMoveTests(unittest.TestCase):
         calls, errors = self._worker(make_model(bucket="b"),
                                      make_model(bucket="other"), job)
         self.assertEqual(errors, [])
-        self.assertEqual(calls, [("copy", "data/"), ("delete", "data/")])
+        self.assertEqual(calls, [("copy", "data/"), ("delete", "data/copied.txt")])
 
 
 class _SlowRemote:

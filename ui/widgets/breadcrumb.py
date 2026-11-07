@@ -28,6 +28,13 @@ class Breadcrumb(QScrollArea):
         self._lay.addStretch(1)
         self.setWidget(self._inner)
         self._last_key = None
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setSingleShot(True)
+        self._scroll_timer.timeout.connect(self._scroll_to_end)
+
+    def _scroll_to_end(self):
+        bar = self.horizontalScrollBar()
+        bar.setValue(bar.maximum())
 
     def _clear(self):
         # Remove everything except the trailing stretch.
@@ -76,5 +83,4 @@ class Breadcrumb(QScrollArea):
                 self._add_sep()
                 self._add_segment(p, acc, is_last=(i == len(parts) - 1))
         # Keep the newest (deepest) segment in view.
-        QTimer.singleShot(0, lambda: self.horizontalScrollBar().setValue(
-            self.horizontalScrollBar().maximum()))
+        self._scroll_timer.start(0)

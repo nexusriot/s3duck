@@ -187,6 +187,56 @@ class _WindowCase(unittest.TestCase):
 
 class WindowTwoWayTests(_WindowCase):
 
+    def test_unsuccessful_run_cannot_acknowledge_different_same_size_files(self):
+        path = os.path.join(self.local, "a")
+        with open(path, "wb") as handle:
+            handle.write(b"NEW")
+        old = _state("a", size=3, etag=hashlib.md5(b"old").hexdigest())
+        state_file = self.win.two_way_state_file(self.local, "p/")
+        save_state(state_file, old)
+        self.win.data_model.clone_for_worker = lambda: _DigestModel({"p/a": b"old"})
+        action = {"action": UPLOAD, "rel": "a", "size": 3, "reason": "changed locally"}
+        for status in ("error", "cancelled", "paused"):
+            with self.subTest(status=status):
+                entry = types.SimpleNamespace(status=status)
+                with patch.object(self.win, "start_sync", return_value=entry):
+                    self.win.start_two_way_sync([action], self.local, "p/", old)
+                entry.on_finished(entry)
+                self._wait()
+                recorded = load_state(state_file)
+                self.assertEqual(recorded, old)
+                # A later remote deletion must preserve these unsent bytes.
+                local = {"a": (3, os.stat(path).st_mtime)}
+                self.assertEqual(plan_two_way(local, {}, recorded)[0]["action"], CONFLICT)
+
+    def test_rejected_job_does_not_write_a_new_baseline(self):
+        with open(os.path.join(self.local, "a"), "wb") as handle:
+            handle.write(b"NEW")
+        self.win.data_model.clone_for_worker = lambda: _DigestModel({"p/a": b"old"})
+        with patch.object(self.win, "start_sync", return_value=None):
+            self.win.start_two_way_sync(
+                [{"action": UPLOAD, "rel": "a", "size": 3, "reason": ""}],
+                self.local, "p/", {})
+        self._wait()
+        self.assertEqual(load_state(self.win.two_way_state_file(self.local, "p/")), {})
+
+    def test_rescan_does_not_acknowledge_excluded_or_new_unplanned_files(self):
+        for name, body in (("same", b"ok"), ("excluded", b"NEW"), ("late", b"NEW")):
+            with open(os.path.join(self.local, name), "wb") as handle:
+                handle.write(body)
+        old = _state("excluded", "deleted-both", size=3, etag="old")
+        self.win.data_model.clone_for_worker = lambda: _DigestModel(
+            {"p/same": b"ok", "p/excluded": b"old", "p/late": b"old"})
+        self.win.start_two_way_sync(
+            [{"action": SKIP, "rel": "same", "size": 2, "reason": "same content"}],
+            self.local, "p/", old)
+        self._wait()
+        recorded = load_state(self.win.two_way_state_file(self.local, "p/"))
+        self.assertEqual(recorded["excluded"], old["excluded"])
+        self.assertNotIn("late", recorded)
+        self.assertNotIn("deleted-both", recorded)
+        self.assertIn("same", recorded)
+
     def test_nothing_to_run_still_records_the_state(self):
         with open(os.path.join(self.local, "a"), "wb") as handle:
             handle.write(b"x")
@@ -214,6 +264,7 @@ class WindowTwoWayTests(_WindowCase):
             handle.write(b"x")
         remote = _DigestModel({"p/n": b"x", "p/c": b"zz"})
         self.win.data_model.clone_for_worker = lambda: remote
+        entry.status = "done"
         entry.on_finished(entry)
         self._wait()
         state = load_state(self.win.two_way_state_file(self.local, "p/"))

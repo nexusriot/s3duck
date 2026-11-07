@@ -120,6 +120,7 @@ class AccessWindowMixin:
         return True
 
     def apply_sse_c_key(self, key):
+        self.invalidate_listing_cache()
         self.data_model.set_sse_c_key(key)
         if key:
             self.log(f"SSE-C on for this session (key MD5 {sse_c_fingerprint(key)})")

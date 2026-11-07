@@ -154,18 +154,15 @@ class UsageMixin:
         # enable/disable Σ based on whether we can compute a target
         try:
             b, _p = self._usage_target_from_selection()
-            self.btnBucketUsage.setEnabled(bool(b) and not self.transfers_active())
+            thread = getattr(self, "_bucket_usage_thread", None)
+            self.btnBucketUsage.setEnabled(
+                bool(b) and not self.transfers_active()
+                and not (thread is not None and self._thread_is_running(thread)))
         except Exception:
             pass
 
-        # If usage window is open, refresh on selection changes (but don't stack threads)
-        try:
-            if self._bucket_usage_dialog is not None and self._bucket_usage_dialog.isVisible():
-                t = getattr(self, "_bucket_usage_thread", None)
-                if t is None or not t.isRunning():
-                    self.request_bucket_usage()
-        except Exception:
-            pass
+        # Calculations are explicit: changing the highlighted row must never
+        # start a recursive bucket scan, even with the usage window open.
 
     def open_size_explorer(self):
         """Drill into the bucket by prefix, sized by what it holds."""

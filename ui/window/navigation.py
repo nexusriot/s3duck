@@ -8,6 +8,7 @@ from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QInputDialog, QMessageBox
 from core.formatting import _listing_summary
 from core.locations import parse_location, serialize_location
+from core.listing_cache import ListingCache
 from core.naming import _human_bytes
 from model import FSObjectType
 from ui.constants import DEFAULT_LISTING_LIMIT, UP_ENTRY_LABEL
@@ -154,8 +155,20 @@ class NavigationMixin:
         if self._refuse_navigation():
             return False
         self.change_current_folder(prefix or "")
+        navigate_kwargs.setdefault("use_cache", True)
         self.navigate(**navigate_kwargs)
         return True
+
+    def invalidate_listing_cache(self):
+        cache = getattr(self, "_listing_cache", None)
+        if cache is not None:
+            cache.clear()
+        self._listing_cache_generation = getattr(
+            self, "_listing_cache_generation", 0) + 1
+
+    def _listing_cache_key(self, bucket, prefix):
+        return (self.profile_name, self.data_model.profile_endpoint_url,
+                bucket, prefix, self.listing_limit())
 
     def listing_settled(self) -> bool:
         """True when the rows on screen are the listing of the model's
@@ -413,7 +426,7 @@ class NavigationMixin:
                 # enter_bucket resets navigation to the bucket root.
                 self.data_model.current_folder = target_prefix
                 self.data_model.prev_folder = ""
-            self.navigate(select_up_entry=True, force=True)
+            self.navigate(select_up_entry=True, force=True, use_cache=True)
 
         def _on_enter_failure(bucket_name: str, err_msg: str):
             if self._closing:
@@ -470,7 +483,7 @@ class NavigationMixin:
 
     def navigate(self, restore_name: str = None,
                  select_up_entry: bool = False, show_loading: bool = False,
-                 force: bool = False):
+                 force: bool = False, use_cache: bool = False):
         """Asynchronous navigation (bucket list / bucket objects) to keep UI responsive."""
 
         if (not force) and self.transfers_active():
@@ -490,6 +503,15 @@ class NavigationMixin:
             self.statusBar().showMessage("Opening bucket — please wait…", 2000)
             return
 
+        if not hasattr(self, "_listing_cache"):
+            self._listing_cache = ListingCache()
+        # Refresh and existing mutation callers fetch anew by default. Only
+        # location changes explicitly opt into reusing a session listing.
+        if not use_cache:
+            self.invalidate_listing_cache()
+        self._nav_cache_generation = getattr(
+            self, "_listing_cache_generation", 0)
+
         self._reset_search_on_navigate()
         self._remember_current_selection()
 
@@ -500,6 +522,7 @@ class NavigationMixin:
 
         bucket = self.data_model.bucket or ""
         prefix = self.data_model.current_folder or ""
+        self._nav_cache_key = self._listing_cache_key(bucket, prefix)
 
         self.listview.setEnabled(False)
         # Until this listing lands, the rows on screen belong to where the
@@ -516,6 +539,12 @@ class NavigationMixin:
         # orphaned worker cannot race us. Stale results are discarded by the
         # _nav_seq check in _on_navigation_finished.
         self._park_nav_thread()
+
+        cached = (self._listing_cache.get(self._nav_cache_key)
+                  if bucket and use_cache else None)
+        if cached is not None:
+            self._on_navigation_finished(seq, cached, "")
+            return
 
         th = QThread(self)
         wk = NavigationWorker(self.data_model.clone_for_worker(), seq, bucket,
@@ -664,6 +693,13 @@ class NavigationMixin:
 
         if mode == "bucket_items":
             items = payload.get("items") or []
+            if (not payload.get("cached")
+                    and getattr(self, "_nav_cache_generation", 0)
+                    == getattr(self, "_listing_cache_generation", 0)):
+                cache = getattr(self, "_listing_cache", None)
+                key = getattr(self, "_nav_cache_key", None)
+                if cache is not None and key is not None:
+                    cache.put(key, payload)
             # The rows are the listing of the payload's prefix, whatever the
             # model was nudged to since; key resolution follows the rows.
             if payload.get("bucket") == (self.data_model.bucket or ""):
@@ -683,7 +719,8 @@ class NavigationMixin:
                 show_folder = self.data_model.current_folder if self.data_model.current_folder else "/"
                 self.statusBar().showMessage(
                     f"[{self.profile_name}][{self.data_model.bucket}] {show_folder}"
-                    f" — {_listing_summary(items)}", 0)
+                    f" — {_listing_summary(items)}"
+                    + (" (cached — Refresh to update)" if payload.get("cached") else ""), 0)
 
             self._set_listing_truncated(
                 bool(payload.get("truncated")), len(items))
@@ -742,7 +779,7 @@ class NavigationMixin:
                 new_path = new_path + "/"
 
             self.change_current_folder(new_path)
-            self.navigate(restore_name=leaving)
+            self.navigate(restore_name=leaving, use_cache=True)
 
             ix = self.listview.currentIndex()
             if not ix.isValid() and self.proxy.rowCount() > 0:

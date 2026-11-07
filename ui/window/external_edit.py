@@ -172,6 +172,7 @@ class ExternalEditMixin:
         thread.start()
 
     def _on_edit_uploaded(self, path, now, key, result, exc, thread):
+        self.invalidate_listing_cache()
         threads = self.__dict__.get("_edit_threads", [])
         if thread in threads:
             threads.remove(thread)

@@ -303,6 +303,11 @@ class MoveToProfileWorkerTests(unittest.TestCase):
 
             def copy_prefix_to_model(self, src, dest, dst, **_kw):
                 calls.append(("copy_prefix", src, dst))
+                return [src + "copied.txt"]
+
+            def delete_exact(self, keys, **_kw):
+                for key in keys:
+                    self.delete(key)
 
             def delete(self, key, **_kw):
                 calls.append(("delete", key))
@@ -316,7 +321,7 @@ class MoveToProfileWorkerTests(unittest.TestCase):
         worker.move_to_profile()
         self.assertEqual(calls, [("copy", "a", "x/a"),
                                  ("copy_prefix", "f/", "x/f/"),
-                                 ("delete", "a"), ("delete", "f/")])
+                                 ("delete", "a"), ("delete", "f/copied.txt")])
 
     def test_a_failed_copy_deletes_nothing(self):
         source, calls = self._source(fail_on="b")

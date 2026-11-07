@@ -64,29 +64,39 @@ class TwoWaySyncMixin:
 
     def start_two_way_sync(self, actions, local_dir, prefix, state, bucket=""):
         """
-        Queue a two-way plan, and record the new state when it has run.
+        Queue a two-way plan, and record the new state after success.
 
         Conflicts are not run; their old state is kept, so they are still
         conflicts next time instead of quietly becoming a one-way copy.
         """
         bucket = bucket or self.data_model.bucket
+        tracked = {a["rel"] for a in actions}
         conflicts = {a["rel"] for a in actions if a.get("action") == CONFLICT}
+        keep_old = conflicts | (set(state or {}) - tracked)
         runnable = [a for a in actions if a.get("action") not in (CONFLICT, "skip")]
         state_file = self.two_way_state_file(local_dir, prefix, bucket)
-        finish = (lambda _entry=None: self._record_two_way_state(
-            local_dir, prefix, bucket, state_file, conflicts, state))
+        def finish(completed=None):
+            if completed is not None and completed.status != "done":
+                # Equal size does not prove that a failed upload/download
+                # synchronized the bytes. Keep the previous baseline so the
+                # next pass still sees unsent edits and deletion conflicts.
+                self.log("two-way sync: incomplete run; previous state kept")
+                return
+            self._record_two_way_state(
+                local_dir, prefix, bucket, state_file, keep_old, state,
+                tracked=tracked)
         entry = None
         if runnable:
             entry = self.start_sync(runnable, local_dir, prefix, "both",
                                     bucket=bucket)
-        if entry is None:
+        if not runnable:
             finish()
-        else:
+        elif entry is not None:
             entry.on_finished = finish
         return entry
 
     def _record_two_way_state(self, local_dir, prefix, bucket, state_file,
-                              conflicts, old_state):
+                              conflicts, old_state, tracked=None):
         """Rescan both sides off the UI thread and write what they agree on."""
         clone = self.data_model.clone_for_worker()
         clone.bucket = bucket
@@ -94,7 +104,13 @@ class TwoWaySyncMixin:
         def _scan(_w):
             local = scan_local_tree(local_dir, strict=True)
             remote, _skipped = remote_digest_tree(clone, prefix)
-            paths = build_state(local, remote, keep_old=conflicts,
+            keep_old = set(conflicts) & (set(local) | set(remote))
+            if tracked is not None:
+                # Excluded paths and files that appeared after the preview
+                # have not been compared or transferred by this run.
+                local = {rel: value for rel, value in local.items() if rel in tracked}
+                remote = {rel: value for rel, value in remote.items() if rel in tracked}
+            paths = build_state(local, remote, keep_old=keep_old,
                                 old_state=old_state)
             save_state(state_file, paths, meta={
                 "bucket": bucket, "prefix": prefix, "local": local_dir})

@@ -35,6 +35,7 @@ class CredentialsMixin:
         """
         Apply a new profile without restarting the app.
         """
+        self.invalidate_listing_cache()
         old_profile = getattr(self, "profile_name", None)
         # Before the name changes: the location is stored per profile, so the
         # one being left behind has to record where it was first.
@@ -240,6 +241,7 @@ class CredentialsMixin:
             return False
         if minted is None:
             return False
+        self.invalidate_listing_cache()
         self.data_model.access_key = minted.get("access_key", "")
         self.data_model.secret_key = minted.get("secret_key", "")
         self.data_model.session_token = minted.get("session_token", "")
