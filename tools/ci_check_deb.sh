@@ -3,8 +3,8 @@
 # that past bugs turned into shipped regressions.
 set -euo pipefail
 
-# This version's package, not whatever build/ happens to hold. CI checks a
-# fresh checkout with exactly one .deb in it, so `ls build/*.deb` worked there
+# This version's package, not whatever dist/ happens to hold. CI checks a
+# fresh checkout with exactly one .deb in it, so `ls dist/*.deb` worked there
 # and broke the moment the version was bumped locally: the glob then matched
 # the previous package too and handed dpkg-deb a two-line filename.
 version=$(sed -n 's/^__VERSION__ = "\(.*\)"$/\1/p' version.py)
@@ -62,11 +62,11 @@ check_one() {
 }
 
 shopt -s nullglob
-debs=(build/s3duck_"${version}"_*.deb)
+debs=(dist/s3duck_"${version}"_*.deb)
 shopt -u nullglob
 
 if [ "${#debs[@]}" -eq 0 ]; then
-  echo "::error::no .deb for ${version} in build/ — run 'make deb' first"
+  echo "::error::no .deb for ${version} in dist/ — run 'make deb' first"
   exit 1
 fi
 

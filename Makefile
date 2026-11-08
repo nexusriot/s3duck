@@ -48,7 +48,9 @@ help:
 	@echo "    test-one T=x  one test, class or module (e.g. T=tests.unit.test_core_planning)"
 	@echo ""
 	@echo "  Everything"
-	@echo "    all           Linux: binary, Windows .exe, debs, rpm  macOS: universal .pkg"
+	@echo "    all           every artifact this host can build -> $(DIST_DIR)/"
+	@echo "                  Linux: binary, Windows .exe, debs, rpm"
+	@echo "                  macOS: universal .app, .pkg and .dmg"
 	@echo ""
 	@echo "  Packaging"
 	@echo "    deb           .deb for this machine's architecture"
@@ -56,7 +58,7 @@ help:
 	@echo "    deb-arm64     .deb for arm64"
 	@echo "    debs          both architectures"
 	@echo "    check-deb     inspect the built .deb the way CI does"
-	@echo "    rpm           noarch .rpm, built in a Fedora container -> $(BUILD_DIR)/"
+	@echo "    rpm           noarch .rpm, built in a Fedora container -> $(DIST_DIR)/"
 	@echo "    pkg           universal (arm64+x86_64) macOS installer .pkg (run on macOS)"
 	@echo ""
 	@echo "  Binaries (PyInstaller)"
@@ -119,17 +121,17 @@ check: test e2e-all
 .PHONY: deb
 deb:
 	bash build_deb.sh
-	@echo ">> $(BUILD_DIR)/$(APP)_$(VERSION)_*.deb"
+	@echo ">> $(DIST_DIR)/$(APP)_$(VERSION)_*.deb"
 
 .PHONY: deb-amd64
 deb-amd64:
 	bash build_deb.sh amd64
-	@echo ">> $(BUILD_DIR)/$(APP)_$(VERSION)_amd64.deb"
+	@echo ">> $(DIST_DIR)/$(APP)_$(VERSION)_amd64.deb"
 
 .PHONY: deb-arm64
 deb-arm64:
 	bash build_deb.sh arm64
-	@echo ">> $(BUILD_DIR)/$(APP)_$(VERSION)_arm64.deb"
+	@echo ">> $(DIST_DIR)/$(APP)_$(VERSION)_arm64.deb"
 
 # Pure Python, so the payload is identical and only the control field differs.
 .PHONY: debs
@@ -144,7 +146,7 @@ check-deb:
 .PHONY: rpm
 rpm:
 	bash build_rpm.sh
-	@echo ">> $(BUILD_DIR)/$(APP)-$(VERSION)-1.*.noarch.rpm"
+	@echo ">> $(DIST_DIR)/$(APP)-$(VERSION)-1.*.noarch.rpm"
 
 # Universal installer for /Applications. Needs a universal2 python.org Python
 # (PYTHON=...); builds in its own venv under build/, not .venv.
@@ -199,22 +201,31 @@ win-lock:
 
 # ---- everything ------------------------------------------------------------
 
-# Everything this host can build. PyInstaller cannot cross-build macOS, and
-# pkgbuild is Apple's, so the set depends on where it runs; together the two
-# hosts produce the full release. Not the default goal: bare `make` still
-# prints help.
+# Every artifact this host can build, all in dist/. PyInstaller cannot
+# cross-build macOS and pkgbuild/create-dmg are macOS tools, so the set
+# depends on where it runs; a Linux run plus a macOS run is the full release.
+# Not the default goal: bare `make` still prints help.
+#
+# On macOS the steps are ordered, not prerequisites: `pkg` builds the
+# universal dist/s3duck.app that `dmg` then packs, and `make -j` must not
+# run them side by side.
+.PHONY: all
 ifeq ($(shell uname -s),Darwin)
-ALL_TARGETS := pkg
+all:
+	$(MAKE) pkg
+	$(MAKE) dmg
+	@$(MAKE) --no-print-directory all-report
 else
-ALL_TARGETS := bin win debs rpm
+all: bin win debs rpm
+	@$(MAKE) --no-print-directory all-report
+	@echo "  (macOS .app/.pkg/.dmg: run 'make all' on a Mac)"
 endif
 
-.PHONY: all
-all: $(ALL_TARGETS)
+.PHONY: all-report
+all-report:
 	@echo ""
-	@echo "built for $(shell uname -s):"
-	@ls -1 $(DIST_DIR)/$(APP) $(DIST_DIR)/$(APP).exe $(DIST_DIR)/*.pkg \
-		$(BUILD_DIR)/$(APP)_$(VERSION)_*.deb $(BUILD_DIR)/$(APP)-$(VERSION)-*.rpm \
+	@echo "built for $(shell uname -s) in $(DIST_DIR)/:"
+	@cd $(DIST_DIR) && ls -1d $(APP) $(APP).exe $(APP).app *.pkg *.dmg *.deb *.rpm \
 		2>/dev/null | sed 's/^/  /'
 
 # ---- development -----------------------------------------------------------

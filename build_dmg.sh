@@ -12,12 +12,11 @@ if [ ! -d "dist/$app" ]; then
   echo "dist/$app not found — run build_macos_bin.sh (make macos) first"; exit 1
 fi
 
-# Create a folder (named dmg) to prepare our DMG in (if it doesn't already exist).
-mkdir -p dist/dmg
-# Empty the dmg folder; -f so a fresh, empty folder is not an error.
-rm -rf dist/dmg/*
-# Copy the app bundle to the dmg folder.
-cp -r "dist/$app" dist/dmg
+# Stage the DMG contents under build/, so dist/ holds only artifacts.
+stage=build/dmg
+rm -rf "$stage"
+mkdir -p "$stage"
+cp -r "dist/$app" "$stage"
 # If the DMG already exists, delete it.
 test -f "dist/S3Duck.dmg" && rm "dist/S3Duck.dmg"
 create-dmg \
@@ -30,4 +29,4 @@ create-dmg \
   --hide-extension "$app" \
   --app-drop-link 425 120 \
   "dist/S3Duck.dmg" \
-  "dist/dmg/"
+  "$stage/"

@@ -46,4 +46,6 @@ sed -i "s/_arch_/$arch/g" $folder_name/DEBIAN/control
 size=$(du -sk --exclude=DEBIAN "$folder_name" | cut -f1)
 sed -i "s/_size_/$size/g" $folder_name/DEBIAN/control
 
-cd build/ && dpkg-deb --build -Z gzip --root-owner-group $project
+# Staged under build/, shipped to dist/ with every other artifact.
+mkdir -p dist
+dpkg-deb --build -Z gzip --root-owner-group "$folder_name" dist/

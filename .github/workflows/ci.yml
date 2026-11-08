@@ -124,7 +124,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: s3duck-deb
-          path: build/*.deb
+          path: dist/*.deb
           if-no-files-found: error
 
   e2e:

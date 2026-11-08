@@ -3,7 +3,7 @@
 # rpmbuild the host has: Fedora's macros decide what a noarch package looks
 # like. Base image pinned by digest; only the .rpm leaves the build.
 #
-# Build with `make rpm` (BuildKit required). The package lands in build/.
+# Build with `make rpm` (BuildKit required). The package lands in dist/.
 
 FROM fedora:43@sha256:f01112b9a1f1d0504ad962d9adfa401425033f8ab067e0a821904ebdde5b8ca5 AS build
 

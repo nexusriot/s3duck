@@ -329,12 +329,24 @@ With `--delete`, a run that would delete more than 5 files and 10% of the destin
 it, so the two never disagree about how something is built; the version is
 read from `__VERSION__` in `version.py` rather than repeated anywhere.
 
+Every artifact lands in `dist/`; `build/` only holds intermediate files.
+
 ```bash
+make all          # everything this host can build (see below)
 make deb          # this machine's architecture
 make debs         # amd64 + arm64
+make rpm          # noarch .rpm (Docker)
 make bin          # self-contained Linux binary
+make win          # Windows .exe (Docker + Wine)
+make pkg          # universal macOS installer (on macOS)
 make clean        # build/, dist/, caches, PyInstaller leftovers
 ```
+
+### Everything: `make all`
+On Linux it builds the Linux binary, the Windows `.exe`, both `.deb`s and the
+`.rpm`. On macOS it builds the universal `s3duck.app`, `.pkg` and `.dmg`.
+PyInstaller cannot cross-build for macOS, so a full release is one run on
+each. Both runs list what they produced at the end.
 
 ### Debian / Ubuntu package
 ```bash
@@ -344,8 +356,18 @@ make deb-arm64              # explicit architecture (or: bash build_deb.sh arm64
 The only tool it needs is `dpkg-deb`, which every Debian/Ubuntu system has
 (it is part of `dpkg`); the script stops if it is missing. Run the scripts
 with `bash` rather than `./`: their `#!/bin/env bash` shebang only resolves on
-a usr-merged filesystem. Output: `build/s3duck_<version>_<arch>.deb`,
+a usr-merged filesystem. Output: `dist/s3duck_<version>_<arch>.deb`,
 checkable with `make check-deb`
+
+### Fedora / RHEL package
+```bash
+make rpm                    # or: bash build_rpm.sh
+```
+Built with Fedora's `rpmbuild` in a Fedora container pinned by digest, so the
+host needs only Docker. It ships the same files as the `.deb`
+(`tools/stage_payload.sh` stages both) and depends on the distribution's
+`python3-pyqt6`, `qt6-qtsvg` and boto3. Output:
+`dist/s3duck-<version>-1.fc43.noarch.rpm`.
 
 ### Linux binary (PyInstaller)
 ```bash
@@ -354,20 +376,29 @@ make bin                    # or, with the venv active: bash build_linux_bin.sh
 `make bin` puts `.venv/bin` on PATH first, because `requirements.txt`
 installs PyInstaller into the venv rather than onto the system PATH.
 
-### macOS binary + DMG
+### macOS: app, installer, DMG
 ```bash
-make macos                            # native arch
-make macos ARCH=universal2            # fat binary (x86_64 + arm64)
-make dmg
+make macos                  # native-arch dist/s3duck.app
+make pkg                    # universal app + dist/S3Duck-<version>-universal.pkg
+make dmg                    # packs dist/s3duck.app into dist/S3Duck.dmg
 ```
-`make macos` leaves `dist/s3duck.app`; `make dmg` packs it into
-`dist/S3Duck.dmg` and needs `create-dmg` (`brew install create-dmg`).
+`make pkg` needs a universal2 Python, i.e. the python.org installer, not
+Homebrew's (`PYTHON=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3`).
+PyQt6-Qt6 and cffi publish no universal2 wheels, so it downloads both
+architectures and fuses them with `delocate-merge`, in a separate venv under
+`build/`. Set `PKG_SIGN_IDENTITY` to sign the installer. `make dmg` needs
+`create-dmg` (`brew install create-dmg`).
 
 ### Windows binary
-```bat
-build_win.cmd
+```bash
+make win                    # from Linux, in Docker
 ```
-Run it from a prompt where `pyinstaller` is on PATH (the activated venv).
+Runs Windows Python and PyInstaller under Wine, in an image where everything
+is pinned (base image digest, Debian snapshot, Python package hash, wheel
+hashes in `packaging/windows/requirements.lock`). The build step itself has
+no network access. After changing `requirements.txt`, refresh the lock with
+`make win-lock`. On Windows itself, `build_win.cmd` from a prompt with
+`pyinstaller` on PATH does the same.
 
 Pre-built releases are available on the [GitHub releases page](https://github.com/nexusriot/s3duck/releases/latest).
 
@@ -473,14 +504,17 @@ s3duck/
 │   ├── unit/            One module per area, mirroring the tree above
 │   ├── e2e/             Model end-to-end suite + its MinIO compose harness
 │   └── e2e_gui/         GUI end-to-end suite: the real window, headless
-├── tools/               CI helpers and the icon report
+├── tools/               CI helpers, the icon report, the shared .deb/.rpm payload
+├── packaging/           Pinned Docker builds: windows/ (.exe via Wine), rpm/
 │
-├── Makefile             Front door: make test / e2e / e2e-gui / deb / bin / clean
+├── Makefile             Front door: make test / e2e / all / deb / rpm / win / clean
 ├── requirements.txt     Python dependencies
 ├── run_e2e.sh           End-to-end suites against a throwaway MinIO
 ├── build_deb.sh         Build .deb package
+├── build_rpm.sh         Build .rpm package (Docker)
 ├── build_linux_bin.sh   Build Linux self-contained binary
 ├── build_macos_bin.sh   Build macOS self-contained binary
+├── build_pkg.sh         Universal macOS app + .pkg installer
 ├── build_dmg.sh         Pack macOS binary into .dmg
 └── build_win.cmd        Build Windows self-contained binary
 ```

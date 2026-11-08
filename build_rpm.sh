@@ -12,5 +12,5 @@ echo "building rpm for s3duck $version (noarch)"
 DOCKER_BUILDKIT=1 docker build \
   -f packaging/rpm/Dockerfile \
   --target artifact \
-  --output type=local,dest=build \
+  --output type=local,dest=dist \
   .
