@@ -1,0 +1,14 @@
+# Build context for packaging/windows/Dockerfile (repo root). Keep it to what
+# PyInstaller needs; .venv alone is hundreds of MB of Linux wheels.
+.git
+.venv
+.idea
+.vscode
+.serena
+build
+dist
+tests
+**/__pycache__
+*.spec
+*.s3duckpart*
+s3duck.log*

@@ -58,7 +58,8 @@ help:
 	@echo "    bin, linux    self-contained Linux binary -> $(DIST_DIR)/"
 	@echo "    macos         self-contained macOS binary (run on macOS)"
 	@echo "    dmg           pack the macOS binary into a .dmg (run on macOS)"
-	@echo "    windows       how to build on Windows"
+	@echo "    win           Windows .exe via Wine in Docker -> $(DIST_DIR)/"
+	@echo "    win-lock      refresh the hash-locked Windows wheel list"
 	@echo ""
 	@echo "  Development"
 	@echo "    run           launch the app from this checkout"
@@ -158,11 +159,25 @@ dmg: export PATH := $(VENV_BIN):$(PATH)
 dmg:
 	bash build_dmg.sh
 
-.PHONY: windows
-windows:
-	@echo "Windows builds run build_win.cmd on Windows:"
-	@echo "    build_win.cmd"
-	@echo "(PyInstaller cannot cross-build a Windows binary from here.)"
+# A Windows .exe from Linux: Windows Python + PyInstaller under Wine, in a
+# pinned Docker image (see packaging/windows/Dockerfile). Only the exe comes
+# out; build_win.cmd stays the way to build natively on Windows.
+# After changing requirements.txt, refresh the lock with `make win-lock`.
+.PHONY: win windows
+win windows:
+	DOCKER_BUILDKIT=1 docker build \
+		-f packaging/windows/Dockerfile \
+		--target artifact \
+		--output type=local,dest=$(DIST_DIR) \
+		.
+	@echo ">> $(DIST_DIR)/$(APP).exe"
+
+.PHONY: win-lock
+win-lock:
+	uv pip compile requirements.txt \
+		--python-platform x86_64-pc-windows-msvc --python-version 3.12 \
+		--only-binary :all: --generate-hashes --no-header \
+		-o packaging/windows/requirements.lock
 
 # ---- development -----------------------------------------------------------
 

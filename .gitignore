@@ -1,21 +1,26 @@
+# Python
 .venv/
-.vscode/
-.idea/
 __pycache__/
 .pytest_cache/
+
+# Editors and tooling
+.idea/
+.vscode/
+.serena/
+
+# Build output: build_*.sh, `make deb` and `make win` all write here
 build/
 dist/
 
 # Written by PyInstaller, not by hand
 s3duck.spec
 
-# Things the app itself writes, in case it is run against this checkout:
-# interrupted downloads, an exported manifest, a saved problem report and the
-# session log.
+# Things the app writes next to the files it handles, in case it is run
+# against this checkout: interrupted transfers (.s3duckpart + .meta sidecar),
+# an exported manifest, and a saved problem report or session log export.
+# The live session log goes to ~/.config/s3duck/, not here.
 *.s3duckpart
 *.s3duckpart.meta
 *-manifest.csv
 s3duck-report.txt
 s3duck-log-*.txt
-s3duck.log
-s3duck.log.*
