@@ -31,31 +31,11 @@ echo "creating $folder_name"
 mkdir -p $folder_name
 cp -r DEBIAN/ $folder_name
 bin_dir="$folder_name/usr/bin"
-lib_dir="$folder_name/usr/lib/s3duck"
-res_dir="$lib_dir/resources"
 mkdir -p $bin_dir
-mkdir -p $lib_dir
-mkdir -p $res_dir
 cp s3duck $bin_dir
 cp s3duck-cli $bin_dir
-cp -r icons/ $lib_dir
-cp resources/ducky.ico $res_dir
-cp resources/ducky.png $lib_dir
-cp resources/s3duck.desktop $lib_dir
-cp LICENSE $lib_dir
-# The top-level modules, then every package beside them. A flat `cp *.py` was
-# what shipped before, and it would drop a package directory silently: the
-# install then dies on its first import. Packages are discovered by their
-# __init__.py rather than listed, so adding one needs no edit here -- but
-# tests/ is a package too and has no business in the payload, so it is named.
-cp *.py $lib_dir
-find . -mindepth 2 -maxdepth 2 -name __init__.py \
-     -not -path './.venv/*' -not -path './build/*' -not -path './tests/*' \
-     -printf '%h\0' \
-  | xargs -0 -r -I{} cp -r {} $lib_dir
-# cp -r brings the build host's bytecode along, which is dead weight in the
-# package and stale the moment the interpreter differs.
-find $lib_dir -name __pycache__ -type d -prune -exec rm -rf {} +
+# The /usr/lib/s3duck tree; shared with build_rpm.sh so both ship the same.
+bash tools/stage_payload.sh "$folder_name/usr/lib/s3duck" || exit 1
 
 
 sed -i "s/_version_/$version/g" $folder_name/DEBIAN/control

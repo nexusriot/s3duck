@@ -12,8 +12,9 @@ __pycache__/
 build/
 dist/
 
-# Written by PyInstaller, not by hand
-s3duck.spec
+# Written by PyInstaller into the repo root, not by hand (packaging/rpm/s3duck.spec
+# is hand-written and tracked)
+/s3duck.spec
 
 # Things the app writes next to the files it handles, in case it is run
 # against this checkout: interrupted transfers (.s3duckpart + .meta sidecar),

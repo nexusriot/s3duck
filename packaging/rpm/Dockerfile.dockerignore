@@ -1,0 +1,14 @@
+# Build context for packaging/rpm/Dockerfile (repo root). Keep it to what
+# the package ships; .venv alone is hundreds of MB.
+.git
+.venv
+.idea
+.vscode
+.serena
+build
+dist
+tests
+**/__pycache__
+*.spec
+*.s3duckpart*
+s3duck.log*

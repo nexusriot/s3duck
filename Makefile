@@ -47,12 +47,17 @@ help:
 	@echo "    test-v        unit suite, verbose"
 	@echo "    test-one T=x  one test, class or module (e.g. T=tests.unit.test_core_planning)"
 	@echo ""
+	@echo "  Everything"
+	@echo "    all           Linux: binary, Windows .exe, debs, rpm  macOS: universal .pkg"
+	@echo ""
 	@echo "  Packaging"
 	@echo "    deb           .deb for this machine's architecture"
 	@echo "    deb-amd64     .deb for amd64"
 	@echo "    deb-arm64     .deb for arm64"
 	@echo "    debs          both architectures"
 	@echo "    check-deb     inspect the built .deb the way CI does"
+	@echo "    rpm           noarch .rpm, built in a Fedora container -> $(BUILD_DIR)/"
+	@echo "    pkg           universal (arm64+x86_64) macOS installer .pkg (run on macOS)"
 	@echo ""
 	@echo "  Binaries (PyInstaller)"
 	@echo "    bin, linux    self-contained Linux binary -> $(DIST_DIR)/"
@@ -134,6 +139,19 @@ debs: deb-amd64 deb-arm64
 check-deb:
 	bash tools/ci_check_deb.sh
 
+# Same payload as the .deb (tools/stage_payload.sh), noarch, built with
+# Fedora's rpmbuild in a pinned container: packaging/rpm/.
+.PHONY: rpm
+rpm:
+	bash build_rpm.sh
+	@echo ">> $(BUILD_DIR)/$(APP)-$(VERSION)-1.*.noarch.rpm"
+
+# Universal installer for /Applications. Needs a universal2 python.org Python
+# (PYTHON=...); builds in its own venv under build/, not .venv.
+.PHONY: pkg
+pkg:
+	bash build_pkg.sh
+
 # ---- binaries --------------------------------------------------------------
 
 # The build scripts call a bare `pyinstaller`, which requirements.txt installs
@@ -178,6 +196,26 @@ win-lock:
 		--python-platform x86_64-pc-windows-msvc --python-version 3.12 \
 		--only-binary :all: --generate-hashes --no-header \
 		-o packaging/windows/requirements.lock
+
+# ---- everything ------------------------------------------------------------
+
+# Everything this host can build. PyInstaller cannot cross-build macOS, and
+# pkgbuild is Apple's, so the set depends on where it runs; together the two
+# hosts produce the full release. Not the default goal: bare `make` still
+# prints help.
+ifeq ($(shell uname -s),Darwin)
+ALL_TARGETS := pkg
+else
+ALL_TARGETS := bin win debs rpm
+endif
+
+.PHONY: all
+all: $(ALL_TARGETS)
+	@echo ""
+	@echo "built for $(shell uname -s):"
+	@ls -1 $(DIST_DIR)/$(APP) $(DIST_DIR)/$(APP).exe $(DIST_DIR)/*.pkg \
+		$(BUILD_DIR)/$(APP)_$(VERSION)_*.deb $(BUILD_DIR)/$(APP)-$(VERSION)-*.rpm \
+		2>/dev/null | sed 's/^/  /'
 
 # ---- development -----------------------------------------------------------
 
