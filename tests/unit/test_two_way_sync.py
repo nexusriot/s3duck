@@ -106,8 +106,9 @@ class StateTests(unittest.TestCase):
             self.assertEqual(path, state_path(tmp, "http://e", "b", "p/", "/data/"))
             self.assertNotEqual(path, state_path(tmp, "http://e", "b", "q/", "/data"))
             self.assertEqual(load_state(path), {})
-            save_state(os.path.join(tmp, "deep", "s.json"), {"a": 1})
-            self.assertEqual(load_state(os.path.join(tmp, "deep", "s.json")), {"a": 1})
+            entry = {"a": {"local": [1, 2.0], "remote": [1, "etag"]}}
+            save_state(os.path.join(tmp, "deep", "s.json"), entry)
+            self.assertEqual(load_state(os.path.join(tmp, "deep", "s.json")), entry)
             with open(path, "w") as handle:
                 handle.write("{broken")
             self.assertEqual(load_state(path), {})

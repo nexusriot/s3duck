@@ -242,10 +242,30 @@ class CredentialsMixin:
         if minted is None:
             return False
         self.invalidate_listing_cache()
-        self.data_model.access_key = minted.get("access_key", "")
-        self.data_model.secret_key = minted.get("secret_key", "")
-        self.data_model.session_token = minted.get("session_token", "")
-        self.data_model._client = None
+        # Every queued, paused or failed job holds a clone of the model made
+        # when it was queued. Left alone, the retry of a job that failed on
+        # ExpiredToken -- the very thing a refresh is accepted for -- ran
+        # with the dead token again. A clone is recognised by the keys it
+        # was made with, so another profile's model is never touched.
+        stale = (self.data_model.access_key, self.data_model.secret_key,
+                 self.data_model.session_token)
+        models = [self.data_model]
+        for entry in list((getattr(self, "_queue_entries", None) or {})
+                          .values()):
+            for model in (getattr(entry, "source_model", None),
+                          getattr(entry, "dest_model", None)):
+                if (model is not None and model not in models
+                        and (model.access_key, model.secret_key,
+                             model.session_token) == stale
+                        and getattr(model, "profile_endpoint_url", None)
+                        == getattr(self.data_model, "profile_endpoint_url",
+                                   None)):
+                    models.append(model)
+        for model in models:
+            model.access_key = minted.get("access_key", "")
+            model.secret_key = minted.get("secret_key", "")
+            model.session_token = minted.get("session_token", "")
+            model._client = None
         self.session_expires = minted.get("expires", "")
         self._persist_refreshed_credentials(minted)
         self._update_credential_status()

@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -567,7 +568,8 @@ TRANSIENT_ERROR_CODES = frozenset({
     "InternalError", "InternalServerError", "ServiceUnavailable", "SlowDown",
     "RequestTimeout", "RequestTimeoutException", "RequestTimeTooSkewed",
     "ThrottlingException", "Throttling", "TooManyRequests",
-    "OperationAborted", "PriorRequestNotComplete", "BandwidthLimitExceeded",
+    "OperationAborted", "ConditionalRequestConflict",
+    "PriorRequestNotComplete", "BandwidthLimitExceeded",
     "503 SlowDown",
 })
 TRANSIENT_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
@@ -665,9 +667,17 @@ INSTANCE_SOCKET = "s3duck-ipc"
 
 def instance_socket_name(base=INSTANCE_SOCKET) -> str:
     try:
-        return f"{base}-{os.getuid()}"
+        name = f"{base}-{os.getuid()}"
     except AttributeError:      # Windows
         return f"{base}-{os.environ.get('USERNAME', 'user')}"
+    # A bare name lands in the shared temp directory, where whoever listens
+    # on it first receives every location this user opens. The session's
+    # runtime directory is private to the user, so the socket goes there
+    # whenever there is one.
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    if runtime and _is_own_directory(runtime):
+        return os.path.join(runtime, name)
+    return name
 
 
 def send_to_running_instance(payload, name="", timeout_ms=400) -> bool:
@@ -712,6 +722,9 @@ class InstanceServer(QObject):
             probe.disconnectFromServer()
             return False
         self._server = QLocalServer(self)
+        # Only this user may connect: a location is a navigation request.
+        self._server.setSocketOptions(
+            QLocalServer.SocketOption.UserAccessOption)
         # A crash leaves the socket file behind; without this the second run
         # can never listen again.
         QLocalServer.removeServer(name)
@@ -799,6 +812,46 @@ class LogFile:
 
 
 TEMP_PREFIX = "s3duck_"
+# What TempWorkspace.session_dir creates: the prefix, the PID, and the eight
+# characters tempfile.mkdtemp appends.
+_SESSION_DIR_NAME = re.compile(r"^s3duck_\d{1,10}_[a-z0-9_]{8}$")
+
+
+def _is_own_directory(path) -> bool:
+    """A real directory (not a link to one) that this user owns."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(info.st_mode):
+        return False
+    getuid = getattr(os, "getuid", None)
+    return getuid is None or info.st_uid == getuid()
+
+
+def restrict_config_dir(path="") -> bool:
+    """
+    Make the app's config directory readable by its owner only.
+
+    It holds the settings file -- by default the credential key beside the
+    credentials it protects -- plus the session log, the saved queue and the
+    two-way sync state, and all of them were created with the process umask:
+    0664 inside 0775 on a stock desktop, which is every local user. Closing
+    the directory covers each of them, including the ones Qt rewrites.
+    A no-op where POSIX modes do not apply.
+    """
+    if os.name != "posix":
+        return False
+    path = path or os.path.join(os.path.expanduser("~"), ".config", "s3duck")
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        if os.path.islink(path) or os.lstat(path).st_uid != os.getuid():
+            return False
+        if stat.S_IMODE(os.lstat(path).st_mode) != 0o700:
+            os.chmod(path, 0o700)
+        return True
+    except OSError:
+        return False
 
 
 def pid_is_alive(pid) -> bool:
@@ -812,7 +865,10 @@ def pid_is_alive(pid) -> bool:
         os.kill(int(pid), 0)
     except ProcessLookupError:
         return False
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError: a number no PID can be. Uncaught, one directory
+        # named "s3duck_99999999999_x" in a shared /tmp -- which any local
+        # user can create -- stopped every window from opening.
         return True
     except OSError:
         return True     # exists but not ours, or the platform won't say
@@ -879,10 +935,17 @@ class TempWorkspace:
             return removed
         for name in names:
             pid = self.owner_pid(name)
-            if pid is None or pid == self.pid or is_alive(pid):
+            if pid is None or pid == self.pid:
                 continue
+            # The temp root is shared with every other program and user. A
+            # name that merely starts like ours ("s3duck_2024_backup") is
+            # somebody's folder, and a dead PID in it is not permission to
+            # delete it: only the exact shape mkdtemp gave us, in a real
+            # directory this user owns, is a leftover of ours.
             path = os.path.join(self.root, name)
-            if not os.path.isdir(path):
+            if not _SESSION_DIR_NAME.match(name) or not _is_own_directory(path):
+                continue
+            if is_alive(pid):
                 continue
             shutil.rmtree(path, ignore_errors=True)
             if not os.path.exists(path):

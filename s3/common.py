@@ -8,6 +8,7 @@ working; a name nothing imports from model is reached from here instead.
 """
 
 import os
+import sys
 import threading
 import time
 import types
@@ -287,6 +288,17 @@ def require_safe_local_destination(base_dir, target):
             f"reached through a symlink): {target}")
 
 
+def _local_collision_key(path) -> str:
+    """What two local paths share when they name the same file on disk."""
+    path = os.path.normcase(os.path.normpath(path))
+    # macOS and Windows volumes fold case by default. Asking the volume
+    # would need the folder to exist already; refusing a second spelling on
+    # the rare case-sensitive one costs a named skip, not a lost file.
+    if sys.platform in ("darwin", "win32"):
+        path = path.casefold()
+    return path
+
+
 def plan_prefix_download(key, folder_path, entries) -> PrefixDownloadPlan:
     """
     Map the objects under a prefix to the local paths a download would write.
@@ -306,7 +318,15 @@ def plan_prefix_download(key, folder_path, entries) -> PrefixDownloadPlan:
     for k, size in entries:
         if not k:
             continue
-        rel = os.path.relpath(k, prefix)
+        # relpath raises on Windows for a key that reads as another drive
+        # ("D:/x", "//srv/share/x") -- one such key used to abort the whole
+        # folder, and the overwrite scan with it.
+        try:
+            rel = os.path.relpath(k, prefix)
+        except ValueError:
+            _refuse(k, "cannot be mapped to a path inside the folder being "
+                       "downloaded into")
+            continue
         if rel == ".":
             continue
         out_path = os.path.join(base_dir, rel)
@@ -344,11 +364,28 @@ def plan_prefix_download(key, folder_path, entries) -> PrefixDownloadPlan:
         while rel:
             folders.add(os.path.normcase(rel))
             rel = os.path.dirname(rel)
-    files = []
-    for k, rel, out_path, size in wanted:
+    # relpath normalises, so "p/a/b", "p/a//b" and "p/a/./b" are three
+    # objects and one local path -- and on a case-insensitive filesystem so
+    # are "A.txt" and "a.txt". Unchecked, the second silently replaced the
+    # first and the job reported success for both; on the ranged path two
+    # threads wrote one part file at once. One key gets the path; the
+    # others are refused by name. The key that spells the path exactly is
+    # preferred, because it is the one a listing of the folder shows.
+    def _spelled_exactly(entry):
+        k, rel = entry[0], entry[1]
+        tail = k[len(prefix):] if str(k).startswith(prefix) else None
+        return 0 if tail == rel.replace(os.sep, "/") else 1
+
+    files, claimed = [], {}
+    for k, rel, out_path, size in sorted(wanted, key=_spelled_exactly):
         if os.path.normcase(rel) in folders:
             _refuse(k, "a folder of the same name is also being downloaded")
             continue
+        slot = _local_collision_key(out_path)
+        if slot in claimed:
+            _refuse(k, f"'{claimed[slot]}' downloads to the same local file")
+            continue
+        claimed[slot] = k
         files.append((k, out_path, size))
     return PrefixDownloadPlan(
         base_dir, [p for _r, p in dirs], files, unsafe, reasons)

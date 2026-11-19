@@ -15,6 +15,7 @@ from core.naming import format_media_time, media_kind
 from model import Model as DataModel
 from ui.dialogs.reports import SelectDialog, select_format
 from ui.widgets.highlighters import CodeHighlighter
+from ui.widgets.thumbnails import decode_raster
 from utils import (
     DialogDismissMixin, FuncWorker, join_qthread, release_worker_on_finish,
 )
@@ -375,8 +376,10 @@ class PreviewDialog(DialogDismissMixin, QDialog):
             ctype.startswith("image/") and "svg" not in ctype
         )
         if is_raster and ext != ".svg":
-            pix = QPixmap()
-            if pix.loadFromData(data):
+            # decode_raster, not loadFromData: Qt sniffs the format from the
+            # bytes, so the extension check above does not keep an SVG out.
+            pix = QPixmap.fromImage(decode_raster(data))
+            if not pix.isNull():
                 self._img_label.setPixmap(pix)
                 self._stack.setCurrentIndex(1)
                 return

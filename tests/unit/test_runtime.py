@@ -70,16 +70,16 @@ class TempWorkspaceTests(unittest.TestCase):
         self.assertTrue(os.path.isdir(ws.session_dir))
 
     def test_sweep_reclaims_roots_whose_owner_is_gone(self):
-        os.makedirs(os.path.join(self.root, "s3duck_4242_abc"))
+        os.makedirs(os.path.join(self.root, "s3duck_4242_abcd1234"))
         ws = TempWorkspace(root=self.root, pid=1234)
         removed = ws.sweep(is_alive=lambda pid: False)
         self.assertEqual(
-            removed, [os.path.join(self.root, "s3duck_4242_abc")])
+            removed, [os.path.join(self.root, "s3duck_4242_abcd1234")])
         self.assertFalse(os.path.exists(removed[0]))
 
     def test_sweep_never_touches_a_running_instance(self):
         """A second s3duck may be using its own staging right now."""
-        live = os.path.join(self.root, "s3duck_4242_abc")
+        live = os.path.join(self.root, "s3duck_4242_abcd1234")
         os.makedirs(live)
         ws = TempWorkspace(root=self.root, pid=1234)
         self.assertEqual(ws.sweep(is_alive=lambda pid: True), [])

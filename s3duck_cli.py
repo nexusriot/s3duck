@@ -27,7 +27,8 @@ from core.sync_plan import (
 from model import FSObjectType, Model, safe_local_path
 from profile_switcher import decrypt_profile, load_profiles
 from utils import (
-    CredentialError, CredentialStore, run_credential_process, scan_local_tree,
+    CredentialError, CredentialStore, restrict_config_dir,
+    run_credential_process, scan_local_tree,
 )
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE = 0, 1, 2
@@ -264,6 +265,10 @@ class Cli:
             prefix = key if not key or key.endswith("/") else key + "/"
             os.makedirs(dst, exist_ok=True)
             tree = model.list_tree(prefix)
+            if not tree:
+                # A typo'd prefix used to exit 0 with an empty folder: the
+                # nightly backup that copies nothing and reports success.
+                raise CliError(f"nothing found under s3://{bucket}/{prefix}")
             failed = 0
             for rel in sorted(tree):
                 path = safe_local_path(dst, rel)
@@ -333,11 +338,18 @@ class Cli:
         failed = 0
         for action in actions:
             rel, kind = action["rel"], action["action"]
-            path = safe_local_path(local, rel)
-            if not path:
-                self.err.write(f"skipped (escapes {local}): {rel}\n")
-                failed += 1
-                continue
+            # The containment check guards what is WRITTEN or REMOVED here.
+            # Applied to every action it also refused to upload a symlinked
+            # source file (which the scan had listed) and to delete a remote
+            # extra whose key is not a legal local name.
+            if kind in ("download", "delete_local"):
+                path = safe_local_path(local, rel)
+                if not path:
+                    self.err.write(f"skipped (escapes {local}): {rel}\n")
+                    failed += 1
+                    continue
+            else:
+                path = os.path.join(local, *rel.split("/"))
             try:
                 self.say(f"{kind} {rel}")
                 if kind == "upload":
@@ -373,5 +385,13 @@ def main(argv=None, out=None, err=None, model_factory=None) -> int:
         return EXIT_FAILED
 
 
+def _entry() -> int:
+    # The cron user never opens the window, so the config directory is
+    # closed from here too (utils.restrict_config_dir says why). Only on a
+    # real launch: main() is also what the tests call.
+    restrict_config_dir(os.path.dirname(open_settings().fileName()))
+    return main()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_entry())

@@ -41,7 +41,10 @@ def bulk_rename_plan(items, *, mode=BULK_RENAME_FIND, find="", replace="",
                 try:
                     flags = 0 if case_sensitive else re.IGNORECASE
                     new = re.sub(find, replace, name, flags=flags)
-                except re.error as exc:
+                except (re.error, OverflowError, RecursionError) as exc:
+                    # re raises the last two as well ("a{99999999999}", deep
+                    # nesting); uncaught in the live preview, a keystroke
+                    # aborted the process.
                     return [], [f"Invalid regular expression: {exc}"]
             elif case_sensitive:
                 new = name.replace(find, replace)

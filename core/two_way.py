@@ -168,7 +168,30 @@ def load_state(path) -> dict:
     except (OSError, ValueError):
         return {}
     paths = data.get("paths") if isinstance(data, dict) else None
-    return paths if isinstance(paths, dict) else {}
+    if not isinstance(paths, dict):
+        return {}
+    # One malformed entry used to raise out of the planner on every run, so
+    # the pair could not sync again until the file was deleted by hand. An
+    # entry that cannot be read is dropped instead: with no history a path
+    # is settled by content or listed as a conflict, never deleted.
+    return {rel: entry for rel, entry in paths.items()
+            if _entry_is_readable(entry)}
+
+
+def _entry_is_readable(entry) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    for side in ("local", "remote"):
+        seen = entry.get(side)
+        if seen is None:
+            continue
+        if not isinstance(seen, (list, tuple)) or len(seen) < 2:
+            return False
+        numeric = seen[:2] if side == "local" else seen[:1]
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               for value in numeric):
+            return False
+    return True
 
 
 def save_state(path, paths, meta=None):

@@ -892,14 +892,25 @@ class CopyKeepsTheStorageClassTests(unittest.TestCase):
         self.assertNotIn("StorageClass", c.copies[0])
         self.assertNotIn("MetadataDirective", c.copies[0])
 
-    def test_a_class_the_caller_knows_costs_no_head(self):
-        """The whole point of carrying it on the job row: a thousand-object
-        copy must not become a thousand extra round trips."""
+    def test_a_class_the_caller_knows_is_not_asked_for_again(self):
+        """The class on the job row wins over what the source says. The one
+        HEAD a copy inside its bucket makes is for the encryption, which no
+        listing carries -- see CopyKeepsTheEncryptionTests -- and it must
+        stay one."""
         c = self.Client(head_class="GLACIER_IR")
         self.m._client = c
         self.m.copy_object("a.tif", "b.tif", storage_class="ONEZONE_IA")
-        self.assertEqual(self._heads(c), 0)
+        self.assertEqual(self._heads(c), 1)
         self.assertEqual(c.copies[0]["StorageClass"], "ONEZONE_IA")
+
+    def test_a_copy_to_another_bucket_costs_no_head(self):
+        """There the destination's default encryption is the policy in
+        force, so nothing about the source has to be asked."""
+        c = self.Client(head_class="GLACIER_IR")
+        self.m._client = c
+        self.m.copy_object("a.tif", "b.tif", dst_bucket="other",
+                           storage_class="ONEZONE_IA")
+        self.assertEqual(self._heads(c), 0)
 
     def test_a_caller_that_knows_nothing_asks_the_source(self):
         """The other pane lists no class, and a job replayed from an old
@@ -917,7 +928,7 @@ class CopyKeepsTheStorageClassTests(unittest.TestCase):
         c = self.Client(head_class="GLACIER")
         self.m._client = c
         self.m.copy_object("a.txt", "b.txt", storage_class="")
-        self.assertEqual(self._heads(c), 0)
+        self.assertEqual(self._heads(c), 1)
         self.assertNotIn("StorageClass", c.copies[0])
 
     def test_a_head_the_credentials_refuse_still_copies(self):
@@ -943,7 +954,8 @@ class CopyKeepsTheStorageClassTests(unittest.TestCase):
         landed = {kw["Key"]: kw.get("StorageClass") for kw in c.copies}
         self.assertEqual(landed,
                          {"dst/cold.tif": "GLACIER_IR", "dst/warm.txt": None})
-        self.assertEqual(self._heads(c), 0)
+        # One each, for the encryption; never a second for the class.
+        self.assertEqual(self._heads(c), 2)
 
     def test_a_huge_object_keeps_its_class_through_the_multipart_route(self):
         """CreateMultipartUpload defines the new object outright, so a class
@@ -1050,6 +1062,141 @@ class CopyKeepsTheStorageClassTests(unittest.TestCase):
         self.m._client = c
         with self.assertRaises(botocore.exceptions.ClientError):
             self.m.copy_object("a.txt", "b.txt", storage_class="STANDARD_IA")
+
+class CopyKeepsTheEncryptionTests(unittest.TestCase):
+    """
+    REGRESSION (deep review): CopyObject does not inherit the source's
+    encryption -- a copy that names none takes the bucket's default. A
+    rename, a move or a delete-to-trash of an object under its own KMS key
+    produced a copy under the default and then deleted the original, leaving
+    the data readable without kms:Decrypt on that key.
+    """
+
+    KEY = "arn:aws:kms:eu-west-1:111122223333:key/abcd"
+
+    class Client(FakeS3Client):
+        def __init__(self, head=None, copy_errors=(), **kw):
+            super().__init__(**kw)
+            self._head = dict(head or {})
+            self._copy_errors = list(copy_errors)
+            self.copies = []
+
+        def head_object(self, **kw):
+            self.calls.append(("head_object", kw))
+            return dict(self._head)
+
+        def copy_object(self, **kw):
+            self.calls.append(("copy_object", kw))
+            self.copies.append(kw)
+            if self._copy_errors:
+                raise self._copy_errors.pop(0)
+            return {}
+
+    def setUp(self):
+        self.m = make_model(bucket="src")
+
+    def _kms(self, **more):
+        return dict({"ServerSideEncryption": "aws:kms",
+                     "SSEKMSKeyId": self.KEY}, **more)
+
+    def test_a_rename_restates_the_kms_key(self):
+        c = self.Client(head=self._kms(BucketKeyEnabled=True))
+        self.m._client = c
+        self.m.copy_object("a.bin", "b.bin", storage_class="STANDARD")
+        sent = c.copies[0]
+        self.assertEqual(sent["ServerSideEncryption"], "aws:kms")
+        self.assertEqual(sent["SSEKMSKeyId"], self.KEY)
+        self.assertIs(sent["BucketKeyEnabled"], True)
+        self.assertEqual(sent["MetadataDirective"], "COPY")
+
+    def test_a_folder_copy_restates_it_for_every_object(self):
+        c = self.Client(head=self._kms())
+        self.m._client = c
+        self.m.get_keys_with_class = lambda prefix, log_fn=None: [
+            ("in/one", 1, "STANDARD"), ("in/two", 1, "STANDARD_IA")]
+        self.m.copy_prefix("in/", "out/")
+        self.assertEqual({kw["Key"]: kw.get("SSEKMSKeyId") for kw in c.copies},
+                         {"out/one": self.KEY, "out/two": self.KEY})
+
+    def test_the_one_head_answers_the_class_as_well(self):
+        """A caller that knows nothing must not pay for two."""
+        c = self.Client(head=self._kms(StorageClass="STANDARD_IA"))
+        self.m._client = c
+        self.m.copy_object("a.bin", "b.bin")
+        self.assertEqual(len(c.calls_of("head_object")), 1)
+        self.assertEqual(c.copies[0]["StorageClass"], "STANDARD_IA")
+        self.assertEqual(c.copies[0]["SSEKMSKeyId"], self.KEY)
+
+    def test_an_unencrypted_object_is_copied_exactly_as_it_always_was(self):
+        c = self.Client(head={})
+        self.m._client = c
+        self.m.copy_object("a.txt", "b.txt", storage_class="STANDARD")
+        self.assertEqual(set(c.copies[0]), {"CopySource", "Bucket", "Key"})
+
+    def test_sse_s3_carries_no_kms_fields(self):
+        """Either beside AES256 is refused by the service."""
+        c = self.Client(head={"ServerSideEncryption": "AES256",
+                              "BucketKeyEnabled": True})
+        self.m._client = c
+        self.m.copy_object("a.txt", "b.txt", storage_class="STANDARD")
+        self.assertEqual(c.copies[0]["ServerSideEncryption"], "AES256")
+        self.assertNotIn("SSEKMSKeyId", c.copies[0])
+        self.assertNotIn("BucketKeyEnabled", c.copies[0])
+
+    def test_another_bucket_keeps_its_own_default(self):
+        """The source's key may not exist where the copy is going; the
+        destination's default governs, as it does for an upload."""
+        c = self.Client(head=self._kms())
+        self.m._client = c
+        self.m.copy_object("a.bin", "a.bin", dst_bucket="other",
+                           storage_class="STANDARD")
+        self.assertNotIn("ServerSideEncryption", c.copies[0])
+        self.assertEqual(c.calls_of("head_object"), [])
+
+    def test_a_head_the_credentials_refuse_still_copies(self):
+        c = self.Client()
+        c.head_object = lambda **kw: (_ for _ in ()).throw(
+            _client_error("AccessDenied", op="HeadObject"))
+        self.m._client = c
+        self.m.copy_object("a.txt", "b.txt", storage_class="STANDARD")
+        self.assertEqual(set(c.copies[0]), {"CopySource", "Bucket", "Key"})
+
+    def test_a_backend_without_encryption_still_copies(self):
+        """One that reports an encryption on HEAD and cannot be asked for
+        it: the copy goes out again plain, and says so."""
+        c = self.Client(head={"ServerSideEncryption": "AES256"},
+                        copy_errors=[_client_error("NotImplemented",
+                                                   op="CopyObject")])
+        self.m._client = c
+        logged = []
+        self.m.copy_object("a.txt", "b.txt", storage_class="STANDARD",
+                           log_fn=logged.append)
+        self.assertEqual(len(c.copies), 2)
+        self.assertNotIn("ServerSideEncryption", c.copies[1])
+        self.assertTrue(any("encryption" in line for line in logged))
+
+    def test_a_refused_class_does_not_take_the_encryption_with_it(self):
+        c = self.Client(head=self._kms(),
+                        copy_errors=[_client_error("InvalidStorageClass",
+                                                   op="CopyObject")])
+        self.m._client = c
+        self.m.copy_object("a.bin", "b.bin", storage_class="GLACIER_IR")
+        self.assertNotIn("StorageClass", c.copies[1])
+        self.assertEqual(c.copies[1]["SSEKMSKeyId"], self.KEY)
+
+    def test_a_key_the_caller_may_not_use_fails_the_copy(self):
+        """Quietly copying under another key is the bug; on a move the
+        source must still be there afterwards."""
+        c = self.Client(head=self._kms(),
+                        copy_errors=[_client_error("AccessDenied",
+                                                   op="CopyObject")])
+        self.m._client = c
+        with self.assertRaises(botocore.exceptions.ClientError):
+            self.m.copy_object("a.bin", "b.bin", storage_class="STANDARD")
+        self.assertEqual(len(c.copies), 1)
+
+
+
 class StorageClassInListingsTests(unittest.TestCase):
     """get_keys_with_class is what lets a recursive copy keep every tier
     without a HEAD per object."""

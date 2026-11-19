@@ -308,6 +308,21 @@ class DownloadMixin:
             # after the file is under its final name leaves the bad bytes
             # there, where the next sync — same size, newer mtime — calls
             # them up to date and never repairs them.
+            if self.verify_downloads and not (etag or head):
+                # The HEAD above failed on something transient and the GET
+                # then succeeded. Without a second look the file was moved
+                # into place unchecked and nothing said so -- with the
+                # setting that exists to catch a corrupt download on.
+                try:
+                    head = self.head_with_checksum(key)
+                    etag = self.normalize_etag(head.get("ETag"))
+                except TransferCancelled:
+                    raise
+                except Exception as exc:
+                    head = None
+                    if log_fn:
+                        log_fn(f"'{key}' was downloaded but NOT verified: "
+                               f"its stored digest could not be read ({exc})")
             if self.verify_downloads and (etag or head):
                 if not self.verify_download(staged, etag, head=head,
                                             log_fn=log_fn, key=key):

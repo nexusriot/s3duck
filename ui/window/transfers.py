@@ -737,6 +737,7 @@ class TransferQueueMixin:
         if not records:
             return 0
         restored = 0
+        refused = []
         for record in records:
             needs_key = record.get("sse_c_md5", "")
             entry = self.assign_thread_operation(
@@ -759,6 +760,17 @@ class TransferQueueMixin:
                     self.log(f"{entry.label} needs the SSE-C key it was "
                              f"queued with (MD5 {needs_key}); set it, then "
                              "resume")
+            else:
+                refused.append(record)
+        if refused:
+            # A job that could not be queued just now -- the credentials
+            # prompt was declined, say -- is still unfinished work. Dropped
+            # here, the next queue write erased it from disk as well.
+            self._pending_restore = refused
+            self._queue_panel.show_restore_offer(
+                describe_pending(refused) + ".")
+            self.log(f"{len(refused)} unfinished transfer(s) could not be "
+                     "queued and are still offered")
         self.log(f"restored {restored} unfinished transfer(s)")
         return restored
 
@@ -1016,6 +1028,11 @@ class TransferQueueMixin:
             # A partial first attempt left markers too; undo must cover them.
             fresh.started_at = entry.started_at
             fresh.full_job = list(entry.full_job or entry.job or [])
+            # The follow-up belongs to the work, not to the attempt: without
+            # it a two-way sync that succeeded on its retry never recorded
+            # its state, and the next run called every file it had just
+            # transferred a conflict.
+            fresh.on_finished = getattr(entry, "on_finished", None)
         return fresh
 
     def failed_entries(self) -> list:

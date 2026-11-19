@@ -58,6 +58,31 @@ class CrossProfileCopyTests(ServerCase):
                                             Key="typed.json")
         self.assertEqual(head["ContentType"], "application/json")
 
+    def test_the_tags_travel_with_it(self):
+        """A GET and a PUT again: CopyObject would have copied the tag set,
+        an upload starts with none, and a move then deletes the source --
+        the only copy of its tags. The copy asks for them only when the GET
+        says there are any (x-amz-tagging-count), which is a claim about the
+        server: one that does not send the header would silently drop them."""
+        self.put("xp/tagged.txt", b"tagged", Tagging="team=infra&note=a%20b")
+        got = self.model.client.get_object(
+            Bucket=self.model.bucket, Key="xp/tagged.txt")
+        got["Body"].close()
+        self.assertEqual(got.get("TagCount"), 2,
+                         "this backend does not report a tag count on GET")
+        self.model.copy_to_model("xp/tagged.txt", self.dest, "tagged.txt")
+        tags = self.dest.client.get_object_tagging(
+            Bucket=self.dest_bucket, Key="tagged.txt")["TagSet"]
+        self.assertEqual(sorted((t["Key"], t["Value"]) for t in tags),
+                         [("note", "a b"), ("team", "infra")])
+
+    def test_an_untagged_object_arrives_untagged(self):
+        self.put("xp/plain.txt", b"plain")
+        self.model.copy_to_model("xp/plain.txt", self.dest, "plain.txt")
+        tags = self.dest.client.get_object_tagging(
+            Bucket=self.dest_bucket, Key="plain.txt")["TagSet"]
+        self.assertEqual(tags, [])
+
     def test_the_source_is_left_alone(self):
         self.put("xp/keep.txt", b"original")
         self.model.copy_to_model("xp/keep.txt", self.dest, "copy.txt")

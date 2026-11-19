@@ -45,30 +45,49 @@ def build_exclude_matcher(patterns):
     if not cleaned:
         return lambda _rel: False
 
-    dir_prefixes = []
+    # A directory pattern used to be compared as a literal prefix and a
+    # glob only against the whole path or the file name. "*.egg-info/",
+    # ".*/", "/build/" and "cache*" below the root therefore excluded
+    # nothing -- and with delete on, a file the user had excluded was
+    # deleted as an extra. Every pattern is now globbed against each
+    # directory on the way down as well: its name, and its path from the
+    # root.
+    dir_patterns = []
     globs = []
     for pattern in cleaned:
-        if pattern.endswith("/"):
-            dir_prefixes.append(pattern.rstrip("/"))
-        else:
-            globs.append(pattern)
+        is_dir = pattern.endswith("/")
+        while pattern.startswith("./"):
+            pattern = pattern[2:]
+        pattern = pattern.strip("/")
+        if not pattern:
+            continue
+        (dir_patterns if is_dir else globs).append(pattern)
 
     def _match(rel):
         rel = (rel or "").strip("/")
         if not rel:
             return False
         parts = rel.split("/")
-        for prefix in dir_prefixes:
-            if rel == prefix or rel.startswith(prefix + "/"):
+        folders = parts[:-1]
+        folder_paths = ["/".join(parts[:end])
+                        for end in range(1, len(parts))]
+        for pattern in dir_patterns:
+            if fnmatch.fnmatch(rel, pattern):
                 return True
-            if prefix in parts[:-1]:
+            if any(fnmatch.fnmatch(path, pattern) for path in folder_paths):
+                return True
+            if "/" not in pattern and any(
+                    fnmatch.fnmatch(folder, pattern) for folder in folders):
                 return True
         name = parts[-1]
         for pattern in globs:
             if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(name, pattern):
                 return True
-            # a bare directory name also excludes its contents
-            if pattern in parts[:-1]:
+            # a directory matching the pattern also excludes its contents
+            if any(fnmatch.fnmatch(folder, pattern) for folder in folders):
+                return True
+            if "/" in pattern and any(
+                    fnmatch.fnmatch(path, pattern) for path in folder_paths):
                 return True
         return False
 
@@ -117,12 +136,26 @@ def build_sync_plan(local_entries, remote_entries, *, direction,
         landing = {rel: rel for rel in source}
     claimed = set(landing.values())
 
+    # "a/b" and "a//b" are two keys and one local file. Planned as two
+    # downloads, each run fetched both onto the same path, the later one
+    # won, and -- their sizes differing -- the next run did it again. One
+    # key owns the path: the one spelled like it, else the first.
+    owner = {}
+    for rel in sorted(source, key=lambda r: (landing[r] != r, r)):
+        if not is_excluded(rel):
+            owner.setdefault(landing[rel], rel)
+
     actions = []
     for rel in sorted(source):
         if is_excluded(rel):
             continue
         src_size, src_mtime = source[rel]
         target = landing[rel]
+        if owner.get(target, rel) != rel:
+            actions.append({
+                "action": "skip", "rel": rel, "size": src_size,
+                "reason": f"same local file as '{owner[target]}'"})
+            continue
         if target not in dest:
             actions.append({"action": transfer, "rel": rel,
                             "size": src_size, "reason": "missing at destination"})

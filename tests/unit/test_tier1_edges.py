@@ -48,7 +48,7 @@ class _SlowEditModel(_EditModel):
         self.release = threading.Event()
         self.entered = threading.Event()
 
-    def put_object_body(self, key, data, if_match=""):
+    def put_object_body(self, key, data, if_match="", **_kw):
         self.entered.set()
         self.release.wait(5)
         return super().put_object_body(key, data, if_match)

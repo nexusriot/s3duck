@@ -20,6 +20,28 @@ queue that survives a restart, and audio/video preview.
   and is lost on close. Storing the destination profile's *name* and
   re-reading its credentials on restore would close that gap.
 
+## Open review findings
+
+Found in the deep review round and left for a decision rather than fixed:
+
+- **Metadata edit and "Fix Content-Type" drop Content-Language and
+  Expires** — the REPLACE copy re-sends four content headers
+  (`s3/object_admin.py`, `set_object_metadata`).
+- **Promoting an old version lands in STANDARD** and cannot handle one over
+  5 GiB (`make_version_current`).
+- **Server text is shown as rich text** — an error message or imported
+  profile name containing markup is rendered by `QMessageBox` and tooltips;
+  dialogs that show service text should set `PlainText`.
+- **Keyring mode mints a second key when the entry is missing** instead of
+  refusing while profiles encrypted under the first still exist.
+- **Watch and two-way sync bind their clone by bucket name only**, without
+  resetting the endpoint the way `_worker_model_for` does (unverified).
+- **A public URL omits the bucket** when the bucket's name equals any label
+  of the endpoint host (`minio` at `minio.local`), and a policy template
+  for prefix `public` also covers `public-internal/`.
+- `ci.yml` has no `permissions:` block and pins actions by tag;
+  `DEBIAN/prerm` uses `rm` without `-f`.
+
 ## Tier 2 — bucket administration
 
 Block Public Access, server access logging, a read-only replication view,

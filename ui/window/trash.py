@@ -44,10 +44,15 @@ class TrashMixin:
                 index_of=lambda row: row[1]) or []
             if not moves and not deletes:
                 return 0, 0
-        if moves:
-            self.assign_thread_operation("move", moves)
+        # Deletes first. The queue runs jobs in order, and a selection can
+        # hold the trash itself (Ctrl+A at the bucket root includes
+        # ".trash/"): queued after the move, that delete emptied the trash
+        # of what the move had just put there -- everything selected was
+        # gone for good under a prompt that said it could be restored.
         if deletes:
             self.assign_thread_operation("delete", deletes)
+        if moves:
+            self.assign_thread_operation("move", moves)
         return len(moves), len(deletes)
 
     def delete_verb(self, keys) -> str:

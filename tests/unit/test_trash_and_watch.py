@@ -83,9 +83,11 @@ class TrashWindowTests(_Window):
         self.assertEqual(win.delete_verb([".trash/a"]), "Delete")
         self.assertEqual(win.queue_delete(["a", ".trash/b"]), (1, 1))
         calls = [c.args for c in win.assign_thread_operation.call_args_list]
-        self.assertEqual(calls[0][0], "move")
-        self.assertEqual(calls[0][1][0][1], ".trash/a")
-        self.assertEqual(calls[1], ("delete", [".trash/b"]))
+        # The delete is queued first; tests/unit/test_deep_review_fixes.py
+        # (TrashNeverEatsWhatItJustTookTests) says why the order matters.
+        self.assertEqual(calls[0], ("delete", [".trash/b"]))
+        self.assertEqual(calls[1][0], "move")
+        self.assertEqual(calls[1][1][0][1], ".trash/a")
 
     def test_the_setting_is_per_profile(self):
         win = self._window()

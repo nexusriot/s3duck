@@ -7,6 +7,8 @@ else changed meanwhile is never overwritten without asking.
 """
 
 import os
+import shutil
+import time
 from datetime import datetime
 from PyQt6.QtCore import QFileSystemWatcher, QThread, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices
@@ -156,7 +158,11 @@ class ExternalEditMixin:
         state["busy"] = True
 
         def _put(_w):
-            return clone.put_object_body(key, data, if_match=if_match)
+            # preserve_properties, as the in-app editor passes: without it
+            # every save from the external editor rewrote the object with
+            # no user metadata, no tags, the default class and encryption.
+            return clone.put_object_body(key, data, if_match=if_match,
+                                         preserve_properties=True)
 
         thread = QThread(self)
         worker = FuncWorker(_put)
@@ -194,6 +200,24 @@ class ExternalEditMixin:
             self.statusBar().showMessage(f"Could not save {key}: {exc}", 8000)
         if path in self._edit_pending:
             self._edit_timer.start(self.EXTERNAL_EDIT_SETTLE_MS)
+
+    def _unsaved_edits_dir(self) -> str:
+        return os.path.join(
+            os.path.expanduser("~"), ".config", "s3duck", "unsaved-edits")
+
+    def _rescue_unsaved_edit(self, path, key) -> str:
+        """Copy an edit that could not be uploaded somewhere that survives
+        the session; returns where, or "" if even that failed."""
+        try:
+            folder = self._unsaved_edits_dir()
+            os.makedirs(folder, mode=0o700, exist_ok=True)
+            name = os.path.basename(path) or os.path.basename(key) or "edit"
+            target = os.path.join(
+                folder, time.strftime("%Y%m%d-%H%M%S-") + name)
+            shutil.copy2(path, target)
+            return target
+        except OSError:
+            return ""
 
     def _resolve_edit_conflict(self, path, state, now):
         box = QMessageBox(self)
@@ -234,15 +258,30 @@ class ExternalEditMixin:
             for path in unsent:
                 state = edits[path]
                 key, etag = state["key"], state["etag"]
-                with open(path, "rb") as handle:
-                    data = handle.read()
+                try:
+                    with open(path, "rb") as handle:
+                        data = handle.read()
+                except OSError as exc:
+                    QMessageBox.warning(self, "Edit in external app",
+                                        f"{key} was not saved: {exc}")
+                    continue
                 _result, exc = run_with_progress(
                     self, f"Saving {key}…",
                     lambda _w, _m=state["model"], _k=key, _d=data, _e=etag:
-                    _m.put_object_body(_k, _d, if_match=_e))
+                    _m.put_object_body(_k, _d, if_match=_e,
+                                       preserve_properties=True))
                 if exc is not None:
+                    # The edited file lives in the session's temp workspace,
+                    # which is removed when the window closes -- and this is
+                    # the window closing. Reporting the failure and carrying
+                    # on destroyed the only copy of the user's changes.
+                    kept = self._rescue_unsaved_edit(path, key)
+                    where = (f"\n\nYour edited copy was kept at:\n{kept}"
+                             if kept else "")
+                    self.log(f"external edit of {key} not saved: {exc}"
+                             + (f"; copy kept at {kept}" if kept else ""))
                     QMessageBox.warning(self, "Edit in external app",
-                                        f"{key} was not saved: {exc}")
+                                        f"{key} was not saved: {exc}{where}")
         watcher = getattr(self, "_edit_watcher", None)
         if watcher is not None:
             paths = watcher.files() + watcher.directories()

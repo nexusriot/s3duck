@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QPushButton, QVBoxLayout,
 )
 
+from core.profile import profile_name_problem
 from utils import (
     str_to_bool, center_on_screen, load_aws_profiles, PROFILE_ACCENTS,
     normalize_accent, expiry_state,
@@ -104,6 +105,9 @@ class SettingsWindow(QDialog):
         btn_apply = self.buttonBox.button(QDialogButtonBox.StandardButton.Ok)
         btn_apply.setEnabled(False)
         self.retrunVal = None
+        # A name saved before separators were refused stays editable as it
+        # is; only a new or changed name has to pass.
+        self._original_name = str(name or "")
         self.nameLineEdit.setText(name)
         self.urlLineEdit.setText(url)
         self.regionEdit.setText(region)
@@ -210,15 +214,21 @@ class SettingsWindow(QDialog):
         # what produces them, so requiring both would make it unsaveable.
         has_keys = bool(self.accessKeyEdit.text()) and bool(
             self.secretKeyEdit.text())
-        taken = self.nameLineEdit.text().strip() in self._taken_names
+        typed = self.nameLineEdit.text()
+        taken = typed.strip() in self._taken_names
+        problem = ""
+        if typed and typed != getattr(self, "_original_name", ""):
+            problem = profile_name_problem(typed)
+        if taken:
+            problem = "Another profile already has this name"
+        taken = bool(problem)
         btn_apply.setEnabled(
             bool(self.nameLineEdit.text())
             and not taken
             and bool(self.urlLineEdit.text())
             and (has_keys or bool(self.credentialProcessEdit.text().strip()))
         )
-        self.nameLineEdit.setToolTip(
-            "Another profile already has this name" if taken else "")
+        self.nameLineEdit.setToolTip(problem)
         self.nameLineEdit.setStyleSheet(
             "border: 1px solid #c62828;" if taken else "")
 

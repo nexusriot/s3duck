@@ -101,3 +101,51 @@ class UploadSourceSafetyTests(ServerCase):
             self.assertFalse(os.path.exists(model._upload_state_path("changing-upload", path)))
             uploads = client.list_multipart_uploads(Bucket=self.bucket).get("Uploads") or []
             self.assertFalse(any(u["Key"] == "changing-upload" for u in uploads))
+
+
+class CopyKeepsTheEncryptionTests(ServerCase):
+    """
+    REGRESSION (deep review): a copy inside a bucket named no encryption, so
+    the new object took the bucket's default instead of the source's own --
+    and a rename or a move then deleted the original.
+    """
+
+    def _put_encrypted(self, key, **sse):
+        try:
+            self.put(key, b"secret", **sse)
+        except botocore.exceptions.ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("NotImplemented", "InvalidArgument",
+                        "KMS.NotFoundException"):
+                self.skipTest(f"this server has no KMS configured ({code})")
+            raise
+
+    def _head(self, key):
+        return self.model.client.head_object(Bucket=self.bucket, Key=key)
+
+    def test_a_kms_object_is_still_under_kms_after_a_rename(self):
+        self._put_encrypted("enc/kms.bin", ServerSideEncryption="aws:kms")
+        source = self._head("enc/kms.bin")
+        self.model.copy_object("enc/kms.bin", "enc/kms-renamed.bin")
+        copied = self._head("enc/kms-renamed.bin")
+        self.assertEqual(copied.get("ServerSideEncryption"), "aws:kms")
+        self.assertEqual(copied.get("SSEKMSKeyId"), source.get("SSEKMSKeyId"))
+        self.assertEqual(self.body("enc/kms-renamed.bin"), b"secret")
+
+    def test_a_folder_copy_keeps_it_for_every_object(self):
+        self._put_encrypted("encdir/a.bin", ServerSideEncryption="aws:kms")
+        self._put_encrypted("encdir/b.bin", ServerSideEncryption="AES256")
+        self.put("encdir/plain.bin", b"plain")
+        self.model.copy_prefix("encdir/", "encout/")
+        self.assertEqual(
+            {key: self._head(key).get("ServerSideEncryption")
+             for key in self.keys("encout/")},
+            {"encout/a.bin": "aws:kms", "encout/b.bin": "AES256",
+             "encout/plain.bin": None})
+
+    def test_an_unencrypted_object_stays_unencrypted(self):
+        self.put("enc/plain.txt", b"plain")
+        self.model.copy_object("enc/plain.txt", "enc/plain-copy.txt")
+        self.assertIsNone(
+            self._head("enc/plain-copy.txt").get("ServerSideEncryption"))
+        self.assertEqual(self.body("enc/plain-copy.txt"), b"plain")

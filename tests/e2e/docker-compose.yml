@@ -20,6 +20,10 @@ services:
       # Object Lock needs this off; it is a throwaway server on a private
       # compose network either way.
       MINIO_BROWSER: "off"
+      # A static, throwaway KMS key, so SSE-S3 and SSE-KMS requests are
+      # accepted and the tests can see what a copy does to an object's
+      # encryption. Nothing is encrypted unless a test asks for it.
+      MINIO_KMS_SECRET_KEY: "s3duck-e2e:czNkdWNrLWUyZS10aHJvd2F3YXkta21zLWtleS0zMmI="
     # tmpfs rather than a volume, for the reason the old file gave for
     # having no volume at all: a run that depended on what a previous one
     # left behind would not be hermetic. It also settles ownership, which a

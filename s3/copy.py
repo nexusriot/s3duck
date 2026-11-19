@@ -43,7 +43,8 @@ class CopyMixin:
         """
         extra = {}
         for field in ("ContentType", "CacheControl", "ContentDisposition",
-                      "ContentEncoding"):
+                      "ContentEncoding", "ContentLanguage", "Expires",
+                      "WebsiteRedirectLocation"):
             value = (resp or {}).get(field)
             if value:
                 extra[field] = value
@@ -51,6 +52,24 @@ class CopyMixin:
         if metadata:
             extra["Metadata"] = dict(metadata)
         extra.update(upload_extra_args or {})
+        return extra
+
+    def _carry_tags(self, extra, src_key, resp, log_fn=None) -> dict:
+        """
+        Add the source's tags to a streamed copy's ExtraArgs.
+
+        CopyObject copies the tag set; an upload starts with none. A move
+        routed through a stream -- another region, another profile -- then
+        deleted the source, and with it the only copy of its tags. Tags the
+        destination's own upload rules assign win, like everything else.
+
+        The GET that opened the stream already says whether there are any
+        (x-amz-tagging-count), so an untagged object costs no request.
+        """
+        if (resp or {}).get("TagCount") and "Tagging" not in extra:
+            tagging = self._source_tagging(self.bucket, src_key, log_fn=log_fn)
+            if tagging:
+                extra["Tagging"] = tagging
         return extra
 
     def _storage_class_to_preserve(self, src_key, storage_class):
@@ -171,6 +190,7 @@ class CopyMixin:
             extra = drop_unsendable_checksum_args(
                 dst_model.client,
                 self._carried_extra_args(resp, dst_model.upload_extra_args))
+            self._carry_tags(extra, src_key, resp, log_fn=log_fn)
             callback = _BotoProgressAdapter(
                 resp.get("ContentLength"), dst_key, progress_cb,
                 cancel_event=cancel_event, limiter=self.rate_limiter)
@@ -244,6 +264,7 @@ class CopyMixin:
             # difference nobody asked for.
             extra.pop("StorageClass", None)
             extra.update(self._preserved_class_args(storage_class))
+            self._carry_tags(extra, src_key, resp, log_fn=log_fn)
 
             dst_client.upload_fileobj(
                 _CopySourceReader(body, cancel_event), dst_bucket, dst_key,
@@ -465,12 +486,17 @@ class CopyMixin:
         # copy without spending a request discovering what it would have
         # copied.
         self._guard_write()
+        head = self._head_for_in_bucket_copy(src_key, dst_bucket, size)
+        if storage_class is None and head:
+            # The HEAD made for the encryption names the class as well.
+            storage_class = head.get("StorageClass") or "STANDARD"
         storage_class = self._storage_class_to_preserve(src_key, storage_class)
         try:
             return self._copy_object_routed(
                 src_key, dst_key, dst_bucket=dst_bucket, log_fn=log_fn,
                 allow_stream=allow_stream, size=size,
-                cancel_event=cancel_event, storage_class=storage_class)
+                cancel_event=cancel_event, storage_class=storage_class,
+                encryption=self._sse_args(head))
         except botocore.exceptions.ClientError as exc:
             # One place for it: every route here reads the source, so every
             # route refuses an archived one, and the raw code says nothing
@@ -478,10 +504,34 @@ class CopyMixin:
             self._raise_if_archived(exc, src_key, storage_class)
             raise
 
+    def _head_for_in_bucket_copy(self, src_key, dst_bucket, size) -> dict:
+        """
+        HEAD of the source of a copy that stays in its bucket, else {}.
+
+        CopyObject does not inherit the source's encryption: a copy that
+        names none takes the bucket's DEFAULT. A rename, a move or a
+        delete-to-trash of an object written under its own KMS key therefore
+        produced a copy under the default -- and then deleted the original,
+        leaving the data readable without kms:Decrypt on that key. Only the
+        source can say how it is encrypted (no listing does), so this is the
+        one request a copy pays per object; see _sse_args.
+
+        Not asked when the copy leaves the bucket: there the destination's
+        own default is the policy in force, as it is for an upload, and the
+        source's key may not even exist in its region. Not asked for an
+        object over the single-copy limit either -- the multipart route
+        makes its own HEAD and carries the encryption from it.
+        """
+        if (dst_bucket or self.bucket) != self.bucket:
+            return {}
+        if size is not None and int(size) > self.MAX_SINGLE_COPY_BYTES:
+            return {}
+        return self._head_for_rewrite(src_key)
+
     def _copy_object_routed(self, src_key: str, dst_key: str,
                             dst_bucket: str = None, log_fn=None,
                             allow_stream=True, size=None, cancel_event=None,
-                            storage_class=""):
+                            storage_class="", encryption=None):
         """
         The three routes of a copy, cheapest first.
 
@@ -496,6 +546,8 @@ class CopyMixin:
         cross_bucket = dst_bucket != self.bucket
         copy_source = {"Bucket": self.bucket, "Key": src_key}
         preserved = self._preserved_class_args(storage_class)
+        # The source's own encryption, restated; see _head_for_in_bucket_copy.
+        named = dict(preserved, **(encryption or {}))
 
         def _multipart(known_size):
             try:
@@ -540,8 +592,7 @@ class CopyMixin:
             # change_storage_class() wears for the same request.
             self.client.copy_object(
                 CopySource=copy_source, Bucket=dst_bucket, Key=dst_key,
-                **(dict(preserved, MetadataDirective="COPY")
-                   if preserved else {}))
+                **(dict(named, MetadataDirective="COPY") if named else {}))
 
         try:
             _do()
@@ -560,7 +611,21 @@ class CopyMixin:
                 return self._copy_object_routed(
                     src_key, dst_key, dst_bucket=dst_bucket, log_fn=log_fn,
                     allow_stream=allow_stream, size=size,
-                    cancel_event=cancel_event, storage_class="STANDARD")
+                    cancel_event=cancel_event, storage_class="STANDARD",
+                    encryption=encryption)
+            if encryption and code == "NotImplemented":
+                # A backend that reports an encryption on HEAD and has no
+                # way to be asked for it. Only "not implemented" is read
+                # this way: a KMS refusal (no access to the key) is let out,
+                # because quietly copying under another key is the very
+                # thing restating the encryption is here to prevent.
+                if log_fn:
+                    log_fn(f"restating the encryption of '{src_key}' was "
+                           f"refused ({code}); copying it without")
+                return self._copy_object_routed(
+                    src_key, dst_key, dst_bucket=dst_bucket, log_fn=log_fn,
+                    allow_stream=allow_stream, size=size,
+                    cancel_event=cancel_event, storage_class=storage_class)
             oversized = self._oversized_copy_source(exc, src_key)
             if oversized:
                 if log_fn:

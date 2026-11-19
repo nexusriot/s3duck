@@ -23,7 +23,7 @@ def build_search_matcher(query: str = "", *, regex: bool = False,
         try:
             compiled = re.compile(
                 needle, 0 if case_sensitive else re.IGNORECASE)
-        except re.error as exc:
+        except (re.error, OverflowError, RecursionError) as exc:
             raise ValueError(f"Invalid regular expression: {exc}") from exc
     elif not case_sensitive:
         needle = needle.lower()

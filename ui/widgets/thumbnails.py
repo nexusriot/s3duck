@@ -9,8 +9,10 @@ import collections
 import os
 import queue
 import threading
-from PyQt6.QtCore import QObject, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QImage
+from PyQt6.QtCore import (
+    QBuffer, QByteArray, QIODevice, QObject, QSize, Qt, pyqtSignal,
+)
+from PyQt6.QtGui import QImage, QImageReader
 from PyQt6.QtWidgets import QAbstractItemView, QListView
 
 THUMB_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
@@ -26,9 +28,31 @@ def wants_thumbnail(name, size) -> bool:
             and 0 < int(size or 0) <= THUMB_MAX_BYTES)
 
 
+# Formats that are documents rather than pixels. Qt picks a decoder from the
+# bytes, not the name, so an SVG uploaded as "photo.png" went to the SVG
+# renderer -- and a two-kilobyte one of nested <use> elements takes minutes to
+# draw, on the UI thread, for anyone who merely opens the folder.
+_NON_RASTER_FORMATS = frozenset({"svg", "svgz", "pdf"})
+
+
+def decode_raster(data) -> QImage:
+    """*data* as an image, or a null QImage when it is not a raster one."""
+    payload = QByteArray(bytes(data or b""))
+    buffer = QBuffer(payload)
+    if not buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+        return QImage()
+    reader = QImageReader(buffer)
+    kind = bytes(reader.format()).decode("ascii", "replace").lower()
+    if not kind or kind in _NON_RASTER_FORMATS:
+        return QImage()
+    image = reader.read()
+    buffer.close()
+    return image
+
+
 def thumbnail_image(data, side=THUMB_SIZE):
     """*data* decoded and scaled to fit a square, or None if undecodable."""
-    image = QImage.fromData(data)
+    image = decode_raster(data)
     if image.isNull():
         return None
     return image.scaled(side, side, Qt.AspectRatioMode.KeepAspectRatio,

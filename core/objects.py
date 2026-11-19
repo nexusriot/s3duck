@@ -32,12 +32,21 @@ def raise_on_delete_errors(resp, log_fn=None, limit=5):
 
 
 def _object_already_there(exc) -> bool:
-    """Whether a conditional write was refused because the key is taken."""
+    """
+    Whether a conditional write was refused because the key is taken.
+
+    Only a 412 says that. A 409 -- ConditionalRequestConflict,
+    OperationAborted -- says another request on the key was in flight and
+    this one should be repeated; read as "already exists" it turned a
+    retryable failure into a file reported as skipped and never uploaded.
+    """
     response = getattr(exc, "response", None) or {}
     code = (response.get("Error") or {}).get("Code", "")
     status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
-    return code in ("PreconditionFailed", "ConditionalRequestConflict") \
-        or status in (412, 409)
+    if status == 409 or code in ("ConditionalRequestConflict",
+                                 "OperationAborted"):
+        return False
+    return code == "PreconditionFailed" or status == 412
 
 
 def merge_tags(current, add=None, remove=None, replace=False) -> list:

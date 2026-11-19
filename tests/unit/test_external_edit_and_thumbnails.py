@@ -63,7 +63,7 @@ class _EditModel:
         if self.change_during_download:
             self.etag = "moved"
 
-    def put_object_body(self, key, data, if_match=""):
+    def put_object_body(self, key, data, if_match="", **_kw):
         self.puts.append((key, data, if_match))
         if if_match and if_match != self.etag:
             raise Model.PreconditionFailed("changed")

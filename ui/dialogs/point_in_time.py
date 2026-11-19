@@ -61,7 +61,16 @@ class PointInTimeDialog(DialogDismissMixin, QDialog):
         note.setWordWrap(True)
         self.versioning_note = QLabel("")
         self.versioning_note.setWordWrap(True)
-        if versioning not in ("Enabled", "Suspended"):
+        if versioning == "Suspended":
+            # "Nothing is destroyed" is not true here: with versioning
+            # suspended a write or a delete REPLACES the version whose id is
+            # "null" instead of stacking a new one on top of it.
+            self.versioning_note.setText(
+                "Versioning is SUSPENDED on this bucket. Anything written "
+                "while it was suspended has no version of its own, so "
+                "restoring or deleting such an object here replaces it for "
+                "good. Enable versioning first if those objects matter.")
+        elif versioning != "Enabled":
             self.versioning_note.setText(
                 "Versioning is not enabled on this bucket, so there is no "
                 "history to go back to; only objects whose single version "

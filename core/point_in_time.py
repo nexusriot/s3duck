@@ -42,7 +42,16 @@ def plan_point_in_time(versions, as_of) -> list:
 
     actions = []
     for key in sorted(by_key):
-        history = sorted(by_key[key], key=_stamp, reverse=True)
+        # LastModified has one-second resolution, so a version and the
+        # delete marker written over it can carry the same stamp. The sort
+        # is stable and a listing gives versions before markers, so the tie
+        # used to go to the version -- and a key created and deleted within
+        # one second was "restored" at that moment. The latest entry is the
+        # newer of two equal stamps, whatever order they arrived in.
+        history = sorted(
+            by_key[key],
+            key=lambda v: (_stamp(v), bool(v.get("is_latest"))),
+            reverse=True)
         current = next((v for v in history if v.get("is_latest")), history[0])
         then = next((v for v in history if _stamp(v) <= moment), None)
         exists_now = not current.get("is_delete_marker")

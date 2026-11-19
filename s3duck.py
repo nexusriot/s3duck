@@ -39,8 +39,9 @@ from utils import (
     normalize_accent, themed_icon, expiry_state, load_aws_profiles,
     run_credential_process, CredentialStore, CREDENTIAL_STORE_LOCAL,
     CREDENTIAL_STORE_KEYRING, CREDENTIAL_STORE_PASSPHRASE, keyring_available,
-    InstanceServer, send_to_running_instance,
+    InstanceServer, send_to_running_instance, restrict_config_dir,
 )
+from core.profile import safe_profile_name
 from theme import apply_theme
 from settings_store import SettingsStore
 
@@ -1234,12 +1235,27 @@ class Profiles(QDialog):
         crypto = self._crypto_or_warn()
         if crypto is None:
             return
+        # A bundle is somebody else's file. Its credential_process is a
+        # command line this app runs on Run -- unasked, whenever the profile
+        # has no keys or says they expired, both of which the bundle's author
+        # also chooses. So the commands are shown and have to be accepted;
+        # otherwise the profiles arrive without them.
+        commands = [
+            (str(entry.get("name") or "").strip(),
+             str(entry.get("credential_process") or "").strip())
+            for entry in profiles
+            if str(entry.get("name") or "").strip()
+            and str(entry.get("credential_process") or "").strip()]
+        keep_commands = bool(commands) and self._confirm_imported_commands(
+            commands)
         existing = {item.name for item in self.items}
         added = 0
         for entry in profiles:
-            name = str(entry.get("name") or "").strip()
+            name = safe_profile_name(entry.get("name"))
             if not name:
                 continue
+            if not keep_commands:
+                entry = dict(entry, credential_process="")
             # Never clobber a profile that is already configured here.
             while name in existing:
                 name = f"{name}-imported"
@@ -1276,6 +1292,28 @@ class Profiles(QDialog):
         self.select_last()
         QMessageBox.information(
             self, "Import profiles", f"Imported {added} profile(s).")
+
+    def _confirm_imported_commands(self, commands) -> bool:
+        """Ask before keeping the commands an imported bundle would run."""
+        shown = "\n".join(
+            f"{name}:  {command}" for name, command in commands[:10])
+        if len(commands) > 10:
+            shown += f"\n… and {len(commands) - 10} more"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Import profiles")
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(
+            f"{len(commands)} imported profile(s) fetch their credentials by "
+            "running a command on this computer:\n\n"
+            f"{shown}\n\n"
+            "Keep these commands? Only do so if you trust where the bundle "
+            "came from. Without them the profiles are imported with no "
+            "command, and you can add one yourself.")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes
+                               | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        return box.exec() == QMessageBox.StandardButton.Yes
 
     def save_settings(self):
         with SettingsStore(self.settings).group("profiles"):
@@ -1570,6 +1608,9 @@ def main():
         return
 
     app = QApplication(sys.argv)
+    # Before anything is read or written there: see restrict_config_dir.
+    restrict_config_dir(
+        os.path.dirname(QSettings("s3duck", "s3duck").fileName()))
     # Cross-platform font with emoji fallback
     font = QFont()
     # prefer system UI font; then add family fallbacks

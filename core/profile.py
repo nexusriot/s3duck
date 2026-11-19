@@ -19,6 +19,32 @@ Defaults do the padding's job now, and they do it per field.
 from dataclasses import dataclass, replace
 
 
+# A profile's name is a path segment in the settings file: "team" owns the
+# keys "bookmarks/team", "pending_queue/team", ... and removing one of those
+# removes everything beneath it. A profile called "team/prod" therefore lost
+# its saved queue, tabs and bookmarks whenever "team" cleared its own.
+PROFILE_NAME_SEPARATORS = "/\\"
+
+
+def profile_name_problem(name) -> str:
+    """Why *name* cannot be given to a profile, or "" if it can."""
+    name = str(name or "")
+    if not name.strip():
+        return "A name is required"
+    bad = [ch for ch in PROFILE_NAME_SEPARATORS if ch in name]
+    if bad:
+        return "A profile name cannot contain " + " or ".join(bad)
+    return ""
+
+
+def safe_profile_name(name) -> str:
+    """*name* as a profile may carry it: trimmed, separators replaced."""
+    name = str(name or "").strip()
+    for ch in PROFILE_NAME_SEPARATORS:
+        name = name.replace(ch, "_")
+    return name
+
+
 @dataclass(frozen=True)
 class ProfileSettings:
     """Everything about one S3 connection: where, as whom, and how."""

@@ -224,18 +224,51 @@ class UploadMixin:
         digest = hashlib.sha256(identity.encode()).hexdigest()[:32]
         return os.path.join(self.upload_state_dir, digest + ".json")
 
-    def _read_upload_state(self, path, key, size, mtime, chunk_size):
+    @staticmethod
+    def _upload_options_fingerprint(extra) -> str:
+        """
+        One short string for everything CreateMultipartUpload was told.
+
+        A digest, never the arguments themselves: they can carry an SSE-C
+        key, and the resume record is a plain file.
+        """
+        blob = json.dumps(extra or {}, sort_keys=True, default=str)
+        return hashlib.sha256(blob.encode()).hexdigest()[:32]
+
+    def _read_upload_state(self, path, key, size, mtime, chunk_size,
+                           options=None):
         """
         The stored upload id, but only if it still describes this exact upload.
 
         A changed size, mtime or part size means the parts already on the
         server no longer line up with what we would send, so resuming would
         assemble a corrupt object.
+
+        *options* is the fingerprint of the upload's arguments. Encryption,
+        storage class, tags and the checksum algorithm are fixed when a
+        multipart upload is created, so resuming one made under other
+        settings finished the object with the OLD ones -- unencrypted, say,
+        after SSE-KMS had been switched on -- and said nothing. Such an
+        upload is aborted and started again. A record written before the
+        fingerprint existed is resumed as it always was.
         """
         try:
             with open(path) as handle:
                 saved = json.load(handle)
         except Exception:
+            return None
+        stale = (options is not None and saved.get("options") is not None
+                 and saved.get("options") != options)
+        if stale:
+            try:
+                if (saved.get("key") == key
+                        and saved.get("bucket") == self.bucket
+                        and saved.get("upload_id")):
+                    self.client.abort_multipart_upload(
+                        Bucket=self.bucket, Key=key,
+                        UploadId=str(saved["upload_id"]))
+            except Exception:
+                pass    # best effort; Incomplete uploads lists what is left
             return None
         try:
             same = (
@@ -249,14 +282,18 @@ class UploadMixin:
             return None
         return str(saved.get("upload_id") or "") if same else None
 
-    def _write_upload_state(self, path, key, upload_id, size, mtime, chunk_size):
+    def _write_upload_state(self, path, key, upload_id, size, mtime, chunk_size,
+                            options=None):
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        record = {
+            "bucket": self.bucket, "key": key, "upload_id": upload_id,
+            "size": int(size), "mtime": float(mtime),
+            "chunk_size": int(chunk_size),
+        }
+        if options is not None:
+            record["options"] = options
         with open(path, "w") as handle:
-            json.dump({
-                "bucket": self.bucket, "key": key, "upload_id": upload_id,
-                "size": int(size), "mtime": float(mtime),
-                "chunk_size": int(chunk_size),
-            }, handle)
+            json.dump(record, handle)
 
     def _uploaded_parts(self, key, upload_id) -> dict:
         """
@@ -343,8 +380,9 @@ class UploadMixin:
         # the SDK was not already sending.
         extra.setdefault("ChecksumAlgorithm", self.DEFAULT_PART_CHECKSUM)
 
+        options = self._upload_options_fingerprint(extra)
         upload_id = self._read_upload_state(
-            state_path, key, size, mtime, chunk)
+            state_path, key, size, mtime, chunk, options=options)
         done = {}
         if upload_id:
             try:
@@ -358,7 +396,7 @@ class UploadMixin:
                 Bucket=self.bucket, Key=key, **extra)["UploadId"]
             done = {}
         self._write_upload_state(
-            state_path, key, upload_id, size, mtime, chunk)
+            state_path, key, upload_id, size, mtime, chunk, options=options)
 
         # A stored part whose length disagrees with what we would send cannot
         # be trusted, so it is re-sent rather than reused.

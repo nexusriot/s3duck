@@ -961,9 +961,11 @@ class Worker(QObject):
         # job = [(key, is_folder, days, tier)]
         initiated = 0
         skipped = 0
+        failures = []
         for index, (key, is_folder, days, tier) in enumerate(self.job):
             if self._cancel_event.is_set():
                 raise TransferCancelled("cancelled")
+            failed_before = len(failures)
             for k in self._iter_object_keys(key, is_folder):
                 ok, reason = self.data_model.restore_object(
                     k, days=days, tier=tier
@@ -971,10 +973,35 @@ class Worker(QObject):
                 if ok:
                     initiated += 1
                     self.progress.emit(f"restore initiated: {k}")
-                else:
+                elif self._restore_refusal_is_a_skip(reason):
                     skipped += 1
                     self.progress.emit(f"restore skipped ({reason}): {k}")
-            self.item_done.emit(index)
+                else:
+                    # AccessDenied, a throttle, a dropped connection: the
+                    # restore was not started. Counted as "skipped", a job
+                    # in which every request was refused ended "done".
+                    failures.append(f"{k}: {reason}")
+                    self.progress.emit(f"restore failed ({reason}): {k}")
+            # As in set_storage_class: a row with a failure is not finished.
+            if len(failures) == failed_before:
+                self.item_done.emit(index)
         self.progress.emit(
-            f"restore done: {initiated} initiated, {skipped} skipped"
+            f"restore done: {initiated} initiated, {skipped} skipped, "
+            f"{len(failures)} failed"
         )
+        if failures:
+            self.error.emit(
+                f"{len(failures)} object(s) could not be restored:\n\n"
+                + "\n".join(failures[:10]))
+
+    @staticmethod
+    def _restore_refusal_is_a_skip(reason) -> bool:
+        """
+        Whether a refused restore means "nothing to do" rather than "failed".
+
+        Already in progress, and an object that is not archived at all --
+        which a whole-folder restore meets on every STANDARD object in it.
+        """
+        text = str(reason or "")
+        return (text.startswith("Restore is already in progress")
+                or text.startswith("InvalidObjectState"))

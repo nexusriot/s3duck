@@ -74,10 +74,22 @@ class AccessMixin:
         target_bucket = str(target_bucket or "").strip()
         status = {}
         if target_bucket:
-            status["LoggingEnabled"] = {
-                "TargetBucket": target_bucket,
-                "TargetPrefix": str(target_prefix or ""),
-            }
+            # Read-modify-write, as put_bucket_website does: the dialog edits
+            # two fields, and rebuilding the document from them deleted the
+            # TargetGrants and the TargetObjectKeyFormat (partitioned
+            # prefixes) a bucket had been given elsewhere.
+            try:
+                current = (self._optional_document(
+                    self.client.get_bucket_logging) or {}).get(
+                        "LoggingEnabled") or {}
+            except Exception:
+                current = {}
+            enabled = {field: current[field]
+                       for field in ("TargetGrants", "TargetObjectKeyFormat")
+                       if current.get(field)}
+            enabled["TargetBucket"] = target_bucket
+            enabled["TargetPrefix"] = str(target_prefix or "")
+            status["LoggingEnabled"] = enabled
         self.client.put_bucket_logging(
             Bucket=self.bucket, BucketLoggingStatus=status)
         if log_fn:
