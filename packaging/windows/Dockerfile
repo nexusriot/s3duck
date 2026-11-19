@@ -15,6 +15,8 @@
 # the layers above it fetched.
 #
 # Build with `make win` (BuildKit required). The exe lands in dist/.
+# `make win-installer` builds the setup program instead: the stages at the
+# bottom of this file.
 
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS toolchain
 
@@ -81,7 +83,7 @@ RUN --network=none \
 
 # ---------------------------------------------------------------------------
 
-FROM toolchain AS build
+FROM toolchain AS source
 
 # Fixed hash seed and timestamp for reproducibility.
 # PE header timestamps still vary, so builds are close but not byte-identical.
@@ -90,6 +92,11 @@ ENV PYTHONHASHSEED=0 \
 
 WORKDIR /src
 COPY . .
+
+# ---------------------------------------------------------------------------
+
+# `make win`: one self-contained exe that unpacks itself on every start.
+FROM source AS build
 
 RUN --network=none \
     wine 'C:\Python\python.exe' -m PyInstaller \
@@ -107,3 +114,57 @@ RUN --network=none \
 # writes this stage's filesystem, owned by the invoking user.
 FROM scratch AS artifact
 COPY --from=build /out/s3duck.exe /s3duck.exe
+
+# ---------------------------------------------------------------------------
+
+# `make win-installer`: the same app as a folder (s3duck.exe + _internal/).
+# An installed program has somewhere to keep its files, so it should not pay
+# the one-file exe's unpack-to-%TEMP% on every launch.
+FROM source AS build-dir
+
+RUN --network=none \
+    wine 'C:\Python\python.exe' -m PyInstaller \
+        --noconfirm --clean \
+        --windowed --onedir \
+        --add-data='icons;icons' \
+        --add-data='resources/ducky.ico;resources/.' \
+        --icon='resources/ducky.ico' \
+        --distpath /out --workpath /tmp/pyi-build \
+        s3duck.py \
+ && test -f /out/s3duck/s3duck.exe && test -d /out/s3duck/_internal
+
+# ---------------------------------------------------------------------------
+
+# NSIS is a native Linux compiler for Windows installers, so this stage needs
+# no Wine. Its own stage, from the same pinned base and archive snapshot,
+# rather than one more package in `toolchain`: that would rebuild the whole
+# Wine prefix for the sake of a tool the exe build never runs.
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS installer-build
+
+ARG DEBIAN_SNAPSHOT=20261101T000000Z
+ENV DEBIAN_FRONTEND=noninteractive \
+    SOURCE_DATE_EPOCH=1700000000
+
+RUN rm -f /etc/apt/sources.list.d/debian.sources \
+ && printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s trixie main\ndeb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/%s trixie-security main\n' \
+        "$DEBIAN_SNAPSHOT" "$DEBIAN_SNAPSHOT" > /etc/apt/sources.list \
+ && apt-get -o Acquire::Retries=5 update \
+ && apt-get install -y --no-install-recommends nsis \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /installer
+COPY --from=build-dir /out/s3duck ./app
+COPY packaging/windows/installer.nsi LICENSE version.py ./
+COPY resources/ducky.ico ./
+
+# The version is read from version.py here, the way the Makefile and
+# build_deb.sh read it, so it is never written a second time.
+RUN --network=none \
+    VERSION="$(sed -n 's/^__VERSION__ = "\(.*\)"$/\1/p' version.py)" \
+ && test -n "$VERSION" \
+ && mkdir /out \
+ && makensis -V2 -WX -DVERSION="$VERSION" \
+        -DOUTFILE="/out/s3duck-${VERSION}-setup.exe" installer.nsi
+
+FROM scratch AS installer
+COPY --from=installer-build /out/ /

@@ -66,6 +66,7 @@ help:
 	@echo "    macos         self-contained macOS binary (run on macOS)"
 	@echo "    dmg           pack the macOS binary into a .dmg (run on macOS)"
 	@echo "    win           Windows .exe via Wine in Docker -> $(DIST_DIR)/"
+	@echo "    win-installer Windows setup .exe: per-user or Program Files"
 	@echo "    win-lock      refresh the hash-locked Windows wheel list"
 	@echo ""
 	@echo "  Development"
@@ -191,6 +192,20 @@ win windows:
 		--output type=local,dest=$(DIST_DIR) \
 		.
 	@echo ">> $(DIST_DIR)/$(APP).exe"
+
+# A setup program around the same app, built as a folder rather than as one
+# self-unpacking exe: packaging/windows/installer.nsi (NSIS, which runs
+# natively on Linux). It asks whether to install for the current user
+# (%LOCALAPPDATA%\Programs, no administrator rights) or for everyone
+# (Program Files); unattended, `/S /CurrentUser` or `/S /AllUsers`.
+.PHONY: win-installer
+win-installer:
+	DOCKER_BUILDKIT=1 docker build \
+		-f packaging/windows/Dockerfile \
+		--target installer \
+		--output type=local,dest=$(DIST_DIR) \
+		.
+	@echo ">> $(DIST_DIR)/$(APP)-$(VERSION)-setup.exe"
 
 .PHONY: win-lock
 win-lock:

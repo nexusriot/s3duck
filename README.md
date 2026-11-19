@@ -338,6 +338,7 @@ make debs         # amd64 + arm64
 make rpm          # noarch .rpm (Docker)
 make bin          # self-contained Linux binary
 make win          # Windows .exe (Docker + Wine)
+make win-installer  # Windows setup .exe: per-user or Program Files
 make pkg          # universal macOS installer (on macOS)
 make clean        # build/, dist/, caches, PyInstaller leftovers
 ```
@@ -399,6 +400,23 @@ hashes in `packaging/windows/requirements.lock`). The build step itself has
 no network access. After changing `requirements.txt`, refresh the lock with
 `make win-lock`. On Windows itself, `build_win.cmd` from a prompt with
 `pyinstaller` on PATH does the same.
+
+### Windows installer
+```bash
+make win-installer          # dist/s3duck-<version>-setup.exe
+```
+The same pinned build, with the app as a folder instead of one self-unpacking
+exe, wrapped by NSIS (`packaging/windows/installer.nsi`). The installer asks
+who it is for:
+
+- **Only me** — `%LOCALAPPDATA%\Programs\S3 Duck`, no administrator rights.
+- **Anyone who uses this computer** — `Program Files\S3 Duck`.
+
+An administrator gets one UAC prompt at start and both choices; a standard
+user is not prompted and gets "only me". Unattended: `/S /CurrentUser` or
+`/S /AllUsers`, optionally with `/D=C:\Folder` last. It adds a Start menu
+shortcut (a desktop one is optional) and an entry under Installed apps;
+uninstalling leaves settings and saved profiles alone.
 
 Pre-built releases are available on the [GitHub releases page](https://github.com/nexusriot/s3duck/releases/latest).
 
@@ -505,7 +523,7 @@ s3duck/
 │   ├── e2e/             Model end-to-end suite + its MinIO compose harness
 │   └── e2e_gui/         GUI end-to-end suite: the real window, headless
 ├── tools/               CI helpers, the icon report, the shared .deb/.rpm payload
-├── packaging/           Pinned Docker builds: windows/ (.exe via Wine), rpm/
+├── packaging/           Pinned Docker builds: windows/ (.exe via Wine, installer), rpm/
 │
 ├── Makefile             Front door: make test / e2e / all / deb / rpm / win / clean
 ├── requirements.txt     Python dependencies
